@@ -1,0 +1,33 @@
+[project]
+name = "goc-mpc"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Tassos Manganaris",email = "tassos.manganaris@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+]
+
+[build-system]
+requires = ["py-build-cmake~=0.4.3"]
+build-backend = "py_build_cmake.build"
+
+[tool.py-build-cmake.module]
+name = "goc_mpc"
+directory = "src"
+
+[tool.py-build-cmake.sdist]
+include = ["CMakeLists.txt", "src/goc_mpc_cpp"]
+
+[tool.py-build-cmake.cmake]
+minimum_version = "3.17"
+build_type = "RelWithDebInfo"
+source_path = "."
+build_args = ["-j"]
+install_components = ["python_modules"]
+
+[tool.poetry.group.dev.dependencies]
+py-build-cmake = "^0.4.3"
+
