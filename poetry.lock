@@ -95,6 +95,18 @@ docs = ["myst-parser (==3.0.1)", "sphinx (==7.4.7)", "sphinx-book-theme (==1.1.3
 test = ["jinja2 (>=3.1.2,<3.2.0)", "nox (>=2023.4.22,<2024)"]
 
 [[package]]
+name = "pybind11-stubgen"
+version = "2.5.4"
+description = "PEP 561 type stubs generator for pybind11 modules"
+optional = false
+python-versions = "~=3.7"
+groups = ["dev"]
+files = [
+    {file = "pybind11_stubgen-2.5.4-py3-none-any.whl", hash = "sha256:8625f25da48cf96eea24ba7cae673b5f49b45847b6ef01eead60c4eb762fe5c5"},
+    {file = "pybind11_stubgen-2.5.4.tar.gz", hash = "sha256:b6bd44a6d4ba55cef80bd8af92f1f8195b1c6bb0f7bd2f6d785c9530ce6bcae9"},
+]
+
+[[package]]
 name = "pyproject-metadata"
 version = "0.7.1"
 description = "PEP 621 metadata parsing"
@@ -158,5 +170,5 @@ files = [
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.10"
-content-hash = "782e862a29d396d92d7316a419e9accea17e32788fb473c2dd30b5d9323f56e2"
+python-versions = ">=3.10,<4.0"
+content-hash = "1432a1f10e911bdb82ff89c9c6bd9bf512115c14ce125569eec4724e058e4c31"

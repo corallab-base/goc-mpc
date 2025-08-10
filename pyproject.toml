@@ -6,7 +6,7 @@ authors = [
     {name = "Tassos Manganaris",email = "tassos.manganaris@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<4.0"
 dependencies = [
 ]
 
@@ -19,7 +19,7 @@ name = "goc_mpc"
 directory = "src"
 
 [tool.py-build-cmake.sdist]
-include = ["CMakeLists.txt", "src/goc_mpc_cpp"]
+include = ["CMakeLists.txt", "cmake", "src/goc_mpc_cpp"]
 
 [tool.py-build-cmake.cmake]
 minimum_version = "3.17"
@@ -30,4 +30,5 @@ install_components = ["python_modules"]
 
 [tool.poetry.group.dev.dependencies]
 py-build-cmake = "^0.4.3"
+pybind11-stubgen = "^2.5.4"
 
