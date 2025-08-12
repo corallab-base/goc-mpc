@@ -8,7 +8,7 @@ namespace py = pybind11;
 
 GraphOrderingProblem build_graph_ordering_problem(
 	const py::array_t<double>& waypoints,
-	const py::array_t<double>& graph_np,
+	const py::array_t<unsigned int>& graph_np,
 	const py::array_t<double>& x0_np,
 	const py::array_t<double>& v0_np) {
 
