@@ -32,6 +32,8 @@ pybind11_add_module(_goc_mpc_cpp MODULE
     "src/goc_mpc_cpp/goc_mpc/goc_mpc.cpp"
     "src/goc_mpc_cpp/goc_mpc/graph_timing_mpc.cpp"
     "src/goc_mpc_cpp/goc_mpc/graph_ordering_mpc_problem.cpp"
+    "src/goc_mpc_cpp/goc_mpc/graph_waypoint_mpc.cpp"
+    "src/goc_mpc_cpp/goc_mpc/graph_waypoint_mpc_problem.cpp"
 )
 target_link_libraries(_goc_mpc_cpp PRIVATE drake::drake)
 target_compile_definitions(_goc_mpc_cpp PRIVATE

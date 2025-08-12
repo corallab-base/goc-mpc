@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
-// #include "waypoint_mpc.hpp"
+#include "graph_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 
 namespace py = pybind11;
@@ -20,4 +20,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("get_vels", &GraphTimingMPC::get_vels)
 		.def("get_times", &GraphTimingMPC::get_times)
 		.def("fill_cubic_spline", &GraphTimingMPC::fill_cubic_spline);
+        py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
+                .def(py::init<const py::array_t<double>&, unsigned int, unsigned int, unsigned int>())
+		.def("solve", &GraphWaypointMPC::solve)
+		.def("get_waypoints", &GraphWaypointMPC::get_waypoints);
 }
