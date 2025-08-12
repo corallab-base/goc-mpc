@@ -19,6 +19,7 @@
 
 #include "timing_mpc_problem.hpp"
 #include "../splines.hpp"
+#include "../utils.hpp"
 
 using namespace pybind11::literals;
 namespace py = pybind11;

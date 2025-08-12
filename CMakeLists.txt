@@ -24,6 +24,7 @@ find_package(drake CONFIG REQUIRED)
 pybind11_add_module(_goc_mpc_cpp MODULE
     "src/goc_mpc_cpp/goc_mpc.cpp"
     "src/goc_mpc_cpp/splines.cpp"
+    "src/goc_mpc_cpp/utils.cpp"
     "src/goc_mpc_cpp/sec_mpc/sec_mpc.cpp"
     "src/goc_mpc_cpp/sec_mpc/waypoint_mpc.cpp"
     "src/goc_mpc_cpp/sec_mpc/timing_mpc.cpp"
