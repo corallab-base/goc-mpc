@@ -9,7 +9,7 @@ namespace py = pybind11;
  */
 
 
-TimingMPC::TimingMPC(const py::array_t<double>& _waypoints, double _time_cost, double _ctrl_cost)
+TimingMPC::TimingMPC(const Eigen::MatrixXd& _waypoints, double _time_cost, double _ctrl_cost)
   : waypoints(_waypoints),
     time_cost(_time_cost),
     ctrl_cost(_ctrl_cost) {
@@ -51,8 +51,8 @@ TimingMPC::TimingMPC(const py::array_t<double>& _waypoints, double _time_cost, d
 }
 
 
-int TimingMPC::solve(const py::array_t<double>& x0,
-		     const py::array_t<double>& v0,
+int TimingMPC::solve(const Eigen::VectorXd& x0,
+		     const Eigen::VectorXd& v0,
 		     int verbose) {
 
 	struct TimingProblem problem = build_timing_problem(

@@ -34,9 +34,9 @@ struct TimingProblem {
 
 
 TimingProblem build_timing_problem(
-	const py::array_t<double>& waypoints,
-	const py::array_t<double>& x0_np,
-	const py::array_t<double>& v0_np,
+	const Eigen::MatrixXd& wps,
+	const Eigen::VectorXd& x0,
+	const Eigen::VectorXd& v0,
 	double time_cost,
 	double ctrl_cost,
 	bool opt_time_deltas,

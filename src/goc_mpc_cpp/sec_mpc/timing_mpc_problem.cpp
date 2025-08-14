@@ -7,9 +7,9 @@ using namespace pybind11::literals;
 namespace py = pybind11;
 
 TimingProblem build_timing_problem(
-	const py::array_t<double>& waypoints,
-	const py::array_t<double>& x0_np,
-	const py::array_t<double>& v0_np,
+	const Eigen::MatrixXd& wps,
+	const Eigen::VectorXd& x0,
+	const Eigen::VectorXd& v0,
 	double time_cost,
 	double ctrl_cost,
 	bool opt_time_deltas,
@@ -22,28 +22,8 @@ TimingProblem build_timing_problem(
 
 	using namespace drake::solvers;
 
-	const ssize_t K = waypoints.shape(0);
-	const ssize_t d = waypoints.shape(1);
-
-	// Create Eigen objects from input arrays
-	Eigen::VectorXd x0(d);
-	Eigen::VectorXd v0(d);
-	Eigen::MatrixXd wps(K, d);
-
-	auto x0_u = x0_np.unchecked<1>();
-	auto v0_u = v0_np.unchecked<1>();
-	auto wps_u = waypoints.unchecked<2>();
-
-	for (size_t i = 0; i < K; ++i) {
-		for (size_t j = 0; j < d; ++j) {
-			wps(i, j) = wps_u(i, j);
-		}
-	}
-
-	for (size_t i = 0; i < d; ++i) {
-		x0(i) = x0_u(i);
-		v0(i) = v0_u(i);
-	}
+	const ssize_t K = wps.rows();
+	const ssize_t d = wps.cols();
 
 	// Create program
 	TimingProblem problem;

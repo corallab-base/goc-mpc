@@ -24,16 +24,13 @@ find_package(drake CONFIG REQUIRED)
 pybind11_add_module(_goc_mpc_cpp MODULE
     "src/goc_mpc_cpp/goc_mpc.cpp"
     "src/goc_mpc_cpp/splines.cpp"
+    "src/goc_mpc_cpp/graphs.cpp"
     "src/goc_mpc_cpp/utils.cpp"
-    "src/goc_mpc_cpp/sec_mpc/sec_mpc.cpp"
-    "src/goc_mpc_cpp/sec_mpc/waypoint_mpc.cpp"
-    "src/goc_mpc_cpp/sec_mpc/timing_mpc.cpp"
     "src/goc_mpc_cpp/sec_mpc/timing_mpc_problem.cpp"
     "src/goc_mpc_cpp/goc_mpc/goc_mpc.cpp"
     "src/goc_mpc_cpp/goc_mpc/graph_timing_mpc.cpp"
-    "src/goc_mpc_cpp/goc_mpc/graph_ordering_mpc_problem.cpp"
     "src/goc_mpc_cpp/goc_mpc/graph_waypoint_mpc.cpp"
-    "src/goc_mpc_cpp/goc_mpc/graph_waypoint_mpc_problem.cpp"
+    "src/goc_mpc_cpp/goc_mpc/graph_short_path_mpc.cpp"
 )
 target_link_libraries(_goc_mpc_cpp PRIVATE drake::drake)
 target_compile_definitions(_goc_mpc_cpp PRIVATE

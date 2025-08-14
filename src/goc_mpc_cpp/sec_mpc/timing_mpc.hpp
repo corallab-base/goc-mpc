@@ -52,13 +52,13 @@ struct TimingMPC {
 	bool never_done = false;
 
 	// Constructor
-	TimingMPC(const py::array_t<double>& _waypoints,
+	TimingMPC(const Eigen::MatrixXd& _waypoints,
 		  double _timeCost = 1e0,
 		  double _ctrlCost = 1e0);
 
 	// Core solve routine
-	int solve(const py::array_t<double>& x0,
-		  const py::array_t<double>& v0,
+	int solve(const Eigen::VectorXd& x0,
+		  const Eigen::VectorXd& v0,
 		  int verbose = 1);
 
 	// Phase tracking
