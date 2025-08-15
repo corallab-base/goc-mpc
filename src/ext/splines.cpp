@@ -13,129 +13,81 @@ namespace py = pybind11;
  * CubicPiece
  */
 
-void CubicPiece::set(const py::array_t<double>& x0,
-                     const py::array_t<double>& v0,
-                     const py::array_t<double>& x1,
-                     const py::array_t<double>& v1,
+void CubicPiece::set(const Eigen::VectorXd& x0,
+                     const Eigen::VectorXd& v0,
+                     const Eigen::VectorXd& x1,
+                     const Eigen::VectorXd& v1,
                      double tau) {
-        auto x0_ = x0.unchecked<1>();
-        auto v0_ = v0.unchecked<1>();
-        auto x1_ = x1.unchecked<1>();
-        auto v1_ = v1.unchecked<1>();
-
-        ssize_t dim = x0_.shape(0);
-        this->a = py::array_t<double>(dim);
-        this->b = py::array_t<double>(dim);
-        this->c = py::array_t<double>(dim);
-        this->d = py::array_t<double>(dim);
-
-        auto a_ = this->a.mutable_unchecked<1>();
-        auto b_ = this->b.mutable_unchecked<1>();
-        auto c_ = this->c.mutable_unchecked<1>();
-        auto d_ = this->d.mutable_unchecked<1>();
+        ssize_t dim = x0.size();
+        _a = Eigen::VectorXd(dim);
+	_b = Eigen::VectorXd(dim);
+	_c = Eigen::VectorXd(dim);
+	_d = Eigen::VectorXd(dim);
 
         double tau2 = tau * tau;
         double tau3 = tau * tau2;
 
         for (ssize_t i = 0; i < dim; ++i) {
-                d_(i) = x0_(i);
-                c_(i) = v0_(i);
-                b_(i) = (3.0 * (x1_(i) - x0_(i)) - tau * (v1_(i) + 2.0 * v0_(i))) / tau2;
-                a_(i) = (-2.0 * (x1_(i) - x0_(i)) + tau * (v1_(i) + v0_(i))) / tau3;
+                _d(i) = x0(i);
+                _c(i) = v0(i);
+                _b(i) = (3.0 * (x1(i) - x0(i)) - tau * (v1(i) + 2.0 * v0(i))) / tau2;
+                _a(i) = (-2.0 * (x1(i) - x0(i)) + tau * (v1(i) + v0(i))) / tau3;
         }
 }
 
-void CubicPiece::eval_into(py::object x,
-                           py::object xDot,
-                           py::object xDDot,
-                           double t) const
-{
-        ssize_t dim = this->d.shape(0);
+// Fill any subset of outputs. Pass std::nullopt for ones you don't want.
+void CubicPiece::eval_into(std::optional<Eigen::Ref<Eigen::VectorXd>> x,
+			   std::optional<Eigen::Ref<Eigen::VectorXd>> xDot,
+			   std::optional<Eigen::Ref<Eigen::VectorXd>> xDDot,
+			   double t) const {
+	const int n = _a.size();
+	const double t2 = t * t;
+	const double t3 = t2 * t;
 
-        auto a_ = this->a.unchecked<1>();
-        auto b_ = this->b.unchecked<1>();
-        auto c_ = this->c.unchecked<1>();
-        auto d_ = this->d.unchecked<1>();
+	if (x) {
+		if (x->size() != n) {
+			throw std::runtime_error("x has wrong size");
+		}
+		// x(t) = d + t c + t^2 b + t^3 a
+		x->noalias() = _d + t * _c + t2 * _b + t3 * _a;
+	}
 
-        double t2 = t * t;
-        double t3 = t2 * t;
+	if (xDot) {
+		if (xDot->size() != n) {
+			throw std::runtime_error("xDot has wrong size");
+		}
+		// x'(t) = c + 2 t b + 3 t^2 a
+		xDot->noalias() = _c + (2.0 * t) * _b + (3.0 * t2) * _a;
+	}
 
-        // Position
-        if (!x.is_none()) {
-                if (!py::isinstance<py::array_t<double>>(x)) {
-                        throw py::type_error("x must be a NumPy array or None");
-                }
-
-                py::array_t<double> x_arr = x.cast<py::array_t<double>>();
-                if (x_arr.ndim() != 1 || x_arr.shape(0) != dim) {
-                        throw py::value_error("x must have shape (dim,) matching the spline");
-                }
-
-                auto x_ = x_arr.mutable_unchecked<1>();
-                for (ssize_t i = 0; i < dim; ++i) {
-                        x_(i) = d_(i) + t * c_(i) + t2 * b_(i) + t3 * a_(i);
-                }
-        }
-
-        // Velocity
-        if (!xDot.is_none()) {
-                if (!py::isinstance<py::array_t<double>>(xDot)) {
-                        throw py::type_error("xDot must be a NumPy array or None");
-                }
-
-                py::array_t<double> xDot_arr = xDot.cast<py::array_t<double>>();
-                if (xDot_arr.ndim() != 1 || xDot_arr.shape(0) != dim) {
-                        throw py::value_error("xDot must have shape (dim,) matching the spline");
-                }
-
-                auto xDot_ = xDot_arr.mutable_unchecked<1>();
-                for (ssize_t i = 0; i < dim; ++i) {
-                        xDot_(i) = c_(i) + 2.0 * t * b_(i) + 3.0 * t2 * a_(i);
-                }
-        }
-
-        // Acceleration
-        if (!xDDot.is_none()) {
-                if (!py::isinstance<py::array_t<double>>(xDDot)) {
-                        throw py::type_error("xDDot must be a NumPy array or None");
-                }
-
-                py::array_t<double> xDDot_arr = xDDot.cast<py::array_t<double>>();
-                if (xDDot_arr.ndim() != 1 || xDDot_arr.shape(0) != dim) {
-                        throw py::value_error("xDDot must have shape (dim,) matching the spline");
-                }
-
-                auto xDDot_ = xDDot_arr.mutable_unchecked<1>();
-                for (ssize_t i = 0; i < dim; ++i) {
-                        xDDot_(i) = 2.0 * b_(i) + 6.0 * t * a_(i);
-                }
-        }
+	if (xDDot) {
+		if (xDDot->size() != n) {
+			throw std::runtime_error("xDDot has wrong size");
+		}
+		// x''(t) = 2 b + 6 t a
+		xDDot->noalias() = 2.0 * _b + (6.0 * t) * _a;
+	}
 }
 
-py::array_t<double> CubicPiece::eval(double t, unsigned int diff) const {
-        ssize_t dim = this->d.shape(0);
-        auto a_ = this->a.unchecked<1>();
-        auto b_ = this->b.unchecked<1>();
-        auto c_ = this->c.unchecked<1>();
-        auto d_ = this->d.unchecked<1>();
+Eigen::VectorXd CubicPiece::eval(double t, unsigned int diff) const {
+        ssize_t dim = _a.size();
 
-        py::array_t<double> out(dim);
-        auto out_ = out.mutable_unchecked<1>();
+	Eigen::VectorXd out(dim);
         double t2 = t * t;
 
         if (diff == 0) {
                 double t3 = t2 * t;
                 for (ssize_t i = 0; i < dim; ++i)
-                        out_(i) = d_(i) + t * c_(i) + t2 * b_(i) + t3 * a_(i);
+                        out(i) = _d(i) + t * _c(i) + t2 * _b(i) + t3 * _a(i);
         } else if (diff == 1) {
                 for (ssize_t i = 0; i < dim; ++i)
-                        out_(i) = c_(i) + 2.0 * t * b_(i) + 3.0 * t2 * a_(i);
+                        out(i) = _c(i) + 2.0 * t * _b(i) + 3.0 * t2 * _a(i);
         } else if (diff == 2) {
                 for (ssize_t i = 0; i < dim; ++i)
-                        out_(i) = 2.0 * b_(i) + 6.0 * t * a_(i);
+                        out(i) = 2.0 * _b(i) + 6.0 * t * _a(i);
         } else if (diff == 3) {
                 for (ssize_t i = 0; i < dim; ++i)
-                        out_(i) = 6.0 * a_(i);
+                        out(i) = 6.0 * _a(i);
         } else {
                 throw py::value_error("CubicPiece::eval(): derivative order must be 0–3");
         }
@@ -147,475 +99,274 @@ py::array_t<double> CubicPiece::eval(double t, unsigned int diff) const {
  * CubicSpline
  */
 
-py::array_t<double> get_row(const py::array_t<double>& mat, ssize_t i) {
-        if (mat.ndim() != 2) {
-                throw py::value_error("Expected a 2D array");
-        }
-
-        ssize_t cols = mat.shape(1);
-        auto mat_ = mat.unchecked<2>();
-
-        py::array_t<double> row(cols);
-        auto row_ = row.mutable_unchecked<1>();
-
-        for (ssize_t j = 0; j < cols; ++j) {
-                row_(j) = mat_(i, j);
-        }
-
-        return row;
-}
-
-void CubicSpline::set(const py::array_t<double>& pts,
-                      const py::array_t<double>& vels,
-                      const py::array_t<double>& times)
+void CubicSpline::set(const Eigen::MatrixXd& pts,
+                      const Eigen::MatrixXd& vels,
+                      const Eigen::VectorXd& times)
 {
-        if (times.ndim() != 1 || times.shape(0) < 2) {
-                throw py::value_error("CubicSpline::set() requires at least 2 time points");
-        }
+        // if (times.ndim() != 1 || times.shape(0) < 2) {
+        //         throw py::value_error("CubicSpline::set() requires at least 2 time points");
+        // }
 
-        if (pts.ndim() != 2 || vels.ndim() != 2) {
-                throw py::value_error("pts and vels must be 2D arrays");
-        }
+        // if (pts.ndim() != 2 || vels.ndim() != 2) {
+        //         throw py::value_error("pts and vels must be 2D arrays");
+        // }
 
-        if (pts.shape(0) != vels.shape(0)) {
-                throw py::value_error("pts and vels must have the same number of rows");
-        }
+        // if (pts.shape(0) != vels.shape(0)) {
+        //         throw py::value_error("pts and vels must have the same number of rows");
+        // }
 
-        if (pts.shape(0) != times.shape(0)) {
-                throw py::value_error("pts/vels rows must match time entries");
-        }
+        // if (pts.shape(0) != times.shape(0)) {
+        //         throw py::value_error("pts/vels rows must match time entries");
+        // }
 
-        this->times = times;
-        ssize_t K = pts.shape(0) - 1;
-        this->pieces.resize(K);
-
-        auto times_ = times.unchecked<1>();
+        this->_times = times;
+	this->_dim = pts.cols();
+        ssize_t K = pts.rows() - 1;
+        this->_pieces.resize(K);
 
         for (ssize_t k = 0; k < K; ++k) {
-                py::array_t<double> x0 = get_row(pts, k);
-                py::array_t<double> v0 = get_row(vels, k);
-                py::array_t<double> x1 = get_row(pts, k + 1);
-                py::array_t<double> v1 = get_row(vels, k + 1);
-                double tau = times_(k + 1) - times_(k);
-                this->pieces[k].set(x0, v0, x1, v1, tau);
+		Eigen::VectorXd x0 = pts.row(k);
+		Eigen::VectorXd v0 = vels.row(k);
+		Eigen::VectorXd x1 = pts.row(k + 1);
+		Eigen::VectorXd v1 = vels.row(k + 1);
+                double tau = times(k + 1) - times(k);
+                this->_pieces[k].set(x0, v0, x1, v1, tau);
         }
 }
 
-void CubicSpline::append(const py::array_t<double>& pts,
-                         const py::array_t<double>& vels,
-                         const py::array_t<double>& new_times)
-{
-        ssize_t dim = pts.shape(1);
+// Append K_new segments defined by (pts, vels, new_times).
+// Shapes:
+//   pts:  (K_new, dim)
+//   vels: (K_new, dim)
+//   new_times: (K_new,)   -- durations; must be positive and (strictly) increasing cumulative offsets
+void CubicSpline::append(const Eigen::Ref<const Eigen::MatrixXd>& pts,
+			 const Eigen::Ref<const Eigen::MatrixXd>& vels,
+			 const Eigen::Ref<const Eigen::VectorXd>& new_times) {
 
-        if (new_times.ndim() != 1 || new_times.shape(0) < 1 || new_times.at(0) < 1e-6) {
-                throw py::value_error("CubicSpline::append(): new_times[0] must be > 0");
-        }
+	// Basic checks mirroring your Python code
+	if (new_times.size() < 1 || new_times(0) <= 1e-6) {
+		throw std::invalid_argument("CubicSpline::append(): new_times[0] must be > 0");
+	}
 
-        auto times_ = this->times.unchecked<1>();
-        ssize_t T = times_.shape(0);
-        if (T < 2) throw py::value_error("CubicSpline::append(): spline must be initialized first");
+	const int T = static_cast<int>(_times.size());
+	if (T < 2) {
+		throw std::invalid_argument("CubicSpline::append(): spline must be initialized first");
+	}
 
-        // Get last time segment duration
-        double t_end = times_(T - 1);
-        double t_prev = times_(T - 2);
-        double dt_last = t_end - t_prev;
+	const int K_new = static_cast<int>(pts.rows());
+	if (K_new <= 0) {
+		throw std::invalid_argument("CubicSpline::append(): pts must have at least one row");
+	}
+	if (vels.rows() != pts.rows() || vels.cols() != pts.cols()) {
+		throw std::invalid_argument("CubicSpline::append(): vels shape must match pts");
+	}
+	if (new_times.size() != K_new) {
+		throw std::invalid_argument("CubicSpline::append(): new_times length must equal pts.rows()");
+	}
 
-        // Evaluate current end state into two new arrays
-        py::array_t<double> x = py::array_t<double>({dim});
-        py::array_t<double> xDot = py::array_t<double>({dim});
-        this->pieces.back().eval_into(x, xDot, py::none(), dt_last);
+	// Dimension consistency
+	const int d = static_cast<int>(pts.cols());
+	if (_dim < 0) _dim = d;
+	if (d != _dim) {
+		throw std::invalid_argument("CubicSpline::append(): pts.cols() != spline dimension");
+	}
 
-        // Extend time array
-        std::vector<double> new_times_vec(T);
-        for (ssize_t i = 0; i < T; ++i)
-                new_times_vec[i] = times_(i);
+	// Ensure new_times is strictly increasing (durations increasing cumulatively)
+	for (int i = 1; i < new_times.size(); ++i) {
+		if (new_times(i) - new_times(i-1) <= 1e-12) {
+			throw std::invalid_argument("CubicSpline::append(): new_times must be strictly increasing");
+		}
+	}
 
-        auto new_times_ = new_times.unchecked<1>();
-        for (ssize_t i = 0; i < new_times.shape(0); ++i)
-                new_times_vec.push_back(t_end + new_times_(i));
+	// Last segment duration of the existing spline
+	const double t_end  = _times(T - 1);
+	const double t_prev = _times(T - 2);
+	const double dt_last = t_end - t_prev;
 
-        this->times = py::array_t<double>(new_times_vec.size(), new_times_vec.data());
+	// Evaluate current end state at dt_last
+	Eigen::VectorXd x(d), xDot(d);
+	{
+		Eigen::Ref<Eigen::VectorXd> x_ref(x);
+		Eigen::Ref<Eigen::VectorXd> xdot_ref(xDot);
+		// no acceleration requested
+		_pieces.back().eval_into(x_ref, xdot_ref, std::nullopt, dt_last);
+	}
 
-        // Resize and insert new segments
-        ssize_t K_new = pts.shape(0);
-        ssize_t K_old = this->pieces.size();
-        this->pieces.resize(K_old + K_new);
+	// Extend _times with the new absolute times
+	Eigen::VectorXd new_times_abs(T + K_new);
+	new_times_abs.head(T) = _times;
+	for (int i = 0; i < K_new; ++i) {
+		new_times_abs(T + i) = t_end + new_times(i);
+	}
+	_times.swap(new_times_abs);
 
-        // First segment connects to last known (x, xDot)
-        py::array_t<double> x1 = get_row(pts, 0);
-        py::array_t<double> v1 = get_row(vels, 0);
-        this->pieces[K_old].set(x, xDot, x1, v1, new_times_(0));
+	// Resize pieces to fit the K_new appended segments
+	const int K_old = static_cast<int>(_pieces.size());
+	_pieces.resize(K_old + K_new);
 
-        // Remaining new segments
-        for (ssize_t k = 1; k < K_new; ++k) {
-                py::array_t<double> x0 = get_row(pts, k - 1);
-                py::array_t<double> v0 = get_row(vels, k - 1);
-                py::array_t<double> x1 = get_row(pts, k);
-                py::array_t<double> v1 = get_row(vels, k);
-                double tau = new_times_(k) - new_times_(k - 1);
-                this->pieces[K_old + k].set(x0, v0, x1, v1, tau);
-        }
+	// First appended segment connects from the current end state (x, xDot)
+	{
+		Eigen::VectorXd x1  = pts.row(0).transpose();
+		Eigen::VectorXd v1  = vels.row(0).transpose();
+		const double tau = new_times(0);
+		_pieces[K_old].set(x, xDot, x1, v1, tau);
+	}
+
+	// Remaining appended segments use (x0, v0) = previous waypoint, (x1, v1) = current waypoint
+	for (int k = 1; k < K_new; ++k) {
+		Eigen::VectorXd x0  = pts.row(k - 1).transpose();
+		Eigen::VectorXd v0  = vels.row(k - 1).transpose();
+		Eigen::VectorXd x1  = pts.row(k).transpose();
+		Eigen::VectorXd v1  = vels.row(k).transpose();
+		const double tau = new_times(k) - new_times(k - 1);
+		if (tau <= 1e-12) {
+			throw std::invalid_argument("CubicSpline::append(): segment duration must be positive");
+		}
+		_pieces[K_old + k].set(x0, v0, x1, v1, tau);
+	}
 }
 
 unsigned int CubicSpline::get_piece(double t) const {
-        auto times_ = this->times.unchecked<1>();
-        ssize_t N = times_.shape(0);
+        ssize_t n = _times.size();
 
-        if (N < 2)
+        if (n < 2)
                 throw py::value_error("CubicSpline is empty");
 
-        if (t <= times_(0)) return 0;
-        if (t >= times_(N - 1)) return this->pieces.size() - 1;
+        if (t <= _times(0)) return 0;
+        if (t >= _times(n - 1)) return this->_pieces.size() - 1;
 
-        for (ssize_t k = 1; k < N; ++k) {
-                if (t < times_(k)) return k - 1;
+        for (ssize_t k = 1; k < n; ++k) {
+                if (t < _times(k)) return k - 1;
         }
-        return N - 2;  // fallback
+        return n - 2;  // fallback
 }
 
-void CubicSpline::eval_into(py::object x,
-                            py::object xDot,
-                            py::object xDDot,
-                            double t) const {
-        auto times_ = this->times.unchecked<1>();
-        ssize_t N = times_.shape(0);
+void CubicSpline::eval_into(std::optional<Eigen::Ref<Eigen::VectorXd>> x,
+			    std::optional<Eigen::Ref<Eigen::VectorXd>> xDot,
+			    std::optional<Eigen::Ref<Eigen::VectorXd>> xDDot,
+			    double t) const
+{
+	const int N = static_cast<int>(_times.size());
+	if (N < 2) {
+		throw std::invalid_argument("CubicSpline is empty");
+	}
 
-        if (N < 2)
-                throw py::value_error("CubicSpline is empty");
+	const double t0 = _times(0);
+	const double tN = _times(N - 1);
 
-        double t0 = times_(0);
-        double tN = times_(N - 1);
+	// Quick size checks (if provided)
+	const int d = _dim;
+	auto chk = [d](const std::optional<Eigen::Ref<Eigen::VectorXd>>& v, const char* name){
+		if (v && v->size() != d) {
+			throw std::invalid_argument(std::string(name) + " has wrong size");
+		}
+	};
+	chk(x,    "x");
+	chk(xDot, "xDot");
+	chk(xDDot,"xDDot");
 
-        // Dispatch to first piece
-        if (t <= t0) {
-                this->pieces[0].eval_into(x, xDot, xDDot, 0.0);
+	// Before-first interval: evaluate at start; zero acceleration if requested
+	if (t <= t0) {
+		_pieces.front().eval_into(x, xDot, xDDot, /*t_rel=*/0.0);
+		if (xDDot) {
+			xDDot->setZero();  // match original: force zero acceleration at boundary
+		}
+		return;
+	}
 
-                if (!xDDot.is_none()) {
-                        py::array_t<double> xDot_arr = xDot.cast<py::array_t<double>>();
-                        py::array_t<double> xDDot_arr = xDDot.cast<py::array_t<double>>();
+	// After-last interval: evaluate at end; zero acceleration if requested
+	if (t >= tN) {
+		const double tau_last = _times(N - 1) - _times(N - 2);
+		_pieces.back().eval_into(x, xDot, xDDot, /*t_rel=*/tau_last);
+		if (xDDot) {
+			xDDot->setZero();
+		}
+		return;
+	}
 
-                        if (xDDot_arr.ndim() != 1 || xDDot_arr.shape(0) != xDot_arr.shape(0)) {
-                                throw py::value_error("xDDot must match xDot shape for zeroing");
-                        }
-
-                        auto acc_ = xDDot_arr.mutable_unchecked<1>();
-                        for (ssize_t i = 0; i < acc_.shape(0); ++i) {
-                                acc_(i) = 0.0;
-                        }
-                }
-
-                return;
-        }
-
-        // Dispatch to last piece
-        if (t >= tN) {
-                this->pieces.back().eval_into(x, xDot, xDDot, tN - times_(N - 2));
-
-                if (!xDDot.is_none()) {
-                        py::array_t<double> xDot_arr = xDot.cast<py::array_t<double>>();
-                        py::array_t<double> xDDot_arr = xDDot.cast<py::array_t<double>>();
-
-                        if (xDDot_arr.ndim() != 1 || xDDot_arr.shape(0) != xDot_arr.shape(0)) {
-                                throw py::value_error("xDDot must match xDot shape for zeroing");
-                        }
-
-                        auto acc_ = xDDot_arr.mutable_unchecked<1>();
-                        for (ssize_t i = 0; i < acc_.shape(0); ++i) {
-                                acc_(i) = 0.0;
-                        }
-                }
-
-                return;
-        }
-
-        // Main case: evaluate at piece k
-        unsigned int k = this->get_piece(t);
-        double t_rel = t - times_(k);
-        this->pieces[k].eval_into(x, xDot, xDDot, t_rel);
+	// Main case: find piece k and evaluate at relative time
+	const unsigned int k = get_piece(t);
+	const double t_rel = t - _times(static_cast<int>(k));
+	_pieces[static_cast<size_t>(k)].eval_into(x, xDot, xDDot, t_rel);
 }
 
+Eigen::VectorXd CubicSpline::eval(double t, unsigned int diff) const {
+	const int N = static_cast<int>(_times.size());
+	if (N < 2) {
+		throw std::invalid_argument("CubicSpline::eval(): spline is empty");
+	}
 
-py::array_t<double> CubicSpline::eval(double t, unsigned int diff) const {
-        // Get output shape from evaluating a single sample
-        ssize_t dim = this->pieces[0].a.shape(0);
-        py::array_t<double> out(dim);
-        if (diff == 0)      this->eval_into(out, py::none(), py::none(), t);
-        else if (diff == 1) this->eval_into(py::none(), out, py::none(), t);
-        else if (diff == 2) this->eval_into(py::none(), py::none(), out, t);
-        else {
-                unsigned int k = this->get_piece(t);
-                double t_rel = t - this->times.unchecked<1>()(k);
-                out = this->pieces[k].eval(t_rel, diff);
-        }
-        return out;
+	// Determine dimension once (prefer stored _dim, otherwise infer)
+	const int d = (_dim >= 0) ? _dim
+		: static_cast<int>(/* e.g. */ _pieces.front()._d.size());
+	Eigen::VectorXd out(d);
+
+	if (diff <= 2) {
+		// Prepare optionals
+		std::optional<Eigen::Ref<Eigen::VectorXd>> X, Xd, Xdd;
+
+		if (diff == 0) {
+			X.emplace(out);                // position
+		} else if (diff == 1) {
+			Xd.emplace(out);               // velocity
+		} else { // diff == 2
+			Xdd.emplace(out);              // acceleration
+		}
+
+		// Reuse the spline dispatcher you already implemented
+		this->eval_into(std::move(X), std::move(Xd), std::move(Xdd), t);
+		return out;
+	}
+
+	// Higher derivatives: delegate to the appropriate piece (same as your original)
+	const unsigned int k = this->get_piece(t);
+	const double t_rel = t - _times(static_cast<int>(k));
+	return _pieces[k].eval(t_rel, diff);
 }
 
-py::array_t<double> CubicSpline::eval_multiple(const py::array_t<double>& T, unsigned int diff) const {
-        auto T_ = T.unchecked<1>();
-        ssize_t M = T.shape(0);
+Eigen::MatrixXd CubicSpline::eval_multiple(const Eigen::Ref<const Eigen::VectorXd>& T,
+                                           unsigned int diff) const {
+	const int N = static_cast<int>(_times.size());
+	if (N < 2) {
+		throw std::invalid_argument("CubicSpline::eval_multiple(): spline is empty");
+	}
 
-        // Get output shape from evaluating a single sample
-        py::array_t<double> first = this->eval(T_(0), diff);
-        ssize_t dim = first.shape(0);
+	const int M = static_cast<int>(T.size());
+	const int d = (_dim >= 0) ? _dim
+		: static_cast<int>(/* e.g. */ _pieces.front()._a.size()); // or your stored dim
 
-        py::array_t<double> out({M, dim});
-        auto out_ = out.mutable_unchecked<2>();
+	Eigen::MatrixXd out(M, d);
+	if (M == 0) return out;  // empty query → empty matrix (0 × d)
 
-        for (ssize_t i = 0; i < M; ++i) {
-                py::array_t<double> vi = this->eval(T_(i), diff);
-                auto vi_ = vi.unchecked<1>();
-                for (ssize_t j = 0; j < dim; ++j)
-                        out_(i, j) = vi_(j);
-        }
+	if (diff <= 2) {
+		// Use eval_into to fill each row efficiently.
+		Eigen::VectorXd tmp(d);
+		for (int i = 0; i < M; ++i) {
+			std::optional<Eigen::Ref<Eigen::VectorXd>> X, Xd, Xdd;
+			if      (diff == 0) X.emplace(tmp);
+			else if (diff == 1) Xd.emplace(tmp);
+			else                Xdd.emplace(tmp);  // diff == 2
 
-        return out;
+			this->eval_into(std::move(X), std::move(Xd), std::move(Xdd), T(i));
+			out.row(i) = tmp.transpose();
+		}
+	} else {
+		// Higher derivatives: delegate to piece-wise eval (returns VectorXd)
+		for (int i = 0; i < M; ++i) {
+			out.row(i) = this->eval(T(i), diff).transpose();
+		}
+	}
+
+	return out;
 }
 
 double CubicSpline::begin() const {
-        return this->times.unchecked<1>()(0);
+        return this->_times(0);
 }
 
 double CubicSpline::end() const {
-        return this->times.unchecked<1>()(this->times.shape(0) - 1);
+        return this->_times(this->_times.size() - 1);
 }
-
-/*
- * Costs and Constraints
- */
-
-#include "cubic_spline_leap_cost.cpp"
-// #include "cubic_spline_acc0.cpp"
-// #include "cubic_spline_acc1.cpp"
-// #include "cubic_spline_max_acc.cpp"
-// #include "cubic_spline_max_jerk.cpp"
-// #include "cubic_spline_max_vel.cpp"
-// #include "cubic_spline_pos_vel_acc.cpp"
-
-// double single_piece_cost(Eigen::VectorXd x0, Variable v0, Eigen::VectorXd x1, Variable v1, Variable tau) {
-// 	Eigen::VectorXd D = (x1 - x0) - 0.5 * tau * (v0 + v1);
-// 	Eigen::VectorXd V = v1 - v0;
-// 	const double s12 = std::sqrt(12.0);
-// 	double cost = (s12 * std::pow(tau, -1.5)) * D.norm() + std::pow(tau, -0.5) * V.norm();
-// 	return cost * cost;
-// };
-
-// This struct represents a cost/constraint block for enforcing max velocity in a cubic spline segment
-// Inputs: fixed waypoints x0, x1; decision velocities v0, v1; decision scalar tau
-// struct CubicSplineMaxVelCost {
-// 	const Eigen::VectorXd x0, x1;
-// 	const double max_vel;
-
-// 	explicit CubicSplineMaxVelCost(const Eigen::VectorXd& x0_,
-// 				       const Eigen::VectorXd& x1_,
-// 				       double max_vel_)
-// 		: x0(x0_), x1(x1_), max_vel(max_vel_) {}
-
-// 	// Evaluate the 4 * d-dimensional constraint vector
-// 	Eigen::VectorXd operator()(const Eigen::Ref<const Eigen::VectorXd>& x) const {
-// 		const int d = x0_.size();
-// 		Eigen::VectorXd v0 = x.segment(0, d);
-// 		Eigen::VectorXd v1 = x.segment(d, d);
-// 		double tau = x(2 * d);
-
-// 		double tau2 = tau * tau;
-// 		Eigen::VectorXd c = v0;
-// 		Eigen::VectorXd b = 3. * (x1 - x0) - tau * (v1 + 2. * v0);
-// 		Eigen::VectorXd a = -2. * (x1 - x0) + tau * (v1 + v0);
-
-// 		// Compute approximation of peak velocity (mid-trajectory)
-// 		Eigen::VectorXd vmax = c + (1. / tau) * (b + 0.75 * a);
-
-// 		Eigen::VectorXd y(4 * d);
-// 		y.segment(0 * d, d) = v0 - max_vel * Eigen::VectorXd::Ones(d);
-// 		y.segment(1 * d, d) = -v0 - max_vel * Eigen::VectorXd::Ones(d);
-// 		y.segment(2 * d, d) = vmax - max_vel * Eigen::VectorXd::Ones(d);
-// 		y.segment(3 * d, d) = -vmax - max_vel * Eigen::VectorXd::Ones(d);
-
-// 		return y;
-// 	}
-
-// };
-
-
-// arr CubicSplineMaxJer(const arr& x0, const arr& v0, const arr& x1, const arr& v1, double tau, const arr& tauJ) {
-//   //jerk is 6a
-//   double tau2 = tau*tau, tau3 = tau*tau2, tau4 = tau2*tau2;
-//   arr a6 = 6./tau3 * (-2.*(x1-x0) + tau*(v1+v0));
-//   if(tauJ.N) {
-//     a6.J() += (36./tau4 * (x1-x0)) * tauJ;
-//     a6.J() += (-12./tau3 * (v1+v0)) * tauJ;
-//   }
-
-//   uint n=x0.N;
-//   arr y(2*n);
-//   if(a6.jac) y.J().sparse().resize(y.N, a6.jac->d1, 0);
-//   y.setVectorBlock(a6, 0*n);
-//   y.setVectorBlock(-a6, 1*n);
-//   return y;
-// }
-
-// arr CubicSplineAcc0(const arr& x0, const arr& v0, const arr& x1, const arr& v1, double tau, const arr& tauJ) {
-//   //acceleration is 6a t + 2b
-//   double tau2 = tau*tau, tau3 = tau*tau2;
-//   arr b2 = 2./tau2 * (3.*(x1-x0) - tau*(v1+2.*v0));
-//   if(tauJ.N) {
-//     b2.J() += -12./tau3 * (x1-x0) * tauJ;
-//     b2.J() -= -2./tau2 * (v1+2.*v0) * tauJ;
-//   }
-//   return b2;
-// }
-
-// arr CubicSplineAcc1(const arr& x0, const arr& v0, const arr& x1, const arr& v1, double tau, const arr& tauJ) {
-//   //acceleration is 6a t + 2b
-//   double tau2 = tau*tau, tau3 = tau*tau2;
-//   //  arr d = x0;
-//   //  arr c = v0;
-//   arr b2 = 2./tau2 * (3.*(x1-x0) - tau*(v1+2.*v0));
-//   if(tauJ.N) {
-//     b2.J() += -12./tau3 * (x1-x0) * tauJ;
-//     b2.J() -= -2./tau2 * (v1+2.*v0) * tauJ;
-//   }
-//   arr a6_tau = 6./tau2 * (-2.*(x1-x0) + tau*(v1+v0));
-//   if(tauJ.N) {
-//     a6_tau.J() -= -24./tau3 * (x1-x0) * tauJ;
-//     a6_tau.J() += -6./tau2 * (v1+v0) * tauJ;
-//   }
-//   return a6_tau + b2;
-// }
-
-// arr CubicSplineMaxAcc(const arr& x0, const arr& v0, const arr& x1, const arr& v1, double tau, const arr& tauJ) {
-//   //acceleration is 6a t + 2b
-//   double tau2 = tau*tau, tau3 = tau*tau2;
-//   //  arr d = x0;
-//   //  arr c = v0;
-//   arr b2 = 2./tau2 * (3.*(x1-x0) - tau*(v1+2.*v0));
-//   if(tauJ.N) {
-//     b2.J() += -12./tau3 * (x1.noJ()-x0.noJ()) * tauJ;
-//     b2.J() -= -2./tau2 * (v1.noJ()+2.*v0.noJ()) * tauJ;
-//   }
-//   arr a6_tau = 6./tau2 * (-2.*(x1-x0) + tau*(v1+v0));
-//   if(tauJ.N) {
-//     a6_tau.J() -= -24./tau3 * (x1.noJ()-x0.noJ()) * tauJ;
-//     a6_tau.J() += -6./tau2 * (v1.noJ()+v0.noJ()) * tauJ;
-//   }
-
-//   uint d=x0.N;
-//   arr y(4*d);
-//   if(b2.jac) y.J().sparse().resize(y.N, b2.jac->d1, 0);
-//   y.setVectorBlock(b2, 0*d);
-//   y.setVectorBlock(-b2, 1*d);
-//   y.setVectorBlock(b2 + a6_tau, 2*d);
-//   y.setVectorBlock(-b2 - a6_tau, 3*d);
-//   return y;
-// }
-
-
-// arr CubicSplineMaxVel(const arr& x0, const arr& v0, const arr& x1, const arr& v1, double tau, const arr& tauJ) {
-// 	//acc is 6a t + 2b; with root at t=-b/3a
-// 	//velocity is 3a t^2 + 2b t + c; at root is -b^2 / 3a + c
-
-// #if 1
-// 	double tau2 = tau*tau;
-// 	//  arr d = x0;
-// 	arr c = v0;
-// 	arr b = (3.*(x1-x0) - tau*(v1+2.*v0));
-// 	if(tauJ.N) {
-// 		b.J() -= (v1+2.*v0) * tauJ;
-// 	}
-// 	arr a = (-2.*(x1-x0) + tau*(v1+v0));
-// 	if(tauJ.N) {
-// 		a.J() += (v1+v0) * tauJ;
-// 	}
-// 	arr t=-tau*b.noJ()/(3.*a.noJ());
-// 	//indicators for each dimension
-// 	arr iv0=zeros(t.N), iv1=zeros(t.N), ivm=zeros(t.N);
-// 	for(uint i=0; i<t.N; i++) {
-// 		if(t(i)<=0) iv0(i)=1.;
-// 		else if(t(i)>=tau) iv1(i)=1.;
-// 		else ivm(i)=1.;
-// 	}
-// 	arr vmax = c + (1./tau) * (b + 3./4.*a);
-// 	if(tauJ.N) {
-// 		vmax.J() -= (1./tau2) * (b + 3./4.*a) * tauJ;
-// 	}
-
-// 	//  vmax = iv0%v0;
-// 	//  vmax += iv1%v1;
-// 	//  vmax += ((1./(3.*tau)) * ((ivm%b%b)/a) + c);
-// 	//  if(tauJ.N){
-// 	//    vmax.J() -= (1./(3.*tau2)) * ((ivm%b%b)/a) * tauJ;
-// 	//  }
-// #endif
-
-// 	uint n=x0.N;
-// 	arr y(4*n);
-// 	y.setZero();
-// 	if(v0.jac) y.J().sparse().resize(y.N, v0.jac->d1, 0);
-// 	else if(vmax.jac) y.J().sparse().resize(y.N, vmax.jac->d1, 0);
-// 	y.setVectorBlock(v0, 0*n);
-// 	y.setVectorBlock(-v0, 1*n);
-// 	y.setVectorBlock(vmax, 2*n);
-// 	y.setVectorBlock(-vmax, 3*n);
-// 	return y;
-// }
-
-// void CubicSplinePosVelAcc(arr& pos, arr& vel, arr& acc, double trel, const arr& x0, const arr& v0, const arr& x1, const arr& v1, double tau, const arr& tauJ) {
-//   //position at time t:
-//   // a t^3 + b t^2 + c t + d
-
-//   CHECK_GE(trel, 0., "");
-//   CHECK_LE(trel, 1., "");
-
-//   double tau2 = tau*tau;
-//   double tau3 = tau2*tau;
-//   arr d = x0;
-//   arr c = v0;
-// #if 0
-//   arr b = 1./tau2 * (3.*(x1-x0) - tau*(v1+2.*v0));
-//   if(tauJ.N) {
-//     b.J() += -6./tau3 * (x1.noJ()-x0.noJ()) * tauJ;
-//     b.J() -= -1./tau2 * (v1.noJ()+2.*v0.noJ()) * tauJ;
-//   }
-//   arr a = 1./tau3 * (-2.*(x1-x0) + tau*(v1+v0));
-//   if(tauJ.N) {
-//     a.J() -= -6./tau4 * (x1.noJ()-x0.noJ()) * tauJ;
-//     a.J() += -2./tau3 * (v1.noJ()+v0.noJ()) * tauJ;
-//   }
-// #endif
-//   arr c_tau = tau*c;
-//   if(tauJ.N) { if(c_tau.jac) c_tau.J() += (c) * tauJ; else c_tau.J() = c*tauJ; }
-
-//   arr b_tau2 = (3.*(x1-x0) - tau*(v1+2.*v0));
-//   if(tauJ.N) b_tau2.J() -= (v1.noJ()+2.*v0.noJ()) * tauJ;
-
-//   arr b_tau1 = 1./tau * b_tau2;
-//   if(tauJ.N) b_tau1.J() += (-1./tau2) * b_tau2.noJ() * tauJ;
-
-//   arr b_tau0 = 1./tau2 * b_tau2;
-//   if(tauJ.N) b_tau0.J() += (-2./tau3) * b_tau2.noJ() * tauJ;
-
-//   arr a_tau3 = (-2.*(x1-x0) + tau*(v1+v0));
-//   if(tauJ.N) a_tau3.J() += (v1+v0) * tauJ;
-
-//   arr a_tau2 = 1./tau * a_tau3;
-//   if(tauJ.N) a_tau2.J() += (-1./tau2) * a_tau3.noJ() * tauJ;
-
-//   arr a_tau1 = 1./tau2 * a_tau3;
-//   if(tauJ.N) a_tau1.J() += (-2./tau3) * a_tau3.noJ() * tauJ;
-
-//   //arr a_tau0 = 1./tau3 * a_tau3;
-//   //if(tauJ.N) a_tau0.J() += (-3./tau4) * a_tau3.noJ() * tauJ;
-
-//   if(!!pos) pos = (trel*trel*trel)*a_tau3 + (trel*trel)*b_tau2 + trel*c_tau + d;
-//   if(!!vel) vel = (3.*trel*trel)*a_tau2 + (2.*trel)*b_tau1 + c;
-//   if(!!acc) acc = (6.*trel)*a_tau1 + (2.)*b_tau0;
-// #if 0
-//   if(!!pos) pos = (t*t*t)*a + (t*t)*b + t*c + d;
-//   if(!!vel) vel = (3.*t*t)*a + (2.*t)*b + c;
-//   if(!!acc) acc = (6.*t)*a + (2.)*b;
-// #endif
-// }
-
 
 
 /*

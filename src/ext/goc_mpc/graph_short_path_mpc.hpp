@@ -37,8 +37,8 @@ struct ShortPathProblem {
 
 
 ShortPathProblem build_short_path_problem(
-	const py::array_t<double>& ref_points_np,
-	const py::array_t<double>& ref_velocities_np,
+	const Eigen::VectorXd& ref_points,
+	const Eigen::VectorXd& ref_velocities,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
 	double tau);
@@ -48,11 +48,11 @@ struct GraphShortPathMPC {
 	// Inputs, number of steps, dimension, reference traj
 	unsigned int _num_steps, _dim;
 	double _time_per_step;
-	py::array_t<double> _times;
+	Eigen::VectorXd _times;
 
 	// Outputs
-	py::array_t<double> _points;
-	py::array_t<double> _vels;
+	Eigen::MatrixXd _points;
+	Eigen::MatrixXd _vels;
 
 	// Constructor
 	GraphShortPathMPC(unsigned int num_steps,
@@ -62,8 +62,7 @@ struct GraphShortPathMPC {
 	// Core solve routine
 	int solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& v0, const CubicSpline& reference);
 
-	py::array_t<double> get_points() const;
-	py::array_t<double> get_times() const;
-	py::array_t<double> get_vels() const;
-
+	Eigen::MatrixXd get_points() const;
+	Eigen::MatrixXd get_vels() const;
+	Eigen::VectorXd get_times() const;
 };
