@@ -5,10 +5,58 @@ GraphOfConstraints::GraphOfConstraints(
 	unsigned int num_agents, unsigned int dim,
 	const Eigen::VectorXd& global_x_lb,
 	const Eigen::VectorXd& global_x_ub)
-	: num_agents(num_agents),
+	: num_phis(0),
+	  _num_total_assignables(0),
+	  num_agents(num_agents),
 	  dim(dim),
 	  _global_x_lb(global_x_lb),
 	  _global_x_ub(global_x_ub) {}
+
+std::pair<std::vector<std::vector<size_t>>,
+	  std::vector<std::pair<size_t, size_t>>> GraphOfConstraints::get_agent_paths(
+		  const std::vector<size_t>& remaining_vertices,
+		  const Eigen::VectorXi& assignments) const {
+	const InducedSubgraphView<py::object> sg = InducedSubgraphView<py::object>(
+		structure, remaining_vertices);
+
+	// This function introduces the idea now that every node has exactly one phi. That seems pretty reasonable.
+
+	std::vector<std::vector<size_t>> agent_nodes(num_agents);
+	std::vector<std::pair<size_t, size_t>> cross_agent_edges;
+
+	sg.dfs_visit_from_sources(
+		[this, assignments, &agent_nodes, &cross_agent_edges]
+		(size_t node, std::optional<size_t> parent) {
+			int parent_assignment = -1;
+			if (parent && phi_map.contains(*parent)) {
+				const int parent_phi_id = phi_map.at(*parent);
+				parent_assignment = assignments(parent_phi_id);
+			}
+
+			size_t assignment = -1;
+			if (phi_map.contains(node)) {
+				const int phi_id = phi_map.at(node);
+				assignment = assignments(phi_id);
+
+				if (assignment == -1) {
+					for (size_t ag = 0; ag < num_agents; ++ag) {
+						agent_nodes[ag].push_back(node);
+					}
+				} else {
+					agent_nodes[assignment].push_back(node);
+				}
+			}
+
+			if (parent && parent_assignment != -1 && assignment != -1 &&
+			    parent_assignment != assignment) {
+				cross_agent_edges.emplace_back(node, *parent);
+			}
+		});
+
+	return std::make_pair<std::vector<std::vector<size_t>>&,
+			      std::vector<std::pair<size_t, size_t>>&>(agent_nodes, cross_agent_edges);
+}
+
 
 // Joint-Agent Constraint Adders (typed)
 

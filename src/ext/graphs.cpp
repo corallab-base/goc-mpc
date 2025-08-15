@@ -115,6 +115,87 @@ std::vector<size_t> Graph<LabelT>::dfs(size_t s) const {
 }
 
 template <typename LabelT>
+void Graph<LabelT>::dfs_visit(
+    size_t s,
+    const std::function<void(size_t, std::optional<size_t>)>& cb) const
+{
+  check_node(s);
+  if (!_alive[s]) return;
+
+  const size_t n = num_nodes();
+  std::vector<char> vis(n, 0);
+
+  using Frame = std::pair<size_t, std::optional<size_t>>; // (u, parent)
+  std::vector<Frame> st;
+  st.reserve(n);
+  st.emplace_back(s, std::nullopt);
+
+  while (!st.empty()) {
+    auto [u, parent] = st.back();
+    st.pop_back();
+
+    if (u >= n || vis[u] || !_alive[u]) continue;
+    vis[u] = 1;
+
+    cb(u, parent);  // preorder
+
+    // Push neighbors in reverse to get a stable left-to-right preorder.
+    const auto& nbrs = _adj[u];
+    for (auto it = nbrs.rbegin(); it != nbrs.rend(); ++it) {
+      const size_t v = it->to;
+      if (v < n && !vis[v] && _alive[v]) st.emplace_back(v, u);
+    }
+  }
+}
+
+template <typename LabelT>
+void Graph<LabelT>::dfs_visit_from_sources(
+    const std::function<void(size_t, std::optional<size_t>)>& cb) const
+{
+  const size_t n = num_nodes();
+  if (n == 0) return;
+
+  // Compute (in-)degree among alive nodes.
+  std::vector<size_t> indeg(n, 0);
+  for (size_t u = 0; u < n; ++u) {
+    if (!_alive[u]) continue;
+    for (const auto& e : _adj[u]) {
+      const size_t v = e.to;
+      if (v < n && _alive[v]) ++indeg[v];
+    }
+  }
+
+  std::vector<char> vis(n, 0);
+
+  auto do_dfs = [&](size_t root) {
+    using Frame = std::pair<size_t, std::optional<size_t>>;
+    std::vector<Frame> st;
+    st.emplace_back(root, std::nullopt);
+    while (!st.empty()) {
+      auto [u, parent] = st.back();
+      st.pop_back();
+      if (u >= n || vis[u] || !_alive[u]) continue;
+      vis[u] = 1;
+      cb(u, parent);
+      const auto& nbrs = _adj[u];
+      for (auto it = nbrs.rbegin(); it != nbrs.rend(); ++it) {
+        const size_t v = it->to;
+        if (v < n && !vis[v] && _alive[v]) st.emplace_back(v, u);
+      }
+    }
+  };
+
+  // Start from sources; for undirected graphs this means zero-degree nodes.
+  for (size_t u = 0; u < n; ++u) {
+    if (_alive[u] && indeg[u] == 0 && !vis[u]) do_dfs(u);
+  }
+
+  // Optional: if you want to ensure every alive node is visited even when
+  // there are cycles / no sources, you could fall back here:
+  // for (size_t u = 0; u < n; ++u) if (_alive[u] && !vis[u]) do_dfs(u);
+}
+
+template <typename LabelT>
 typename Graph<LabelT>::SSSPResult Graph<LabelT>::dijkstra(size_t s, std::function<double(const LabelT&)> weight_fn) const {
 	check_node(s);
 	const double INF = std::numeric_limits<double>::infinity();
@@ -372,10 +453,98 @@ InducedSubgraphView<LabelT>::edges() const {
 	};
 }
 
+// DFS
+
+template <typename LabelT>
+void InducedSubgraphView<LabelT>::dfs_visit(
+    size_t s,
+    const std::function<void(size_t, std::optional<size_t>)>& cb) const
+{
+  if (!contains_node(s)) return;
+
+  const size_t n = _g->num_nodes();
+  std::vector<char> vis(n, 0);
+
+  using Frame = std::pair<size_t, std::optional<size_t>>;
+  std::vector<Frame> st;
+  st.emplace_back(s, std::nullopt);
+
+  while (!st.empty()) {
+    auto [u, parent] = st.back(); st.pop_back();
+    if (u >= n || vis[u] || !contains_node(u)) continue;
+    vis[u] = 1;
+
+    cb(u, parent);
+
+    // Collect filtered neighbors first, then push in reverse for stable order.
+    std::vector<size_t> tmp;
+    for (const auto& e : neighbors(u)) {
+      const size_t v = e.to; // guaranteed in view by neighbors()
+      if (v < n && !vis[v] && contains_node(v)) tmp.push_back(v);
+    }
+    for (auto it = tmp.rbegin(); it != tmp.rend(); ++it) {
+      st.emplace_back(*it, u);
+    }
+  }
+}
+
+template <typename LabelT>
+void InducedSubgraphView<LabelT>::dfs_visit_from_sources(
+    const std::function<void(size_t, std::optional<size_t>)>& cb) const
+{
+  const size_t n = _g->num_nodes();
+  if (_node_list.empty()) return;
+
+  // In-degree inside the view only.
+  std::vector<size_t> indeg(n, 0);
+  for (size_t u : _node_list) {
+    // neighbors(u) already filters to nodes in the view
+    for (const auto& e : neighbors(u)) {
+      ++indeg[e.to];
+    }
+  }
+
+  std::vector<char> vis(n, 0);
+
+  auto do_dfs = [&](size_t root) {
+    using Frame = std::pair<size_t, std::optional<size_t>>;
+    std::vector<Frame> st;
+    st.emplace_back(root, std::nullopt);
+    while (!st.empty()) {
+      auto [u, parent] = st.back(); st.pop_back();
+      if (u >= n || vis[u] || !contains_node(u)) continue;
+      vis[u] = 1;
+
+      cb(u, parent);
+
+      std::vector<size_t> tmp;
+      for (const auto& e : neighbors(u)) {
+        const size_t v = e.to; // in view
+        if (v < n && !vis[v] && contains_node(v)) tmp.push_back(v);
+      }
+      for (auto it = tmp.rbegin(); it != tmp.rend(); ++it) {
+        st.emplace_back(*it, u);
+      }
+    }
+  };
+
+  // Start DFS from all sources in the view.
+  for (size_t u : _node_list) {
+    if (indeg[u] == 0 && !vis[u]) do_dfs(u);
+  }
+
+  // Optional fallback to cover any remaining nodes (e.g., cycles):
+  // for (size_t u : _node_list) if (!vis[u]) do_dfs(u);
+}
+
 // ---- explicit instantiations ----------------------------------------------
 
+
+template class Graph<double>;
+template class Graph<py::object>;
+
 template class InducedSubgraphView<double>;
-template class InducedSubgraphView<pybind11::object>;
+template class InducedSubgraphView<py::object>;
 
 
 /*

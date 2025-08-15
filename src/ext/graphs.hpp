@@ -46,6 +46,17 @@ public:
 	struct BFSResult { std::vector<std::optional<size_t>> parent; std::vector<int> dist; };
 	BFSResult bfs(size_t s) const;
 
+	// DFS from a specific start node; calls cb(u, parent) on discovery (preorder).
+	// Skips inactive nodes. parent = std::nullopt at root.
+	void dfs_visit(size_t s,
+		       const std::function<void(size_t, std::optional<size_t>)>& cb) const;
+
+	// DFS starting from all "source" nodes (zero in-degree among alive nodes).
+	// For undirected graphs, sources are the zero-degree nodes.
+	// Calls cb(u, parent) for each discovered node exactly once.
+	void dfs_visit_from_sources(
+		const std::function<void(size_t, std::optional<size_t>)>& cb) const;
+
 	std::vector<size_t> dfs(size_t s) const;
 
 	struct SSSPResult { std::vector<double> dist; std::vector<std::optional<size_t>> parent; };
@@ -61,10 +72,6 @@ private:
 	std::vector<std::vector<Edge>> _adj;
 	std::vector<bool> _alive;
 };
-
-
-template class Graph<pybind11::object>;
-
 
 /// Read-only, zero-copy induced subgraph view over Graph<LabelT>.
 /// Lifetime note: invalidated by structural mutations of the parent Graph
@@ -171,6 +178,16 @@ public:
 
 	/// Access the parent graph (const).
 	const GraphT& parent() const { return *_g; }
+
+
+	// DFS within the view from a specific start node (must be contained).
+	// Calls cb(u, parent) on discovery. Skips nodes not in the view.
+	void dfs_visit(size_t s,
+		       const std::function<void(size_t, std::optional<size_t>)>& cb) const;
+
+	// DFS within the view starting from all view-sources (zero in-degree inside the view).
+	void dfs_visit_from_sources(
+		const std::function<void(size_t, std::optional<size_t>)>& cb) const;
 
 private:
 	const GraphT* _g;               // parent graph (not owning)

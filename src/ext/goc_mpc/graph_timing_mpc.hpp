@@ -12,7 +12,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
-#include "../sec_mpc/timing_mpc_problem.hpp"
+#include "graph_of_constraints.hpp"
 #include "../splines.hpp"
 #include "../utils.hpp"
 
@@ -36,21 +36,48 @@ struct GraphOrderingProblem {
 };
 
 GraphOrderingProblem build_graph_ordering_problem(
+	const Graph<py::object>& structure,
 	const Eigen::MatrixXd& waypoints,
-	const Eigen::MatrixXi& graph,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0);
+
+struct GraphTimingProblem {
+	// Necessary to use a unique_ptr for movability. Weird...
+	std::unique_ptr<drake::solvers::MathematicalProgram> prog;
+	std::vector<Eigen::MatrixXd> wps_list;
+	std::vector<drake::solvers::MatrixXDecisionVariable> vs_list;
+	std::vector<drake::solvers::MatrixXDecisionVariable> time_deltas_list;
+
+	GraphTimingProblem(size_t num_agents)
+		: prog(std::make_unique<drake::solvers::MathematicalProgram>()),
+		  wps_list(num_agents),
+		  vs_list(num_agents),
+		  time_deltas_list(num_agents) {}
+
+	GraphTimingProblem(const GraphTimingProblem&) = delete;
+	GraphTimingProblem& operator=(const GraphTimingProblem&) = delete;
+
+	GraphTimingProblem(GraphTimingProblem&&) = default;
+	GraphTimingProblem& operator=(GraphTimingProblem&&) = default;
+};
+
+GraphTimingProblem build_graph_timing_problem(
+	const Graph<py::object>& structure,
+	const Eigen::MatrixXd& waypoints,
+	const Eigen::VectorXd& x0,
+	const Eigen::VectorXd& v0);
+
 
 struct GraphTimingMPC {
 	// Inputs, waypoints and graph (adjacency matrix) encoding ordering constraints.
 	// Eigen::MatrixXd _waypoints;
-	// Eigen::MatrixXi _graph;
+	const GraphOfConstraints* _graph;
 	unsigned int _num_agents, _dim;
 
 	// Outputs
-	// py::array_t<unsigned int> _ordering;
-	// py::array_t<double> _time_deltas;
-	// py::array_t<double> _vels;
+	std::vector<Eigen::MatrixXd> _wps_list;
+	std::vector<Eigen::MatrixXd> _vs_list;
+	std::vector<Eigen::VectorXd> _time_deltas_list;
 
 	// Optimization parameters
 	double _time_cost;
@@ -63,18 +90,21 @@ struct GraphTimingMPC {
 	// bool never_done = false;
 
 	// Constructor
-	GraphTimingMPC(
-		unsigned int num_agents, unsigned int dim,
-		double time_cost = 1e0,
-		double ctrl_cost = 1e0);
+	GraphTimingMPC(const GraphOfConstraints& graph,
+		       double time_cost = 1e0,
+		       double ctrl_cost = 1e0);
 
 	// Core solve routine
-	std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXd>> solve(
-		const Eigen::MatrixXi& graph,
-		const Eigen::VectorXd& x0,
-		const Eigen::VectorXd& v0,
-		const Eigen::MatrixXd& waypoints,
-		const Eigen::VectorXi& assignments);
+	void solve(const Eigen::VectorXd& x0,
+		   const Eigen::VectorXd& v0,
+		   const std::vector<size_t>& remaining_vertices,
+		   const Eigen::MatrixXd& waypoints,
+		   const Eigen::VectorXi& assignments);
+
+	// Spline generator
+	void fill_cubic_splines(std::vector<CubicSpline>& splines,
+				const Eigen::VectorXd& x0,
+				const Eigen::VectorXd& v0) const;
 
 	// Phase tracking
 	// double current_minimum_time_delta() const;
@@ -94,8 +124,5 @@ struct GraphTimingMPC {
 	// void update_backtrack();
 	// void update_set_phase(unsigned int phase_to);
 
-	// Spline generator
-	// void fill_cubic_spline(CubicSpline& S,
-	// 		       const py::array_t<double>& x0,
-	// 		       const py::array_t<double>& v0) const;
+
 };

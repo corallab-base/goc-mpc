@@ -7,111 +7,96 @@ using namespace pybind11::literals;
 namespace py = pybind11;
 
 
-GraphOrderingProblem build_graph_ordering_problem(
-	const Eigen::MatrixXd& wps,
-	const Eigen::MatrixXi& graph,
-	const Eigen::VectorXd& x0,
-	const Eigen::VectorXd& v0) {
+// GraphOrderingProblem build_graph_ordering_problem(
+// 	const Eigen::MatrixXd& wps,
+// 	const Eigen::MatrixXi& graph,
+// 	const Eigen::VectorXd& x0,
+// 	const Eigen::VectorXd& v0) {
 
-	using namespace drake::solvers;
+// 	using namespace drake::solvers;
 
-	const ssize_t K = wps.rows();
-	const ssize_t d = wps.cols();
+// 	const ssize_t K = wps.rows();
+// 	const ssize_t d = wps.cols();
 
-	// Create program
-	GraphOrderingProblem problem;
+// 	// Create program
+// 	GraphOrderingProblem problem;
 
-	// Create decision variables
-	// p(i,j) = 1 iff waypoint i is at position j
-	MatrixXDecisionVariable p = problem.prog->NewBinaryVariables(K, K, "p");
-	problem.p = p;
+// 	// Create decision variables
+// 	// p(i,j) = 1 iff waypoint i is at position j
+// 	MatrixXDecisionVariable p = problem.prog->NewBinaryVariables(K, K, "p");
+// 	problem.p = p;
 
-	// Doubly-Stochastic
-	// Each waypoint exactly once: sum_k p(i,k) = 1
-	for (int i = 0; i < K; ++i) {
-		VectorX<Variable> row = p.row(i);
-		problem.prog->AddLinearEqualityConstraint(Eigen::RowVectorXd::Ones(K), 1.0, row);
-	}
-	// Each position filled: sum_i p(i,k) = 1
-	for (int j = 0; j < K; ++j) {
-		VectorX<Variable> col = p.col(j);
-		problem.prog->AddLinearEqualityConstraint(Eigen::RowVectorXd::Ones(K), 1.0, col);
-	}
+// 	// Doubly-Stochastic
+// 	// Each waypoint exactly once: sum_k p(i,k) = 1
+// 	for (int i = 0; i < K; ++i) {
+// 		VectorX<Variable> row = p.row(i);
+// 		problem.prog->AddLinearEqualityConstraint(Eigen::RowVectorXd::Ones(K), 1.0, row);
+// 	}
+// 	// Each position filled: sum_i p(i,k) = 1
+// 	for (int j = 0; j < K; ++j) {
+// 		VectorX<Variable> col = p.col(j);
+// 		problem.prog->AddLinearEqualityConstraint(Eigen::RowVectorXd::Ones(K), 1.0, col);
+// 	}
 
-	// Precedence: i must appear before j  ==>  sum_k k*P(i,k) + 1 <= sum_k k*P(j,k)
-	for (int i = 0; i < K; ++i) {
-		for (int j = 0; j < K; ++j) {
-			if (graph(i, j) == 1) {
-				VectorX<Variable> lhs_vars(2*K);
-				Eigen::RowVectorXd lhs_coeffs = Eigen::RowVectorXd::Zero(2*K);
-				// pack as [P(i, 0 through n-1), P(j, 0 through n-1)]
-				for (int k = 0; k < K; ++k) {
-					lhs_vars(k)     = p(i, k);
-					lhs_vars(K + k) = p(j, k);
-					lhs_coeffs(k)       = k;       // +k * P(i,k)
-					lhs_coeffs(K + k)   = -k;      // -k * P(j,k)
-				}
-				/* lb occurs when P(i,0) = 1 and P(j, K-1) = 1. Therefore k*P(i, k) - k*P(j, k) = -(K - 1). */
-				problem.prog->AddLinearConstraint(lhs_coeffs, -(K-1), -1, lhs_vars); // enforces pos(i)+1 <= pos(j)
-			}
-		}
-	}
+// 	// Precedence: i must appear before j  ==>  sum_k k*P(i,k) + 1 <= sum_k k*P(j,k)
+// 	for (int i = 0; i < K; ++i) {
+// 		for (int j = 0; j < K; ++j) {
+// 			if (graph(i, j) == 1) {
+// 				VectorX<Variable> lhs_vars(2*K);
+// 				Eigen::RowVectorXd lhs_coeffs = Eigen::RowVectorXd::Zero(2*K);
+// 				// pack as [P(i, 0 through n-1), P(j, 0 through n-1)]
+// 				for (int k = 0; k < K; ++k) {
+// 					lhs_vars(k)     = p(i, k);
+// 					lhs_vars(K + k) = p(j, k);
+// 					lhs_coeffs(k)       = k;       // +k * P(i,k)
+// 					lhs_coeffs(K + k)   = -k;      // -k * P(j,k)
+// 				}
+// 				/* lb occurs when P(i,0) = 1 and P(j, K-1) = 1. Therefore k*P(i, k) - k*P(j, k) = -(K - 1). */
+// 				problem.prog->AddLinearConstraint(lhs_coeffs, -(K-1), -1, lhs_vars); // enforces pos(i)+1 <= pos(j)
+// 			}
+// 		}
+// 	}
 
-	// Helpers: squared distances from x0 to xi for all i
-	// squared distances between xi and xj for all i,j
-	Eigen::VectorXd s2(K);
-	Eigen::MatrixXd d2(K, K);
-	for (int i = 0; i < K; ++i) {
-		s2(i) = (wps.row(i).transpose() - x0).squaredNorm();
-		for (int j = 0; j < K; ++j) {
-			d2(i,j) = (wps.row(i) - wps.row(j)).squaredNorm();
-		}
-	}
+// 	// Helpers: squared distances from x0 to xi for all i
+// 	// squared distances between xi and xj for all i,j
+// 	Eigen::VectorXd s2(K);
+// 	Eigen::MatrixXd d2(K, K);
+// 	for (int i = 0; i < K; ++i) {
+// 		s2(i) = (wps.row(i).transpose() - x0).squaredNorm();
+// 		for (int j = 0; j < K; ++j) {
+// 			d2(i,j) = (wps.row(i) - wps.row(j)).squaredNorm();
+// 		}
+// 	}
 
-	// Objective: sum_i s2(i)*p(i,0) + sum_{k=1}^{n-1} sum_{i,j} d2(i,j)*p(i,k-1)*p(j,k)
+// 	// Objective: sum_i s2(i)*p(i,0) + sum_{k=1}^{n-1} sum_{i,j} d2(i,j)*p(i,k-1)*p(j,k)
 
-	// The second term is quadratic in binaries; to keep MILP, use a *linear* proxy:
-	// e.g., sum_{k=1}^{n-1} sum_{j} (min_i D2(i,j)) * p(j,k)  (lower-bound-ish) or just sum over k of degrees.
-	// A better linear surrogate: use a fixed "nearest predecessor" cost C(j,k) = min_i D2(i,j).
-	Eigen::VectorXd c_min(K);
-	for (int j = 0; j < K; ++j) {
-		double m = std::numeric_limits<double>::infinity();
-		for (int i = 0; i < K; ++i) if (i != j) m = std::min(m, d2(i,j));
-		c_min(j) = std::isfinite(m) ? m : 0.0;
-	}
-	drake::solvers::LinearCost* obj = nullptr;
-	// Build linear objective: sum_i s2(i)*p(i,0) + sum_{k=1}^{n-1} sum_j c_min(j)*p(j,k)
-	Eigen::VectorXd coeffs(K*K);
-	coeffs.setZero();
-	int idx = 0;
-	for (int i = 0; i < K; ++i) {
-		for (int j = 0; j < K; ++j, ++idx) {
-			double c = (j == 0) ? s2(i) : c_min(i);
-			coeffs(idx) = c;
-		}
-	}
-	drake::VectorX<Variable> allP(K*K);
-	idx = 0;
-	for (int i = 0; i < K; ++i) for (int j = 0; j < K; ++j) allP[idx++] = p(i, j);
-	problem.prog->AddLinearCost(coeffs, 0.0, allP);
+// 	// The second term is quadratic in binaries; to keep MILP, use a *linear* proxy:
+// 	// e.g., sum_{k=1}^{n-1} sum_{j} (min_i D2(i,j)) * p(j,k)  (lower-bound-ish) or just sum over k of degrees.
+// 	// A better linear surrogate: use a fixed "nearest predecessor" cost C(j,k) = min_i D2(i,j).
+// 	Eigen::VectorXd c_min(K);
+// 	for (int j = 0; j < K; ++j) {
+// 		double m = std::numeric_limits<double>::infinity();
+// 		for (int i = 0; i < K; ++i) if (i != j) m = std::min(m, d2(i,j));
+// 		c_min(j) = std::isfinite(m) ? m : 0.0;
+// 	}
+// 	drake::solvers::LinearCost* obj = nullptr;
+// 	// Build linear objective: sum_i s2(i)*p(i,0) + sum_{k=1}^{n-1} sum_j c_min(j)*p(j,k)
+// 	Eigen::VectorXd coeffs(K*K);
+// 	coeffs.setZero();
+// 	int idx = 0;
+// 	for (int i = 0; i < K; ++i) {
+// 		for (int j = 0; j < K; ++j, ++idx) {
+// 			double c = (j == 0) ? s2(i) : c_min(i);
+// 			coeffs(idx) = c;
+// 		}
+// 	}
+// 	drake::VectorX<Variable> allP(K*K);
+// 	idx = 0;
+// 	for (int i = 0; i < K; ++i) for (int j = 0; j < K; ++j) allP[idx++] = p(i, j);
+// 	problem.prog->AddLinearCost(coeffs, 0.0, allP);
 
-	return std::move(problem);
-}
-
-/*
- * Timing MPC
- */
-
-GraphTimingMPC::GraphTimingMPC(unsigned int num_agents,
-			       unsigned int dim,
-			       double time_cost,
-			       double ctrl_cost)
-	: _num_agents(num_agents),
-	  _dim(dim),
-	  _time_cost(time_cost),
-	  _ctrl_cost(ctrl_cost) {
-	return;
-}
+// 	return std::move(problem);
+// }
 
 // std::set<unsigned int> GraphTimingMPC::_next_nodes() const {
 // 	std::set<unsigned int> next_nodes;
@@ -144,28 +129,157 @@ GraphTimingMPC::GraphTimingMPC(unsigned int num_agents,
 // 	return _completed_phases.size() == _num_nodes;
 // }
 
-std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXd>> GraphTimingMPC::solve(
-	const Eigen::MatrixXi& graph,
+GraphTimingProblem build_graph_timing_problem(
+	const GraphOfConstraints& graph,
+	const std::vector<size_t>& remaining_vertices,
+	const Eigen::MatrixXd& waypoints,
+	const Eigen::VectorXi& assignments,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
-	const Eigen::MatrixXd& waypoints,
-	const Eigen::VectorXi& assignments) {
+	double time_cost,
+	double time_cost2,
+	double ctrl_cost) {
+
+	using namespace drake::solvers;
+
+	GraphTimingProblem problem(graph.num_agents);
 
 	/* at this point, the waypoint optimizer has decided on assignments of
 	 * agents to assignable tasks and their positions for satisfying those
 	 * tasks. the order may not be completely determined for an individual
 	 * agent, so we also solve for an optimal ordering if necessary. */
 
-	// for (int i = 0; i < _num_agents; ++i) {
+	// TODO: use assignments to settle conditional edges.
 
+	size_t dim = graph.dim;
+
+	const auto pair = graph.get_agent_paths(remaining_vertices, assignments);
+	const auto agent_nodes = pair.first;
+	const auto cross_agent_edges = pair.second;
+
+	// for (auto edge : cross_agent_edges) {
+	// 	std::cout << "edge u: " << edge.first << std::endl;
+	// 	std::cout << "edge v: " << edge.second << std::endl;
 	// }
 
-	// const bool totally_ordered = true;
-	// if (!totally_ordered) {
+	for (int i = 0; i < graph.num_agents; ++i) {
+		const std::vector<size_t> agent_i_nodes = agent_nodes[i];
+		const size_t agent_spline_length = agent_i_nodes.size();
+		char time_deltas_name[32];
+		char vs_name[32];
 
-	// } else {
+		Eigen::MatrixXd wps_i(agent_spline_length, dim);
+		for (size_t j = 0; j < agent_spline_length; ++j) {
+			size_t node = agent_i_nodes[j];
+			for (size_t k = 0; k < dim; ++k) {
+				wps_i(j, k) = waypoints(node, i * dim + k);
+			}
+		}
+		problem.wps_list[i] = wps_i;
 
-	// }
+		snprintf(time_deltas_name, 32, "time_deltas_%d", i);
+		snprintf(vs_name, 32, "vs_%d", i);
+
+		// Create variables
+		VectorXDecisionVariable time_deltas_i = problem.prog->NewContinuousVariables(agent_spline_length, time_deltas_name);
+		for (size_t j = 0; j < agent_spline_length; ++j) {
+			problem.prog->AddBoundingBoxConstraint(0.01, 10.0, time_deltas_i(j));
+		}
+		problem.time_deltas_list[i] = time_deltas_i;
+
+		MatrixXDecisionVariable vs_i = problem.prog->NewContinuousVariables(agent_spline_length - 1, dim, vs_name);
+		problem.vs_list[i] = vs_i;
+
+		// Set initial guess
+		problem.prog->SetInitialGuess(vs_i, Eigen::MatrixXd::Constant(vs_i.rows(), vs_i.cols(), 1.0));
+		problem.prog->SetInitialGuess(time_deltas_i, Eigen::VectorXd::Constant(agent_spline_length, 10.0));
+
+		// 1. Linear objective: sum(time_deltas) (OT_f in original code)
+		if (time_cost > 0.0) {
+			problem.prog->AddLinearCost(time_cost * Eigen::RowVectorXd::Ones(agent_spline_length), time_deltas_i);
+		}
+
+		// 2. Also, quadratic time_delta objective : sum_i time_deltas_i^2
+		if (time_cost2 > 0.0) {
+			const Eigen::MatrixXd Q = time_cost2 * Eigen::MatrixXd::Identity(agent_spline_length, agent_spline_length);
+			const Eigen::VectorXd b = Eigen::VectorXd::Zero(agent_spline_length);
+			problem.prog->AddQuadraticCost(Q, b, time_deltas_i);
+		}
+
+		// 3. Control costs
+		if (ctrl_cost > 0) {
+			const double s12 = std::sqrt(12.0);
+
+			for (size_t j = 0; j < agent_spline_length - 1; ++j) {
+				VectorX<Expression> xK(dim), xKm1(dim), vK(dim), vKm1(dim);
+				const Expression tau(time_deltas_i(j));
+				if (j == 0) {
+					for (int k = 0; k < dim; ++k) {
+						xKm1(k) = Expression(x0(i * dim + k));
+						vKm1(k) = Expression(v0(i * dim + k));
+						xK(k)   = Expression(wps_i(0, k));
+						vK(k)   = Expression(vs_i(0, k));
+					}
+				} else {
+					for (int k = 0; k < dim; ++k) {
+						xKm1(k) = Expression(wps_i(k-1, k));
+						vKm1(k) = Expression(vs_i(k-1, k));
+						xK(k)   = Expression(wps_i(k, k));
+						vK(k)   = Expression(vs_i(k, k));
+					}
+				}
+				const VectorX<Expression> D = (xK - xKm1) - (0.5 * tau * (vKm1 + vK));
+				const VectorX<Expression> V = (vK - vKm1);
+				const VectorX<Expression> tilD = s12 * pow(tau, -1.5) * D;
+				const VectorX<Expression> tilV = pow(tau, -0.5) * V;
+				const Expression c = tilD.squaredNorm() + tilV.squaredNorm();
+				problem.prog->AddCost(c);
+			}
+		}
+
+		// for (size_t node : nodes) {
+		// 	std::cout << "node: " << node << std::endl;
+		// }
+
+		// DFS with agent filter
+		// const auto agent_subgraphs;
+
+		// const bool totally_ordered = true;
+		// if (!totally_ordered) {
+		// 	// Solve for ordering
+		// } else {
+		// 	ordering = arange(0, agent_subgraph);
+		// }
+
+		//
+
+		// with ordering, add to program a single spline optimization problem
+	}
+
+	return problem;
+}
+
+/*
+ * Graph Timing MPC
+ */
+
+GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
+			       double time_cost,
+			       double ctrl_cost)
+	: _graph(&graph),
+	  _num_agents(graph.num_agents),
+	  _dim(graph.dim),
+	  _time_cost(time_cost),
+	  _ctrl_cost(ctrl_cost),
+	  _vs_list(graph.num_agents),
+	  _time_deltas_list(graph.num_agents) {}
+
+void GraphTimingMPC::solve(
+	const Eigen::VectorXd& x0,
+	const Eigen::VectorXd& v0,
+	const std::vector<size_t>& remaining_vertices,
+	const Eigen::MatrixXd& waypoints,
+	const Eigen::VectorXi& assignments) {
 
 	/* after the individual agents' positions are totally ordered we
 	 * construct each agent's spline. */
@@ -180,56 +294,52 @@ std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXd>> GraphTimingMPC::solve
 	/* we solve for the velocities and timings using epigraph on the final
 	 * timing */
 
+	// // for (int ag = 0; ag < _num_agents; ++ag) {
+	// // 	for
+	// // }
 
+	// const unsigned int num_nodes = graph.rows();
 
+	// struct GraphOrderingProblem ordering_problem = build_graph_ordering_problem(
+	// 	waypoints, graph, x0, v0);
 
-	// for (int ag = 0; ag < _num_agents; ++ag) {
-	// 	for
+	// // Solve
+	// drake::solvers::MosekSolver solver;
+	// const auto ordering_result = solver.Solve(*ordering_problem.prog);
+	// // auto ordering_result = drake::solvers::Solve(*ordering_problem.prog);
+
+	// Eigen::VectorXi ordering;
+	// if (ordering_result.is_success()) {
+	// 	for (int i = 0; i < num_nodes; ++i) {
+	// 		for (int j = 0; j < num_nodes; ++j) {
+	// 			const double val = ordering_result.GetSolution(ordering_problem.p(i, j));
+	// 			if (val > 0.5) {
+	// 				ordering(i) = j;
+	// 				break;
+	// 			}
+	// 		}
+	// 	}
+	// } else {
+	// 	std::cerr << "Ordering Optimization failed." << std::endl;
+	// 	return std::nullopt;
 	// }
 
-	const unsigned int num_nodes = graph.rows();
+	// /* TODO: Change according to phase */
+	// /* initialize output ordering array (n,) */
+	// Eigen::MatrixXd ordered_waypoints({num_nodes, _dim});
+	// for (size_t i = 0; i < num_nodes; ++i) {
+	// 	const auto rank = ordering(i);
+	// 	for (size_t j = 0; j < _dim; ++j) {
+	// 		ordered_waypoints(i, j) = waypoints(rank, j);
+	// 	}
+	// }
 
-	struct GraphOrderingProblem ordering_problem = build_graph_ordering_problem(
-		waypoints, graph, x0, v0);
+	GraphTimingProblem problem = build_graph_timing_problem(
+		*_graph, remaining_vertices, waypoints, assignments, x0, v0,
+		_time_cost, 0.0, _ctrl_cost);
 
-	// Solve
-	drake::solvers::MosekSolver solver;
-	const auto ordering_result = solver.Solve(*ordering_problem.prog);
-	// auto ordering_result = drake::solvers::Solve(*ordering_problem.prog);
-
-	Eigen::VectorXi ordering;
-	if (ordering_result.is_success()) {
-		for (int i = 0; i < num_nodes; ++i) {
-			for (int j = 0; j < num_nodes; ++j) {
-				const double val = ordering_result.GetSolution(ordering_problem.p(i, j));
-				if (val > 0.5) {
-					ordering(i) = j;
-					break;
-				}
-			}
-		}
-	} else {
-		std::cerr << "Ordering Optimization failed." << std::endl;
-		return std::nullopt;
-	}
-
-	/* TODO: Change according to phase */
-	/* initialize output ordering array (n,) */
-	Eigen::MatrixXd ordered_waypoints({num_nodes, _dim});
-	for (size_t i = 0; i < num_nodes; ++i) {
-		const auto rank = ordering(i);
-		for (size_t j = 0; j < _dim; ++j) {
-			ordered_waypoints(i, j) = waypoints(rank, j);
-		}
-	}
-
-	struct TimingProblem problem = build_timing_problem(
-		ordered_waypoints,
-		x0, v0,
-		_time_cost, _ctrl_cost,
-		true, false,
-		-1.0, -1.0, -1.0,
-		false, -1.0);
+	// Store ordered waypoints used in problem
+	_wps_list = problem.wps_list;
 
 	// Solve
 	auto result = drake::solvers::Solve(*problem.prog);
@@ -237,15 +347,55 @@ std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXd>> GraphTimingMPC::solve
 	if (result.is_success()) {
 		std::cout << "Success" << std::endl;
 
-		const auto v = result.GetSolution(problem.v);
-		const auto taus = result.GetSolution(problem.time_deltas);
+		size_t m = _graph->num_agents;
+		std::vector<CubicSpline> splines(m);
 
-		return std::make_pair(v, taus);
+		for (size_t i = 0; i < m; ++i) {
+			_vs_list[i] = result.GetSolution(problem.vs_list[i]);
+			_time_deltas_list[i] = result.GetSolution(problem.time_deltas_list[i]);
+		}
 	} else {
 		std::cerr << "Optimization failed." << std::endl;
-		return std::nullopt;
 	}
 }
+
+Eigen::VectorXd cumsum_with_zero(const Eigen::VectorXd& x) {
+	ssize_t n = x.size();
+	Eigen::VectorXd y(n+1);
+	double s = 0.0;
+	for (ssize_t i = 0; i < n + 1; ++i) {
+		y(i) = s;
+		s += x(i);
+	}
+	return y;
+}
+
+void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline>& splines,
+					const Eigen::VectorXd& x0,
+					const Eigen::VectorXd& v0) const {
+
+	size_t m = _graph->num_agents;
+	size_t d = _dim;
+
+	for (size_t i = 0; i < m; ++i) {
+		const size_t spline_length_i = _wps_list[i].rows() + 1;
+
+		Eigen::VectorXd x0_i = x0.segment(i * d, d);
+		Eigen::MatrixXd wps_i(spline_length_i, d);
+		wps_i.row(0) = x0_i;
+		wps_i.bottomRows(spline_length_i - 1) = _wps_list[i];
+
+		Eigen::VectorXd v0_i = v0.segment(i * d, d);
+		Eigen::MatrixXd vs_i(spline_length_i, d);
+		vs_i.row(0) = v0_i;
+		vs_i.bottomRows(spline_length_i - 1) = _vs_list[i];
+
+		Eigen::VectorXd times_i = cumsum_with_zero(_time_deltas_list[i]);
+
+		splines[i].set(wps_i, vs_i, times_i);
+	}
+}
+
 
 // Safe indexing and accessors
 // py::array_t<double> GraphTimingMPC::get_waypoints() const {
@@ -427,16 +577,3 @@ std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXd>> GraphTimingMPC::solve
 // }
 
 
-// void GraphTimingMPC::fill_cubic_spline(CubicSpline& S, const py::array_t<double>& x0, const py::array_t<double>& v0) const {
-
-// 	py::array_t<double> pts = this->get_waypoints();
-// 	py::array_t<double> times = this->get_times();
-// 	py::array_t<double> vels = this->get_vels();
-// 	pts = prepend_row_2d(pts, x0);
-// 	vels = prepend_row_2d(vels, v0);
-// 	times = prepend_1d(times, 0.0);
-
-// 	if (times.size() > 1) {
-// 		S.set(pts, vels, times);
-// 	}
-// }

@@ -24,6 +24,7 @@ struct GraphWaypointProblem {
 	std::unique_ptr<drake::solvers::MathematicalProgram> prog;
 	drake::solvers::MatrixXDecisionVariable Assignments;
 	drake::solvers::MatrixXDecisionVariable X;
+	std::map<size_t, size_t> subgraph_assignable_id_to_phi;
 
 	GraphWaypointProblem()
 		: prog(nullptr) {}
@@ -43,7 +44,7 @@ struct GraphWaypointMPC {
 	// Inputs: _graph (adjacency matrix) encoding ordering constraints.
 	// _m number of agents
 	// _z number of assignments
-	const GraphOfConstraints& _graph;
+	const GraphOfConstraints* _graph;
 
 	// Constructor
 	GraphWaypointMPC(const GraphOfConstraints& graph);

@@ -11,16 +11,16 @@ namespace py = pybind11;
 
 
 GraphWaypointProblem build_graph_waypoint_problem(
-	const GraphOfConstraints& graph,
+	const GraphOfConstraints* graph,
 	const std::vector<size_t>& remaining_vertices) {
 
-	using namespace drake::solvers;
+	const int num_agents = graph->num_agents;
 
-	const InducedSubgraphView<py::object> subgraph = InducedSubgraphView<py::object>(graph.structure, remaining_vertices);
+	const InducedSubgraphView<py::object> subgraph = InducedSubgraphView<py::object>(graph->structure, remaining_vertices);
 	std::map<size_t, size_t> phi_to_subgraph_node_id;
 	std::map<size_t, size_t> phi_to_subgraph_assignable_id;
+	std::map<size_t, size_t> subgraph_assignable_id_to_phi;
 	const int num_nodes = subgraph.num_nodes();
-	const int num_agents = graph.num_agents;
 
 	std::cout << "here1" << std::endl;
 	
@@ -29,23 +29,31 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	for (int v : remaining_vertices) {
 		std::cout << "v: " << v << std::endl;
 
-		if (graph.phi_map.contains(v)) {
+		if (graph->phi_map.contains(v)) {
 			// Store the relevant ops so they can be applied
-			const int phi_id = graph.phi_map.at(v);
-			subgraph_ops.push_back(graph.ops.at(phi_id));
+			const size_t phi_id = graph->phi_map.at(v);
+
+			std::cout << "phi_id: " << phi_id << std::endl;
+
+			subgraph_ops.push_back(graph->ops.at(phi_id));
 
 			// Record the mapping from phi id to subgraph node and assignable var idxs.
 			phi_to_subgraph_node_id[phi_id] = subgraph.subgraph_id(v);
-			if (graph.ops.at(phi_id).kind == DeferredOpKind::kAgentLinearEq) {
+			if (graph->ops.at(phi_id).kind == DeferredOpKind::kAgentLinearEq) {
+				subgraph_assignable_id_to_phi[num_subgraph_assignables] = phi_id;
 				phi_to_subgraph_assignable_id[phi_id] = num_subgraph_assignables++;
 			}
 		}
 	}
 
+	using namespace drake::solvers;
 
 	// Create program
 	GraphWaypointProblem problem;
-	problem.prog = std::make_unique<drake::solvers::MathematicalProgram>();
+	problem.prog = std::make_unique<MathematicalProgram>();
+
+	// record subgraph_assignable_id_to_phi because eventually we want to ascribe the assignments to specific phis
+	problem.subgraph_assignable_id_to_phi = subgraph_assignable_id_to_phi;
 
 	// a: binary assignment variables (z x m).
 	// Drake exposes a direct API for binary matrices. :contentReference[oaicite:1]{index=1}
@@ -60,7 +68,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	}
 
 	// x: continuous configuration variables (n x d).
-	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(num_nodes * num_agents, graph.dim, "X");
+	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(num_nodes * num_agents, graph->dim, "X");
 	problem.X = X;
 
 	//
@@ -97,7 +105,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
  */
 
 GraphWaypointMPC::GraphWaypointMPC(const GraphOfConstraints& graph)
-	: _graph(graph) {}
+	: _graph(&graph) {}
 
 std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXi>> GraphWaypointMPC::solve(
 	const std::vector<size_t>& remaining_vertices,
@@ -143,15 +151,18 @@ std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXi>> GraphWaypointMPC::sol
 
 		const int num_remaining_nodes = remaining_vertices.size();
 		const int num_subgraph_assignables = problem.Assignments.rows();
-		const int num_agents = _graph.num_agents;
-		const int dim = _graph.dim;
+		const size_t num_phis = _graph->num_phis;
+		const size_t num_agents = _graph->num_agents;
+		const size_t dim = _graph->dim;
 
-		Eigen::VectorXi assignments(num_subgraph_assignables);
-		for (int i = 0; i < num_subgraph_assignables; ++i) {
+		Eigen::VectorXi assignments = Eigen::VectorXi::Constant(num_phis, -1);
+		for (size_t i = 0; i < num_subgraph_assignables; ++i) {
+			const size_t phi_id = problem.subgraph_assignable_id_to_phi[i];
+
 			for (int j = 0; j < num_agents; ++j) {
 				const double val = result.GetSolution(problem.Assignments(i, j));
 				if (val > 0.5) {
-					assignments(i) = j;
+					assignments(phi_id) = j;
 					break;
 				}
 			}

@@ -43,9 +43,9 @@ struct DeferredOp {
 
 struct GraphOfConstraints {
 	Graph<py::object> structure;
-	std::map<size_t, int> phi_map;
+	std::map<size_t, size_t> phi_map;
 	std::map<int, struct DeferredOp> ops;
-	size_t _num_phis, _num_total_assignables, num_agents, dim;
+	size_t num_phis, _num_total_assignables, num_agents, dim;
 
 	// Required for big-M computation
 	Eigen::VectorXd _global_x_lb;
@@ -57,6 +57,11 @@ struct GraphOfConstraints {
 			   const Eigen::VectorXd& global_x_ub);
 
 	Graph<py::object> get_structure() const { return structure; }
+
+	std::pair<std::vector<std::vector<size_t>>,
+		  std::vector<std::pair<size_t, size_t>>> get_agent_paths(
+			  const std::vector<size_t>& remaining_vertices,
+			  const Eigen::VectorXi& assignments) const;
 	
 	// Plain Constraint Adders (typed)
 	// Note: these copy the numpy array's passed to them, but they're called
@@ -82,7 +87,7 @@ struct GraphOfConstraints {
 private:
 	template <typename F>
 	void _add_op(DeferredOpKind kind, size_t node, F&& f) {
-		const size_t id = _num_phis++;
+		const size_t id = num_phis++;
 		phi_map[node] = id;
 		ops[id] = DeferredOp{kind, id, node, std::forward<F>(f)};
 	}
