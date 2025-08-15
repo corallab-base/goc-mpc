@@ -18,6 +18,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
 		.def(py::init<unsigned int, unsigned int, const Eigen::VectorXd&, const Eigen::VectorXd&>())
 		.def_readonly("structure", &GraphOfConstraints::structure)
+		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
+		.def_readonly("dim", &GraphOfConstraints::dim)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq);
 

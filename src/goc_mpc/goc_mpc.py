@@ -2,8 +2,8 @@ import numpy as np
 
 from goc_mpc.graphs import Graph
 
-from ._goc_mpc_cpp.splines import CubicSpline
-from ._goc_mpc_cpp.goc_mpc import (
+from ._ext.splines import CubicSpline
+from ._ext.goc_mpc import (
     GraphOfConstraints,
     GraphWaypointMPC,
     GraphTimingMPC,
@@ -19,19 +19,19 @@ class GraphOfConstraintsMPC():
             time_delta_cutoff: float = 0.5
     ):
         # problem definition data
-        state_lower_bound = np.ones(dim) * -10.0
-        state_upper_bound = np.ones(dim) * 10.0
+        num_agents = graph.num_agents
+        dim = graph.dim
         short_path_length = 10
         short_path_time_per_step = 0.1
 
         # persistent data
-        self.main_graph = main_graph
+        self.graph = graph
         self.last_cycle_time = 0.0
         self.last_cycle_spline = CubicSpline()
         self.last_cycle_waypoints = None
         self.last_cycle_short_path = None
         self.completed_phases = set()
-        self.remaining_phases = list(range(main_graph.num_nodes()))
+        self.remaining_phases = list(range(graph.structure.num_nodes))
         
         # configuration
         self.time_delta_cutoff = time_delta_cutoff
@@ -39,7 +39,7 @@ class GraphOfConstraintsMPC():
         self.ctrl_cost = 1.0
 
         # solvers
-        self.waypoint_mpc = GraphWaypointMPC(main_graph, num_agents, dim, state_lower_bound, state_upper_bound)
+        self.waypoint_mpc = GraphWaypointMPC(graph)
         self.timing_mpc = GraphTimingMPC(num_agents, dim, 1.0, 1.0)
         self.short_path_mpc = GraphShortPathMPC(short_path_length, dim, short_path_time_per_step)
         
@@ -49,7 +49,7 @@ class GraphOfConstraintsMPC():
 
     def _current_graph(self, assignments: np.ndarray) -> np.ndarray:
         # TODO: Implement support for conditional edges
-        return self.main_graph
+        return self.graph
 
     def _solve_for_timing(self, time_delta, x, x_dot, waypoints, assignments):
 

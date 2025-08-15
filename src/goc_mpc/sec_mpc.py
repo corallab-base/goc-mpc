@@ -1,1 +1,1 @@
-# from ._goc_mpc_cpp.sec_mpc import *  # noqa: F403
+# from ._ext.sec_mpc import *  # noqa: F403

@@ -17,31 +17,31 @@ find_package(pybind11 REQUIRED)
 find_package(drake CONFIG REQUIRED)
 
 #
-# _goc_mpc_cpp module stuff
+# _ext module stuff
 #
 
 # Compile the example Python module
-pybind11_add_module(_goc_mpc_cpp MODULE
-    "src/goc_mpc_cpp/goc_mpc.cpp"
-    "src/goc_mpc_cpp/splines.cpp"
-    "src/goc_mpc_cpp/graphs.cpp"
-    "src/goc_mpc_cpp/utils.cpp"
-    "src/goc_mpc_cpp/sec_mpc/timing_mpc_problem.cpp"
-    "src/goc_mpc_cpp/goc_mpc/goc_mpc.cpp"
-    "src/goc_mpc_cpp/goc_mpc/graph_of_constraints.cpp"
-    "src/goc_mpc_cpp/goc_mpc/graph_timing_mpc.cpp"
-    "src/goc_mpc_cpp/goc_mpc/graph_waypoint_mpc.cpp"
-    "src/goc_mpc_cpp/goc_mpc/graph_short_path_mpc.cpp"
+pybind11_add_module(_ext MODULE
+    "src/ext/goc_mpc.cpp"
+    "src/ext/splines.cpp"
+    "src/ext/graphs.cpp"
+    "src/ext/utils.cpp"
+    "src/ext/sec_mpc/timing_mpc_problem.cpp"
+    "src/ext/goc_mpc/goc_mpc.cpp"
+    "src/ext/goc_mpc/graph_of_constraints.cpp"
+    "src/ext/goc_mpc/graph_timing_mpc.cpp"
+    "src/ext/goc_mpc/graph_waypoint_mpc.cpp"
+    "src/ext/goc_mpc/graph_short_path_mpc.cpp"
 )
-target_link_libraries(_goc_mpc_cpp PRIVATE drake::drake)
-target_compile_definitions(_goc_mpc_cpp PRIVATE
-    MODULE_NAME=_goc_mpc_cpp
+target_link_libraries(_ext PRIVATE drake::drake)
+target_compile_definitions(_ext PRIVATE
+    MODULE_NAME=_ext
     VERSION_INFO="${PY_FULL_VERSION}"
 )
 
 # Install the Python module
 set(PYTHON_MODULE_DESTINATION ${PY_BUILD_CMAKE_IMPORT_NAME})
-install(TARGETS _goc_mpc_cpp
+install(TARGETS _ext
         EXCLUDE_FROM_ALL
         COMPONENT python_modules
         DESTINATION ${PYTHON_MODULE_DESTINATION})

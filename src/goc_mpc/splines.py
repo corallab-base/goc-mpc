@@ -1,1 +1,1 @@
-from ._goc_mpc_cpp.splines import *  # noqa: F403
+from ._ext.splines import *  # noqa: F403
