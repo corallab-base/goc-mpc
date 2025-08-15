@@ -28,6 +28,7 @@ pybind11_add_module(_goc_mpc_cpp MODULE
     "src/goc_mpc_cpp/utils.cpp"
     "src/goc_mpc_cpp/sec_mpc/timing_mpc_problem.cpp"
     "src/goc_mpc_cpp/goc_mpc/goc_mpc.cpp"
+    "src/goc_mpc_cpp/goc_mpc/graph_of_constraints.cpp"
     "src/goc_mpc_cpp/goc_mpc/graph_timing_mpc.cpp"
     "src/goc_mpc_cpp/goc_mpc/graph_waypoint_mpc.cpp"
     "src/goc_mpc_cpp/goc_mpc/graph_short_path_mpc.cpp"

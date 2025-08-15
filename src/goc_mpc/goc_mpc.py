@@ -3,16 +3,21 @@ import numpy as np
 from goc_mpc.graphs import Graph
 
 from ._goc_mpc_cpp.splines import CubicSpline
-from ._goc_mpc_cpp.goc_mpc import GraphWaypointMPC, GraphTimingMPC, GraphShortPathMPC
+from ._goc_mpc_cpp.goc_mpc import (
+    GraphOfConstraints,
+    GraphWaypointMPC,
+    GraphTimingMPC,
+    GraphShortPathMPC
+)
 
 
 class GraphOfConstraintsMPC():
 
-    def __init__(self,
-                 main_graph: Graph,
-                 num_agents: int,
-                 dim: int,
-                 time_delta_cutoff: float = 0.5):
+    def __init__(
+            self,
+            graph: GraphOfConstraints,
+            time_delta_cutoff: float = 0.5
+    ):
         # problem definition data
         state_lower_bound = np.ones(dim) * -10.0
         state_upper_bound = np.ones(dim) * 10.0
@@ -26,7 +31,7 @@ class GraphOfConstraintsMPC():
         self.last_cycle_waypoints = None
         self.last_cycle_short_path = None
         self.completed_phases = set()
-        self.remaining_phases = set(range(main_graph.num_nodes()))
+        self.remaining_phases = list(range(main_graph.num_nodes()))
         
         # configuration
         self.time_delta_cutoff = time_delta_cutoff

@@ -56,8 +56,125 @@ public:
 private:
 	void check_node(size_t u) const;
 
-	bool directed_;
-	size_t nodes_alive_ = 0;
-	std::vector<std::vector<Edge>> adj_;
-	std::vector<bool> alive_;
+	bool _directed;
+	size_t _nodes_alive = 0;
+	std::vector<std::vector<Edge>> _adj;
+	std::vector<bool> _alive;
+};
+
+
+template class Graph<pybind11::object>;
+
+
+/// Read-only, zero-copy induced subgraph view over Graph<LabelT>.
+/// Lifetime note: invalidated by structural mutations of the parent Graph
+/// (adding/removing nodes/edges). Safe against non-structural const reads.
+template <typename LabelT>
+class InducedSubgraphView {
+public:
+	using GraphT = Graph<LabelT>;
+	using Edge   = typename GraphT::Edge;
+
+	/// Construct from parent graph and a list of nodes to keep.
+	InducedSubgraphView(const GraphT& g, const std::vector<size_t>& nodes);
+
+	size_t num_nodes() const;
+
+	/// True if u is in the view and still alive in the parent.
+	bool contains_node(size_t u) const;
+
+	/// Unique integer from 0 - num_nodes for vertex u in subgraph.
+	size_t subgraph_id(size_t u) const;
+
+	/// Out-degree in the subgraph (directed graphs). Returns 0 if u not in view.
+	size_t degree(size_t u) const;
+
+	/// Forward iterator filtering a parent's neighbor list on the mask.
+	class NeighborIter {
+	public:
+		using InnerIter = typename std::vector<Edge>::const_iterator;
+
+		NeighborIter(const GraphT* g,
+			     const std::vector<bool>* mask,
+			     size_t u,
+			     InnerIter it,
+			     InnerIter end);
+
+		const Edge& operator*() const;
+		const Edge* operator->() const;
+		NeighborIter& operator++();
+		bool operator==(const NeighborIter& o) const;
+		bool operator!=(const NeighborIter& o) const;
+
+	private:
+		void advance_to_valid();
+
+		const GraphT* _g = nullptr;
+		const std::vector<bool>* _mask = nullptr;
+		size_t _u = 0;
+		InnerIter _it{};
+		InnerIter _end{};
+	};
+
+	struct NeighborRange {
+		NeighborIter _begin;
+		NeighborIter _end;
+		NeighborIter begin() const { return _begin; }
+		NeighborIter end()   const { return _end; }
+	};
+
+	/// Subgraph-filtered neighbors of u. Empty range if u not contained.
+	NeighborRange neighbors(size_t u) const;
+
+	/// Nodes present in the subgraph (compact list).
+	const std::vector<size_t>& nodes() const { return _node_list; }
+
+	/// (u, e) pair when iterating edges() without copying edges.
+	struct EdgeRef { size_t u; const Edge* e; };
+
+	/// Iterator over all edges in the subgraph (outer loop over nodes in view).
+	class EdgeIter {
+	public:
+		EdgeIter(const GraphT* g,
+			 const std::vector<bool>* mask,
+			 const std::vector<size_t>* node_list,
+			 size_t node_idx);
+
+		EdgeRef operator*() const;
+		EdgeIter& operator++();
+		bool operator==(const EdgeIter& o) const;
+		bool operator!=(const EdgeIter& o) const;
+
+	private:
+		void advance_node();
+		void advance_edge();
+
+		const GraphT* _g = nullptr;
+		const std::vector<bool>* _mask = nullptr;
+		const std::vector<size_t>* _node_list = nullptr;
+		size_t _node_idx = 0;
+
+		typename std::vector<Edge>::const_iterator _it{};
+		typename std::vector<Edge>::const_iterator _end_it{};
+		bool _at_end = false;
+	};
+
+	struct EdgeRange {
+		EdgeIter _begin;
+		EdgeIter _end;
+		EdgeIter begin() const { return _begin; }
+		EdgeIter end()   const { return _end; }
+	};
+
+	/// Iterate all edges (u -> e->to) in the induced view.
+	EdgeRange edges() const;
+
+	/// Access the parent graph (const).
+	const GraphT& parent() const { return *_g; }
+
+private:
+	const GraphT* _g;               // parent graph (not owning)
+	std::vector<bool>   _mask;      // membership mask by node id
+	std::vector<size_t> _node_list; // compact node list (for fast outer loops)
+	std::map<size_t, size_t> _subgraph_id_map;
 };

@@ -8,27 +8,27 @@ import matplotlib.pyplot as plt
 from mujoco import viewer
 
 from goc_mpc.systems import OnePointMassEnv
-from goc_mpc.goc_mpc import GraphOfConstraintsMPC
-from goc_mpc.graphs import Graph
+from goc_mpc.goc_mpc import GraphOfConstraints, GraphOfConstraintsMPC
 from goc_mpc.utils.mesh_cat_mirror import MeshCatMirror
 
 
 def one_point_example():
+    # env and visualization
     env = OnePointMassEnv(mode="servo", n_substeps=5)
-
     mirror = MeshCatMirror(env.model, env.data, bodies=["p1"], radius=0.05)
 
-    # GoC-MPC
-    graph = Graph()
-    graph.add_nodes(2)
-    graph.add_edge(0, 1)
-
+    # problem set-up
     num_agents = 1
     dim = 3
 
-    goc_mpc = GraphOfConstraintsMPC(graph, num_agents, dim)
-    goc_mpc.add_linear_eq(0, np.eye(3), np.array([0.0, 0.0, 2.0]))
-    goc_mpc.add_linear_eq(1, np.eye(3), np.array([0.0, 0.0, 3.0]))
+    graph = GraphOfConstraints(num_agents, dim)
+    graph.add_nodes(2)
+    graph.add_edge(0, 1)
+    graph.add_linear_eq(0, np.eye(3), np.array([0.0, 0.0, 2.0]))
+    graph.add_linear_eq(1, np.eye(3), np.array([0.0, 0.0, 3.0]))
+
+    # GoC-MPC
+    goc_mpc = GraphOfConstraintsMPC(graph)
 
     observed_qs = []
 
