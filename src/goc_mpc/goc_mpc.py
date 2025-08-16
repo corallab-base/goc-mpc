@@ -27,7 +27,7 @@ class GraphOfConstraintsMPC():
         # persistent data
         self.graph = graph
         self.last_cycle_time = 0.0
-        self.last_cycle_spline = CubicSpline()
+        self.last_cycle_splines = [CubicSpline()] * num_agents
         self.last_cycle_waypoints = None
         self.last_cycle_short_path = None
         self.completed_phases = set()
@@ -40,18 +40,14 @@ class GraphOfConstraintsMPC():
 
         # solvers
         self.waypoint_mpc = GraphWaypointMPC(graph)
-        self.timing_mpc = GraphTimingMPC(num_agents, dim, 1.0, 1.0)
-        self.short_path_mpc = GraphShortPathMPC(short_path_length, dim, short_path_time_per_step)
-        
+        self.timing_mpc = GraphTimingMPC(graph, 1.0, 1.0)
+        # self.short_path_mpc = GraphShortPathMPC(short_path_length, dim, short_path_time_per_step)
+
     def _solve_for_waypoints(self, x: np.ndarray):
-        waypoints, assignments = self.waypoint_mpc.solve(self.remaining_phases, x)
-        return waypoints, assignments
+        success = self.waypoint_mpc.solve(self.remaining_phases, x)
+        return success
 
-    def _current_graph(self, assignments: np.ndarray) -> np.ndarray:
-        # TODO: Implement support for conditional edges
-        return self.graph
-
-    def _solve_for_timing(self, time_delta, x, x_dot, waypoints, assignments):
+    def _solve_for_timing(self, time_delta, x, x_dot):
 
         # PROGRESSION: progress time and potentially change phase
         # if not self.timing_mpc.done() and time_delta > 0.0:
@@ -81,15 +77,24 @@ class GraphOfConstraintsMPC():
         #         # resolve the timing problem
         #         # TODO: understand if there is something to do with ctrlErr
 
-        graph = self._current_graph(assignments)
-        self.timing_mpc.solve(graph, x, x_dot, waypoints, assignments)
-        self.timing_mpc.fill_cubic_spline(self.last_cycle_spline, x, x_dot)
+        # get references to the stored waypoints and assignments solutions from waypoint_mpc
+        waypoints = self.waypoint_mpc.view_waypoints()
+        assignments = self.waypoint_mpc.view_assignments()
 
-    def _solve_for_short_path(self, x, x_dot):
-        self.short_path_mpc.solve(x, x_dot, self.last_cycle_spline)
-        ps = self.short_path_mpc.get_points()
-        ts = self.short_path_mpc.get_times()
-        return (ps, ts)
+        breakpoint()
+        
+        success = self.timing_mpc.solve(x, x_dot, self.remaining_phases, waypoints, assignments)
+        if success:
+            self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, x_dot)
+            return True
+        else:
+            return False
+
+    # def _solve_for_short_path(self, x, x_dot):
+        # self.short_path_mpc.solve(x, x_dot, self.last_cycle_spline)
+        # ps = self.short_path_mpc.get_points()
+        # ts = self.short_path_mpc.get_times()
+        # return (ps, ts)
 
     def step(self, t, x, x_dot):
         "Returns the short horizon for the controller to execute."
@@ -97,15 +102,16 @@ class GraphOfConstraintsMPC():
         delta = t - self.last_cycle_time
         self.last_cycle_time = t
 
-        waypoints, assignments = self._solve_for_waypoints(x)
-        self._solve_for_timing(delta, x, x_dot, waypoints, assignments)
-        xi_h, ts = self._solve_for_short_path(x, x_dot)
+        success = self._solve_for_waypoints(x)
+        success = self._solve_for_timing(delta, x, x_dot)
+        # xi_h, ts = self._solve_for_short_path(x, x_dot)
 
-        # update state
-        self.last_cycle_waypoints = waypoints
-        self.last_cycle_short_path = (xi_h)
+        # # update state
+        # self.last_cycle_waypoints = waypoints
+        # self.last_cycle_short_path = (xi_h)
 
-        return xi_h, ts
+        # return xi_h, ts
+        return None, None
 
     #
     # task definition helpers

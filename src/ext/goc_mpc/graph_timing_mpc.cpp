@@ -267,14 +267,30 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 			       double time_cost,
 			       double ctrl_cost)
 	: _graph(&graph),
-	  _num_agents(graph.num_agents),
-	  _dim(graph.dim),
 	  _time_cost(time_cost),
 	  _ctrl_cost(ctrl_cost),
 	  _vs_list(graph.num_agents),
-	  _time_deltas_list(graph.num_agents) {}
+	  _time_deltas_list(graph.num_agents) {
 
-void GraphTimingMPC::solve(
+	size_t num_agents = _graph->num_agents;
+	size_t num_nodes = _graph->structure.num_nodes();
+	size_t dim = _graph->dim;
+
+	_wps_list.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		_wps_list[i] = Eigen::MatrixXd::Zero(num_nodes, dim);
+	}
+	_vs_list.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		_vs_list[i] = Eigen::MatrixXd::Zero(num_nodes, dim);
+	}
+	_time_deltas_list.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		_time_deltas_list[i] = Eigen::VectorXd::Zero(num_nodes);
+	}
+}
+
+bool GraphTimingMPC::solve(
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
 	const std::vector<size_t>& remaining_vertices,
@@ -347,15 +363,25 @@ void GraphTimingMPC::solve(
 	if (result.is_success()) {
 		std::cout << "Success" << std::endl;
 
-		size_t m = _graph->num_agents;
-		std::vector<CubicSpline> splines(m);
+		for (size_t i = 0; i < _graph->num_agents; ++i) {
+			Eigen::MatrixXd vs = result.GetSolution(problem.vs_list[i]);
+			Eigen::VectorXd taus = result.GetSolution(problem.time_deltas_list[i]);
 
-		for (size_t i = 0; i < m; ++i) {
-			_vs_list[i] = result.GetSolution(problem.vs_list[i]);
-			_time_deltas_list[i] = result.GetSolution(problem.time_deltas_list[i]);
+			const size_t agent_spline_length = taus.size() + 1;
+			_agent_spline_length_map[i] = agent_spline_length;
+
+			for (size_t j = 0; j < vs.rows(); ++j) {
+				_vs_list[i].row(j) = vs.row(j);
+			}
+
+			for (size_t j = 0; j < taus.size(); ++j) {
+				_time_deltas_list[i](j) = taus(j);
+			}
 		}
+		return true;
 	} else {
 		std::cerr << "Optimization failed." << std::endl;
+		return false;
 	}
 }
 
@@ -370,15 +396,14 @@ Eigen::VectorXd cumsum_with_zero(const Eigen::VectorXd& x) {
 	return y;
 }
 
-void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline>& splines,
+void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline*>& splines,
 					const Eigen::VectorXd& x0,
 					const Eigen::VectorXd& v0) const {
 
-	size_t m = _graph->num_agents;
-	size_t d = _dim;
+	size_t d = _graph->dim;
 
-	for (size_t i = 0; i < m; ++i) {
-		const size_t spline_length_i = _wps_list[i].rows() + 1;
+	for (size_t i = 0; i < _graph->num_agents; ++i) {
+		const size_t spline_length_i = _agent_spline_length_map.at(i);
 
 		Eigen::VectorXd x0_i = x0.segment(i * d, d);
 		Eigen::MatrixXd wps_i(spline_length_i, d);
@@ -388,11 +413,12 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline>& splines,
 		Eigen::VectorXd v0_i = v0.segment(i * d, d);
 		Eigen::MatrixXd vs_i(spline_length_i, d);
 		vs_i.row(0) = v0_i;
-		vs_i.bottomRows(spline_length_i - 1) = _vs_list[i];
+		vs_i.block(1, 0, spline_length_i - 2, d) = _vs_list[i];
+		vs_i.row(spline_length_i - 1).setZero();
 
 		Eigen::VectorXd times_i = cumsum_with_zero(_time_deltas_list[i]);
 
-		splines[i].set(wps_i, vs_i, times_i);
+		splines[i]->set(wps_i, vs_i, times_i);
 	}
 }
 

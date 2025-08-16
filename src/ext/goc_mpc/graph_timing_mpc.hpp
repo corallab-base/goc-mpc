@@ -69,15 +69,14 @@ GraphTimingProblem build_graph_timing_problem(
 
 
 struct GraphTimingMPC {
-	// Inputs, waypoints and graph (adjacency matrix) encoding ordering constraints.
-	// Eigen::MatrixXd _waypoints;
+	// Input: reference to graph of constraints
 	const GraphOfConstraints* _graph;
-	unsigned int _num_agents, _dim;
 
-	// Outputs
+	// Persistent Output Buffers
 	std::vector<Eigen::MatrixXd> _wps_list;
 	std::vector<Eigen::MatrixXd> _vs_list;
 	std::vector<Eigen::VectorXd> _time_deltas_list;
+	std::map<size_t, size_t> _agent_spline_length_map;
 
 	// Optimization parameters
 	double _time_cost;
@@ -95,14 +94,14 @@ struct GraphTimingMPC {
 		       double ctrl_cost = 1e0);
 
 	// Core solve routine
-	void solve(const Eigen::VectorXd& x0,
+	bool solve(const Eigen::VectorXd& x0,
 		   const Eigen::VectorXd& v0,
 		   const std::vector<size_t>& remaining_vertices,
 		   const Eigen::MatrixXd& waypoints,
 		   const Eigen::VectorXi& assignments);
 
 	// Spline generator
-	void fill_cubic_splines(std::vector<CubicSpline>& splines,
+	void fill_cubic_splines(std::vector<CubicSpline*>& splines,
 				const Eigen::VectorXd& x0,
 				const Eigen::VectorXd& v0) const;
 

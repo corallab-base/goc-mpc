@@ -25,11 +25,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
                 .def(py::init<const GraphOfConstraints&>())
-		.def("solve", &GraphWaypointMPC::solve);
+		.def("solve", &GraphWaypointMPC::solve)
+		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
+		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
-                .def(py::init<unsigned int, unsigned int, double, double>())
-		.def("solve", &GraphTimingMPC::solve);
+                .def(py::init<const GraphOfConstraints&, double, double>())
+		.def("solve", &GraphTimingMPC::solve)
+		.def("fill_cubic_splines", &GraphTimingMPC::fill_cubic_splines);
 
 	// .def("get_ordering", &GraphTimingMPC::get_ordering)
 	// .def("get_waypoints", &GraphTimingMPC::get_waypoints)
