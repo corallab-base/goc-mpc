@@ -52,8 +52,12 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	GraphWaypointProblem problem;
 	problem.prog = std::make_unique<MathematicalProgram>();
 
+	// record the subgraph
+	problem.subgraph = std::make_unique<InducedSubgraphView<py::object>>(subgraph);
+
 	// record subgraph_assignable_id_to_phi because eventually we want to ascribe the assignments to specific phis
 	problem.subgraph_assignable_id_to_phi = subgraph_assignable_id_to_phi;
+	problem.phi_to_subgraph_assignable_id = phi_to_subgraph_assignable_id;
 
 	// a: binary assignment variables (z x m).
 	// Drake exposes a direct API for binary matrices. :contentReference[oaicite:1]{index=1}
@@ -105,9 +109,13 @@ GraphWaypointProblem build_graph_waypoint_problem(
  */
 
 GraphWaypointMPC::GraphWaypointMPC(const GraphOfConstraints& graph)
-	: _graph(&graph) {}
+	: _graph(&graph) {
+	// Allocate persistent output buffers.
+	_waypoints = Eigen::MatrixXd::Zero(_graph->structure.num_nodes(), _graph->num_agents * _graph->dim);
+	_assignments = Eigen::VectorXi::Zero(_graph->num_phis);
+}
 
-std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXi>> GraphWaypointMPC::solve(
+bool GraphWaypointMPC::solve(
 	const std::vector<size_t>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
@@ -155,34 +163,35 @@ std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXi>> GraphWaypointMPC::sol
 		const size_t num_agents = _graph->num_agents;
 		const size_t dim = _graph->dim;
 
-		Eigen::VectorXi assignments = Eigen::VectorXi::Constant(num_phis, -1);
-		for (size_t i = 0; i < num_subgraph_assignables; ++i) {
-			const size_t phi_id = problem.subgraph_assignable_id_to_phi[i];
-
-			for (int j = 0; j < num_agents; ++j) {
-				const double val = result.GetSolution(problem.Assignments(i, j));
-				if (val > 0.5) {
-					assignments(phi_id) = j;
-					break;
+		for (size_t i = 0; i < num_phis; ++i) {
+			if (problem.phi_to_subgraph_assignable_id.contains(i)) {
+				const size_t subgraph_assignable_id = problem.subgraph_assignable_id_to_phi[i];
+				for (int j = 0; j < num_agents; ++j) {
+					const double val = result.GetSolution(problem.Assignments(subgraph_assignable_id, j));
+					if (val > 0.5) {
+						_assignments(i) = j;
+						break;
+					}
 				}
+			} else {
+				_assignments(i) = -1;
 			}
 		}
 
 		Eigen::MatrixXd X_flat = result.GetSolution(problem.X);
-		Eigen::MatrixXd X(num_remaining_nodes, num_agents * dim);
-		for (int i = 0; i < num_remaining_nodes; ++i) {
-			// take block of m rows and stack them horizontally
+		for (size_t v : remaining_vertices) {
+			const size_t i = problem.subgraph->subgraph_id(v);
 			Eigen::RowVectorXd row(num_agents * dim);
 			for (int j = 0; j < num_agents; ++j) {
 				row.segment(j * dim, dim) = X_flat.row(i * num_agents + j);
 			}
-			X.row(i) = row;
+			_waypoints.row(i) = row;
 		}
 
-		return std::make_pair(X, assignments);
+		return true;
 	} else {
 		std::cerr << "Optimization failed." << std::endl;
-		return std::nullopt;
+		return false;
 	}
 }
 
