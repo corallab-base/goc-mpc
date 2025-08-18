@@ -45,6 +45,7 @@ struct GraphTimingProblem {
 	// Necessary to use a unique_ptr for movability. Weird...
 	std::unique_ptr<drake::solvers::MathematicalProgram> prog;
 	std::vector<Eigen::MatrixXd> wps_list;
+	std::vector<std::vector<size_t>> agent_nodes_list;
 	std::vector<drake::solvers::MatrixXDecisionVariable> vs_list;
 	std::vector<drake::solvers::MatrixXDecisionVariable> time_deltas_list;
 
@@ -76,11 +77,15 @@ struct GraphTimingMPC {
 	std::vector<Eigen::MatrixXd> _wps_list;
 	std::vector<Eigen::MatrixXd> _vs_list;
 	std::vector<Eigen::VectorXd> _time_deltas_list;
+	std::vector<std::vector<size_t>> _agent_nodes_list;
 	std::map<size_t, size_t> _agent_spline_length_map;
 
 	// Optimization parameters
 	double _time_cost;
 	double _ctrl_cost;
+	double _max_vel;
+	double _max_acc;
+	double _max_jerk;
 
 	// Phase management
 	// std::set<int> _completed_phases;
@@ -91,7 +96,10 @@ struct GraphTimingMPC {
 	// Constructor
 	GraphTimingMPC(const GraphOfConstraints& graph,
 		       double time_cost = 1e0,
-		       double ctrl_cost = 1e0);
+		       double ctrl_cost = 1e0,
+		       double max_vel = -1.0,
+		       double max_acc = -1.0,
+		       double max_jerk = -1.0);
 
 	// Core solve routine
 	bool solve(const Eigen::VectorXd& x0,
@@ -99,6 +107,8 @@ struct GraphTimingMPC {
 		   const std::vector<size_t>& remaining_vertices,
 		   const Eigen::MatrixXd& waypoints,
 		   const Eigen::VectorXi& assignments);
+
+	std::set<size_t> set_progressed_time(double delta, double tau_cutoff);
 
 	// Spline generator
 	void fill_cubic_splines(std::vector<CubicSpline*>& splines,

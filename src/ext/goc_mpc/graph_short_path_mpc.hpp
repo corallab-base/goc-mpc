@@ -46,7 +46,7 @@ ShortPathProblem build_short_path_problem(
 
 struct GraphShortPathMPC {
 	// Inputs, number of steps, dimension, reference traj
-	unsigned int _num_steps, _dim;
+	unsigned int _num_steps, _num_agents, _dim;
 	double _time_per_step;
 	Eigen::VectorXd _times;
 
@@ -56,13 +56,16 @@ struct GraphShortPathMPC {
 
 	// Constructor
 	GraphShortPathMPC(unsigned int num_steps,
+			  unsigned int num_agents,
 			  unsigned int dim,
 			  double time_per_step);
 
 	// Core solve routine
-	int solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& v0, const CubicSpline& reference);
+	bool solve(const Eigen::VectorXd& x0,
+		   const Eigen::VectorXd& v0,
+		   const std::vector<CubicSpline>& reference);
 
-	Eigen::MatrixXd get_points() const;
-	Eigen::MatrixXd get_vels() const;
-	Eigen::VectorXd get_times() const;
+	const Eigen::MatrixXd &view_points() { return _points; }
+	const Eigen::MatrixXd &view_vels() { return _vels; }
+	const Eigen::VectorXd &view_times() { return _times; }
 };

@@ -1,5 +1,8 @@
 #include "graph_of_constraints.hpp"
 
+using drake::solvers::Binding;
+using drake::solvers::Constraint;
+
 // Constructor
 GraphOfConstraints::GraphOfConstraints(
 	unsigned int num_agents, unsigned int dim,
@@ -57,6 +60,45 @@ std::pair<std::vector<std::vector<size_t>>,
 			      std::vector<std::pair<size_t, size_t>>&>(agent_nodes, cross_agent_edges);
 }
 
+std::vector<size_t> GraphOfConstraints::get_phi_ids(size_t node) const {
+	// TODO: Maybe expand if nodes in the future support multiple phi ids (probably will).
+	std::vector<size_t> phi_ids = { phi_map.at(node) };
+	return phi_ids;
+}
+
+bool GraphOfConstraints::evaluate_phi(size_t phi_id,
+                                      const Eigen::VectorXd& x,
+                                      int assignment_phi,
+                                      double tol) const {
+	auto it = _constraints_per_phi.find(phi_id);
+	if (it == _constraints_per_phi.end()) {
+		return true;
+	}
+	for (const auto& pc : it->second) {
+		const Eigen::VectorXd z = pc.make_input(x, assignment_phi);
+		if (!pc.binding.evaluator()->CheckSatisfied(z, tol)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void GraphOfConstraints::clear_constraints_per_phi() {
+	return _constraints_per_phi.clear();
+}
+
+
+// We’ll assume x is laid out as [x_0, x_1, ..., x_{num_agents-1}], each x_i ∈ R^dim
+auto make_pulls_for_agent_i(int agent_i, int dim) {
+	std::vector<PhiConstraint::Pull> pulls;
+	pulls.reserve(dim + 1);
+	for (int j = 0; j < dim; ++j) {
+		// x index for agent_i’s j-th component:
+		pulls.emplace_back(PhiConstraint::PullX{agent_i * dim + j});
+	}
+	pulls.emplace_back(PhiConstraint::PullAssign{agent_i}); // the selector s_i
+	return pulls;
+}
 
 // Joint-Agent Constraint Adders (typed)
 
@@ -96,7 +138,12 @@ void GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Ei
 			}
 		}
 
-		prog.AddLinearEqualityConstraint(A, b, joint_config_k);
+		auto beq = prog.AddLinearEqualityConstraint(A, b, joint_config_k);
+
+		PhiConstraint pc(drake::solvers::Binding<drake::solvers::Constraint>(beq), // upcast
+				 { PhiConstraint::PullAllX{} }); // one sentinel entry
+
+		_constraints_per_phi[phi_id].push_back(std::move(pc));
 	});
 }
 
@@ -115,7 +162,7 @@ void GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const 
 			joint_config_k << X.row(node_k + ag);
 		}
 
-		prog.AddLinearConstraint(A, lb, ub, joint_config_k);
+		auto constraint = prog.AddLinearConstraint(A, lb, ub, joint_config_k);
 	});
 }
 
@@ -134,7 +181,7 @@ void GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd
 			joint_config_k << X.row(node_k + ag);
 		}
 
-		prog.AddQuadraticCost(Q, b, c, joint_config_k);
+		auto constraint = prog.AddQuadraticCost(Q, b, c, joint_config_k);
 	});
 }
 
@@ -210,10 +257,17 @@ void GraphOfConstraints::add_assignable_linear_eq(int k,
 				const double b_lo = -rhs + M_lo;
 
 				const double ninf = -std::numeric_limits<double>::infinity();
-				prog.AddLinearConstraint(a_up, ninf, b_up, vars);
-				prog.AddLinearConstraint(a_lo, ninf, b_lo, vars);
+
+				auto upper = prog.AddLinearConstraint(a_up, ninf, b_up, vars);
+				auto lower = prog.AddLinearConstraint(a_lo, ninf, b_lo, vars);
+
+				auto pulls = make_pulls_for_agent_i(i, dim);
+				_constraints_per_phi[phi_id].push_back(PhiConstraint{upper, pulls});
+				_constraints_per_phi[phi_id].push_back(PhiConstraint{lower, pulls});
 			}
 		}
+
+		
 	});
 }
 

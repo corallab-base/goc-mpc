@@ -15,6 +15,8 @@
 #include "../graphs.hpp"
 #include "../utils.hpp"
 
+using drake::solvers::Binding;
+using drake::solvers::Constraint;
 using namespace pybind11::literals;
 namespace py = pybind11;
 
@@ -41,11 +43,52 @@ struct DeferredOp {
 			   const std::map<size_t, size_t>&)> builder;
 };
 
+struct PhiConstraint {
+	using BindingC = drake::solvers::Binding<drake::solvers::Constraint>;
+
+	struct PullX      { int x_index; };     // z[p] = x[x_index]
+	struct PullAssign { int agent_i; };     // z[p] = (agent_i == assignment_phi) ? 1 : 0
+	struct PullAllX   {};                   // z = x  (must match sizes)
+
+	using Pull = std::variant<PullX, PullAssign, PullAllX>;
+
+	BindingC binding;
+	std::vector<Pull> pulls;  // either {PullAllX{}} or one entry per var
+
+	PhiConstraint(BindingC b, std::vector<Pull> ps) : binding(b), pulls(ps) {}
+	
+	// Build evaluator input z from (x, assignment_phi)
+	Eigen::VectorXd make_input(const Eigen::VectorXd& x, int assignment_phi) const {
+		// Fast path: whole x is the input
+		if (pulls.size() == 1 && std::holds_alternative<PullAllX>(pulls[0])) {
+			// Sanity check: sizes must match
+			DRAKE_DEMAND(x.size() == binding.variables().size());
+			return x;
+		}
+		// General path: per-entry gather
+		Eigen::VectorXd z(pulls.size());
+		for (int p = 0; p < static_cast<int>(pulls.size()); ++p) {
+			if (auto px = std::get_if<PullX>(&pulls[p])) {
+				z[p] = x[px->x_index];
+			} else if (auto pa = std::get_if<PullAssign>(&pulls[p])) {
+				z[p] = (pa->agent_i == assignment_phi) ? 1.0 : 0.0;
+			} else {
+				throw std::logic_error("PullAllX must be the only entry if used.");
+			}
+		}
+		return z;
+	}
+};
+
+
 struct GraphOfConstraints {
 	Graph<py::object> structure;
 	std::map<size_t, size_t> phi_map;
-	std::map<int, struct DeferredOp> ops;
+	std::map<size_t, struct DeferredOp> ops;
 	size_t num_phis, _num_total_assignables, num_agents, dim;
+
+        // For each phi, you may have one or many "phi constraints".
+	std::unordered_map<size_t, std::vector<PhiConstraint>> _constraints_per_phi;
 
 	// Required for big-M computation
 	Eigen::VectorXd _global_x_lb;
@@ -62,7 +105,16 @@ struct GraphOfConstraints {
 		  std::vector<std::pair<size_t, size_t>>> get_agent_paths(
 			  const std::vector<size_t>& remaining_vertices,
 			  const Eigen::VectorXi& assignments) const;
+
+	std::vector<size_t> get_phi_ids(size_t node) const;
+
+	bool evaluate_phi(size_t phi_id,
+			  const Eigen::VectorXd& x,
+			  int assignment_phi,
+			  double tol) const;
 	
+	void clear_constraints_per_phi();
+
 	// Plain Constraint Adders (typed)
 	// Note: these copy the numpy array's passed to them, but they're called
 	// once so it's fine.

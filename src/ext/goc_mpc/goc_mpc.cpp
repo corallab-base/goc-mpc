@@ -20,28 +20,28 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("dim", &GraphOfConstraints::dim)
+		.def("get_phi_ids", &GraphOfConstraints::get_phi_ids)
+		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq);
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
-                .def(py::init<const GraphOfConstraints&>())
+                .def(py::init<GraphOfConstraints&>())
 		.def("solve", &GraphWaypointMPC::solve)
 		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
 		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
-                .def(py::init<const GraphOfConstraints&, double, double>())
+                .def(py::init<const GraphOfConstraints&, double, double, double, double, double>())
 		.def("solve", &GraphTimingMPC::solve)
+		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)
 		.def("fill_cubic_splines", &GraphTimingMPC::fill_cubic_splines);
 
-	// .def("get_ordering", &GraphTimingMPC::get_ordering)
-	// .def("get_waypoints", &GraphTimingMPC::get_waypoints)
-	// .def("get_vels", &GraphTimingMPC::get_vels)
-	// .def("get_times", &GraphTimingMPC::get_times)
-	// .def("fill_cubic_spline", &GraphTimingMPC::fill_cubic_spline);
-
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
-                .def(py::init<unsigned int, unsigned int, double>(),
-		     py::arg("steps"), py::arg("dim"), py::arg("time_per_step"))
-		.def("solve", &GraphShortPathMPC::solve);
+                .def(py::init<unsigned int, unsigned int, unsigned int, double>(),
+		     py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"), py::arg("time_per_step"))
+		.def("solve", &GraphShortPathMPC::solve)
+		.def("view_points", &GraphShortPathMPC::view_points, py::return_value_policy::reference_internal)
+		.def("view_vels", &GraphShortPathMPC::view_vels, py::return_value_policy::reference_internal)
+		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal);
 }

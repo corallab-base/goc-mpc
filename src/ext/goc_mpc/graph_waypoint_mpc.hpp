@@ -45,7 +45,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 struct GraphWaypointMPC {
 	// reference to graph of constraints object.
-	const GraphOfConstraints* _graph;
+	GraphOfConstraints* _graph;
 
 	// persistent output buffers;
 	// _waypoints is (_graph.num_nodes, _graph.num_agents * _graph.dim)
@@ -54,7 +54,7 @@ struct GraphWaypointMPC {
 	Eigen::VectorXi _assignments;
 
 	// Constructor
-	GraphWaypointMPC(const GraphOfConstraints& graph);
+	GraphWaypointMPC(GraphOfConstraints& graph);
 
 	// std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXi>>
 

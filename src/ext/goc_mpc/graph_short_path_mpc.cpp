@@ -82,9 +82,11 @@ ShortPathProblem build_short_path_problem(
  */
 
 GraphShortPathMPC::GraphShortPathMPC(unsigned int num_steps,
+				     unsigned int num_agents,
 				     unsigned int dim,
 				     double time_per_step)
 	: _num_steps(num_steps),
+	  _num_agents(num_agents),
 	  _dim(dim),
 	  _time_per_step(time_per_step) {
 
@@ -95,7 +97,7 @@ GraphShortPathMPC::GraphShortPathMPC(unsigned int num_steps,
 	}
 
 	/* short path points */
-	_points = Eigen::VectorXd(_num_steps, _dim);
+	_points = Eigen::MatrixXd(_num_steps, _dim);
 	for (int i = 0; i < _num_steps; ++i) {
 		for (int j = 0; j < _dim; ++j) {
 			_points(i, j) = 0.0;
@@ -111,10 +113,15 @@ GraphShortPathMPC::GraphShortPathMPC(unsigned int num_steps,
 	}
 }
 
-int GraphShortPathMPC::solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& v0, const CubicSpline& reference) {
+bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& v0, const std::vector<CubicSpline>& references) {
 
-	Eigen::MatrixXd ref_points = reference.eval_multiple(_times, 0);
-	Eigen::MatrixXd ref_velocities = reference.eval_multiple(_times, 1);
+	Eigen::MatrixXd ref_points(_num_steps, _num_agents * _dim);
+	Eigen::MatrixXd ref_velocities(_num_steps, _num_agents * _dim);
+
+	for (int ag = 0; ag < _num_agents; ++ag) {
+		ref_points.block(0, ag * _dim, _num_steps, _dim) = references[ag].eval_multiple(_times, 0);
+		ref_velocities.block(0, ag * _dim, _num_steps, _dim) = references[ag].eval_multiple(_times, 1);
+	}
 	
 	struct ShortPathProblem problem = build_short_path_problem(ref_points,
 								   ref_velocities,
@@ -124,25 +131,10 @@ int GraphShortPathMPC::solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& v
 	auto result = drake::solvers::Solve(*problem.prog);
 
 	if (result.is_success()) {
-		std::cout << "Success" << std::endl;
-
 		_points = result.GetSolution(problem.xi);
 		_vels = result.GetSolution(problem.v);
+		return true;
 	} else {
-		std::cerr << "Optimization failed." << std::endl;
+		return false;
 	}
-
-	return 0;
-}
-
-Eigen::MatrixXd GraphShortPathMPC::get_points() const {
-	return _points;
-}
-
-Eigen::MatrixXd GraphShortPathMPC::get_vels() const {
-	return _vels;
-}
-
-Eigen::VectorXd GraphShortPathMPC::get_times() const {
-	return _times;
 }

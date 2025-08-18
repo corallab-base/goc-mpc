@@ -11,7 +11,7 @@ namespace py = pybind11;
 
 
 GraphWaypointProblem build_graph_waypoint_problem(
-	const GraphOfConstraints* graph,
+	GraphOfConstraints* graph,
 	const std::vector<size_t>& remaining_vertices) {
 
 	const int num_agents = graph->num_agents;
@@ -22,18 +22,12 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	std::map<size_t, size_t> subgraph_assignable_id_to_phi;
 	const int num_nodes = subgraph.num_nodes();
 
-	std::cout << "here1" << std::endl;
-	
 	size_t num_subgraph_assignables = 0;
 	std::vector<DeferredOp> subgraph_ops;
 	for (int v : remaining_vertices) {
-		std::cout << "v: " << v << std::endl;
-
 		if (graph->phi_map.contains(v)) {
 			// Store the relevant ops so they can be applied
 			const size_t phi_id = graph->phi_map.at(v);
-
-			std::cout << "phi_id: " << phi_id << std::endl;
 
 			subgraph_ops.push_back(graph->ops.at(phi_id));
 
@@ -96,6 +90,9 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		}
 	}
 
+	// clear graph of constraints' _constraints_per_phi
+	graph->clear_constraints_per_phi();
+
 	// Add constraints/costs from registry
 	for (const DeferredOp op : subgraph_ops) {
 		op.builder(*(problem.prog), problem.X, problem.Assignments, phi_to_subgraph_node_id, phi_to_subgraph_assignable_id);
@@ -108,7 +105,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
  * Waypoint MPC
  */
 
-GraphWaypointMPC::GraphWaypointMPC(const GraphOfConstraints& graph)
+GraphWaypointMPC::GraphWaypointMPC(GraphOfConstraints& graph)
 	: _graph(&graph) {
 	// Allocate persistent output buffers.
 	_waypoints = Eigen::MatrixXd::Zero(_graph->structure.num_nodes(), _graph->num_agents * _graph->dim);
@@ -155,8 +152,6 @@ bool GraphWaypointMPC::solve(
 	// auto result = drake::solvers::Solve(*problem.prog);
 
 	if (result.is_success()) {
-		std::cout << "Success" << std::endl;
-
 		const int num_remaining_nodes = remaining_vertices.size();
 		const int num_subgraph_assignables = problem.Assignments.rows();
 		const size_t num_phis = _graph->num_phis;
@@ -190,7 +185,6 @@ bool GraphWaypointMPC::solve(
 
 		return true;
 	} else {
-		std::cerr << "Optimization failed." << std::endl;
 		return false;
 	}
 }
