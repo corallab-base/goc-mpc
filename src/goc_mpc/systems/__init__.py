@@ -1,3 +1,4 @@
-from .one_point_mass_env import OnePointMassEnv
 from .one_2d_point_mass_env import One2DPointMassEnv
+from .two_2d_point_mass_env import Two2DPointMassEnv
+from .one_point_mass_env import OnePointMassEnv
 from .two_point_mass_env import TwoPointMassEnv

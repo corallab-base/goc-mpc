@@ -12,8 +12,8 @@ except Exception:
 from goc_mpc.utils.mesh_cat_mirror import MeshCatMirror
 
 
-MJCF_TWO_POINT_MASSES = r"""
-<mujoco model="two_point_masses">
+MJCF_TWO_POINT_MASS = r"""
+<mujoco model="one_point_mass">
   <option timestep="0.002" gravity="0 0 -9.81"/>
   <compiler angle="radian"/>
   <worldbody>
@@ -35,17 +35,15 @@ MJCF_TWO_POINT_MASSES = r"""
     <camera name="topdown" pos="0 0 3.0" zaxis="0 0 -1"/>
     <geom name="ground" type="plane" size="5 5 0.1" rgba="0.8 0.9 1 1"/>
     <body name="p1" pos="0 0 1.0">
-      <!-- Three orthogonal sliders => qpos: x1,y1,z1 -->
+      <!-- Two orthogonal sliders => qpos: x1,y1 -->
       <joint name="p1_x" type="slide" axis="1 0 0" damping="0.1"/>
       <joint name="p1_y" type="slide" axis="0 1 0" damping="0.1"/>
-      <joint name="p1_z" type="slide" axis="0 0 1" damping="0.1"/>
       <geom type="sphere" size="0.05" rgba="0.1 0.4 1 1" mass="1.0"/>
     </body>
-    <body name="p2" pos="0.5 0.0 0.8">
-      <!-- qpos: x2,y2,z2 -->
+    <body name="p2" pos="1.0 0 1.0">
+      <!-- Two orthogonal sliders => qpos: x2,y2 -->
       <joint name="p2_x" type="slide" axis="1 0 0" damping="0.1"/>
       <joint name="p2_y" type="slide" axis="0 1 0" damping="0.1"/>
-      <joint name="p2_z" type="slide" axis="0 0 1" damping="0.1"/>
       <geom type="sphere" size="0.05" rgba="1 0.3 0.1 1" mass="1.0"/>
     </body>
   </worldbody>
@@ -54,16 +52,14 @@ MJCF_TWO_POINT_MASSES = r"""
   <actuator>
     <position name="p1_x_m" joint="p1_x" kp="200" kv="20"/>
     <position name="p1_y_m" joint="p1_y" kp="200" kv="20"/>
-    <position name="p1_z_m" joint="p1_z" kp="300" kv="30"/>
     <position name="p2_x_m" joint="p2_x" kp="200" kv="20"/>
     <position name="p2_y_m" joint="p2_y" kp="200" kv="20"/>
-    <position name="p2_z_m" joint="p2_z" kp="300" kv="30"/>
   </actuator>
 </mujoco>
 """
 
 
-class TwoPointMassEnv:
+class Two2DPointMassEnv:
     """
     A minimal, gym-like MuJoCo environment for two point masses.
 
@@ -71,12 +67,12 @@ class TwoPointMassEnv:
       - 'teleport': step(action) sets qpos[:] = action and calls forward/step.
       - 'servo':    step(action) sets ctrl[:] = action (desired positions) and steps physics.
 
-    Observation = np.concatenate([qpos(6), qvel(6)]) -> shape (12,)
-    Action = positions for both bodies -> shape (6,), [x1,y1,z1,x2,y2,z2]
+    Observation = np.concatenate([qpos(2), qvel(2)]) -> shape (2,)
+    Action = positions for both bodies -> shape (2,), [x1,y1]
     """
     metadata = {"render_modes": ["human", "none"]}
 
-    def __init__(self, mode="teleport", n_substeps=10, xml_str=MJCF_TWO_POINT_MASSES):
+    def __init__(self, mode="teleport", n_substeps=10, xml_str=MJCF_TWO_POINT_MASS):
         assert mode in ("teleport", "servo")
         self.mode = mode
         self.n_substeps = int(n_substeps)
@@ -84,9 +80,9 @@ class TwoPointMassEnv:
         self.model = mj.MjModel.from_xml_string(xml_str)
         self.data = mj.MjData(self.model)
 
-        # Indices: qpos = [x1,y1,z1, x2,y2,z2], ctrl = same ordering via position actuators
-        self.action_dim = 6
-        self.obs_dim = self.model.nq + self.model.nv  # 6 + 6 = 12
+        # Indices: qpos = [x1,y1,x2,y2], ctrl = same ordering via position actuators
+        self.action_dim = 4
+        self.obs_dim = self.model.nq + self.model.nv  # 4 + 4 = 8
 
     def reset(self, qpos=None, qvel=None):
         mj.mj_resetData(self.model, self.data)
@@ -104,6 +100,8 @@ class TwoPointMassEnv:
         assert action.shape == (self.action_dim,)
 
         if self.mode == "teleport":
+            # Set desired joint positions for actuators
+            self.data.ctrl[:] = action
             # Directly set configuration for this step (state player).
             self.data.qpos[:] = action
             # Optionally damp velocities to keep things tame
@@ -147,16 +145,16 @@ class TwoPointMassEnv:
 
 
 if __name__ == "__main__":
-    env = TwoPointMassEnv(mode="teleport", n_substeps=5)
-    obs, _ = env.reset(qpos=np.array([0.0, 0.0, 1.0,   0.5, 0.0, 0.8]))
+    env = Two2DPointMassEnv(mode="teleport", n_substeps=5)
+    obs, _ = env.reset(qpos=np.array([0.0, 0.0, 1.0, 0.0]))
 
     mirror = MeshCatMirror(env.model, env.data, bodies=["p1", "p2"], radius=0.05)
 
     # Demo: two simple Lissajous-ish trajectories played back
     T = 600
     t = np.linspace(0.0, 12.0, T)
-    p1 = np.stack([0.8*np.cos(0.6*t), 0.8*np.sin(0.6*t), 0.9 + 0.1*np.sin(1.2*t)], axis=1)
-    p2 = np.stack([0.6*np.sin(0.9*t+0.5), 0.4*np.sin(0.6*t), 0.8 + 0.1*np.cos(1.0*t)], axis=1)
+    p1 = np.stack([0.8*np.cos(0.6*t), 0.8*np.sin(0.6*t)], axis=1)
+    p2 = np.stack([0.6*np.sin(0.9*t+0.5), 0.4*np.sin(0.6*t)], axis=1)
 
     # If you want to see the viewer, open a terminal window to watch and keep the loop slow.
     use_viewer = False and HAS_VIEWER
@@ -169,12 +167,12 @@ if __name__ == "__main__":
         obs, rew, done, trunc, info = env.step(qpos)
 
         # If you want to slow it down to (roughly) real-time:
-        import time; time.sleep(0.02)
+        time.sleep(0.02)
 
         mirror.push()            # …and push poses to the browser viewer
 
     # # Now try 'servo' mode (physics moves masses to your targets)
-    # env = TwoPointMassEnv(mode="servo", n_substeps=10)
+    # env = OnePointMassEnv(mode="servo", n_substeps=10)
     # env.reset()
     # for k in range(T):
     #     qpos_des = np.concatenate([p1[k], p2[k]], axis=0)   # desired positions
