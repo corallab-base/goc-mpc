@@ -30,7 +30,7 @@ class GraphOfConstraintsMPC():
         # persistent data
         self.graph = graph
         self.last_cycle_time = 0.0
-        self.last_cycle_splines = [CubicSpline()] * num_agents
+        self.last_cycle_splines = [CubicSpline() for _ in range(num_agents)]
         self.last_cycle_waypoints = None
         self.last_cycle_short_path = None
         self.completed_phases = set()
@@ -69,8 +69,6 @@ class GraphOfConstraintsMPC():
                 if all_phis_satisfied:
                     self.completed_phases |= {node}
                     self.remaining_phases.remove(node)
-                    breakpoint()
-
 
         # BACKTRACKING: if the task has been finished
         # if len(self.remaining_phases) == 0:
@@ -92,7 +90,6 @@ class GraphOfConstraintsMPC():
         #         # resolve the timing problem
         #         # TODO: understand if there is something to do with ctrlErr
 
-
         success = self.timing_mpc.solve(x, x_dot, self.remaining_phases, waypoints, assignments)
         if success:
             self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, x_dot)
@@ -105,10 +102,15 @@ class GraphOfConstraintsMPC():
 
         if success:
             points = self.short_path_mpc.view_points()
+            vels = self.short_path_mpc.view_vels()
             times = self.short_path_mpc.view_times()
-            self.last_cycle_short_path = (points, times)
+            self.last_cycle_short_path = (points, vels, times)
 
         return success
+
+    def reset(self):
+        self.last_cycle_time = 0.0
+        self.remaining_phases = list(range(self.graph.structure.num_nodes))
 
     def step(self, t, x, x_dot):
         "Returns the short horizon for the controller to execute."
