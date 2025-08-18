@@ -220,17 +220,24 @@ GraphTimingProblem build_graph_timing_problem(
 			for (size_t j = 0; j < agent_spline_length; ++j) {
 				VectorX<Expression> xJ(dim), xJm1(dim), vJ(dim), vJm1(dim);
 				const Expression tau(time_deltas_i(j));
-				if (j == 0) {
+				if (j == 0 && j < agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(x0(i * dim + k));
 						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(0, k));
 						vJ(k)   = Expression(vs_i(0, k));
 					}
-				} else if (j == agent_spline_length - 1) {
+				} else if (j > 0 && j == agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(wps_i(j-1, k));
 						vJm1(k) = Expression(vs_i(j-1, k));
+						xJ(k)   = Expression(wps_i(j, k));
+						vJ(k).Zero();
+					}
+				} else if (j == 0 && j == agent_spline_length - 1) {
+					for (int k = 0; k < dim; ++k) {
+						xJm1(k) = Expression(x0(i * dim + k));
+						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(j, k));
 						vJ(k).Zero();
 					}
@@ -257,17 +264,24 @@ GraphTimingProblem build_graph_timing_problem(
 				VectorX<Expression> xJm1(dim), xJ(dim), vJm1(dim), vJ(dim);
 				const Expression tau(time_deltas_i(j));
 				const Expression inv_tau = pow(tau, -1.0);
-				if (j == 0) {
+				if (j == 0 && j < agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(x0(i * dim + k));
 						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(0, k));
 						vJ(k)   = Expression(vs_i(0, k));
 					}
-				} else if (j == agent_spline_length - 1) {
+				} else if (j > 0 && j == agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(wps_i(j-1, k));
 						vJm1(k) = Expression(vs_i(j-1, k));
+						xJ(k)   = Expression(wps_i(j, k));
+						vJ(k).Zero();
+					}
+				} else if (j == 0 && j == agent_spline_length - 1) {
+					for (int k = 0; k < dim; ++k) {
+						xJm1(k) = Expression(x0(i * dim + k));
+						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(j, k));
 						vJ(k).Zero();
 					}
@@ -303,17 +317,24 @@ GraphTimingProblem build_graph_timing_problem(
 			for (size_t j = 0; j < agent_spline_length; ++j) {
 				VectorX<Expression> xJm1(dim), xJ(dim), vJm1(dim), vJ(dim);
 				const Expression tau(time_deltas_i(j));
-				if (j == 0) {
+				if (j == 0 && j < agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(x0(i * dim + k));
 						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(0, k));
 						vJ(k)   = Expression(vs_i(0, k));
 					}
-				} else if (j == agent_spline_length - 1) {
+				} else if (j > 0 && j == agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(wps_i(j-1, k));
 						vJm1(k) = Expression(vs_i(j-1, k));
+						xJ(k)   = Expression(wps_i(j, k));
+						vJ(k).Zero();
+					}
+				} else if (j == 0 && j == agent_spline_length - 1) {
+					for (int k = 0; k < dim; ++k) {
+						xJm1(k) = Expression(x0(i * dim + k));
+						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(j, k));
 						vJ(k).Zero();
 					}
@@ -351,17 +372,24 @@ GraphTimingProblem build_graph_timing_problem(
 			for (size_t j = 0; j < agent_spline_length; ++j) {
 				VectorX<Expression> xJ(dim), xJm1(dim), vJ(dim), vJm1(dim);
 				const Expression tau(time_deltas_i(j));
-				if (j == 0) {
+				if (j == 0 && j < agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(x0(i * dim + k));
 						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(0, k));
 						vJ(k)   = Expression(vs_i(0, k));
 					}
-				} else if (j == agent_spline_length - 1) {
+				} else if (j > 0 && j == agent_spline_length - 1) {
 					for (int k = 0; k < dim; ++k) {
 						xJm1(k) = Expression(wps_i(j-1, k));
 						vJm1(k) = Expression(vs_i(j-1, k));
+						xJ(k)   = Expression(wps_i(j, k));
+						vJ(k).Zero();
+					}
+				} else if (j == 0 && j == agent_spline_length - 1) {
+					for (int k = 0; k < dim; ++k) {
+						xJm1(k) = Expression(x0(i * dim + k));
+						vJm1(k) = Expression(v0(i * dim + k));
 						xJ(k)   = Expression(wps_i(j, k));
 						vJ(k).Zero();
 					}
