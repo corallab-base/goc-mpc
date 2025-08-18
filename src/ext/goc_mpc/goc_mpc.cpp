@@ -34,6 +34,7 @@ void init_submodule_goc_mpc(py::module_& m) {
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
                 .def(py::init<const GraphOfConstraints&, double, double, double, double, double>())
 		.def("solve", &GraphTimingMPC::solve)
+		.def("get_agent_spline_length", &GraphTimingMPC::get_agent_spline_length)
 		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)
 		.def("fill_cubic_splines", &GraphTimingMPC::fill_cubic_splines);
 

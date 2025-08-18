@@ -567,6 +567,14 @@ bool GraphTimingMPC::solve(
 	}
 }
 
+size_t GraphTimingMPC::get_agent_spline_length(size_t agent) {
+	if (!_agent_spline_length_map.contains(agent)) {
+		return 0;
+	} else {
+		return _agent_spline_length_map.at(agent);
+	}
+}
+
 std::set<size_t> GraphTimingMPC::set_progressed_time(double delta, double tau_cutoff) {
 	/* this function, instead of resolving for all the vertices and taus, as
 	 * above, just updates the first tau of each remaining active spline.
