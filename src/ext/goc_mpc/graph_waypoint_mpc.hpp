@@ -41,7 +41,8 @@ struct GraphWaypointProblem {
 
 GraphWaypointProblem build_graph_waypoint_problem(
 	const GraphOfConstraints& graph,
-	const std::vector<size_t>& remaining_vertices);
+	const std::vector<size_t>& remaining_vertices,
+	Eigen::VectorXd x0);
 
 struct GraphWaypointMPC {
 	// reference to graph of constraints object.

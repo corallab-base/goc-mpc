@@ -12,7 +12,8 @@ namespace py = pybind11;
 
 GraphWaypointProblem build_graph_waypoint_problem(
 	GraphOfConstraints* graph,
-	const std::vector<size_t>& remaining_vertices) {
+	const std::vector<size_t>& remaining_vertices,
+	Eigen::VectorXd x0) {
 
 	const int num_agents = graph->num_agents;
 
@@ -73,6 +74,19 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	// OBJECTIVE FUNCTION
 	//
 
+	// First, costs to minimize across transitions from x0 to the source
+	// nodes in the subgraph.
+	const size_t dim = graph->dim;
+	for (auto v : subgraph.sources()) {
+		size_t sg_v = subgraph.subgraph_id(v);
+		for (int ag = 0; ag < num_agents; ++ag) {
+			const int node_v_ag_idx = sg_v * num_agents + ag;
+			VectorX<Expression> diff = x0.segment(ag * dim, dim) - X.row(node_v_ag_idx);
+			Expression dist = diff.squaredNorm();
+			problem.prog->AddQuadraticCost(dist);
+		}
+	}
+
 	// Add inter-waypoint costs for all edges
 	// You control the cost body via add_edge_cost
 	// Iterate edges of the subgraph
@@ -117,34 +131,7 @@ bool GraphWaypointMPC::solve(
 	const Eigen::VectorXd& x0) {
 
 	// TODO: use x0
-
-	// unsigned int num_subgraph_assignables = 0;
-	// Eigen::MatrixXi subgraph(num_remaining_nodes, num_remaining_nodes);
-	// _phi_to_subgraph_node_id.clear();
-	// _phi_to_subgraph_assignable_id.clear();
-
-	// int i = 0;
-	// for (auto i_it = remaining_vertices.begin(); i_it != remaining_vertices.end(); ++i_it) {
-	// 	// Record the mapping from phi id to subgraph node and assignable var idxs.
-	// 	const unsigned int phi_id = _graph_to_phi_map[*i_it];
-	// 	const DeferredOp& op = _ops[phi_id];
-	// 	_phi_to_subgraph_node_id[phi_id] = i;
-	// 	if (op.kind == DeferredOpKind::kAgentLinearEq) {
-	// 		_phi_to_subgraph_assignable_id[phi_id] = num_subgraph_assignables++;
-	// 	}
-
-	// 	// Compute subgraph row.
-	// 	int j = 0;
-	// 	for (auto j_it = remaining_vertices.begin(); j_it != remaining_vertices.end(); ++j_it) {
-	// 		subgraph(i, j) = _graph(*i_it, *j_it);
-	// 		++j;
-	// 	}
-	// 	++i;
-	// }
-
-	// std::cout << "Subgraph m:\n" << subgraph << std::endl;
-
-	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, remaining_vertices);
+	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, remaining_vertices, x0);
 
 	// Solve
 	drake::solvers::MosekSolver solver;
