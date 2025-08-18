@@ -185,6 +185,8 @@ public:
 	void dfs_visit(size_t s,
 		       const std::function<void(size_t, std::optional<size_t>)>& cb) const;
 
+	std::vector<size_t> sources() const;
+
 	// DFS within the view starting from all view-sources (zero in-degree inside the view).
 	void dfs_visit_from_sources(
 		const std::function<void(size_t, std::optional<size_t>)>& cb) const;
