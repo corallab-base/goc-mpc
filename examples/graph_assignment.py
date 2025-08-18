@@ -8,10 +8,12 @@ from goc_mpc.goc_mpc import GraphOfConstraints, GraphWaypointMPC
 def graph_assignment_example():
     num_agents = 2
     dim = 2
+    state_lower_bound = np.ones(dim) * -10.0
+    state_upper_bound = np.ones(dim) * 10.0
 
     graph = GraphOfConstraints(num_agents, dim, 
-                               np.array([-10.0, -10.0]),
-                               np.array([10.0, 10.0]))
+                               state_lower_bound,
+                               state_upper_bound)
     graph.structure.add_nodes(4)
     graph.structure.add_edge(0, 1, True)
     graph.structure.add_edge(0, 2, True)
