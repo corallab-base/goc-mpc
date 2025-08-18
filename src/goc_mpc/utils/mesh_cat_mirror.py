@@ -18,7 +18,7 @@ class MeshCatMirror:
     """Mirrors a subset of MuJoCo bodies into a MeshCat browser viewer."""
     def __init__(self, model: mj.MjModel, data: mj.MjData, bodies, radius=0.05):
         self.model, self.data = model, data
-        self.vis = meshcat.Visualizer().open()  # opens browser tab
+        self.vis = meshcat.Visualizer()
         # Build simple visuals (spheres) for the bodies you want to mirror.
         for name in bodies:
             path = self.vis[name]
