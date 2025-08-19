@@ -16,8 +16,8 @@ ShortPathProblem build_short_path_problem(
 
 	using namespace drake::solvers;
 
-	const size_t num_steps = ref_points.rows();
-	const size_t dim = ref_points.cols();
+	const int num_steps = ref_points.rows();
+	const int dim = ref_points.cols();
 
 	// Create program
 	ShortPathProblem problem;

@@ -22,11 +22,9 @@ namespace py = pybind11;
 struct GraphWaypointProblem {
 	// Necessary to use a unique_ptr for movability. Weird...
 	std::unique_ptr<drake::solvers::MathematicalProgram> prog;
-	std::unique_ptr<InducedSubgraphView<py::object>> subgraph;
+	std::unique_ptr<SubgraphOfConstraints> subgraph;
 	drake::solvers::MatrixXDecisionVariable Assignments;
 	drake::solvers::MatrixXDecisionVariable X;
-	std::map<size_t, size_t> subgraph_assignable_id_to_phi;
-	std::map<size_t, size_t> phi_to_subgraph_assignable_id;
 
 	GraphWaypointProblem()
 		: prog(nullptr),
@@ -41,7 +39,7 @@ struct GraphWaypointProblem {
 
 GraphWaypointProblem build_graph_waypoint_problem(
 	const GraphOfConstraints& graph,
-	const std::vector<size_t>& remaining_vertices,
+	const std::vector<int>& remaining_vertices,
 	Eigen::VectorXd x0);
 
 struct GraphWaypointMPC {
@@ -63,7 +61,7 @@ struct GraphWaypointMPC {
 	// subgraph of graph of constraints, solves for the optimal agent
 	// assignment in that graph based on some heuristics, as well as the
 	// sequence of positions for the agents to satisfy the constraints.
-	bool solve(const std::vector<size_t>& remaining_vertices,
+	bool solve(const std::vector<int>& remaining_vertices,
 		   const Eigen::VectorXd& x0);
 
 	const Eigen::MatrixXd &view_waypoints() { return _waypoints; }

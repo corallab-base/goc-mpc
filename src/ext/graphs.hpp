@@ -21,54 +21,54 @@ template <typename LabelT>
 class Graph {
 public:
 	struct Edge {
-		size_t to;
+	        int to;
 		LabelT label;
 	};
 
 	explicit Graph(bool directed = true);
 
-	static Graph WithNodes(size_t n, bool directed = true);
+	static Graph WithNodes(int n, bool directed = true);
 
-	size_t add_node();
-	void add_nodes(size_t n);
-	void remove_node(size_t u);
+        int add_node();
+	void add_nodes(int n);
+	void remove_node(int u);
 
-	void add_edge(size_t u, size_t v, const LabelT &label);
-	bool remove_edge(size_t u, size_t v);
+	void add_edge(int u, int v, const LabelT &label);
+	bool remove_edge(int u, int v);
 
-	size_t num_nodes() const;
+        int num_nodes() const;
 	bool directed() const;
-	bool alive(size_t u) const;
+	bool alive(int u) const;
 
-	const std::vector<Edge>& neighbors(size_t u) const;
-	std::vector<Edge>& neighbors(size_t u);
+	const std::vector<Edge>& neighbors(int u) const;
+	std::vector<Edge>& neighbors(int u);
 
-	struct BFSResult { std::vector<std::optional<size_t>> parent; std::vector<int> dist; };
-	BFSResult bfs(size_t s) const;
+	struct BFSResult { std::vector<std::optional<int>> parent; std::vector<int> dist; };
+	BFSResult bfs(int s) const;
 
 	// DFS from a specific start node; calls cb(u, parent) on discovery (preorder).
 	// Skips inactive nodes. parent = std::nullopt at root.
-	void dfs_visit(size_t s,
-		       const std::function<void(size_t, std::optional<size_t>)>& cb) const;
+	void dfs_visit(int s,
+		       const std::function<void(int, std::optional<int>)>& cb) const;
 
 	// DFS starting from all "source" nodes (zero in-degree among alive nodes).
 	// For undirected graphs, sources are the zero-degree nodes.
 	// Calls cb(u, parent) for each discovered node exactly once.
 	void dfs_visit_from_sources(
-		const std::function<void(size_t, std::optional<size_t>)>& cb) const;
+		const std::function<void(int, std::optional<int>)>& cb) const;
 
-	std::vector<size_t> dfs(size_t s) const;
+	std::vector<int> dfs(int s) const;
 
-	struct SSSPResult { std::vector<double> dist; std::vector<std::optional<size_t>> parent; };
-	SSSPResult dijkstra(size_t s, std::function<double(const LabelT&)> weight_fn) const;
+	struct SSSPResult { std::vector<double> dist; std::vector<std::optional<int>> parent; };
+	SSSPResult dijkstra(int s, std::function<double(const LabelT&)> weight_fn) const;
 
-	std::vector<size_t> topological_sort() const;
+	std::vector<int> topological_sort() const;
 
 private:
-	void check_node(size_t u) const;
+	void check_node(int u) const;
 
 	bool _directed;
-	size_t _nodes_alive = 0;
+        int _nodes_alive = 0;
 	std::vector<std::vector<Edge>> _adj;
 	std::vector<bool> _alive;
 };
@@ -83,18 +83,18 @@ public:
 	using Edge   = typename GraphT::Edge;
 
 	/// Construct from parent graph and a list of nodes to keep.
-	InducedSubgraphView(const GraphT& g, const std::vector<size_t>& nodes);
+	InducedSubgraphView(const GraphT& g, const std::vector<int>& nodes);
 
-	size_t num_nodes() const;
+        int num_nodes() const;
 
 	/// True if u is in the view and still alive in the parent.
-	bool contains_node(size_t u) const;
+	bool contains_node(int u) const;
 
 	/// Unique integer from 0 - num_nodes for vertex u in subgraph.
-	size_t subgraph_id(size_t u) const;
+        int subgraph_id(int u) const;
 
 	/// Out-degree in the subgraph (directed graphs). Returns 0 if u not in view.
-	size_t degree(size_t u) const;
+        int degree(int u) const;
 
 	/// Forward iterator filtering a parent's neighbor list on the mask.
 	class NeighborIter {
@@ -103,7 +103,7 @@ public:
 
 		NeighborIter(const GraphT* g,
 			     const std::vector<bool>* mask,
-			     size_t u,
+			     int u,
 			     InnerIter it,
 			     InnerIter end);
 
@@ -118,7 +118,7 @@ public:
 
 		const GraphT* _g = nullptr;
 		const std::vector<bool>* _mask = nullptr;
-		size_t _u = 0;
+	        int _u = 0;
 		InnerIter _it{};
 		InnerIter _end{};
 	};
@@ -131,21 +131,21 @@ public:
 	};
 
 	/// Subgraph-filtered neighbors of u. Empty range if u not contained.
-	NeighborRange neighbors(size_t u) const;
+	NeighborRange neighbors(int u) const;
 
 	/// Nodes present in the subgraph (compact list).
-	const std::vector<size_t>& nodes() const { return _node_list; }
+	const std::vector<int>& nodes() const { return _node_list; }
 
 	/// (u, e) pair when iterating edges() without copying edges.
-	struct EdgeRef { size_t u; const Edge* e; };
+	struct EdgeRef { int u; const Edge* e; };
 
 	/// Iterator over all edges in the subgraph (outer loop over nodes in view).
 	class EdgeIter {
 	public:
 		EdgeIter(const GraphT* g,
 			 const std::vector<bool>* mask,
-			 const std::vector<size_t>* node_list,
-			 size_t node_idx);
+			 const std::vector<int>* node_list,
+			 int node_idx);
 
 		EdgeRef operator*() const;
 		EdgeIter& operator++();
@@ -158,8 +158,8 @@ public:
 
 		const GraphT* _g = nullptr;
 		const std::vector<bool>* _mask = nullptr;
-		const std::vector<size_t>* _node_list = nullptr;
-		size_t _node_idx = 0;
+		const std::vector<int>* _node_list = nullptr;
+	        int _node_idx = 0;
 
 		typename std::vector<Edge>::const_iterator _it{};
 		typename std::vector<Edge>::const_iterator _end_it{};
@@ -182,18 +182,18 @@ public:
 
 	// DFS within the view from a specific start node (must be contained).
 	// Calls cb(u, parent) on discovery. Skips nodes not in the view.
-	void dfs_visit(size_t s,
-		       const std::function<void(size_t, std::optional<size_t>)>& cb) const;
+	void dfs_visit(int s,
+		       const std::function<void(int, std::optional<int>)>& cb) const;
 
-	std::vector<size_t> sources() const;
+	std::vector<int> sources() const;
 
 	// DFS within the view starting from all view-sources (zero in-degree inside the view).
 	void dfs_visit_from_sources(
-		const std::function<void(size_t, std::optional<size_t>)>& cb) const;
+		const std::function<void(int, std::optional<int>)>& cb) const;
 
 private:
 	const GraphT* _g;               // parent graph (not owning)
 	std::vector<bool>   _mask;      // membership mask by node id
-	std::vector<size_t> _node_list; // compact node list (for fast outer loops)
-	std::map<size_t, size_t> _subgraph_id_map;
+	std::vector<int> _node_list; // compact node list (for fast outer loops)
+	std::map<int, int> _subgraph_id_map;
 };

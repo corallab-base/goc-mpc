@@ -21,6 +21,8 @@ using namespace pybind11::literals;
 namespace py = pybind11;
 
 
+struct SubgraphOfConstraints;
+
 enum class DeferredOpKind {
 	kLinearEq,
 	kLinearIneq,
@@ -34,13 +36,13 @@ enum class DeferredOpKind {
 
 struct DeferredOp {
 	DeferredOpKind kind;
-	size_t id;
-	size_t node;
+	int id;
+	int node;
 	std::function<void(drake::solvers::MathematicalProgram&,
+			   const struct SubgraphOfConstraints&,
+			   const int,
 			   const drake::solvers::MatrixXDecisionVariable&,
-			   const drake::solvers::MatrixXDecisionVariable&,
-			   const std::map<size_t, size_t>&,
-			   const std::map<size_t, size_t>&)> builder;
+			   const drake::solvers::MatrixXDecisionVariable&)> builder;
 };
 
 struct PhiConstraint {
@@ -83,12 +85,13 @@ struct PhiConstraint {
 
 struct GraphOfConstraints {
 	Graph<py::object> structure;
-	std::map<size_t, size_t> phi_map;
-	std::map<size_t, struct DeferredOp> ops;
-	size_t num_phis, _num_total_assignables, num_agents, dim;
-
+	std::map<int, int> node_to_phi_map;
+	std::map<int, int> phi_to_variable_map;
+	std::map<int, struct DeferredOp> ops;
+	int num_phis, _num_variables, _num_total_assignables, num_agents, dim;
+	
         // For each phi, you may have one or many "phi constraints".
-	std::unordered_map<size_t, std::vector<PhiConstraint>> _constraints_per_phi;
+	std::unordered_map<int, std::vector<PhiConstraint>> _constraints_per_phi;
 
 	// Required for big-M computation
 	Eigen::VectorXd _global_x_lb;
@@ -99,16 +102,18 @@ struct GraphOfConstraints {
 			   const Eigen::VectorXd& global_x_lb,
 			   const Eigen::VectorXd& global_x_ub);
 
+	int add_variable();
+
 	Graph<py::object> get_structure() const { return structure; }
 
-	std::pair<std::vector<std::vector<size_t>>,
-		  std::vector<std::pair<size_t, size_t>>> get_agent_paths(
-			  const std::vector<size_t>& remaining_vertices,
+	std::pair<std::vector<std::vector<int>>,
+		  std::vector<std::pair<int, int>>> get_agent_paths(
+			  const std::vector<int>& remaining_vertices,
 			  const Eigen::VectorXi& assignments) const;
 
-	std::vector<size_t> get_phi_ids(size_t node) const;
+	std::vector<int> get_phi_ids(int node) const;
 
-	bool evaluate_phi(size_t phi_id,
+	bool evaluate_phi(int phi_id,
 			  const Eigen::VectorXd& x,
 			  int assignment_phi,
 			  double tol) const;
@@ -134,150 +139,82 @@ struct GraphOfConstraints {
 	// Multi-Agent Constraint Adders (typed)
 
 	// Ax_i = b on node k for some agent i
-	void add_assignable_linear_eq(int node_k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	void add_assignable_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
 private:
 	template <typename F>
-	void _add_op(DeferredOpKind kind, size_t node, F&& f) {
-		const size_t id = num_phis++;
-		phi_map[node] = id;
+	void _add_op(DeferredOpKind kind, int node, F&& f) {
+		const int id = num_phis++;
+		node_to_phi_map[node] = id;
+		ops[id] = DeferredOp{kind, id, node, std::forward<F>(f)};
+	}
+
+	template <typename F>
+	void _add_assignable_op(DeferredOpKind kind, int node, int var, F&& f) {
+		const int id = num_phis++;
+		node_to_phi_map[node] = id;
+		phi_to_variable_map[id] = var;
 		ops[id] = DeferredOp{kind, id, node, std::forward<F>(f)};
 	}
 };
 
+/*
+ * Subgraph
+ */
 
-// struct SubgraphOfConstraints {
-// 	const GraphOfConstraints* _g;
-// 	std::vector<bool>   _mask;       // membership mask
-// 	std::vector<size_t> _node_list;  // compact node list for fast outer loops
+struct SubgraphOfConstraints {
+	InducedSubgraphView<py::object> structure;
+	std::map<int, int> _variable_to_subgraph_variable_id; // unique ids for variables relevant to subgraph.
+	std::map<int, DeferredOp> _subgraph_ops;
 
-// 	// Construct from parent graph and a list of nodes in the subgraph
-// 	SubgraphOfConstraints(const GraphOfConstraints& g, const std::vector<size_t>& nodes);
+	SubgraphOfConstraints(GraphOfConstraints *graph, const std::vector<int>& vertices) :
+		structure(graph->structure, vertices) {
 
-// 	size_t degree(size_t u) const;
+		// std::map<int, int> phi_to_subgraph_node_id;
+		// std::map<int, int> phi_to_subgraph_assignable_id;
+		// std::map<int, int> subgraph_assignable_id_to_phi;
 
-// 	// Lightweight neighbor range that filters on the fly (const-only).
-// 	class NeighborIter {
-// 	public:
-// 		using InnerIter = typename std::vector<Edge>::const_iterator;
-// 		NeighborIter(const GraphT* g, const std::vector<bool>* mask, size_t u, InnerIter it, InnerIter end)
-// 			: g_(g), mask_(mask), u_(u), it_(it), end_(end) { advance_to_valid(); }
+		int num_subgraph_variables = 0;
+		
+		for (int v : vertices) {
+			// if there is/are phi associated with v
+			if (graph->node_to_phi_map.contains(v)) {
+				// Store the relevant ops so they can be applied
+				const int phi_id = graph->node_to_phi_map.at(v);
+				_subgraph_ops[phi_id] = graph->ops.at(phi_id);
 
-// 		const Edge& operator*() const { return *it_; }
-// 		const Edge* operator->() const { return &*it_; }
+				// Record the mapping from phi id to subgraph node and assignable var idxs.
+				if (graph->phi_to_variable_map.contains(phi_id)) {
+					const int variable_id = graph->phi_to_variable_map.at(phi_id);
+					
+					if (!_variable_to_subgraph_variable_id.contains(variable_id)) {
+						_variable_to_subgraph_variable_id[variable_id] = num_subgraph_variables++;
+					}
+					
+				}
+			}
+		}
+	}
 
-// 		NeighborIter& operator++() { ++it_; advance_to_valid(); return *this; }
-// 		bool operator==(const NeighborIter& o) const { return it_ == o.it_; }
-// 		bool operator!=(const NeighborIter& o) const { return !(*this == o); }
+	// Function that returns an iterator to the beginning of the map
+	const std::map<int, DeferredOp>& get_subgraph_ops() const {
+		return _subgraph_ops;
+	}
 
-// 	private:
-// 		void advance_to_valid() {
-// 			while (it_ != end_ && !(it_->to < mask_->size() && (*mask_)[it_->to] && g_->alive(it_->to))) {
-// 				++it_;
-// 			}
-// 		}
-// 		const GraphT* g_;
-// 		const std::vector<bool>* mask_;
-// 		size_t u_;
-// 		InnerIter it_, end_;
-// 	};
+	int num_nodes() const {
+		return structure.num_nodes();
+	}
 
-// 	struct NeighborRange {
-// 		NeighborIter begin_, end_;
-// 		NeighborIter begin() const { return begin_; }
-// 		NeighborIter end()   const { return end_; }
-// 	};
+	int num_variables() const {
+		return _variable_to_subgraph_variable_id.size();
+	}
 
-// 	NeighborRange neighbors(size_t u) const {
-// 		if (!contains_node(u)) {
-// 			// empty range: begin == end
-// 			auto it = g_->neighbors(std::min(u, g_->num_nodes() ? g_->num_nodes()-1 : 0)).end();
-// 			return NeighborRange{NeighborIter(g_, &mask_, u, it, it), NeighborIter(g_, &mask_, u, it, it)};
-// 		}
-// 		const auto& nbrs = g_->neighbors(u);
-// 		return NeighborRange{
-// 			NeighborIter(g_, &mask_, u, nbrs.begin(), nbrs.end()),
-// 			NeighborIter(g_, &mask_, u, nbrs.end(),   nbrs.end())
-// 		};
-// 	}
+	int subgraph_id(int u) const {
+		return structure.subgraph_id(u);
+	}
 
-// 	// Iterate nodes in the subgraph
-// 	const std::vector<size_t>& nodes() const { return node_list_; }
-
-// 	// Iterate all edges in the subgraph (u, Edge&), on the fly
-// 	struct EdgeRef { size_t u; const Edge* e; };
-
-// 	class EdgeIter {
-// 	public:
-// 		EdgeIter(const GraphT* g, const std::vector<bool>* mask,
-// 			 const std::vector<size_t>* node_list, size_t node_idx)
-// 			: g_(g), mask_(mask), node_list_(node_list), node_idx_(node_idx)
-// 			{
-// 				advance_node();
-// 			}
-
-// 		EdgeRef operator*() const { return EdgeRef{ node_list_->at(node_idx_), &*it_ }; }
-// 		EdgeIter& operator++() { ++it_; advance_edge(); return *this; }
-
-// 		bool operator==(const EdgeIter& o) const {
-// 			return node_idx_ == o.node_idx_ && (end_ ? it_ == o.it_ : true);
-// 		}
-// 		bool operator!=(const EdgeIter& o) const { return !(*this == o); }
-
-// 	private:
-// 		void advance_node() {
-// 			// Move to first node that has at least one valid outgoing edge
-// 			while (node_idx_ < node_list_->size()) {
-// 				size_t u = node_list_->at(node_idx_);
-// 				const auto& nbrs = g_->neighbors(u);
-// 				it_ = nbrs.begin(); end_it_ = nbrs.end();
-// 				advance_edge();
-// 				if (it_ != end_it_) { end_ = false; return; }
-// 				++node_idx_;
-// 			}
-// 			// end sentinel
-// 			end_ = true;
-// 		}
-
-// 		void advance_edge() {
-// 			while (node_idx_ < node_list_->size()) {
-// 				while (it_ != end_it_) {
-// 					if ((*mask_)[it_->to] && g_->alive(it_->to)) return;
-// 					++it_;
-// 				}
-// 				++node_idx_;
-// 				if (node_idx_ >= node_list_->size()) { end_ = true; return; }
-// 				size_t u = node_list_->at(node_idx_);
-// 				const auto& nbrs = g_->neighbors(u);
-// 				it_ = nbrs.begin(); end_it_ = nbrs.end();
-// 			}
-// 			end_ = true;
-// 		}
-
-// 		const GraphT* g_;
-// 		const std::vector<bool>* mask_;
-// 		const std::vector<size_t>* node_list_;
-// 		size_t node_idx_ = 0;
-
-// 		typename std::vector<Edge>::const_iterator it_{};
-// 		typename std::vector<Edge>::const_iterator end_it_{};
-// 		bool end_ = false;
-// 	};
-
-// 	struct EdgeRange {
-// 		EdgeIter begin_, end_;
-// 		EdgeIter begin() const { return begin_; }
-// 		EdgeIter end()   const { return end_; }
-// 	};
-
-// 	EdgeRange edges() const {
-// 		return EdgeRange{
-// 			EdgeIter(g_, &mask_, &node_list_, 0),
-// 			EdgeIter(g_, &mask_, &node_list_, node_list_.size())
-// 		};
-// 	}
-
-// 	const GraphT& parent() const { return *g_; }
-
-// private:
-// };
+	int subgraph_variable_id(int var) const {
+		if (!_variable_to_subgraph_variable_id.contains(var)) { return -1; }
+		return _variable_to_subgraph_variable_id.at(var);
+	}
+};

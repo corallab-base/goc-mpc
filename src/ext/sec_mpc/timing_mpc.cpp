@@ -14,8 +14,8 @@ TimingMPC::TimingMPC(const Eigen::MatrixXd& _waypoints, double _time_cost, doubl
     time_cost(_time_cost),
     ctrl_cost(_ctrl_cost) {
 
-	ssize_t n = _waypoints.shape(0);
-	ssize_t d = _waypoints.shape(1);
+	int n = _waypoints.shape(0);
+	int d = _waypoints.shape(1);
 
 	this->_n = n;
 	this->_d = d;
@@ -23,15 +23,15 @@ TimingMPC::TimingMPC(const Eigen::MatrixXd& _waypoints, double _time_cost, doubl
 	/* initialize output times array (n,) */
 	this->time_deltas = py::array_t<double>(n);
 	auto time_deltas_mut = this->time_deltas.mutable_unchecked<1>();
-	for (ssize_t i = 0; i < n; ++i) {
+	for (int i = 0; i < n; ++i) {
 		time_deltas_mut(i) = 10.0;
 	}
 
 	/* initialize output vels array (n-1, d) */
 	this->vels = py::array_t<double>({n - 1, d});
 	auto vels_mut = this->vels.mutable_unchecked<2>();
-	for (ssize_t i = 0; i < n - 1; ++i) {
-		for (ssize_t f = 0; f < d; ++f) {
+	for (int i = 0; i < n - 1; ++i) {
+		for (int f = 0; f < d; ++f) {
 			vels_mut(i, f) = 0.0;
 		}
 	}
@@ -78,14 +78,14 @@ int TimingMPC::solve(const Eigen::VectorXd& x0,
 		// Write velocities to output array
 		auto vels_mut = this->vels.mutable_unchecked<2>();
 		// subtract 1 because last vec isn't relevant
-		for (size_t i = this->phase, j = 0; i < this->_n - 1; ++i, ++j) {
-			for (size_t f = 0; f < this->_d; ++f) {
+		for (int i = this->phase, j = 0; i < this->_n - 1; ++i, ++j) {
+			for (int f = 0; f < this->_d; ++f) {
 				vels_mut(i, f) = v(j, f);
 			}
 		}
 
 		auto time_deltas_mut = this->time_deltas.mutable_unchecked<1>();
-		for (size_t i = this->phase, j = 0; i < this->_n; ++i, ++j) {
+		for (int i = this->phase, j = 0; i < this->_n; ++i, ++j) {
 			printf("Setting time_deltas(%d) = %f\n", i, taus(j));
 			time_deltas_mut(i) = taus(j);
 		}
@@ -156,16 +156,16 @@ py::array_t<double> TimingMPC::get_times() const {
 
 
 py::array_t<double> TimingMPC::get_vels() const {
-	const ssize_t phase_ = static_cast<ssize_t>(this->phase);
-	const ssize_t N = this->waypoints.shape(0);
-	const ssize_t D = this->waypoints.shape(1);
+	const int phase_ = static_cast<int>(this->phase);
+	const int N = this->waypoints.shape(0);
+	const int D = this->waypoints.shape(1);
 
 	// Done: return final velocity (usually zero)
 	if (done()) {
 		return remainder_slice_2d(this->vels, N - 1);
 	}
 
-	ssize_t num_rows = N - phase_;  // including final appended zero row
+	int num_rows = N - phase_;  // including final appended zero row
 
 	// Allocate final velocity array (including appended zero row)
 	py::array_t<double> result({num_rows, D});
@@ -176,24 +176,24 @@ py::array_t<double> TimingMPC::get_vels() const {
 		auto speeds = remainder_slice_1d(this->vels, this->phase).unchecked<1>();
 		auto tangents = remainder_slice_2d(this->tangents, this->phase).unchecked<2>();
 
-		for (ssize_t i = 0; i < num_rows - 1; ++i) {
+		for (int i = 0; i < num_rows - 1; ++i) {
 			double s = speeds(i);
-			for (ssize_t j = 0; j < D; ++j) {
+			for (int j = 0; j < D; ++j) {
 				result_(i, j) = s * tangents(i, j);
 			}
 		}
 	} else {
 		// Directly copy from this->vels
 		auto src = remainder_slice_2d(this->vels, this->phase).unchecked<2>();
-		for (ssize_t i = 0; i < num_rows - 1; ++i) {
-			for (ssize_t j = 0; j < D; ++j) {
+		for (int i = 0; i < num_rows - 1; ++i) {
+			for (int j = 0; j < D; ++j) {
 				result_(i, j) = src(i, j);
 			}
 		}
 	}
 
 	// Append zero vector at the end
-	for (ssize_t j = 0; j < D; ++j) {
+	for (int j = 0; j < D; ++j) {
 		result_(num_rows - 1, j) = 0.0;
 	}
 
@@ -273,7 +273,7 @@ void TimingMPC::update_set_phase(unsigned int phaseTo) {
 	}
 
 	auto time_deltas_ = this->time_deltas.mutable_unchecked<1>();
-	ssize_t N = time_deltas_.shape(0);
+	int N = time_deltas_.shape(0);
 
 	while (this->phase > phaseTo) {
 		if (this->phase < static_cast<unsigned int>(N)) {

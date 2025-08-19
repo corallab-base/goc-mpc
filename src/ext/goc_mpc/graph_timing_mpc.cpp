@@ -15,8 +15,8 @@ namespace py = pybind11;
 
 // 	using namespace drake::solvers;
 
-// 	const ssize_t K = wps.rows();
-// 	const ssize_t d = wps.cols();
+// 	const int K = wps.rows();
+// 	const int d = wps.cols();
 
 // 	// Create program
 // 	GraphOrderingProblem problem;
@@ -131,7 +131,7 @@ namespace py = pybind11;
 
 GraphTimingProblem build_graph_timing_problem(
 	const GraphOfConstraints& graph,
-	const std::vector<size_t>& remaining_vertices,
+	const std::vector<int>& remaining_vertices,
 	const Eigen::MatrixXd& waypoints,
 	const Eigen::VectorXi& assignments,
 	const Eigen::VectorXd& x0,
@@ -154,7 +154,7 @@ GraphTimingProblem build_graph_timing_problem(
 
 	// TODO: use assignments to settle conditional edges.
 
-	size_t dim = graph.dim;
+	int dim = graph.dim;
 	const auto pair = graph.get_agent_paths(remaining_vertices, assignments);
 	const auto agent_nodes = pair.first;
 	const auto cross_agent_edges = pair.second;
@@ -168,10 +168,10 @@ GraphTimingProblem build_graph_timing_problem(
 	problem.agent_nodes_list.resize(graph.num_agents);
 
 	for (int i = 0; i < graph.num_agents; ++i) {
-		const std::vector<size_t> agent_i_nodes = agent_nodes[i];
+		const std::vector<int> agent_i_nodes = agent_nodes[i];
 		problem.agent_nodes_list[i] = agent_i_nodes;
 
-		const size_t agent_spline_length = agent_i_nodes.size();
+		const int agent_spline_length = agent_i_nodes.size();
 
 		// If there is nothing left in this spline, there's nothing to optimize.
 		if (agent_spline_length > 0) {
@@ -179,9 +179,9 @@ GraphTimingProblem build_graph_timing_problem(
 			char vs_name[32];
 
 			Eigen::MatrixXd wps_i(agent_spline_length, dim);
-			for (size_t j = 0; j < agent_spline_length; ++j) {
-				size_t node = agent_i_nodes[j];
-				for (size_t k = 0; k < dim; ++k) {
+			for (int j = 0; j < agent_spline_length; ++j) {
+				int node = agent_i_nodes[j];
+				for (int k = 0; k < dim; ++k) {
 					wps_i(j, k) = waypoints(node, i * dim + k);
 				}
 			}
@@ -192,7 +192,7 @@ GraphTimingProblem build_graph_timing_problem(
 
 			// Create variables
 			VectorXDecisionVariable time_deltas_i = problem.prog->NewContinuousVariables(agent_spline_length, time_deltas_name);
-			for (size_t j = 0; j < agent_spline_length; ++j) {
+			for (int j = 0; j < agent_spline_length; ++j) {
 				problem.prog->AddBoundingBoxConstraint(0.01, 10.0, time_deltas_i(j));
 			}
 			problem.time_deltas_list[i] = time_deltas_i;
@@ -220,7 +220,7 @@ GraphTimingProblem build_graph_timing_problem(
 			if (ctrl_cost > 0) {
 				const double s12 = std::sqrt(12.0);
 
-				for (size_t j = 0; j < agent_spline_length; ++j) {
+				for (int j = 0; j < agent_spline_length; ++j) {
 					VectorX<Expression> xJ(dim), xJm1(dim), vJ(dim), vJm1(dim);
 					const Expression tau(time_deltas_i(j));
 					if (j == 0 && j < agent_spline_length - 1) {
@@ -263,7 +263,7 @@ GraphTimingProblem build_graph_timing_problem(
 
 			// Velocity/Acceleration/Jerk Constraints
 			if (max_vel > 0) {
-				for (size_t j = 0; j < agent_spline_length; ++j) {
+				for (int j = 0; j < agent_spline_length; ++j) {
 					VectorX<Expression> xJm1(dim), xJ(dim), vJm1(dim), vJ(dim);
 					const Expression tau(time_deltas_i(j));
 					const Expression inv_tau = pow(tau, -1.0);
@@ -317,7 +317,7 @@ GraphTimingProblem build_graph_timing_problem(
 			}
 
 			if (max_acc > 0) {
-				for (size_t j = 0; j < agent_spline_length; ++j) {
+				for (int j = 0; j < agent_spline_length; ++j) {
 					VectorX<Expression> xJm1(dim), xJ(dim), vJm1(dim), vJ(dim);
 					const Expression tau(time_deltas_i(j));
 					if (j == 0 && j < agent_spline_length - 1) {
@@ -372,7 +372,7 @@ GraphTimingProblem build_graph_timing_problem(
 			}
 
 			if (max_jerk > 0) {
-				for (size_t j = 0; j < agent_spline_length; ++j) {
+				for (int j = 0; j < agent_spline_length; ++j) {
 					VectorX<Expression> xJ(dim), xJm1(dim), vJ(dim), vJm1(dim);
 					const Expression tau(time_deltas_i(j));
 					if (j == 0 && j < agent_spline_length - 1) {
@@ -449,9 +449,9 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 	  _vs_list(graph.num_agents),
 	  _time_deltas_list(graph.num_agents) {
 
-	size_t num_agents = _graph->num_agents;
-	size_t num_nodes = _graph->structure.num_nodes();
-	size_t dim = _graph->dim;
+	int num_agents = _graph->num_agents;
+	int num_nodes = _graph->structure.num_nodes();
+	int dim = _graph->dim;
 
 	_wps_list.resize(num_agents);
 	for (int i = 0; i < num_agents; ++i) {
@@ -470,7 +470,7 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 bool GraphTimingMPC::solve(
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
-	const std::vector<size_t>& remaining_vertices,
+	const std::vector<int>& remaining_vertices,
 	const Eigen::MatrixXd& waypoints,
 	const Eigen::VectorXi& assignments) {
 
@@ -520,9 +520,9 @@ bool GraphTimingMPC::solve(
 	// /* TODO: Change according to phase */
 	// /* initialize output ordering array (n,) */
 	// Eigen::MatrixXd ordered_waypoints({num_nodes, _dim});
-	// for (size_t i = 0; i < num_nodes; ++i) {
+	// for (int i = 0; i < num_nodes; ++i) {
 	// 	const auto rank = ordering(i);
-	// 	for (size_t j = 0; j < _dim; ++j) {
+	// 	for (int j = 0; j < _dim; ++j) {
 	// 		ordered_waypoints(i, j) = waypoints(rank, j);
 	// 	}
 	// }
@@ -541,18 +541,18 @@ bool GraphTimingMPC::solve(
 	auto result = drake::solvers::Solve(*problem.prog);
 
 	if (result.is_success()) {
-		for (size_t i = 0; i < _graph->num_agents; ++i) {
+		for (int i = 0; i < _graph->num_agents; ++i) {
 			Eigen::MatrixXd vs = result.GetSolution(problem.vs_list[i]);
 			Eigen::VectorXd taus = result.GetSolution(problem.time_deltas_list[i]);
 
-			const size_t agent_spline_length = taus.size() + 1;
+			const int agent_spline_length = taus.size() + 1;
 			_agent_spline_length_map[i] = agent_spline_length;
 
-			for (size_t j = 0; j < vs.rows(); ++j) {
+			for (int j = 0; j < vs.rows(); ++j) {
 				_vs_list[i].row(j) = vs.row(j);
 			}
 
-			for (size_t j = 0; j < taus.size(); ++j) {
+			for (int j = 0; j < taus.size(); ++j) {
 				_time_deltas_list[i](j) = taus(j);
 			}
 		}
@@ -562,7 +562,7 @@ bool GraphTimingMPC::solve(
 	}
 }
 
-size_t GraphTimingMPC::get_agent_spline_length(size_t agent) {
+int GraphTimingMPC::get_agent_spline_length(int agent) {
 	if (!_agent_spline_length_map.contains(agent)) {
 		return 0;
 	} else {
@@ -570,18 +570,18 @@ size_t GraphTimingMPC::get_agent_spline_length(size_t agent) {
 	}
 }
 
-std::set<size_t> GraphTimingMPC::set_progressed_time(double delta, double tau_cutoff) {
+std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutoff) {
 	/* this function, instead of resolving for all the vertices and taus, as
 	 * above, just updates the first tau of each remaining active spline.
 	 * These changes should also update the intialization of the solver. */
 
-	std::set<size_t> passed_nodes;
+	std::set<int> passed_nodes;
 	
-	for (size_t i = 0; i < _graph->num_agents; ++i) {
+	for (int i = 0; i < _graph->num_agents; ++i) {
 		// Eigen::MatrixXd vs = result.GetSolution(problem.vs_list[i]);
 		// Eigen::VectorXd taus = result.GetSolution(problem.time_deltas_list[i]);
 
-		// const size_t agent_spline_length = taus.size() + 1;
+		// const int agent_spline_length = taus.size() + 1;
 		if (_agent_spline_length_map[i] > 0) {
 			const double tau0 = _time_deltas_list[i](0);
 			if (delta < tau0) {
@@ -596,7 +596,7 @@ std::set<size_t> GraphTimingMPC::set_progressed_time(double delta, double tau_cu
 			}
 		}
 
-		// for (size_t j = 0; j < vs.rows(); ++j) {
+		// for (int j = 0; j < vs.rows(); ++j) {
 		// 	_vs_list[i].row(j) = vs.row(j);
 		// }
 	}
@@ -604,10 +604,10 @@ std::set<size_t> GraphTimingMPC::set_progressed_time(double delta, double tau_cu
 	return passed_nodes;
 }
 
-Eigen::VectorXd cumsum_with_zero(const Eigen::VectorXd& x, size_t n) {
+Eigen::VectorXd cumsum_with_zero(const Eigen::VectorXd& x, int n) {
 	Eigen::VectorXd y(n+1);
 	double s = 0.0;
-	for (ssize_t i = 0; i < n + 1; ++i) {
+	for (int i = 0; i < n + 1; ++i) {
 		y(i) = s;
 		s += x(i);
 	}
@@ -618,10 +618,10 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline*>& splines,
 					const Eigen::VectorXd& x0,
 					const Eigen::VectorXd& v0) const {
 
-	size_t d = _graph->dim;
+	int d = _graph->dim;
 
-	for (size_t i = 0; i < _graph->num_agents; ++i) {
-		const size_t spline_length_i = _agent_spline_length_map.at(i);
+	for (int i = 0; i < _graph->num_agents; ++i) {
+		const int spline_length_i = _agent_spline_length_map.at(i);
 
 		if (spline_length_i > 1) {
 			Eigen::VectorXd x0_i = x0.segment(i * d, d);
@@ -707,15 +707,15 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline*>& splines,
 
 
 // py::array_t<double> GraphTimingMPC::get_vels() const {
-// 	const ssize_t phase = 0; // static_cast<ssize_t>(this->phase);
+// 	const int phase = 0; // static_cast<int>(this->phase);
 
 // 	// Done: return final velocity (usually zero)
 // 	if (done()) {
 // 		return remainder_slice_2d(_vels, _num_nodes - 1);
 // 	}
 
-// 	ssize_t num_rows = _num_nodes - phase;  // including final appended zero row
-// 	ssize_t num_cols = _dim;
+// 	int num_rows = _num_nodes - phase;  // including final appended zero row
+// 	int num_cols = _dim;
 
 // 	// Allocate final velocity array (including appended zero row)
 // 	py::array_t<double> result({num_rows, num_cols});
@@ -723,14 +723,14 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline*>& splines,
 
 // 	// Directly copy from this->vels
 // 	auto src = remainder_slice_2d(_vels, phase).unchecked<2>();
-// 	for (ssize_t i = 0; i < num_rows - 1; ++i) {
-// 		for (ssize_t j = 0; j < _dim; ++j) {
+// 	for (int i = 0; i < num_rows - 1; ++i) {
+// 		for (int j = 0; j < _dim; ++j) {
 // 			result_mut(i, j) = src(i, j);
 // 		}
 // 	}
 
 // 	// Append zero vector at the end
-// 	for (ssize_t j = 0; j < _dim; ++j) {
+// 	for (int j = 0; j < _dim; ++j) {
 // 		result_mut(num_rows - 1, j) = 0.0;
 // 	}
 
@@ -826,7 +826,7 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline*>& splines,
 // 	}
 
 // 	auto time_deltas_ = this->time_deltas.mutable_unchecked<1>();
-// 	ssize_t N = time_deltas_.shape(0);
+// 	int N = time_deltas_.shape(0);
 
 // 	while (this->phase > phaseTo) {
 // 		if (this->phase < static_cast<unsigned int>(N)) {

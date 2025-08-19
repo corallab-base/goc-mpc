@@ -22,8 +22,8 @@ TimingProblem build_timing_problem(
 
 	using namespace drake::solvers;
 
-	const ssize_t K = wps.rows();
-	const ssize_t d = wps.cols();
+	const int K = wps.rows();
+	const int d = wps.cols();
 
 	// Create program
 	TimingProblem problem;
@@ -32,13 +32,13 @@ TimingProblem build_timing_problem(
 	VectorXDecisionVariable time_deltas;
 	if (opt_time_deltas) {
 		time_deltas = problem.prog->NewContinuousVariables(K, "time_deltas");
-		for (size_t k = 0; k < K; ++k) {
+		for (int k = 0; k < K; ++k) {
 			problem.prog->AddBoundingBoxConstraint(0.01, 10.0, time_deltas(k));
 		}
 	}
 	problem.time_deltas = time_deltas;
 
-	const size_t vN = opt_last_vel ? K : K - 1;
+	const int vN = opt_last_vel ? K : K - 1;
 	MatrixXDecisionVariable v = problem.prog->NewContinuousVariables(vN, d, "v");
 	problem.v = v;
 
@@ -66,7 +66,7 @@ TimingProblem build_timing_problem(
 	if (ctrl_cost > 0) {
 		const double s12 = std::sqrt(12.0);
 
-		for (size_t k = 0; k < vN; ++k) {
+		for (int k = 0; k < vN; ++k) {
 		        VectorX<Expression> xK(d), xKm1(d), vK(d), vKm1(d);
 		        const Expression tau(time_deltas(k));
 			if (k == 0) {
@@ -105,7 +105,7 @@ TimingProblem build_timing_problem(
 	}
 
 	if (max_vel > 0) {
-		for (size_t k = 0; k < vN; ++k) {
+		for (int k = 0; k < vN; ++k) {
 			VectorX<Expression> xKm1(d), xK(d), vKm1(d), vK(d);
 			const Expression tau(time_deltas(k));
 			const Expression inv_tau = pow(tau, -1.0);
@@ -145,7 +145,7 @@ TimingProblem build_timing_problem(
 	}
 
 	if (max_acc > 0) {
-		for (size_t k = 0; k < vN; ++k) {
+		for (int k = 0; k < vN; ++k) {
 			VectorX<Expression> xKm1(d), xK(d), vKm1(d), vK(d);
 			const Expression tau(time_deltas(k));
 			if (k == 0) {
@@ -182,7 +182,7 @@ TimingProblem build_timing_problem(
 	}
 
 	if (max_jerk > 0) {
-		for (size_t k = 0; k < vN; ++k) {
+		for (int k = 0; k < vN; ++k) {
 			VectorX<Expression> xK(d), xKm1(d), vK(d), vKm1(d);
 		        const Expression tau(time_deltas(k));
 			if (k == 0) {
