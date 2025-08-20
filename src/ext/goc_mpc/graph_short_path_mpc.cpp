@@ -49,9 +49,10 @@ ShortPathProblem build_short_path_problem(
 	// 2. Scaled acceleration objective
 	for (int i = 0; i < num_steps; ++i) {
 		if (i == 0) {
-			const Eigen::VectorXd xKm1 = x0;
+			// only take elements for agent positions
+			const Eigen::VectorXd xKm1 = x0.segment(0, dim);
 			const Eigen::VectorX<Variable> xK = xi.row(i);
-			const Eigen::VectorXd vKm1 = v0;
+			const Eigen::VectorXd vKm1 = v0.segment(0, dim);
 			const Eigen::VectorX<Variable> vK = v.row(i);
 
 			const Eigen::VectorX<Expression> a6_tau = 6.0 / tau2 * (-2.0 * (xK - xKm1) + tau * (vK + vKm1));
@@ -122,7 +123,7 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& 
 		ref_points.block(0, ag * _dim, _num_steps, _dim) = references[ag].eval_multiple(_times, 0);
 		ref_velocities.block(0, ag * _dim, _num_steps, _dim) = references[ag].eval_multiple(_times, 1);
 	}
-	
+
 	struct ShortPathProblem problem = build_short_path_problem(ref_points,
 								   ref_velocities,
 								   x0, v0, _time_per_step);

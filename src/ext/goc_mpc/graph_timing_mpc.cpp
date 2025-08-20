@@ -453,6 +453,7 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 	int num_nodes = _graph->structure.num_nodes();
 	int dim = _graph->dim;
 
+	// A waypoint and velocity array for each agent only.
 	_wps_list.resize(num_agents);
 	for (int i = 0; i < num_agents; ++i) {
 		_wps_list[i] = Eigen::MatrixXd::Zero(num_nodes, dim);
@@ -465,6 +466,8 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 	for (int i = 0; i < num_agents; ++i) {
 		_time_deltas_list[i] = Eigen::VectorXd::Zero(num_nodes);
 	}
+
+	// Maybe: a waypoint and velocity array for all of the objects.
 }
 
 bool GraphTimingMPC::solve(

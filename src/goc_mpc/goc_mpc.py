@@ -115,6 +115,8 @@ class GraphOfConstraintsMPC():
     def step(self, t, x, x_dot):
         "Returns the short horizon for the controller to execute."
 
+        assert x.size == self.graph.total_dim
+
         delta = t - self.last_cycle_time
         self.last_cycle_time = t
 

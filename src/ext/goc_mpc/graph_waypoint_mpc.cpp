@@ -16,6 +16,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	Eigen::VectorXd x0) {
 
 	const int num_agents = graph->num_agents;
+	const int num_objects = graph->num_objects;
 
 	const SubgraphOfConstraints subgraph(graph, remaining_vertices);
 
@@ -72,7 +73,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	const int non_robot_dim = graph->non_robot_dim;
 
 	// x: continuous configuration variables (n x m*d+o).
-	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(subgraph.num_nodes(), num_agents * robot_dim + non_robot_dim, "X");
+	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(subgraph.num_nodes(), num_agents * robot_dim + num_objects * non_robot_dim, "X");
 	problem.X = X;
 
 	//
@@ -123,7 +124,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 GraphWaypointMPC::GraphWaypointMPC(GraphOfConstraints& graph)
 	: _graph(&graph) {
 	// Allocate persistent output buffers.
-	_waypoints = Eigen::MatrixXd::Zero(_graph->structure.num_nodes(), _graph->num_agents * _graph->dim);
+	_waypoints = Eigen::MatrixXd::Zero(_graph->structure.num_nodes(), _graph->total_dim);
 	_assignments = Eigen::VectorXi::Zero(_graph->num_phis);
 }
 
@@ -169,11 +170,11 @@ bool GraphWaypointMPC::solve(
 		Eigen::MatrixXd X_flat = result.GetSolution(problem.X);
 		for (int v : remaining_vertices) {
 			const int i = problem.subgraph->subgraph_id(v);
-			Eigen::RowVectorXd row(num_agents * dim);
-			for (int j = 0; j < num_agents; ++j) {
-				row.segment(j * dim, dim) = X_flat.row(i * num_agents + j);
-			}
-			_waypoints.row(i) = row;
+			// Eigen::RowVectorXd row(num_agents * dim + );
+			// for (int j = 0; j < num_agents; ++j) {
+			// 	row.segment(j * dim, dim) = X_flat.row(i).segment(j * dim * num_agents + j);
+			// }
+			_waypoints.row(i) = X_flat.row(i);
 		}
 
 		return true;

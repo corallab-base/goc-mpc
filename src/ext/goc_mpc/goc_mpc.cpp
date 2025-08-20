@@ -26,11 +26,13 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("dim", &GraphOfConstraints::dim)
+		.def_readonly("total_dim", &GraphOfConstraints::total_dim)
 		.def("add_variable", &GraphOfConstraints::add_variable)
 		.def("get_phi_ids", &GraphOfConstraints::get_phi_ids)
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
-		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq);
+		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
+		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint);
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
                 .def(py::init<GraphOfConstraints&>())

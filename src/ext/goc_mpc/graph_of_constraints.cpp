@@ -14,6 +14,7 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<double> *plant,
 	  _num_variables(0),
 	  _num_total_assignables(0),
 	  num_agents(robots.size()),
+	  num_objects(objects.size()),
 	  dim(0),
 	  non_robot_dim(0),
 	  _global_x_lb(global_x_lb),
@@ -34,12 +35,14 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<double> *plant,
 		ModelInstanceIndex obj = plant->GetModelInstanceByName(s);
 		int obj_qdim = plant->num_positions(obj);
 		int obj_qddim = plant->num_velocities(obj);
-		if (obj_qdim == obj_qddim) {
-			non_robot_dim += obj_qdim;
-		} else {
-			throw std::runtime_error("qdim != qddim unexepectedly.");
+		if (non_robot_dim == 0 && obj_qdim == obj_qddim) {
+			non_robot_dim = obj_qdim;
+		} else if (non_robot_dim != obj_qdim) {
+			throw std::runtime_error("Only supporting objects with the same dimension.");
 		}
 	}
+
+	total_dim = num_agents * dim + num_objects * non_robot_dim;
 }
 
 // add variable
@@ -315,3 +318,107 @@ void GraphOfConstraints::add_assignable_linear_eq(int k,
 		
 		});
 }
+
+// Enforce at graph node k:
+//   robot[agent_i].x == cube[cube_i].x
+//   robot[agent_i].y == cube[cube_i].y
+//   robot[agent_i].z == cube[cube_i].z + delta_z
+//
+// Assumes:
+//   - X(row, col) returns a DecisionVariable for node 'row' and column 'col'.
+//   - Each agent block is length `dim` and each object block is length `non_robot_dim`.
+//   - The full row layout is [agents (num_agents*dim) | objects (num_objects*non_robot_dim)].
+//   - _add_op(kind, k, builder) calls builder(prog, subgraph, phi_id, X, ...optional extras).
+void GraphOfConstraints::add_robot_above_cube_constraint(
+    int k, int agent_i, int cube_i, double delta_z) {
+
+  DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+  DRAKE_DEMAND(agent_i >= 0 && agent_i < num_agents);
+  DRAKE_DEMAND(dim == 3 && non_robot_dim == 3);  // special-case: 3-DoF (x,y,z)
+  DRAKE_DEMAND(cube_i >= 0 && cube_i < num_objects);
+  // If you track num_objects, you can also check cube_i bounds here.
+
+  const int agents_cols = num_agents * dim;
+  const int robot_base  = agent_i * dim;                        // into q_i
+  const int cube_base   = agents_cols + cube_i * non_robot_dim; // into o_q_i
+
+  _add_op(DeferredOpKind::kLinearEq, k,
+    [=, this](auto& prog,
+              const SubgraphOfConstraints& subgraph,
+              const int phi_id,
+              const auto& X,
+              const auto&... /*unused*/) {
+      const int row = subgraph.subgraph_id(k);
+
+      auto add_eq_axis = [&](int axis, double rhs) {
+        drake::solvers::VectorXDecisionVariable v(2);
+        v(0) = X(row, robot_base + axis);      // robot axis
+        v(1) = X(row, cube_base  + axis);      // cube axis
+
+        Eigen::RowVector2d a; a << 1.0, -1.0;  // (robot - cube) = rhs
+        auto binding = prog.AddLinearEqualityConstraint(a, rhs, v);
+
+        // Optional bookkeeping (if you track pulls/touches per-phi):
+        // auto pulls = make_pulls_for_cols({robot_base + axis, cube_base + axis});
+        // _constraints_per_phi[phi_id].push_back(PhiConstraint{binding, pulls});
+      };
+
+      add_eq_axis(0, 0.0);         // x_r - x_c == 0
+      add_eq_axis(1, 0.0);         // y_r - y_c == 0
+      add_eq_axis(2, delta_z);     // z_r - z_c == delta_z
+    }
+  );
+}
+
+// void GraphOfConstraints::add_link_above_point_constraint(
+// 	int k,
+// 	int agent,
+// 	drake::multibody::ModelInstanceIndex robot_mi,
+// 	drake::multibody::ModelInstanceIndex cube_mi,
+// 	double delta_z) {
+
+// 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+
+// 	// const DoFIndices r = GetXYZIndicesFor(*plant, robot_mi);
+// 	// const DoFIndices c = GetXYZIndicesFor(*plant, cube_mi);
+
+// 	_add_op(DeferredOpKind::kLinearEq, k,
+// 		[=, this](auto& prog,
+// 			  const SubgraphOfConstraints& subgraph,
+// 			  const int phi_id,
+// 			  const auto& X,
+// 			  const auto&) {
+// 			const int node_k = subgraph.subgraph_id(k);
+
+// 			// // Returns the decision variable (at node_k) for a given plant q-index,
+// 			// // using your precomputed maps q_to_agent_col_ / q_to_object_col_.
+// 			// auto var_for_q = [&](int q_idx) -> drake::solvers::DecisionVariable {
+// 			// 	if (auto it = q_to_agent_col_.find(q_idx); it != q_to_agent_col_.end())
+// 			// 		return X(node_k, it->second);
+// 			// 	auto jt = q_to_object_col_.find(q_idx);
+// 			// 	DRAKE_DEMAND(jt != q_to_object_col_.end());
+// 			// 	return Objects(node_k, jt->second);
+// 			// };
+
+// 			// auto add_eq = [&](int q_r, int q_c, double rhs) {
+// 			// 	// Build: [1, -1] * [q_r; q_c] = rhs
+// 			// 	drake::solvers::VectorXDecisionVariable v(2);
+// 			// 	v(0) = var_for_q(q_r);
+// 			// 	v(1) = var_for_q(q_c);
+// 			// 	Eigen::RowVector2d a; a << 1.0, -1.0;
+
+// 			// 	auto binding = prog.AddLinearEqualityConstraint(a, rhs, v);
+
+// 			// 	// Optional: bookkeeping (adjust to your PhiConstraint / pulls API).
+// 			// 	// Here we record which plant q indices this row touched.
+// 			// 	// Replace `make_pulls_for_vars(...)` with your actual helper.
+// 			// 	auto pulls = make_pulls_for_vars({q_r, q_c});
+// 			// 	_constraints_per_phi[phi_id].push_back(PhiConstraint{binding, pulls});
+// 			// };
+
+// 			// // x, y, z rows:
+// 			// add_eq(r.ix, c.ix, 0.0);
+// 			// add_eq(r.iy, c.iy, 0.0);
+// 			// add_eq(r.iz, c.iz, delta_z);
+// 		});
+// }

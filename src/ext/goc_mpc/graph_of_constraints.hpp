@@ -94,7 +94,8 @@ struct GraphOfConstraints {
 	std::map<int, int> node_to_phi_map;
 	std::map<int, int> phi_to_variable_map;
 	std::map<int, struct DeferredOp> ops;
-	int num_phis, _num_variables, _num_total_assignables, num_agents, dim, non_robot_dim;
+	int num_phis, _num_variables, _num_total_assignables;
+	int num_agents, num_objects, dim, non_robot_dim, total_dim;
 	
         // For each phi, you may have one or many "phi constraints".
 	std::unordered_map<int, std::vector<PhiConstraint>> _constraints_per_phi;
@@ -152,6 +153,12 @@ struct GraphOfConstraints {
 
 	// Ax_i = b on node k for some agent i
 	void add_assignable_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+
+	// Temp Plant-Based Constraint Adders
+
+	// Sort of hard-coded
+	void add_robot_above_cube_constraint(int k, int agent_i, int cube_i, double delta_z);
+
 
 private:
 	template <typename F>
