@@ -13,7 +13,7 @@ from goc_mpc.utils.mesh_cat_mirror import MeshCatMirror
 
 MJCF_ONE_POINT_MASS = r"""
 <mujoco model="one_point_mass">
-  <option timestep="0.002" gravity="0 0 -9.81"/>
+  <option timestep="0.002" gravity="0 0 0"/>
   <compiler angle="radian"/>
   <worldbody>
     <light name="sun"
@@ -79,6 +79,7 @@ class OnePointMassEnv:
 
     def reset(self, qpos=None, qvel=None):
         mj.mj_resetData(self.model, self.data)
+        self.data.ctrl[:] = qpos
         if qpos is not None:
             assert qpos.shape == (self.model.nq,)
             self.data.qpos[:] = qpos
@@ -93,6 +94,8 @@ class OnePointMassEnv:
         assert action.shape == (self.action_dim,)
 
         if self.mode == "teleport":
+            # Set desired joint positions for actuators
+            self.data.ctrl[:] = action
             # Directly set configuration for this step (state player).
             self.data.qpos[:] = action
             # Optionally damp velocities to keep things tame
@@ -139,7 +142,7 @@ if __name__ == "__main__":
     env = OnePointMassEnv(mode="teleport", n_substeps=5)
     obs, _ = env.reset(qpos=np.array([0.0, 0.0, 1.0,   0.5, 0.0, 0.8]))
 
-    mirror = MeshCatMirror(env.model, env.data, bodies=["p1", "p2"], radius=0.05)
+    mirror = MeshCatMirror(env.model, env.data, bodies=["p1"], radius=0.05)
 
     # Demo: two simple Lissajous-ish trajectories played back
     T = 600

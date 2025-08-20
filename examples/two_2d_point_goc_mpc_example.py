@@ -58,10 +58,18 @@ def two_points_example():
     state_upper_bound = np.ones(dim) * 100.0
 
     graph = GraphOfConstraints(num_agents, dim, state_lower_bound, state_upper_bound)
-    graph.structure.add_nodes(2)
-    # graph.structure.add_edge(0, 1, True)
-    graph.add_assignable_linear_eq(0, np.eye(2), np.array([0.0, 1.0]))
-    graph.add_assignable_linear_eq(1, np.eye(2), np.array([1.0, 1.0]))
+    graph.structure.add_nodes(4)
+    graph.structure.add_edge(0, 2, True)
+    graph.structure.add_edge(1, 3, True)
+
+    graph.add_variable()
+    graph.add_variable()
+
+    graph.add_assignable_linear_eq(0, 0, np.eye(2), np.array([0.0, 1.0]))
+    graph.add_assignable_linear_eq(2, 0, np.eye(2), np.array([0.0, 2.0]))
+
+    graph.add_assignable_linear_eq(1, 1, np.eye(2), np.array([1.0, 1.0]))
+    graph.add_assignable_linear_eq(3, 1, np.eye(2), np.array([1.0, 2.0]))
 
     # GoC-MPC
     goc_mpc = GraphOfConstraintsMPC(graph,
@@ -83,10 +91,10 @@ def two_points_example():
             x, x_dot = obs[:4], obs[4:]
             xi_h, _, _ = goc_mpc.step(k * dt, x, x_dot)
     
-            if k % 100 == 0:
-                fig = visualize_last_cycle(goc_mpc)
-                input("Continue?")
-                plt.close(fig)
+            # if k % 100 == 0:
+            #     fig = visualize_last_cycle(goc_mpc)
+            #     input("Continue?")
+            #     plt.close(fig)
 
             qpos = xi_h[0]
             obs, rew, done, trunc, info = env.step(qpos)

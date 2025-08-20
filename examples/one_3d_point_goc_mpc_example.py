@@ -8,14 +8,14 @@ import matplotlib.pyplot as plt
 from mujoco import viewer
 
 from goc_mpc.plants import build_1pm_1cube_plant
-from goc_mpc.systems import One2DPointMassEnv
+from goc_mpc.systems import OnePointMassEnv
 from goc_mpc.goc_mpc import GraphOfConstraints, GraphOfConstraintsMPC
 from goc_mpc.utils.mesh_cat_mirror import MeshCatMirror
 
 
 def visualize_last_cycle(goc_mpc):
 
-    if goc_mpc.graph.dim != 2:
+    if goc_mpc.graph.dim != 3:
         return
 
     fig, axes = plt.subplots(3)
@@ -31,7 +31,7 @@ def visualize_last_cycle(goc_mpc):
 
         velocities = spline.eval_multiple(times, 1)
         accelerations = spline.eval_multiple(times, 2)
-        for j in range(velocities.shape[1]):
+        for j in range(0, velocities.shape[1] - 1):
             axes[1].plot(times, velocities[:, j], label=f"agent {i} v_{j}")
             axes[2].plot(times, accelerations[:, j], label=f"agent {i} a_{j}")
 
@@ -42,8 +42,8 @@ def visualize_last_cycle(goc_mpc):
 
     # visualize short path
     for ag_i in range(len(goc_mpc.last_cycle_splines)):
-        axes[0].plot(short_path_points[:, ag_i * 2 + 0],
-                     short_path_points[:, ag_i * 2 + 1], color="red")
+        axes[0].plot(short_path_points[:, ag_i * 3 + 0],
+                     short_path_points[:, ag_i * 3 + 1], color="red")
 
     fig.show()
 
@@ -51,7 +51,7 @@ def visualize_last_cycle(goc_mpc):
 
 def one_point_example():
     # env and visualization
-    env = One2DPointMassEnv(mode="teleport", n_substeps=5)
+    env = OnePointMassEnv(mode="teleport", n_substeps=5)
     mirror = MeshCatMirror(env.model, env.data, bodies=["p1"], radius=0.05)
 
     # problem set-up
@@ -66,8 +66,8 @@ def one_point_example():
                                state_lower_bound, state_upper_bound)
     graph.structure.add_nodes(2)
     graph.structure.add_edge(0, 1, True)
-    graph.add_linear_eq(0, np.eye(2), np.array([0.0, 1.0]))
-    graph.add_linear_eq(1, np.eye(2), np.array([1.0, 2.0]))
+    graph.add_linear_eq(0, np.eye(3), np.array([0.0, 1.0, 1.0]))
+    graph.add_linear_eq(1, np.eye(3), np.array([1.0, 2.0, 1.0]))
 
     # GoC-MPC
     goc_mpc = GraphOfConstraintsMPC(graph,
@@ -81,18 +81,18 @@ def one_point_example():
     dt = 1.0 / 30
 
     while True:
-        obs, _ = env.reset(qpos=np.array([0.0, 0.0]))
+        obs, _ = env.reset(qpos=np.array([0.0, 0.0, 1.0]))
         goc_mpc.reset()
         mirror.push()
     
         for k in range(1500):
-            x, x_dot = obs[:2], obs[2:]
+            x, x_dot = obs[:3], obs[3:]
             xi_h, _, _ = goc_mpc.step(k * dt, x, x_dot)
     
-            if k % 200 == 0:
-                fig = visualize_last_cycle(goc_mpc)
-                input("Continue?")
-                plt.close(fig)
+            # if k % 200 == 0:
+            #     fig = visualize_last_cycle(goc_mpc)
+            #     input("Continue?")
+            #     plt.close(fig)
 
             qpos = xi_h[0]
             obs, rew, done, trunc, info = env.step(qpos)
