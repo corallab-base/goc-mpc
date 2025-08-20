@@ -7,7 +7,9 @@
 #include <drake/solvers/branch_and_bound.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
-#include "drake/solvers/solve.h"
+#include <drake/solvers/solve.h>
+#include <drake/multibody/plant/multibody_plant.h>
+#include <drake/multibody/tree/multibody_tree_indexes.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -17,6 +19,8 @@
 
 using drake::solvers::Binding;
 using drake::solvers::Constraint;
+using drake::multibody::MultibodyPlant;
+using drake::multibody::ModelInstanceIndex;
 using namespace pybind11::literals;
 namespace py = pybind11;
 
@@ -84,11 +88,13 @@ struct PhiConstraint {
 
 
 struct GraphOfConstraints {
+
+	const MultibodyPlant<double> *plant;
 	Graph<py::object> structure;
 	std::map<int, int> node_to_phi_map;
 	std::map<int, int> phi_to_variable_map;
 	std::map<int, struct DeferredOp> ops;
-	int num_phis, _num_variables, _num_total_assignables, num_agents, dim;
+	int num_phis, _num_variables, _num_total_assignables, num_agents, dim, non_robot_dim;
 	
         // For each phi, you may have one or many "phi constraints".
 	std::unordered_map<int, std::vector<PhiConstraint>> _constraints_per_phi;
@@ -98,7 +104,13 @@ struct GraphOfConstraints {
 	Eigen::VectorXd _global_x_ub;
 
 	// Constructor
-	GraphOfConstraints(unsigned int num_agents, unsigned int dim,
+	// GraphOfConstraints(unsigned int num_agents, unsigned int dim,
+	// 		   const Eigen::VectorXd& global_x_lb,
+	// 		   const Eigen::VectorXd& global_x_ub);
+
+	GraphOfConstraints(const MultibodyPlant<double> *plant,
+			   const std::vector<std::string> robots,
+			   const std::vector<std::string> objects,
 			   const Eigen::VectorXd& global_x_lb,
 			   const Eigen::VectorXd& global_x_ub);
 

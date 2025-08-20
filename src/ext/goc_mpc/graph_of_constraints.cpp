@@ -4,18 +4,43 @@ using drake::solvers::Binding;
 using drake::solvers::Constraint;
 
 // Constructor
-GraphOfConstraints::GraphOfConstraints(
-	unsigned int num_agents, unsigned int dim,
-	const Eigen::VectorXd& global_x_lb,
-	const Eigen::VectorXd& global_x_ub)
-	: num_phis(0),
+GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<double> *plant,
+				       const std::vector<std::string> robots,
+				       const std::vector<std::string> objects,
+				       const Eigen::VectorXd& global_x_lb,
+				       const Eigen::VectorXd& global_x_ub)
+	: plant(plant),
+	  num_phis(0),
 	  _num_variables(0),
 	  _num_total_assignables(0),
-	  num_agents(num_agents),
-	  dim(dim),
+	  num_agents(robots.size()),
+	  dim(0),
+	  non_robot_dim(0),
 	  _global_x_lb(global_x_lb),
-	  _global_x_ub(global_x_ub) {}
+	  _global_x_ub(global_x_ub) {
 
+	for (const std::string& s : robots) {
+		ModelInstanceIndex robot = plant->GetModelInstanceByName(s);
+		int robot_qdim = plant->num_positions(robot);
+		int robot_qddim = plant->num_velocities(robot);
+		if (dim == 0 && robot_qdim == robot_qddim) {
+			dim = robot_qdim;
+		} else if (dim != robot_qdim) {
+			throw std::runtime_error("Only supporting robots with the same dimension.");
+		}
+	}
+
+	for (const std::string& s : objects) {
+		ModelInstanceIndex obj = plant->GetModelInstanceByName(s);
+		int obj_qdim = plant->num_positions(obj);
+		int obj_qddim = plant->num_velocities(obj);
+		if (obj_qdim == obj_qddim) {
+			non_robot_dim += obj_qdim;
+		} else {
+			throw std::runtime_error("qdim != qddim unexepectedly.");
+		}
+	}
+}
 
 // add variable
 // add assignable phi which depends on a variable => phi_to_variable_map
@@ -135,7 +160,7 @@ void GraphOfConstraints::add_bounding_box(int k, const Eigen::VectorXd& lb, cons
 
 		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
-			joint_config_k << X.row(node_k + ag);
+			joint_config_k << X.row(node_k).segment(ag * dim, dim);;
 		}
 
 		prog.AddBoundingBoxConstraint(lb, ub, joint_config_k);
@@ -154,7 +179,7 @@ void GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Ei
 		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
 			for (int i = 0; i < dim; ++i) {
-				joint_config_k(ag * dim + i) = X(node_k + ag, i);
+				joint_config_k(ag * dim + i) = X(node_k, ag * dim + i);
 			}
 		}
 
@@ -178,7 +203,7 @@ void GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const 
 
 		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
-			joint_config_k << X.row(node_k + ag);
+			joint_config_k << X.row(node_k).segment(ag * dim, dim);
 		}
 
 		auto constraint = prog.AddLinearConstraint(A, lb, ub, joint_config_k);
@@ -196,7 +221,7 @@ void GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd
 
 		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
-			joint_config_k << X.row(node_k + ag);
+			joint_config_k << X.row(node_k).segment(ag * dim, dim);
 		}
 
 		auto constraint = prog.AddQuadraticCost(Q, b, c, joint_config_k);
@@ -250,8 +275,7 @@ void GraphOfConstraints::add_assignable_linear_eq(int k,
 			for (int i = 0; i < num_agents; ++i) {
 				// Variables [ x_{k,i} ; s ] with s = A(variable_k, i)
 				drake::solvers::VectorXDecisionVariable vars(dim + 1);
-				const int row_ki = node_k * num_agents + i;
-				for (int j = 0; j < dim; ++j) vars[j] = X(row_ki, j);
+				for (int j = 0; j < dim; ++j) vars[j] = X(node_k, i*dim + j);
 				vars[dim] = Assignments(variable_k, i);   // <-- use A as selector
 				
 				for (int r = 0; r < A.rows(); ++r) {

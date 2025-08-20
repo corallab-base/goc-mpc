@@ -68,8 +68,11 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			1.0, Assignments.row(i));
 	}
 
-	// x: continuous configuration variables (n x d).
-	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(subgraph.num_nodes() * num_agents, graph->dim, "X");
+	const int robot_dim = graph->dim;
+	const int non_robot_dim = graph->non_robot_dim;
+
+	// x: continuous configuration variables (n x m*d+o).
+	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(subgraph.num_nodes(), num_agents * robot_dim + non_robot_dim, "X");
 	problem.X = X;
 
 	//
@@ -78,12 +81,10 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 	// First, costs to minimize across transitions from x0 to the source
 	// nodes in the subgraph.
-	const int dim = graph->dim;
 	for (auto v : subgraph.structure.sources()) {
 		int sg_v = subgraph.subgraph_id(v);
 		for (int ag = 0; ag < num_agents; ++ag) {
-			const int node_v_ag_idx = sg_v * num_agents + ag;
-			VectorX<Expression> diff = x0.segment(ag * dim, dim) - X.row(node_v_ag_idx);
+			VectorX<Expression> diff = x0.segment(ag * robot_dim, robot_dim) - X.row(sg_v).segment(ag * robot_dim, robot_dim);
 			Expression dist = diff.squaredNorm();
 			problem.prog->AddQuadraticCost(dist);
 		}
@@ -98,9 +99,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		int v = edge.e->to;
 		int sg_v = subgraph.subgraph_id(v);
 		for (int ag = 0; ag < num_agents; ++ag) {
-			const int node_u_ag_idx = sg_u * num_agents + ag;
-			const int node_v_ag_idx = sg_v * num_agents + ag;
-			VectorX<Expression> diff = X.row(node_u_ag_idx) - X.row(node_v_ag_idx);
+			VectorX<Expression> diff = X.row(sg_u).segment(ag * robot_dim, robot_dim) - X.row(sg_v).segment(ag * robot_dim, robot_dim);
 			Expression dist = diff.squaredNorm();
 			problem.prog->AddQuadraticCost(dist);
 		}

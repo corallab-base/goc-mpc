@@ -2,10 +2,12 @@
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
 
+#include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
 
+using drake::multibody::MultibodyPlant;
 namespace py = pybind11;
 
 /*
@@ -16,7 +18,11 @@ void init_submodule_goc_mpc(py::module_& m) {
         py::module_ goc_mpc = m.def_submodule("goc_mpc", "GoC-MPC module.");
 
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
-		.def(py::init<unsigned int, unsigned int, const Eigen::VectorXd&, const Eigen::VectorXd&>())
+		.def(py::init<const MultibodyPlant<double>*,
+		     const std::vector<std::string>,
+		     const std::vector<std::string>,
+		     const Eigen::VectorXd&,
+		     const Eigen::VectorXd&>())
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("dim", &GraphOfConstraints::dim)
