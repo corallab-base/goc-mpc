@@ -245,10 +245,10 @@ std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraint
 // lb <= x <= ub on node k
 int GraphOfConstraints::add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
 	return _add_op(DeferredOpKind::kBoundingBox, k, [=, this](auto& prog,
-							   const SubgraphOfConstraints& subgraph,
-							   const int phi_id,
-							   const auto& X,
-							   const auto&) {
+								  const SubgraphOfConstraints& subgraph,
+								  const int phi_id,
+								  const auto& X,
+								  const auto&) {
 		const unsigned int node_k = subgraph.subgraph_id(k);
 
 		VectorXDecisionVariable joint_config_k(num_agents * dim);
@@ -263,10 +263,10 @@ int GraphOfConstraints::add_bounding_box(int k, const Eigen::VectorXd& lb, const
 // Ax = b on node k
 int GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
 	return _add_op(DeferredOpKind::kLinearEq, k, [=, this](auto& prog,
-							const SubgraphOfConstraints& subgraph,
-							const int phi_id,
-							const auto& X,
-							const auto&) {
+							       const SubgraphOfConstraints& subgraph,
+							       const int phi_id,
+							       const auto& X,
+							       const auto&) {
 		const int node_k = subgraph.subgraph_id(k);
 
 		VectorXDecisionVariable joint_config_k(num_agents * dim);
@@ -288,10 +288,10 @@ int GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Eig
 // lb <= A x <= ub on node k
 int GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
 	return _add_op(DeferredOpKind::kLinearIneq, k, [=, this](auto& prog,
-							  const SubgraphOfConstraints& subgraph,
-							  const int phi_id,
-							  const auto& X,
-							  const auto&) {
+								 const SubgraphOfConstraints& subgraph,
+								 const int phi_id,
+								 const auto& X,
+								 const auto&) {
 		const int node_k = subgraph.subgraph_id(k);
 
 		VectorXDecisionVariable joint_config_k(num_agents * dim);
@@ -306,10 +306,10 @@ int GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const E
 // 0.5 x'Qx + b'x + c on node k
 int GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c) {
 	return _add_op(DeferredOpKind::kQuadraticCost, k, [=, this](auto& prog,
-							     const SubgraphOfConstraints& subgraph,
-							     const int phi_id,
-							     const auto& X,
-							     const auto&) {
+								    const SubgraphOfConstraints& subgraph,
+								    const int phi_id,
+								    const auto& X,
+								    const auto&) {
 		const int node_k = subgraph.subgraph_id(k);
 
 		VectorXDecisionVariable joint_config_k(num_agents * dim);
@@ -344,9 +344,9 @@ inline std::pair<double,double> max_min_ct_x_over_box(const Eigen::RowVectorXd& 
 // Enforce: A * x_{k,i} = b for the unique agent i with A_(var,i) = 1.
 // A.rows() == b.size(), A.cols() == d_
 int GraphOfConstraints::add_assignable_linear_eq(int k,
-						  int var,
-						  const Eigen::MatrixXd& A,
-						  const Eigen::VectorXd& b) {
+						 int var,
+						 const Eigen::MatrixXd& A,
+						 const Eigen::VectorXd& b) {
 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
 	DRAKE_DEMAND(var >= 0 && var < _num_variables);
 	DRAKE_DEMAND(A.cols() == dim);
@@ -356,57 +356,57 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 	_num_total_assignables++;
 
 	return _add_assignable_op(DeferredOpKind::kAgentLinearEq, k, var,
-		[=, this](auto& prog,
-			  const SubgraphOfConstraints& subgraph,
-			  const int phi_id,
-			  const auto& X,
-			  const auto& Assignments) {
+				  [=, this](auto& prog,
+					    const SubgraphOfConstraints& subgraph,
+					    const int phi_id,
+					    const auto& X,
+					    const auto& Assignments) {
 
-			const int node_k = subgraph.subgraph_id(k);
-			const int variable_k = subgraph.subgraph_variable_id(var);
+					  const int node_k = subgraph.subgraph_id(k);
+					  const int variable_k = subgraph.subgraph_variable_id(var);
 
-			for (int i = 0; i < num_agents; ++i) {
-				// Variables [ x_{k,i} ; s ] with s = A(variable_k, i)
-				VectorXDecisionVariable vars(dim + 1);
-				for (int j = 0; j < dim; ++j) vars[j] = X(node_k, i*dim + j);
-				vars[dim] = Assignments(variable_k, i);   // <-- use A as selector
+					  for (int i = 0; i < num_agents; ++i) {
+						  // Variables [ x_{k,i} ; s ] with s = A(variable_k, i)
+						  VectorXDecisionVariable vars(dim + 1);
+						  for (int j = 0; j < dim; ++j) vars[j] = X(node_k, i*dim + j);
+						  vars[dim] = Assignments(variable_k, i);   // <-- use A as selector
 				
-				for (int r = 0; r < A.rows(); ++r) {
-					const Eigen::RowVectorXd c = A.row(r);
-					const auto [max_cx, min_cx] = max_min_ct_x_over_box(
-						c,
-						_global_x_lb,
-						_global_x_ub);
+						  for (int r = 0; r < A.rows(); ++r) {
+							  const Eigen::RowVectorXd c = A.row(r);
+							  const auto [max_cx, min_cx] = max_min_ct_x_over_box(
+								  c,
+								  _global_x_lb,
+								  _global_x_ub);
 
-					const double rhs = b[r];
-					// Pick M so that when s = 0 the constraint is loose:
-					const double M_up = std::max(0.0, max_cx - rhs);  // for c^T x <= rhs
-					const double M_lo = std::max(0.0, rhs - min_cx); // for c^T x >= rhs
+							  const double rhs = b[r];
+							  // Pick M so that when s = 0 the constraint is loose:
+							  const double M_up = std::max(0.0, max_cx - rhs);  // for c^T x <= rhs
+							  const double M_lo = std::max(0.0, rhs - min_cx); // for c^T x >= rhs
 
-					// Encode using constant bounds (move M*(1-s) to LHS):
-					//  c^T x - M(1-s) <= rhs    ⇔  c^T x + M s <= rhs + M
-					// -c^T x - M(1-s) <= -rhs   ⇔ -c^T x + M s <= -rhs + M
-					Eigen::RowVectorXd a_up(dim + 1);
-					a_up.head(dim) = c;    a_up[dim] = M_up;
-					const double b_up = rhs + M_up;
+							  // Encode using constant bounds (move M*(1-s) to LHS):
+							  //  c^T x - M(1-s) <= rhs    ⇔  c^T x + M s <= rhs + M
+							  // -c^T x - M(1-s) <= -rhs   ⇔ -c^T x + M s <= -rhs + M
+							  Eigen::RowVectorXd a_up(dim + 1);
+							  a_up.head(dim) = c;    a_up[dim] = M_up;
+							  const double b_up = rhs + M_up;
 
-					Eigen::RowVectorXd a_lo(dim + 1);
-					a_lo.head(dim) = -c;   a_lo[dim] = M_lo;
-					const double b_lo = -rhs + M_lo;
+							  Eigen::RowVectorXd a_lo(dim + 1);
+							  a_lo.head(dim) = -c;   a_lo[dim] = M_lo;
+							  const double b_lo = -rhs + M_lo;
 
-					const double ninf = -std::numeric_limits<double>::infinity();
+							  const double ninf = -std::numeric_limits<double>::infinity();
 
-					auto upper = prog.AddLinearConstraint(a_up, ninf, b_up, vars);
-					auto lower = prog.AddLinearConstraint(a_lo, ninf, b_lo, vars);
+							  auto upper = prog.AddLinearConstraint(a_up, ninf, b_up, vars);
+							  auto lower = prog.AddLinearConstraint(a_lo, ninf, b_lo, vars);
 
-					auto pulls = make_pulls_for_agent_i(i, dim);
-					_constraints_per_phi[phi_id].push_back(PhiConstraint{upper, pulls});
-					_constraints_per_phi[phi_id].push_back(PhiConstraint{lower, pulls});
-				}
-			}
+							  auto pulls = make_pulls_for_agent_i(i, dim);
+							  _constraints_per_phi[phi_id].push_back(PhiConstraint{upper, pulls});
+							  _constraints_per_phi[phi_id].push_back(PhiConstraint{lower, pulls});
+						  }
+					  }
 
 		
-		});
+				  });
 }
 
 int GraphOfConstraints::add_robot_above_cube_constraint(
@@ -415,57 +415,57 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 	int cube_id, // std::string cube_model_name,
 	double delta_z) {
 
-  DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
-  // DRAKE_DEMAND(agent_i >= 0 && agent_i < num_agents);
-  // DRAKE_DEMAND(cube_i >= 0 && cube_i < num_objects);
-  // If you track num_objects, you can also check cube_i bounds here.
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	// DRAKE_DEMAND(agent_i >= 0 && agent_i < num_agents);
+	// DRAKE_DEMAND(cube_i >= 0 && cube_i < num_objects);
+	// If you track num_objects, you can also check cube_i bounds here.
 
-  const std::string& robot_model_name = _robot_names.at(robot_id);
-  const std::string& cube_model_name = _object_names.at(cube_id);
+	const std::string& robot_model_name = _robot_names.at(robot_id);
+	const std::string& cube_model_name = _object_names.at(cube_id);
 
-  const ModelInstanceIndex robot_mi = plant->GetModelInstanceByName(robot_model_name);
-  const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
+	const ModelInstanceIndex robot_mi = plant->GetModelInstanceByName(robot_model_name);
+	const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
 
-  return _add_op(DeferredOpKind::kNonlinearEq, k,
-    [=, this](auto& prog,
-              const SubgraphOfConstraints& subgraph,
-              const int phi_id,
-              const auto& X,
-              const auto&... /*unused*/) {
+	return _add_op(DeferredOpKind::kNonlinearEq, k,
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&... /*unused*/) {
 
-	    // record that this constraint is statically assigned to this robot.
-	    _phi_to_static_assignment_map[phi_id] = robot_id;
+			       // record that this constraint is statically assigned to this robot.
+			       _phi_to_static_assignment_map[phi_id] = robot_id;
 
-	    const int node_k = subgraph.subgraph_id(k);
+			       const int node_k = subgraph.subgraph_id(k);
 
-	    // Convert X[row] decision variables to Expressions.
-	    const int npos = plant->num_positions();
-	    Eigen::VectorX<Expression> q_all(npos);
-	    for (int j = 0; j < npos; ++j) {
-		    q_all(j) = Expression(X(node_k, j));
-	    }
+			       // Convert X[row] decision variables to Expressions.
+			       const int npos = plant->num_positions();
+			       Eigen::VectorX<Expression> q_all(npos);
+			       for (int j = 0; j < npos; ++j) {
+				       q_all(j) = Expression(X(node_k, j));
+			       }
 
-	    // Context<Expression> with these positions.
-	    auto context = plant->CreateDefaultContext();
-	    plant->SetPositions(context.get(), q_all);
+			       // Context<Expression> with these positions.
+			       auto context = plant->CreateDefaultContext();
+			       plant->SetPositions(context.get(), q_all);
 
-	    // World poses of each model's body.
-	    const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
-	    const auto& cube_body  = plant->GetBodyByName("cb_body", cube_mi);
-	    const RigidTransform<Expression> X_WR =
-		    plant->EvalBodyPoseInWorld(*context, robot_body);
-	    const RigidTransform<Expression> X_WC =
-		    plant->EvalBodyPoseInWorld(*context, cube_body);
+			       // World poses of each model's body.
+			       const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
+			       const auto& cube_body  = plant->GetBodyByName("cb_body", cube_mi);
+			       const RigidTransform<Expression> X_WR =
+				       plant->EvalBodyPoseInWorld(*context, robot_body);
+			       const RigidTransform<Expression> X_WC =
+				       plant->EvalBodyPoseInWorld(*context, cube_body);
 
-	    // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
-	    Eigen::Vector3<Expression> g;
-	    g << (X_WR.translation().x() - X_WC.translation().x()),
-		    (X_WR.translation().y() - X_WC.translation().y()),
-		    (X_WR.translation().z() - X_WC.translation().z() - delta_z);
+			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
+			       Eigen::Vector3<Expression> g;
+			       g << (X_WR.translation().x() - X_WC.translation().x()),
+				       (X_WR.translation().y() - X_WC.translation().y()),
+				       (X_WR.translation().z() - X_WC.translation().z() - delta_z);
 
-	    prog.AddConstraint(g, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-    }
-  );
+			       prog.AddConstraint(g, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+		       }
+		);
 }
 
 // void GraphOfConstraints::add_link_above_point_constraint(
