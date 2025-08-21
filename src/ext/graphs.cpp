@@ -196,6 +196,60 @@ void Graph<LabelT>::dfs_visit_from_sources(
 }
 
 template <typename LabelT>
+void Graph<LabelT>::bfs_visit_from_sources(
+    const std::function<void(int, std::optional<int>)>& cb) const
+{
+    const int n = num_nodes();
+    if (n == 0) return;
+
+    // Compute in-degree among alive nodes.
+    std::vector<int> indeg(n, 0);
+    for (int u = 0; u < n; ++u) {
+        if (!_alive[u]) continue;
+        for (const auto& e : _adj[u]) {
+            const int v = e.to;
+            if (v < n && _alive[v]) ++indeg[v];
+        }
+    }
+
+    std::vector<char> vis(n, 0);
+    std::vector<std::optional<int>> parent(n, std::nullopt);
+    std::queue<int> q;
+
+    // Seed the queue with all sources (alive nodes with indegree 0).
+    for (int u = 0; u < n; ++u) {
+        if (_alive[u] && indeg[u] == 0) {
+            vis[u] = 1;               // mark when enqueuing to avoid duplicates
+            parent[u] = std::nullopt; // root has no parent
+            q.push(u);
+        }
+    }
+
+    // Standard BFS.
+    while (!q.empty()) {
+        const int u = q.front();
+        q.pop();
+        if (u >= n || !_alive[u]) continue;
+
+        cb(u, parent[u]);  // level-order visitation
+
+        const auto& nbrs = _adj[u];
+        for (const auto& e : nbrs) {
+            const int v = e.to;
+            if (v < n && _alive[v] && !vis[v]) {
+                vis[v] = 1;
+                parent[v] = u;
+                q.push(v);
+            }
+        }
+    }
+
+    // Optional: if you want to also visit remaining alive nodes when there are
+    // cycles / no sources, you could add a second pass here to enqueue all
+    // unvisited alive nodes and continue BFS.
+}
+
+template <typename LabelT>
 typename Graph<LabelT>::SSSPResult Graph<LabelT>::dijkstra(int s, std::function<double(const LabelT&)> weight_fn) const {
 	check_node(s);
 	const double INF = std::numeric_limits<double>::infinity();
@@ -559,6 +613,70 @@ void InducedSubgraphView<LabelT>::dfs_visit_from_sources(
 
 	// Optional fallback to cover any remaining nodes (e.g., cycles):
 	// for (int u : _node_list) if (!vis[u]) do_dfs(u);
+}
+
+// BFS
+
+template <typename LabelT>
+void InducedSubgraphView<LabelT>::bfs_visit_from_sources(
+    const std::function<void(int, std::optional<int>)>& cb) const
+{
+    const int n = _g->num_nodes();
+    if (_node_list.empty()) return;
+
+    // In-degree restricted to the view.
+    std::vector<int> indeg(n, 0);
+    for (int u : _node_list) {
+        if (!contains_node(u)) continue;
+        for (const auto& e : neighbors(u)) {
+            ++indeg[e.to]; // neighbors(u) already filtered to nodes in the view
+        }
+    }
+
+    std::vector<char> vis(n, 0);
+    std::vector<std::optional<int>> parent(n, std::nullopt);
+    std::queue<int> q;
+
+    // Seed with all sources in the view (in-degree 0 within the view).
+    for (int u : _node_list) {
+        if (!contains_node(u)) continue;
+        if (indeg[u] == 0 && !vis[u]) {
+            vis[u] = 1;
+            parent[u] = std::nullopt;
+            q.push(u);
+        }
+    }
+
+    // Multi-source BFS over the view.
+    while (!q.empty()) {
+        const int u = q.front(); q.pop();
+        if (u >= n || !contains_node(u)) continue;
+
+        cb(u, parent[u]);
+
+        for (const auto& e : neighbors(u)) {
+            const int v = e.to; // guaranteed in view
+            if (v < n && !vis[v] && contains_node(v)) {
+                vis[v] = 1;
+                parent[v] = u;
+                q.push(v);
+            }
+        }
+    }
+
+    // Optional: ensure all nodes in the view are visited even if there are cycles/no sources.
+    // for (int u : _node_list) {
+    //     if (!contains_node(u) || vis[u]) continue;
+    //     vis[u] = 1; parent[u] = std::nullopt; q.push(u);
+    //     while (!q.empty()) {
+    //         const int x = q.front(); q.pop();
+    //         cb(x, parent[x]);
+    //         for (const auto& e : neighbors(x)) {
+    //             const int y = e.to;
+    //             if (!vis[y]) { vis[y] = 1; parent[y] = x; q.push(y); }
+    //         }
+    //     }
+    // }
 }
 
 // ---- explicit instantiations ----------------------------------------------

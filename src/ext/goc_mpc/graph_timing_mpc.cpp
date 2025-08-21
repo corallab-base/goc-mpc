@@ -565,13 +565,22 @@ bool GraphTimingMPC::solve(
 	}
 }
 
-int GraphTimingMPC::get_agent_spline_length(int agent) {
+int GraphTimingMPC::get_agent_spline_length(int agent) const {
 	if (!_agent_spline_length_map.contains(agent)) {
 		return 0;
 	} else {
 		return _agent_spline_length_map.at(agent);
 	}
 }
+
+std::vector<int> GraphTimingMPC::get_agent_spline_nodes(int agent) const {
+	if (agent < 0 || agent > _agent_nodes_list.size()) {
+		return std::vector<int>();
+	} else {
+		return _agent_nodes_list.at(agent);
+	}
+}
+
 
 std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutoff) {
 	/* this function, instead of resolving for all the vertices and taus, as

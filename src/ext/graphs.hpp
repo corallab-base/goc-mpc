@@ -46,6 +46,8 @@ public:
 	struct BFSResult { std::vector<std::optional<int>> parent; std::vector<int> dist; };
 	BFSResult bfs(int s) const;
 
+	void bfs_visit_from_sources(const std::function<void(int, std::optional<int>)>& cb) const;
+
 	// DFS from a specific start node; calls cb(u, parent) on discovery (preorder).
 	// Skips inactive nodes. parent = std::nullopt at root.
 	void dfs_visit(int s,
@@ -179,7 +181,6 @@ public:
 	/// Access the parent graph (const).
 	const GraphT& parent() const { return *_g; }
 
-
 	// DFS within the view from a specific start node (must be contained).
 	// Calls cb(u, parent) on discovery. Skips nodes not in the view.
 	void dfs_visit(int s,
@@ -190,6 +191,10 @@ public:
 	// DFS within the view starting from all view-sources (zero in-degree inside the view).
 	void dfs_visit_from_sources(
 		const std::function<void(int, std::optional<int>)>& cb) const;
+
+	// BFS
+
+	void bfs_visit_from_sources(const std::function<void(int, std::optional<int>)>& cb) const;
 
 private:
 	const GraphT* _g;               // parent graph (not owning)
