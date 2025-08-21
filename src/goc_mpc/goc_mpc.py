@@ -69,6 +69,7 @@ class GraphOfConstraintsMPC():
                 if all_phis_satisfied:
                     self.completed_phases |= {node}
                     self.remaining_phases.remove(node)
+                    self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
 
         # BACKTRACKING: if the task has been finished
         # if len(self.remaining_phases) == 0:
@@ -119,6 +120,8 @@ class GraphOfConstraintsMPC():
 
         delta = t - self.last_cycle_time
         self.last_cycle_time = t
+
+        self.last_grasp_commands = []
 
         success = self._solve_for_waypoints(x)
         success = self._solve_for_timing(delta, x, x_dot)

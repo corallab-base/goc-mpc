@@ -7,6 +7,7 @@
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
 
+using drake::symbolic::Expression;
 using drake::multibody::MultibodyPlant;
 namespace py = pybind11;
 
@@ -18,16 +19,21 @@ void init_submodule_goc_mpc(py::module_& m) {
         py::module_ goc_mpc = m.def_submodule("goc_mpc", "GoC-MPC module.");
 
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
-		.def(py::init<const MultibodyPlant<double>*,
+		.def(py::init<const MultibodyPlant<Expression>*,
 		     const std::vector<std::string>,
 		     const std::vector<std::string>,
 		     const Eigen::VectorXd&,
 		     const Eigen::VectorXd&>())
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
+		.def_readonly("num_objects", &GraphOfConstraints::num_objects)
 		.def_readonly("dim", &GraphOfConstraints::dim)
+		.def_readonly("non_robot_dim", &GraphOfConstraints::non_robot_dim)
 		.def_readonly("total_dim", &GraphOfConstraints::total_dim)
 		.def("add_variable", &GraphOfConstraints::add_variable)
+		.def("add_grasp_change", &GraphOfConstraints::add_grasp_change)
+		.def("add_assignable_grasp_change", &GraphOfConstraints::add_assignable_grasp_change)
+		.def("get_grasp_changes", &GraphOfConstraints::get_grasp_changes)
 		.def("get_phi_ids", &GraphOfConstraints::get_phi_ids)
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)

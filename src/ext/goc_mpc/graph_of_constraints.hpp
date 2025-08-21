@@ -19,6 +19,7 @@
 
 using drake::solvers::Binding;
 using drake::solvers::Constraint;
+using drake::symbolic::Expression;
 using drake::multibody::MultibodyPlant;
 using drake::multibody::ModelInstanceIndex;
 using namespace pybind11::literals;
@@ -32,7 +33,7 @@ enum class DeferredOpKind {
 	kLinearIneq,
 	kBoundingBox,
 	kQuadraticCost,
-	kNonlinearConstraint,
+	kNonlinearEq,
 	kOther,
 	// MultiAgent
 	kAgentLinearEq,
@@ -89,11 +90,15 @@ struct PhiConstraint {
 
 struct GraphOfConstraints {
 
-	const MultibodyPlant<double> *plant;
+	const MultibodyPlant<Expression> *plant;
+	const std::vector<std::string> _robot_names;
+	const std::vector<std::string> _object_names;
 	Graph<py::object> structure;
 	std::map<int, int> node_to_phi_map;
 	std::map<int, int> phi_to_variable_map;
 	std::map<int, struct DeferredOp> ops;
+	std::map<int, std::tuple<std::string, std::string, std::string>> _grasp_change_map;
+	std::map<int, std::pair<std::string, std::string>> _assignable_grasp_change_map;
 	int num_phis, _num_variables, _num_total_assignables;
 	int num_agents, num_objects, dim, non_robot_dim, total_dim;
 	
@@ -109,7 +114,7 @@ struct GraphOfConstraints {
 	// 		   const Eigen::VectorXd& global_x_lb,
 	// 		   const Eigen::VectorXd& global_x_ub);
 
-	GraphOfConstraints(const MultibodyPlant<double> *plant,
+	GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 			   const std::vector<std::string> robots,
 			   const std::vector<std::string> objects,
 			   const Eigen::VectorXd& global_x_lb,
@@ -133,47 +138,57 @@ struct GraphOfConstraints {
 	
 	void clear_constraints_per_phi();
 
+	// Grasp change util
+	void add_grasp_change(int k, std::string command, std::string robot_model_name, std::string cube_model_name);
+	void add_assignable_grasp_change(int k, std::string command, std::string cube_model_name);
+	std::vector<std::tuple<std::string, std::string, std::string>> get_grasp_changes(int k, Eigen::VectorXi assignments) const;
+	
 	// Plain Constraint Adders (typed)
 	// Note: these copy the numpy array's passed to them, but they're called
 	// once so it's fine.
 
 	// lb <= x <= ub on node k
-	void add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
+	int add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
 
 	// Ax = b on node k
-	void add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
 	// lb <= A x <= ub on node k
-	void add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
+	int add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
 
 	// 0.5 x'Qx + b'x + c on node k
-	void add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c = 0.0);
+	int add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c = 0.0);
 
 	// Multi-Agent Constraint Adders (typed)
 
 	// Ax_i = b on node k for some agent i
-	void add_assignable_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_assignable_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
 	// Temp Plant-Based Constraint Adders
 
 	// Sort of hard-coded
-	void add_robot_above_cube_constraint(int k, int agent_i, int cube_i, double delta_z);
+	int add_robot_above_cube_constraint(int k,
+					    std::string robot_model_name,
+					    std::string cube_model_name,
+					    double delta_z);
 
 
 private:
 	template <typename F>
-	void _add_op(DeferredOpKind kind, int node, F&& f) {
+	int _add_op(DeferredOpKind kind, int node, F&& f) {
 		const int id = num_phis++;
 		node_to_phi_map[node] = id;
 		ops[id] = DeferredOp{kind, id, node, std::forward<F>(f)};
+		return id;
 	}
 
 	template <typename F>
-	void _add_assignable_op(DeferredOpKind kind, int node, int var, F&& f) {
+	int _add_assignable_op(DeferredOpKind kind, int node, int var, F&& f) {
 		const int id = num_phis++;
 		node_to_phi_map[node] = id;
 		phi_to_variable_map[id] = var;
 		ops[id] = DeferredOp{kind, id, node, std::forward<F>(f)};
+		return id;
 	}
 };
 

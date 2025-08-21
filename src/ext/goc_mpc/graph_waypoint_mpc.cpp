@@ -70,6 +70,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	}
 
 	const int robot_dim = graph->dim;
+	const int objs_start = graph->num_agents * graph->dim;
 	const int non_robot_dim = graph->non_robot_dim;
 
 	// x: continuous configuration variables (n x m*d+o).
@@ -80,14 +81,34 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	// OBJECTIVE FUNCTION
 	//
 
-	// First, costs to minimize across transitions from x0 to the source
-	// nodes in the subgraph.
 	for (auto v : subgraph.structure.sources()) {
 		int sg_v = subgraph.subgraph_id(v);
+
+		// First, costs to minimize across transitions from x0 to the source
+		// nodes in the subgraph.
 		for (int ag = 0; ag < num_agents; ++ag) {
 			VectorX<Expression> diff = x0.segment(ag * robot_dim, robot_dim) - X.row(sg_v).segment(ag * robot_dim, robot_dim);
 			Expression dist = diff.squaredNorm();
 			problem.prog->AddQuadraticCost(dist);
+		}
+
+		// TODO: Acknowledge when they move with the robot
+
+		// Second, for the source nodes, add CONSTRAINTS saything that a block
+		// does not move from x0 unless it is moved.
+		for (int obj = 0; obj < num_objects; ++obj) {
+			const int start = objs_start + obj * non_robot_dim;
+
+			// Grab the decision-variable segment (as Expressions)
+			// Note: X.row(sg_v) is RowVector<Expression>, so transpose to column.
+			Eigen::VectorX<drake::symbolic::Expression> X_seg =
+				X.row(sg_v).segment(start, non_robot_dim).transpose();
+
+			// Grab the constant target segment
+			Eigen::VectorXd x0_seg = x0.segment(start, non_robot_dim);
+
+			// Enforce X_seg == x0_seg (all components)
+			problem.prog->AddLinearEqualityConstraint(X_seg, x0_seg);
 		}
 	}
 
@@ -103,6 +124,24 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			VectorX<Expression> diff = X.row(sg_u).segment(ag * robot_dim, robot_dim) - X.row(sg_v).segment(ag * robot_dim, robot_dim);
 			Expression dist = diff.squaredNorm();
 			problem.prog->AddQuadraticCost(dist);
+		}
+
+		// TODO: Acknowledge when they move with the robot
+		for (int obj = 0; obj < num_objects; ++obj) {
+			const int start = objs_start + obj * non_robot_dim;
+
+			// Grab the segment from node u
+			Eigen::VectorX<drake::symbolic::Expression> X_seg_u =
+				X.row(sg_u).segment(start, non_robot_dim).transpose();
+
+			// Grab the segment from node v (as Expressions)
+			// Note: X.row(sg_v) is RowVector<Expression>, so transpose to column.
+			Eigen::VectorX<drake::symbolic::Expression> X_seg_v =
+				X.row(sg_v).segment(start, non_robot_dim).transpose();
+
+
+			// Enforce X_seg == x0_seg (all components)
+			problem.prog->AddLinearEqualityConstraint(X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim));
 		}
 	}
 

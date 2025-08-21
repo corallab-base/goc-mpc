@@ -2,14 +2,19 @@
 
 using drake::solvers::Binding;
 using drake::solvers::Constraint;
+using drake::solvers::VectorXDecisionVariable;
+using drake::symbolic::Expression;
+using drake::math::RigidTransform;
 
 // Constructor
-GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<double> *plant,
+GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 				       const std::vector<std::string> robots,
 				       const std::vector<std::string> objects,
 				       const Eigen::VectorXd& global_x_lb,
 				       const Eigen::VectorXd& global_x_ub)
 	: plant(plant),
+	  _robot_names(robots),
+	  _object_names(objects),
 	  num_phis(0),
 	  _num_variables(0),
 	  _num_total_assignables(0),
@@ -150,18 +155,59 @@ auto make_pulls_for_agent_i(int agent_i, int dim) {
 	return pulls;
 }
 
+// Grasp util
+
+void GraphOfConstraints::add_grasp_change(int k,
+					  std::string command,
+					  std::string robot_model_name,
+					  std::string cube_model_name) {
+	_grasp_change_map[k] = std::make_tuple(command, robot_model_name, cube_model_name);
+}
+
+void GraphOfConstraints::add_assignable_grasp_change(int phi_id,
+						     std::string command,
+						     std::string cube_model_name) {
+	_assignable_grasp_change_map[phi_id] = std::make_pair(command, cube_model_name);
+}
+
+std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraints::get_grasp_changes(int k, Eigen::VectorXi assignments) const {
+	std::vector<std::tuple<std::string, std::string, std::string>> changes;
+
+	if (_grasp_change_map.contains(k)) {
+		changes.push_back(_grasp_change_map.at(k));
+	}
+
+	for (int phi_id : get_phi_ids(k)) {
+		if (_assignable_grasp_change_map.contains(phi_id)) {
+			// if an assignable grasp change was added to this phi,
+			// it should be assigned at this point.
+			int robot_id = assignments(phi_id);
+			if (robot_id == -1) {
+				throw std::runtime_error("Somehow constraint was not assigned.");
+			} else {
+				const std::string& robot_model_name = _robot_names.at(robot_id);
+				const auto& [command, cube_model_name] = _assignable_grasp_change_map.at(phi_id);
+				changes.push_back(std::make_tuple(command, robot_model_name, cube_model_name));
+			}
+		}
+	}
+
+	return changes;
+}
+
+
 // Joint-Agent Constraint Adders (typed)
 
 // lb <= x <= ub on node k
-void GraphOfConstraints::add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
-	_add_op(DeferredOpKind::kBoundingBox, k, [=, this](auto& prog,
+int GraphOfConstraints::add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
+	return _add_op(DeferredOpKind::kBoundingBox, k, [=, this](auto& prog,
 							   const SubgraphOfConstraints& subgraph,
 							   const int phi_id,
 							   const auto& X,
 							   const auto&) {
 		const unsigned int node_k = subgraph.subgraph_id(k);
 
-		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
+		VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
 			joint_config_k << X.row(node_k).segment(ag * dim, dim);;
 		}
@@ -171,15 +217,15 @@ void GraphOfConstraints::add_bounding_box(int k, const Eigen::VectorXd& lb, cons
 }
 
 // Ax = b on node k
-void GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-	_add_op(DeferredOpKind::kLinearEq, k, [=, this](auto& prog,
+int GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	return _add_op(DeferredOpKind::kLinearEq, k, [=, this](auto& prog,
 							const SubgraphOfConstraints& subgraph,
 							const int phi_id,
 							const auto& X,
 							const auto&) {
 		const int node_k = subgraph.subgraph_id(k);
 
-		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
+		VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
 			for (int i = 0; i < dim; ++i) {
 				joint_config_k(ag * dim + i) = X(node_k, ag * dim + i);
@@ -196,15 +242,15 @@ void GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Ei
 }
 
 // lb <= A x <= ub on node k
-void GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
-	_add_op(DeferredOpKind::kLinearIneq, k, [=, this](auto& prog,
+int GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
+	return _add_op(DeferredOpKind::kLinearIneq, k, [=, this](auto& prog,
 							  const SubgraphOfConstraints& subgraph,
 							  const int phi_id,
 							  const auto& X,
 							  const auto&) {
 		const int node_k = subgraph.subgraph_id(k);
 
-		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
+		VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
 			joint_config_k << X.row(node_k).segment(ag * dim, dim);
 		}
@@ -214,15 +260,15 @@ void GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const 
 }
 
 // 0.5 x'Qx + b'x + c on node k
-void GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c) {
-	_add_op(DeferredOpKind::kQuadraticCost, k, [=, this](auto& prog,
+int GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c) {
+	return _add_op(DeferredOpKind::kQuadraticCost, k, [=, this](auto& prog,
 							     const SubgraphOfConstraints& subgraph,
 							     const int phi_id,
 							     const auto& X,
 							     const auto&) {
 		const int node_k = subgraph.subgraph_id(k);
 
-		drake::solvers::VectorXDecisionVariable joint_config_k(num_agents * dim);
+		VectorXDecisionVariable joint_config_k(num_agents * dim);
 		for (int ag = 0; ag < num_agents; ++ag) {
 			joint_config_k << X.row(node_k).segment(ag * dim, dim);
 		}
@@ -253,7 +299,7 @@ inline std::pair<double,double> max_min_ct_x_over_box(const Eigen::RowVectorXd& 
 // A_i x_i = b on node k for some agent i
 // Enforce: A * x_{k,i} = b for the unique agent i with A_(var,i) = 1.
 // A.rows() == b.size(), A.cols() == d_
-void GraphOfConstraints::add_assignable_linear_eq(int k,
+int GraphOfConstraints::add_assignable_linear_eq(int k,
 						  int var,
 						  const Eigen::MatrixXd& A,
 						  const Eigen::VectorXd& b) {
@@ -265,7 +311,7 @@ void GraphOfConstraints::add_assignable_linear_eq(int k,
 	// record an increase in the total number of assignables. (could be removed).
 	_num_total_assignables++;
 
-	_add_assignable_op(DeferredOpKind::kAgentLinearEq, k, var,
+	return _add_assignable_op(DeferredOpKind::kAgentLinearEq, k, var,
 		[=, this](auto& prog,
 			  const SubgraphOfConstraints& subgraph,
 			  const int phi_id,
@@ -277,7 +323,7 @@ void GraphOfConstraints::add_assignable_linear_eq(int k,
 
 			for (int i = 0; i < num_agents; ++i) {
 				// Variables [ x_{k,i} ; s ] with s = A(variable_k, i)
-				drake::solvers::VectorXDecisionVariable vars(dim + 1);
+				VectorXDecisionVariable vars(dim + 1);
 				for (int j = 0; j < dim; ++j) vars[j] = X(node_k, i*dim + j);
 				vars[dim] = Assignments(variable_k, i);   // <-- use A as selector
 				
@@ -319,53 +365,54 @@ void GraphOfConstraints::add_assignable_linear_eq(int k,
 		});
 }
 
-// Enforce at graph node k:
-//   robot[agent_i].x == cube[cube_i].x
-//   robot[agent_i].y == cube[cube_i].y
-//   robot[agent_i].z == cube[cube_i].z + delta_z
-//
-// Assumes:
-//   - X(row, col) returns a DecisionVariable for node 'row' and column 'col'.
-//   - Each agent block is length `dim` and each object block is length `non_robot_dim`.
-//   - The full row layout is [agents (num_agents*dim) | objects (num_objects*non_robot_dim)].
-//   - _add_op(kind, k, builder) calls builder(prog, subgraph, phi_id, X, ...optional extras).
-void GraphOfConstraints::add_robot_above_cube_constraint(
-    int k, int agent_i, int cube_i, double delta_z) {
+int GraphOfConstraints::add_robot_above_cube_constraint(
+	int k,
+	std::string robot_model_name,
+	std::string cube_model_name,
+	double delta_z) {
 
   DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
-  DRAKE_DEMAND(agent_i >= 0 && agent_i < num_agents);
-  DRAKE_DEMAND(dim == 3 && non_robot_dim == 3);  // special-case: 3-DoF (x,y,z)
-  DRAKE_DEMAND(cube_i >= 0 && cube_i < num_objects);
+  // DRAKE_DEMAND(agent_i >= 0 && agent_i < num_agents);
+  // DRAKE_DEMAND(cube_i >= 0 && cube_i < num_objects);
   // If you track num_objects, you can also check cube_i bounds here.
 
-  const int agents_cols = num_agents * dim;
-  const int robot_base  = agent_i * dim;                        // into q_i
-  const int cube_base   = agents_cols + cube_i * non_robot_dim; // into o_q_i
+  const ModelInstanceIndex robot_mi = plant->GetModelInstanceByName(robot_model_name);
+  const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
 
-  _add_op(DeferredOpKind::kLinearEq, k,
+  return _add_op(DeferredOpKind::kNonlinearEq, k,
     [=, this](auto& prog,
               const SubgraphOfConstraints& subgraph,
               const int phi_id,
               const auto& X,
               const auto&... /*unused*/) {
-      const int row = subgraph.subgraph_id(k);
+	    const int node_k = subgraph.subgraph_id(k);
 
-      auto add_eq_axis = [&](int axis, double rhs) {
-        drake::solvers::VectorXDecisionVariable v(2);
-        v(0) = X(row, robot_base + axis);      // robot axis
-        v(1) = X(row, cube_base  + axis);      // cube axis
+	    // Convert X[row] decision variables to Expressions.
+	    const int npos = plant->num_positions();
+	    Eigen::VectorX<Expression> q_all(npos);
+	    for (int j = 0; j < npos; ++j) {
+		    q_all(j) = Expression(X(node_k, j));
+	    }
 
-        Eigen::RowVector2d a; a << 1.0, -1.0;  // (robot - cube) = rhs
-        auto binding = prog.AddLinearEqualityConstraint(a, rhs, v);
+	    // Context<Expression> with these positions.
+	    auto context = plant->CreateDefaultContext();
+	    plant->SetPositions(context.get(), q_all);
 
-        // Optional bookkeeping (if you track pulls/touches per-phi):
-        // auto pulls = make_pulls_for_cols({robot_base + axis, cube_base + axis});
-        // _constraints_per_phi[phi_id].push_back(PhiConstraint{binding, pulls});
-      };
+	    // World poses of each model's body.
+	    const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
+	    const auto& cube_body  = plant->GetBodyByName("cb_body", cube_mi);
+	    const RigidTransform<Expression> X_WR =
+		    plant->EvalBodyPoseInWorld(*context, robot_body);
+	    const RigidTransform<Expression> X_WC =
+		    plant->EvalBodyPoseInWorld(*context, cube_body);
 
-      add_eq_axis(0, 0.0);         // x_r - x_c == 0
-      add_eq_axis(1, 0.0);         // y_r - y_c == 0
-      add_eq_axis(2, delta_z);     // z_r - z_c == delta_z
+	    // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
+	    Eigen::Vector3<Expression> g;
+	    g << (X_WR.translation().x() - X_WC.translation().x()),
+		    (X_WR.translation().y() - X_WC.translation().y()),
+		    (X_WR.translation().z() - X_WC.translation().z() - delta_z);
+
+	    prog.AddConstraint(g, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
     }
   );
 }

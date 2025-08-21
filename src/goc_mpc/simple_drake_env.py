@@ -2,15 +2,17 @@ from typing import List, Optional, Tuple, Dict, Any
 import numpy as np
 from importlib.resources import files
 from pathlib import Path
+from dataclasses import dataclass
 
-from pydrake.multibody.plant import MultibodyPlant, AddMultibodyPlantSceneGraph
-from pydrake.multibody.tree import ModelInstanceIndex
+from pydrake.multibody.plant import MultibodyPlant_, AddMultibodyPlantSceneGraph
+from pydrake.multibody.plant import CoulombFriction
+from pydrake.multibody.tree import ModelInstanceIndex, Body, Frame
 from pydrake.multibody.parsing import Parser
+from pydrake.multibody.math import SpatialVelocity
 from pydrake.geometry import HalfSpace, Box, Rgba, SceneGraph, StartMeshcat, MeshcatVisualizer
 from pydrake.systems.framework import DiagramBuilder
 from pydrake.systems.analysis import Simulator
 from pydrake.math import RigidTransform
-from pydrake.multibody.plant import CoulombFriction
 
 import goc_mpc
 
@@ -30,6 +32,25 @@ def _add_ground(plant, z=0.0, size=200.0, thickness=0.02, mu_s=0.9, mu_d=0.5):
         "ground_visual",
         np.array([0.75, 0.75, 0.75, 1.0])
     )
+
+# def add_free_base_joint_for_object(plant, model_instance, base_body_name="anchor"):
+#     """Ensure the object’s base is free-floating so SetFreeBodyPose works."""
+#     Bo = plant.GetBodyByName(base_body_name, model_instance).body_frame()
+#     # If the base is already connected by any joint, adding another will throw.
+#     # So only do this for single-link “object” models that have no base joint.
+#     plant.AddJoint(
+#         FreeJoint(f"{plant.GetModelInstanceName(model_instance)}_free",
+#                   plant.world_frame(), Bo, RigidTransform()))
+
+
+@dataclass
+class _Grasp:
+    robot_name: str
+    object_name: str
+    robot_frame: Frame        # grasp frame on robot (e.g., "anchor" or "tool0")
+    object_body: Body         # base body of the object
+    X_Ro: RigidTransform      # fixed offset (robot grasp frame → object base)
+    obj_model_instance: ModelInstanceIndex
 
 
 class SimpleDrakeGym:
@@ -55,6 +76,8 @@ class SimpleDrakeGym:
         meshcat=None,
     ):
         self._dt = float(dt)
+
+        self._grasps: Dict[str, _Grasp] = {}   # keyed by object_name
 
         # --- Build plant + scene_graph together (ports are wired for geometry). ---
         builder = DiagramBuilder()
@@ -158,7 +181,7 @@ class SimpleDrakeGym:
             self.plant.SetPositions(self.plant_context, mi, q_i)
 
         for i, mi in enumerate(self._controlled):
-            _place_free_or_q(mi, (i * spacing, 0.0, 1.0))
+            _place_free_or_q(mi, (i * spacing + 0.5, 0.0, 1.0))
 
         for i, mi in enumerate(self._passive):
             _place_free_or_q(mi, (i * spacing, 0.0, 0.1))
@@ -185,33 +208,132 @@ class SimpleDrakeGym:
         self._diagram.ForcedPublish(self._context)
         return self._observe(), {}
 
-    def step(
+    def activate_grasp(
         self,
-        action_q: np.ndarray,
-        action_v: Optional[np.ndarray] = None,
-        *,
-        reward: float = 0.0
-    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        robot_name: str,
+        object_name: str,
+        grasp_frame_on_robot: str = "pm_body",
+        object_base_body: str = "cb_body",
+    ) -> None:
+        """Start rigidly attaching `object_name` to `robot_name` at the current pose."""
+        # Resolve instances & frames/bodies
+        mi_r = self.plant.GetModelInstanceByName(robot_name)
+        mi_o = self.plant.GetModelInstanceByName(object_name)
+        R = self.plant.GetFrameByName(grasp_frame_on_robot, mi_r)
+        Bo = self.plant.GetBodyByName(object_base_body, mi_o)
+
+        # Compute current world poses
+        X_WR = self.plant.CalcRelativeTransform(self.plant_context, self.plant.world_frame(), R)
+        X_WO = self.plant.EvalBodyPoseInWorld(self.plant_context, Bo)
+        # Cache relative pose robot→object
+        X_Ro = X_WR.inverse().multiply(X_WO)   # X_Ro = X_WR⁻¹ * X_WO
+
+        # Optional: make object kinematic-ish while grasped
+        try:
+            self.plant.set_gravity_enabled(mi_o, False)
+        except Exception:
+            pass
+
+        self._grasps[object_name] = _Grasp(
+            robot_name=robot_name,
+            object_name=object_name,
+            robot_frame=R,
+            object_body=Bo,
+            X_Ro=X_Ro,
+            obj_model_instance=mi_o,
+        )
+
+    def release_grasp(self, object_name: str) -> None:
+        """Stop rigid attachment for this object; it resumes normal physics."""
+        g = self._grasps.pop(object_name, None)
+        if g is not None:
+            try:
+                self.plant.set_gravity_enabled(g.obj_model_instance, True)
+            except Exception:
+                pass
+
+    def step(
+            self,
+            action_q: np.ndarray,
+            action_v: Optional[np.ndarray] = None,
+            *,
+            reward: float = 0.0,
+            grasp_cmds: Optional[Tuple[Tuple[str, str, str], ...]] = None,
+    ) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
-        Write (q,v) for controlled models, then advance physics by dt.
-        Uncontrolled models evolve due to contact/dynamics.
+        grasp_cmds: optional tuple of commands, each as (cmd, robot_name, object_name)
+          - cmd == "grab": activate grasp for (robot_name, object_name)
+          - cmd == "release": release grasp for object_name (robot_name ignored)
         """
+        # Apply any grasp commands first (use current state to capture X_Ro)
+        if grasp_cmds:
+            for (cmd, rname, oname) in grasp_cmds:
+                if cmd == "grab":
+                    self.activate_grasp(rname, oname)
+                elif cmd == "release":
+                    self.release_grasp(oname)
+
+        # 1) Apply commanded q/v to controlled robots (your existing code):
         if action_q.shape != (self._action_q_size,):
             raise ValueError(f"action_q must be shape ({self._action_q_size},)")
         if action_v is not None and action_v.shape != (self._action_v_size,):
             raise ValueError(f"action_v must be shape ({self._action_v_size},)")
-
-        # 1) Apply commanded q (and v) to each controlled model instance.
         self._apply_controlled_qv(action_q, action_v)
 
-        # 2) Advance simulator so objects/contacts evolve.
-        self._sim.AdvanceTo(self._context.get_time() + self._dt)
+        # 2) Enforce grasps *before* physics step (prevents big impulses)
+        self._enforce_all_grasps_(match_velocity=True)
+
+        # 3) Advance physics
+        t_next = self._context.get_time() + self._dt
+        self._sim.AdvanceTo(t_next)
+
+        # 4) Enforce again post-step (eliminates small integration drift)
+        self._enforce_all_grasps_(match_velocity=True)
 
         obs = self._observe()
-        done = False
-        truncated = False
-        info: Dict[str, Any] = {}
-        return obs, reward, done, truncated, info
+        return obs, reward, False, False, {}
+
+    def _set_cube_xyz_fast(self, cube_name: str, p_WO):
+        """p_WO = (x, y, z) world position; assumes q[:3] = [x,y,z]."""
+        mi = self.plant.GetModelInstanceByName(cube_name)
+        q = self.plant.GetPositions(self.plant_context, mi).copy()
+        q[:3] = p_WO
+        self.plant.SetPositionsForModelInstance(self.plant_context, mi, q)
+
+    # def _set_cube_vxyz_fast(self, cube_name: str, v_WO):
+    #     """v_WO = (vx,vy,vz) world linear velocity; assumes v[:3] = [vx,vy,vz]."""
+    #     mi = self.plant.GetModelInstanceByName(cube_name)
+    #     v = self.plant.GetVelocities(self.plant_context, mi).copy()
+    #     v[:3] = v_WO
+    #     self.plant.SetVelocitiesForModelInstance(self.plant_context, mi, v)
+
+    def _enforce_all_grasps_(self, match_velocity: bool = True) -> None:
+        """Make each grasped object follow its robot grasp frame exactly."""
+        W = self.plant.world_frame()
+        for g in self._grasps.values():
+            # Current world pose of robot grasp frame
+            X_WR = self.plant.CalcRelativeTransform(self.plant_context, W, g.robot_frame)
+            # Desired object world pose
+            X_WO = X_WR.multiply(g.X_Ro)
+            p_WO = X_WO.translation()
+            # self.set_cube_xyz_fast("cube_1", p_WO)
+            self.plant.SetPositions(self.plant_context, g.object_body.model_instance(), p_WO)
+            # self.plant._set_cube_xyz_fast
+            # self.plant.SetFreeBodyPose(self.plant_context, g.object_body, X_WO)
+
+            if match_velocity:
+                # Try to match object's spatial velocity to the robot's base body (good enough).
+                # If your robot has a specific tool body, prefer that.
+                try:
+                    V_WR = self.plant.EvalBodySpatialVelocityInWorld(
+                        self.plant_context, g.robot_frame.body()
+                    )
+                except Exception:
+                    # Fallback: zero relative velocity
+                    V_WR = SpatialVelocity.Zero()
+
+                # set velocity
+                self.plant.SetVelocities(self.plant_context, g.object_body.model_instance(), V_WR.translational())
 
     def render(self):
         self._diagram.ForcedPublish(self._context)

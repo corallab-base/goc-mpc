@@ -592,7 +592,7 @@ std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutof
 				// _time_deltas_list[i](0) -= delta;
 			} else {
 				// if there is another phase
-				if (_agent_nodes_list[i].size() > 1) {
+				if (_agent_nodes_list[i].size() > 0) {
 					// std::cout << "node should be passed!" << std::endl;
 					passed_nodes.insert(_agent_nodes_list[i][0]);
 				}
