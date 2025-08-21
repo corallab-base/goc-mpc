@@ -82,7 +82,9 @@ std::pair<std::vector<std::vector<int>>,
 	std::vector<std::vector<int>> agent_nodes(num_agents);
 	std::vector<std::pair<int, int>> cross_agent_edges;
 
-	sg.dfs_visit_from_sources(
+	// std::cout << "starting dfs" << std::endl;
+
+	sg.bfs_visit_from_sources(
 		[this, assignments, &agent_nodes, &cross_agent_edges]
 		(int node, std::optional<int> parent) {
 			int parent_assignment = -1;
@@ -96,11 +98,25 @@ std::pair<std::vector<std::vector<int>>,
 				const int phi_id = node_to_phi_map.at(node);
 				assignment = assignments(phi_id);
 
+				// std::cout << phi_id << " belonging to " << node << " is dynamically assigned to " << assignment << std::endl;
+
+				if (_phi_to_static_assignment_map.contains(phi_id) && assignment != -1) {
+					throw std::runtime_error("conflicting assignment");
+				} else if (_phi_to_static_assignment_map.contains(phi_id)) {
+					assignment = _phi_to_static_assignment_map.at(phi_id);
+					// std::cout << phi_id << " belonging to " << node << " is statically assigned to " << assignment << std::endl;
+				}
+
+				// TODO: Clean this up for the case where there
+				// might be multiple phi's on a single node and
+				// we should add the nodes multiple times.
 				if (assignment == -1) {
+					// std::cout << "adding node for all by default" << std::endl;
 					for (int ag = 0; ag < num_agents; ++ag) {
 						agent_nodes[ag].push_back(node);
 					}
 				} else {
+					// std::cout << "adding node " << node << " for " << assignment << std::endl;
 					agent_nodes[assignment].push_back(node);
 				}
 			}
@@ -157,27 +173,36 @@ auto make_pulls_for_agent_i(int agent_i, int dim) {
 
 // Grasp util
 
-void GraphOfConstraints::add_grasp_change(int k,
+void GraphOfConstraints::add_grasp_change(int phi_id,
 					  std::string command,
-					  std::string robot_model_name,
-					  std::string cube_model_name) {
-	_grasp_change_map[k] = std::make_tuple(command, robot_model_name, cube_model_name);
+					  int robot_id,
+					  int cube_id) {
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+
+	std::string robot_model_name = _robot_names.at(robot_id);
+	std::string cube_model_name = _object_names.at(cube_id);
+	_grasp_change_map[phi_id] = std::make_tuple(command, robot_model_name, cube_model_name);
 }
 
+
+// this should be used on an existing assignable phi
 void GraphOfConstraints::add_assignable_grasp_change(int phi_id,
 						     std::string command,
-						     std::string cube_model_name) {
+						     int cube_id) {
+	std::string cube_model_name = _object_names.at(cube_id);
 	_assignable_grasp_change_map[phi_id] = std::make_pair(command, cube_model_name);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraints::get_grasp_changes(int k, Eigen::VectorXi assignments) const {
 	std::vector<std::tuple<std::string, std::string, std::string>> changes;
 
-	if (_grasp_change_map.contains(k)) {
-		changes.push_back(_grasp_change_map.at(k));
-	}
-
 	for (int phi_id : get_phi_ids(k)) {
+		if (_grasp_change_map.contains(phi_id)) {
+			changes.push_back(_grasp_change_map.at(phi_id));
+		}
+
 		if (_assignable_grasp_change_map.contains(phi_id)) {
 			// if an assignable grasp change was added to this phi,
 			// it should be assigned at this point.
@@ -367,14 +392,17 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 
 int GraphOfConstraints::add_robot_above_cube_constraint(
 	int k,
-	std::string robot_model_name,
-	std::string cube_model_name,
+	int robot_id, // std::string robot_model_name,
+	int cube_id, // std::string cube_model_name,
 	double delta_z) {
 
   DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
   // DRAKE_DEMAND(agent_i >= 0 && agent_i < num_agents);
   // DRAKE_DEMAND(cube_i >= 0 && cube_i < num_objects);
   // If you track num_objects, you can also check cube_i bounds here.
+
+  const std::string& robot_model_name = _robot_names.at(robot_id);
+  const std::string& cube_model_name = _object_names.at(cube_id);
 
   const ModelInstanceIndex robot_mi = plant->GetModelInstanceByName(robot_model_name);
   const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
@@ -385,6 +413,10 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
               const int phi_id,
               const auto& X,
               const auto&... /*unused*/) {
+
+	    // record that this constraint is statically assigned to this robot.
+	    _phi_to_static_assignment_map[phi_id] = robot_id;
+
 	    const int node_k = subgraph.subgraph_id(k);
 
 	    // Convert X[row] decision variables to Expressions.

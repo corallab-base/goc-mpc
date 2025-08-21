@@ -95,10 +95,15 @@ struct GraphOfConstraints {
 	const std::vector<std::string> _object_names;
 	Graph<py::object> structure;
 	std::map<int, int> node_to_phi_map;
+
+	// Phi maps
 	std::map<int, int> phi_to_variable_map;
+	std::map<int, int> _phi_to_static_assignment_map;
 	std::map<int, struct DeferredOp> ops;
 	std::map<int, std::tuple<std::string, std::string, std::string>> _grasp_change_map;
 	std::map<int, std::pair<std::string, std::string>> _assignable_grasp_change_map;
+
+	// Rest
 	int num_phis, _num_variables, _num_total_assignables;
 	int num_agents, num_objects, dim, non_robot_dim, total_dim;
 	
@@ -139,8 +144,8 @@ struct GraphOfConstraints {
 	void clear_constraints_per_phi();
 
 	// Grasp change util
-	void add_grasp_change(int k, std::string command, std::string robot_model_name, std::string cube_model_name);
-	void add_assignable_grasp_change(int k, std::string command, std::string cube_model_name);
+	void add_grasp_change(int phi_id, std::string command, int robot_id, int cube_id);
+	void add_assignable_grasp_change(int phi_id, std::string command, int cube_id);
 	std::vector<std::tuple<std::string, std::string, std::string>> get_grasp_changes(int k, Eigen::VectorXi assignments) const;
 	
 	// Plain Constraint Adders (typed)
@@ -168,8 +173,8 @@ struct GraphOfConstraints {
 
 	// Sort of hard-coded
 	int add_robot_above_cube_constraint(int k,
-					    std::string robot_model_name,
-					    std::string cube_model_name,
+					    int robot_id,
+					    int cube_id,
 					    double delta_z);
 
 
