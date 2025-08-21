@@ -69,30 +69,24 @@ int GraphOfConstraints::add_variable()
 	return ++_num_variables;
 }
 
-
-std::pair<std::vector<std::vector<int>>,
-	  std::vector<std::pair<int, int>>> GraphOfConstraints::get_agent_paths(
-		  const std::vector<int>& remaining_vertices,
-		  const Eigen::VectorXi& assignments) const {
+std::tuple<std::vector<std::optional<int>>,
+	   std::vector<std::vector<int>>,
+	   std::vector<struct AgentInteraction>> GraphOfConstraints::get_agent_paths(
+		   const std::vector<int>& remaining_vertices,
+		   const Eigen::VectorXi& assignments) const {
 	const InducedSubgraphView<py::object> sg = InducedSubgraphView<py::object>(
 		structure, remaining_vertices);
 
 	// This function introduces the idea now that every node has exactly one phi. That seems pretty reasonable.
 
 	std::vector<std::vector<int>> agent_nodes(num_agents);
+	std::map<int, std::vector<std::pair<int, int>>> node_to_agent_and_depth_pairs_map;
 	std::vector<std::pair<int, int>> cross_agent_edges;
+	std::vector<struct AgentInteraction> agent_interactions;
 
-	// std::cout << "starting dfs" << std::endl;
-
-	sg.bfs_visit_from_sources(
-		[this, assignments, &agent_nodes, &cross_agent_edges]
-		(int node, std::optional<int> parent) {
-			int parent_assignment = -1;
-			if (parent && node_to_phi_map.contains(*parent)) {
-				const int parent_phi_id = node_to_phi_map.at(*parent);
-				parent_assignment = assignments(parent_phi_id);
-			}
-
+	std::vector<std::optional<int>> parents = sg.bfs_visit_from_sources(
+		[this, &assignments, &agent_nodes, &agent_interactions, &node_to_agent_and_depth_pairs_map]
+		(int node, int depth, std::optional<int> parent) {
 			int assignment = -1;
 			if (node_to_phi_map.contains(node)) {
 				const int phi_id = node_to_phi_map.at(node);
@@ -113,22 +107,47 @@ std::pair<std::vector<std::vector<int>>,
 				if (assignment == -1) {
 					// std::cout << "adding node for all by default" << std::endl;
 					for (int ag = 0; ag < num_agents; ++ag) {
+						int depth = agent_nodes[ag].size();
 						agent_nodes[ag].push_back(node);
+						node_to_agent_and_depth_pairs_map[node].emplace_back(ag, depth);
 					}
 				} else {
+					int depth = agent_nodes[assignment].size();
 					// std::cout << "adding node " << node << " for " << assignment << std::endl;
 					agent_nodes[assignment].push_back(node);
+					node_to_agent_and_depth_pairs_map[node].emplace_back(assignment, depth);
 				}
 			}
 
-			if (parent && parent_assignment != -1 && assignment != -1 &&
-			    parent_assignment != assignment) {
-				cross_agent_edges.emplace_back(node, *parent);
+			int num_pairs = node_to_agent_and_depth_pairs_map[node].size();
+ 			if (num_pairs > 1) {
+				for (int i = 0; i < num_pairs; ++i) {
+					auto& [ag_i, depth_i] = node_to_agent_and_depth_pairs_map[node][i];
+					for (int j = i; j < num_agents; ++j) {
+						auto& [ag_j, depth_j] = node_to_agent_and_depth_pairs_map[node][j];
+						agent_interactions.emplace_back(
+							ag_i, depth_i, ag_j, depth_j, node, node, AgentInteraction::Type::EQUAL);
+					}
+				}
 			}
+		},
+		[this, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
+		(int u, int u_depth, int v, int v_depth) {
+			cross_agent_edges.emplace_back(u, v);
 		});
 
-	return std::make_pair<std::vector<std::vector<int>>&,
-			      std::vector<std::pair<int, int>>&>(agent_nodes, cross_agent_edges);
+	for (auto& [u, v] : cross_agent_edges) {
+		std::vector<std::pair<int, int>> u_agent_and_depth_pairs = node_to_agent_and_depth_pairs_map[u];
+		std::vector<std::pair<int, int>> v_agent_and_depth_pairs = node_to_agent_and_depth_pairs_map[v];
+		for (auto& [ag_i, depth_i] : u_agent_and_depth_pairs) {
+			for (auto& [ag_j, depth_j] : v_agent_and_depth_pairs) {
+				agent_interactions.emplace_back(
+					ag_i, depth_i, ag_j, depth_j, u, v, AgentInteraction::Type::LESS_THAN);
+			}
+		}
+	}
+
+	return std::make_tuple(parents, agent_nodes, agent_interactions);
 }
 
 std::vector<int> GraphOfConstraints::get_phi_ids(int node) const {

@@ -47,7 +47,7 @@ struct GraphTimingProblem {
 	std::vector<Eigen::MatrixXd> wps_list;
 	std::vector<std::vector<int>> agent_nodes_list;
 	std::vector<drake::solvers::MatrixXDecisionVariable> vs_list;
-	std::vector<drake::solvers::MatrixXDecisionVariable> time_deltas_list;
+	std::vector<drake::solvers::VectorXDecisionVariable> time_deltas_list;
 
 	GraphTimingProblem(int num_agents)
 		: prog(std::make_unique<drake::solvers::MathematicalProgram>()),

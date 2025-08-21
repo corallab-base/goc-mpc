@@ -196,57 +196,64 @@ void Graph<LabelT>::dfs_visit_from_sources(
 }
 
 template <typename LabelT>
-void Graph<LabelT>::bfs_visit_from_sources(
-    const std::function<void(int, std::optional<int>)>& cb) const
+std::vector<std::optional<int>> Graph<LabelT>::bfs_visit_from_sources(
+	const std::function<void(int, std::optional<int>)>& cb,
+	const std::function<void(int, int)>& non_tree_cb) const
 {
-    const int n = num_nodes();
-    if (n == 0) return;
+	const int n = num_nodes();
+	std::vector<std::optional<int>> parent(n, std::nullopt);
 
-    // Compute in-degree among alive nodes.
-    std::vector<int> indeg(n, 0);
-    for (int u = 0; u < n; ++u) {
-        if (!_alive[u]) continue;
-        for (const auto& e : _adj[u]) {
-            const int v = e.to;
-            if (v < n && _alive[v]) ++indeg[v];
-        }
-    }
+	if (n == 0) return parent;
 
-    std::vector<char> vis(n, 0);
-    std::vector<std::optional<int>> parent(n, std::nullopt);
-    std::queue<int> q;
+	// Compute in-degree among alive nodes.
+	std::vector<int> indeg(n, 0);
+	for (int u = 0; u < n; ++u) {
+		if (!_alive[u]) continue;
+		for (const auto& e : _adj[u]) {
+			const int v = e.to;
+			if (v < n && _alive[v]) ++indeg[v];
+		}
+	}
 
-    // Seed the queue with all sources (alive nodes with indegree 0).
-    for (int u = 0; u < n; ++u) {
-        if (_alive[u] && indeg[u] == 0) {
-            vis[u] = 1;               // mark when enqueuing to avoid duplicates
-            parent[u] = std::nullopt; // root has no parent
-            q.push(u);
-        }
-    }
+	std::vector<char> vis(n, 0);
+	std::queue<int> q;
 
-    // Standard BFS.
-    while (!q.empty()) {
-        const int u = q.front();
-        q.pop();
-        if (u >= n || !_alive[u]) continue;
+	// Seed the queue with all sources (alive nodes with indegree 0).
+	for (int u = 0; u < n; ++u) {
+		if (_alive[u] && indeg[u] == 0) {
+			vis[u] = 1;               // mark when enqueuing to avoid duplicates
+			parent[u] = std::nullopt; // root has no parent
+			q.push(u);
+		}
+	}
 
-        cb(u, parent[u]);  // level-order visitation
+	// Standard BFS.
+	while (!q.empty()) {
+		const int u = q.front();
+		q.pop();
+		if (u >= n || !_alive[u]) continue;
 
-        const auto& nbrs = _adj[u];
-        for (const auto& e : nbrs) {
-            const int v = e.to;
-            if (v < n && _alive[v] && !vis[v]) {
-                vis[v] = 1;
-                parent[v] = u;
-                q.push(v);
-            }
-        }
-    }
+		cb(u, parent[u]);  // level-order visitation
 
-    // Optional: if you want to also visit remaining alive nodes when there are
-    // cycles / no sources, you could add a second pass here to enqueue all
-    // unvisited alive nodes and continue BFS.
+		const auto& nbrs = _adj[u];
+		for (const auto& e : nbrs) {
+			const int v = e.to;
+			if (v < n && _alive[v] && !vis[v]) {
+				vis[v] = 1;
+				parent[v] = u;
+				q.push(v);
+			} else if (v < n && _alive[v] && vis[v]) {
+				// if v has already been enqueued, this is a non-tree edge.
+				non_tree_cb(u, v);
+			}
+		}
+	}
+
+	// Optional: if you want to also visit remaining alive nodes when there are
+	// cycles / no sources, you could add a second pass here to enqueue all
+	// unvisited alive nodes and continue BFS.
+
+	return parent;
 }
 
 template <typename LabelT>
@@ -618,65 +625,75 @@ void InducedSubgraphView<LabelT>::dfs_visit_from_sources(
 // BFS
 
 template <typename LabelT>
-void InducedSubgraphView<LabelT>::bfs_visit_from_sources(
-    const std::function<void(int, std::optional<int>)>& cb) const
+std::vector<std::optional<int>> InducedSubgraphView<LabelT>::bfs_visit_from_sources(
+	const std::function<void(int, int, std::optional<int>)>& cb,
+	const std::function<void(int, int, int, int)>& non_tree_cb) const
 {
-    const int n = _g->num_nodes();
-    if (_node_list.empty()) return;
+	const int n = _g->num_nodes();
+	std::vector<std::optional<int>> parent(n, std::nullopt);
 
-    // In-degree restricted to the view.
-    std::vector<int> indeg(n, 0);
-    for (int u : _node_list) {
-        if (!contains_node(u)) continue;
-        for (const auto& e : neighbors(u)) {
-            ++indeg[e.to]; // neighbors(u) already filtered to nodes in the view
-        }
-    }
+	if (_node_list.empty()) return parent;
 
-    std::vector<char> vis(n, 0);
-    std::vector<std::optional<int>> parent(n, std::nullopt);
-    std::queue<int> q;
+	// In-degree restricted to the view.
+	std::vector<int> indeg(n, 0);
+	for (int u : _node_list) {
+		if (!contains_node(u)) continue;
+		for (const auto& e : neighbors(u)) {
+			++indeg[e.to]; // neighbors(u) already filtered to nodes in the view
+		}
+	}
 
-    // Seed with all sources in the view (in-degree 0 within the view).
-    for (int u : _node_list) {
-        if (!contains_node(u)) continue;
-        if (indeg[u] == 0 && !vis[u]) {
-            vis[u] = 1;
-            parent[u] = std::nullopt;
-            q.push(u);
-        }
-    }
+	std::vector<char> vis(n, 0);
+	std::vector<int> depths(n, 0);
+	std::queue<int> q;
 
-    // Multi-source BFS over the view.
-    while (!q.empty()) {
-        const int u = q.front(); q.pop();
-        if (u >= n || !contains_node(u)) continue;
+	// Seed with all sources in the view (in-degree 0 within the view).
+	for (int u : _node_list) {
+		if (!contains_node(u)) continue;
+		if (indeg[u] == 0 && !vis[u]) {
+			vis[u] = 1;
+			parent[u] = std::nullopt;
+			q.push(u);
+			depths[u] = 0;
+		}
+	}
 
-        cb(u, parent[u]);
+	// Multi-source BFS over the view.
+	while (!q.empty()) {
+		const int u = q.front(); q.pop();
+		const int depth = depths[u];
+		if (u >= n || !contains_node(u)) continue;
 
-        for (const auto& e : neighbors(u)) {
-            const int v = e.to; // guaranteed in view
-            if (v < n && !vis[v] && contains_node(v)) {
-                vis[v] = 1;
-                parent[v] = u;
-                q.push(v);
-            }
-        }
-    }
+		cb(u, depth, parent[u]);
 
-    // Optional: ensure all nodes in the view are visited even if there are cycles/no sources.
-    // for (int u : _node_list) {
-    //     if (!contains_node(u) || vis[u]) continue;
-    //     vis[u] = 1; parent[u] = std::nullopt; q.push(u);
-    //     while (!q.empty()) {
-    //         const int x = q.front(); q.pop();
-    //         cb(x, parent[x]);
-    //         for (const auto& e : neighbors(x)) {
-    //             const int y = e.to;
-    //             if (!vis[y]) { vis[y] = 1; parent[y] = x; q.push(y); }
-    //         }
-    //     }
-    // }
+		for (const auto& e : neighbors(u)) {
+			const int v = e.to; // guaranteed in view
+			if (v < n && !vis[v] && contains_node(v)) {
+				vis[v] = 1;
+				parent[v] = u;
+				q.push(v);
+				depths[v] = depth + 1;
+			} else if (v < n && vis[v] && contains_node(v)) {
+				non_tree_cb(u, depth, v, depths[v]);
+			}
+		}
+	}
+
+	// Optional: ensure all nodes in the view are visited even if there are cycles/no sources.
+	// for (int u : _node_list) {
+	//     if (!contains_node(u) || vis[u]) continue;
+	//     vis[u] = 1; parent[u] = std::nullopt; q.push(u);
+	//     while (!q.empty()) {
+	//         const int x = q.front(); q.pop();
+	//         cb(x, parent[x]);
+	//         for (const auto& e : neighbors(x)) {
+	//             const int y = e.to;
+	//             if (!vis[y]) { vis[y] = 1; parent[y] = x; q.push(y); }
+	//         }
+	//     }
+	// }
+
+	return parent;
 }
 
 // ---- explicit instantiations ----------------------------------------------

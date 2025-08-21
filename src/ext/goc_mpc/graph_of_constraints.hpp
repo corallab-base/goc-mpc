@@ -87,6 +87,26 @@ struct PhiConstraint {
 	}
 };
 
+struct AgentInteraction {
+	enum Type { LESS_THAN, EQUAL };
+
+	int agent_i;
+	int agent_i_depth;
+	int agent_j;
+	int agent_j_depth;
+	int node_u;
+	int node_v;
+	Type type;
+
+	AgentInteraction(int i, int i_depth, int j, int j_depth, int u, int v, Type t) :
+		agent_i(i),
+		agent_i_depth(i_depth),
+		agent_j(j),
+		agent_j_depth(j_depth),
+		node_u(u),
+		node_v(v),
+		type(t) {}
+};
 
 struct GraphOfConstraints {
 
@@ -129,10 +149,11 @@ struct GraphOfConstraints {
 
 	Graph<py::object> get_structure() const { return structure; }
 
-	std::pair<std::vector<std::vector<int>>,
-		  std::vector<std::pair<int, int>>> get_agent_paths(
-			  const std::vector<int>& remaining_vertices,
-			  const Eigen::VectorXi& assignments) const;
+	std::tuple<std::vector<std::optional<int>>,
+		   std::vector<std::vector<int>>,
+		   std::vector<struct AgentInteraction>> get_agent_paths(
+			   const std::vector<int>& remaining_vertices,
+			   const Eigen::VectorXi& assignments) const;
 
 	std::vector<int> get_phi_ids(int node) const;
 

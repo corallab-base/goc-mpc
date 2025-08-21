@@ -155,9 +155,7 @@ GraphTimingProblem build_graph_timing_problem(
 	// TODO: use assignments to settle conditional edges.
 
 	int dim = graph.dim;
-	const auto pair = graph.get_agent_paths(remaining_vertices, assignments);
-	const auto agent_nodes = pair.first;
-	const auto cross_agent_edges = pair.second;
+	const auto& [parents, agent_nodes, agent_interactions] = graph.get_agent_paths(remaining_vertices, assignments);
 
 	// for (auto edge : cross_agent_edges) {
 	// 	std::cout << "edge u: " << edge.first << std::endl;
@@ -424,7 +422,20 @@ GraphTimingProblem build_graph_timing_problem(
 		// 	ordering = arange(0, agent_subgraph);
 		// }
 
-		// with ordering, add to program a single spline optimization problem
+	}
+
+	for (const struct AgentInteraction& p : agent_interactions) {
+		if (p.type == AgentInteraction::Type::LESS_THAN) {
+			Eigen::VectorX<Expression> taus_i = problem.time_deltas_list[p.agent_i].head(p.agent_i_depth+1);
+			Eigen::VectorX<Expression> taus_j = problem.time_deltas_list[p.agent_j].head(p.agent_j_depth+1);
+			problem.prog->AddLinearConstraint(taus_i.sum() <= taus_j.sum());
+		} else if (p.type == AgentInteraction::Type::EQUAL) {
+			Eigen::VectorX<Expression> taus_i = problem.time_deltas_list[p.agent_i].head(p.agent_i_depth+1);
+			Eigen::VectorX<Expression> taus_j = problem.time_deltas_list[p.agent_j].head(p.agent_j_depth+1);
+			problem.prog->AddLinearConstraint(taus_i.sum() == taus_j.sum());
+		} else {
+			throw std::runtime_error("Not implemented");
+		}
 	}
 
 	return problem;
