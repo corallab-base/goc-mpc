@@ -213,7 +213,7 @@ bool GraphWaypointMPC::solve(
 			// for (int j = 0; j < num_agents; ++j) {
 			// 	row.segment(j * dim, dim) = X_flat.row(i).segment(j * dim * num_agents + j);
 			// }
-			_waypoints.row(i) = X_flat.row(i);
+			_waypoints.row(v) = X_flat.row(i);
 		}
 
 		return true;
