@@ -16,7 +16,8 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 	  _robot_names(robots),
 	  _object_names(objects),
 	  num_phis(0),
-	  _num_variables(0),
+	  num_edge_phis(0),
+	  num_variables(0),
 	  _num_total_assignables(0),
 	  num_agents(robots.size()),
 	  num_objects(objects.size()),
@@ -66,7 +67,7 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 
 int GraphOfConstraints::add_variable()
 {
-	return ++_num_variables;
+	return ++num_variables;
 }
 
 std::tuple<std::vector<std::optional<int>>,
@@ -85,7 +86,7 @@ std::tuple<std::vector<std::optional<int>>,
 	std::vector<struct AgentInteraction> agent_interactions;
 
 	std::vector<std::optional<int>> parents = sg.bfs_visit_from_sources(
-		[this, &assignments, &agent_nodes, &agent_interactions, &node_to_agent_and_depth_pairs_map]
+		[this, &assignments, &agent_nodes, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
 		(int node, int depth, std::optional<int> parent) {
 			int assignment = -1;
 			if (node_to_phi_map.contains(node)) {
@@ -95,6 +96,7 @@ std::tuple<std::vector<std::optional<int>>,
 				// std::cout << phi_id << " belonging to " << node << " is dynamically assigned to " << assignment << std::endl;
 
 				if (_phi_to_static_assignment_map.contains(phi_id) && assignment != -1) {
+					std::cout << "_phi_to_static_assignment_map for " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
 					throw std::runtime_error("conflicting assignment");
 				} else if (_phi_to_static_assignment_map.contains(phi_id)) {
 					assignment = _phi_to_static_assignment_map.at(phi_id);
@@ -119,6 +121,7 @@ std::tuple<std::vector<std::optional<int>>,
 				}
 			}
 
+			// if a node is shared in the agent paths it is an equality agent interaction
 			int num_pairs = node_to_agent_and_depth_pairs_map[node].size();
  			if (num_pairs > 1) {
 				for (int i = 0; i < num_pairs; ++i) {
@@ -128,6 +131,25 @@ std::tuple<std::vector<std::optional<int>>,
 						agent_interactions.emplace_back(
 							ag_i, depth_i, ag_j, depth_j, node, node, AgentInteraction::Type::EQUAL);
 					}
+				}
+			}
+
+			// if there is an edge in the bfs tree from one agent's
+			// path to another agent's path, that is a cross agent
+			// edge and will eventually be a less than interaction.
+			if (parent.has_value()) {
+				bool is_cross_agent = false;
+				for (const auto& [ag_u, _] : node_to_agent_and_depth_pairs_map.at(*parent)) {
+					for (const auto& [ag_v, _] : node_to_agent_and_depth_pairs_map.at(node)) {
+						if (ag_u != ag_v) {
+							is_cross_agent = true;
+							break;
+						}
+					}
+				}
+
+				if (is_cross_agent) {
+					cross_agent_edges.emplace_back(*parent, node);
 				}
 			}
 		},
@@ -150,6 +172,19 @@ std::tuple<std::vector<std::optional<int>>,
 	return std::make_tuple(parents, agent_nodes, agent_interactions);
 }
 
+std::map<int, struct DeferredEdgeOp> GraphOfConstraints::get_next_edge_ops(const std::vector<int> remaining_vertices) const {
+	std::map<int, struct DeferredEdgeOp> e_ops;
+
+	for (const auto& e : structure.incoming_cut_edges(remaining_vertices)) {
+		if (this->edge_to_phi_map.contains(e)) {
+			int edge_phi_id = this->edge_to_phi_map.at(e);
+			e_ops[edge_phi_id] = this->edge_ops.at(edge_phi_id);
+		}
+	}
+
+	return e_ops;
+}
+
 std::vector<int> GraphOfConstraints::get_phi_ids(int node) const {
 	// TODO: Maybe expand if nodes in the future support multiple phi ids (probably will).
 	std::vector<int> phi_ids = { node_to_phi_map.at(node) };
@@ -158,36 +193,29 @@ std::vector<int> GraphOfConstraints::get_phi_ids(int node) const {
 
 bool GraphOfConstraints::evaluate_phi(int phi_id,
                                       const Eigen::VectorXd& x,
-                                      int assignment_phi,
+                                      const Eigen::VectorXi& assignments,
                                       double tol) const {
-	auto it = _constraints_per_phi.find(phi_id);
-	if (it == _constraints_per_phi.end()) {
+	if (!ops.contains(phi_id)) {
 		return true;
+	} else {
+		const DeferredOp& op = ops.at(phi_id);
+		double v = op.eval(x, assignments(phi_id));
+		std::cout << "violation: " << v << std::endl;
+		return v < tol;
 	}
-	for (const auto& pc : it->second) {
-		const Eigen::VectorXd z = pc.make_input(x, assignment_phi);
-		if (!pc.binding.evaluator()->CheckSatisfied(z, tol)) {
-			return false;
-		}
-	}
-	return true;
 }
 
-void GraphOfConstraints::clear_constraints_per_phi() {
-	return _constraints_per_phi.clear();
-}
-
-
-// We’ll assume x is laid out as [x_0, x_1, ..., x_{num_agents-1}], each x_i ∈ R^dim
-auto make_pulls_for_agent_i(int agent_i, int dim) {
-	std::vector<PhiConstraint::Pull> pulls;
-	pulls.reserve(dim + 1);
-	for (int j = 0; j < dim; ++j) {
-		// x index for agent_i’s j-th component:
-		pulls.emplace_back(PhiConstraint::PullX{agent_i * dim + j});
+bool GraphOfConstraints::evaluate_edge_phi(int phi_id,
+					   const Eigen::VectorXd& x,
+					   const Eigen::VectorXi& var_assignments,
+					   double tol) const {
+	if (!edge_ops.contains(phi_id)) {
+		return true;
+	} else {
+		const DeferredEdgeOp& op = edge_ops.at(phi_id);
+		double v = op.eval(x, var_assignments);
+		return v < tol;
 	}
-	pulls.emplace_back(PhiConstraint::PullAssign{agent_i}); // the selector s_i
-	return pulls;
 }
 
 // Grasp util
@@ -244,81 +272,96 @@ std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraint
 
 // lb <= x <= ub on node k
 int GraphOfConstraints::add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
-	return _add_op(DeferredOpKind::kBoundingBox, k, [=, this](auto& prog,
-								  const SubgraphOfConstraints& subgraph,
-								  const int phi_id,
-								  const auto& X,
-								  const auto&) {
-		const unsigned int node_k = subgraph.subgraph_id(k);
+	return _add_op(DeferredOpKind::kBoundingBox, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+			       const unsigned int node_k = subgraph.subgraph_id(k);
 
-		VectorXDecisionVariable joint_config_k(num_agents * dim);
-		for (int ag = 0; ag < num_agents; ++ag) {
-			joint_config_k << X.row(node_k).segment(ag * dim, dim);;
-		}
+			       VectorXDecisionVariable joint_config_k(num_agents * dim);
+			       for (int ag = 0; ag < num_agents; ++ag) {
+				       joint_config_k << X.row(node_k).segment(ag * dim, dim);;
+			       }
 
-		prog.AddBoundingBoxConstraint(lb, ub, joint_config_k);
-	});
+			       prog.AddBoundingBoxConstraint(lb, ub, joint_config_k);
+		       });
 }
 
 // Ax = b on node k
 int GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-	return _add_op(DeferredOpKind::kLinearEq, k, [=, this](auto& prog,
-							       const SubgraphOfConstraints& subgraph,
-							       const int phi_id,
-							       const auto& X,
-							       const auto&) {
-		const int node_k = subgraph.subgraph_id(k);
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+			       const int node_k = subgraph.subgraph_id(k);
 
-		VectorXDecisionVariable joint_config_k(num_agents * dim);
-		for (int ag = 0; ag < num_agents; ++ag) {
-			for (int i = 0; i < dim; ++i) {
-				joint_config_k(ag * dim + i) = X(node_k, ag * dim + i);
-			}
-		}
+			       VectorXDecisionVariable joint_config_k(num_agents * dim);
+			       for (int ag = 0; ag < num_agents; ++ag) {
+				       for (int i = 0; i < dim; ++i) {
+					       joint_config_k(ag * dim + i) = X(node_k, ag * dim + i);
+				       }
+			       }
 
-		auto beq = prog.AddLinearEqualityConstraint(A, b, joint_config_k);
-
-		PhiConstraint pc(drake::solvers::Binding<drake::solvers::Constraint>(beq), // upcast
-				 { PhiConstraint::PullAllX{} }); // one sentinel entry
-
-		_constraints_per_phi[phi_id].push_back(std::move(pc));
-	});
+			       auto beq = prog.AddLinearEqualityConstraint(A, b, joint_config_k);
+		       });
 }
 
 // lb <= A x <= ub on node k
 int GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
-	return _add_op(DeferredOpKind::kLinearIneq, k, [=, this](auto& prog,
-								 const SubgraphOfConstraints& subgraph,
-								 const int phi_id,
-								 const auto& X,
-								 const auto&) {
-		const int node_k = subgraph.subgraph_id(k);
+	return _add_op(DeferredOpKind::kLinearIneq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+			       const int node_k = subgraph.subgraph_id(k);
 
-		VectorXDecisionVariable joint_config_k(num_agents * dim);
-		for (int ag = 0; ag < num_agents; ++ag) {
-			joint_config_k << X.row(node_k).segment(ag * dim, dim);
-		}
+			       VectorXDecisionVariable joint_config_k(num_agents * dim);
+			       for (int ag = 0; ag < num_agents; ++ag) {
+				       joint_config_k << X.row(node_k).segment(ag * dim, dim);
+			       }
 
-		auto constraint = prog.AddLinearConstraint(A, lb, ub, joint_config_k);
-	});
+			       auto constraint = prog.AddLinearConstraint(A, lb, ub, joint_config_k);
+		       });
 }
 
 // 0.5 x'Qx + b'x + c on node k
 int GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c) {
-	return _add_op(DeferredOpKind::kQuadraticCost, k, [=, this](auto& prog,
-								    const SubgraphOfConstraints& subgraph,
-								    const int phi_id,
-								    const auto& X,
-								    const auto&) {
-		const int node_k = subgraph.subgraph_id(k);
+	return _add_op(DeferredOpKind::kQuadraticCost, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+			       const int node_k = subgraph.subgraph_id(k);
 
-		VectorXDecisionVariable joint_config_k(num_agents * dim);
-		for (int ag = 0; ag < num_agents; ++ag) {
-			joint_config_k << X.row(node_k).segment(ag * dim, dim);
-		}
+			       VectorXDecisionVariable joint_config_k(num_agents * dim);
+			       for (int ag = 0; ag < num_agents; ++ag) {
+				       joint_config_k << X.row(node_k).segment(ag * dim, dim);
+			       }
 
-		auto constraint = prog.AddQuadraticCost(Q, b, c, joint_config_k);
-	});
+			       auto constraint = prog.AddQuadraticCost(Q, b, c, joint_config_k);
+		       });
 }
 
 // Single-Agent Constraint Adders (typed)
@@ -348,7 +391,7 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 						 const Eigen::MatrixXd& A,
 						 const Eigen::VectorXd& b) {
 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
-	DRAKE_DEMAND(var >= 0 && var < _num_variables);
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
 	DRAKE_DEMAND(A.cols() == dim);
 	DRAKE_DEMAND(b.size() == A.rows());
 
@@ -356,6 +399,10 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 	_num_total_assignables++;
 
 	return _add_assignable_op(DeferredOpKind::kAgentLinearEq, k, var,
+				  [=, this](const Eigen::VectorXd& x,
+					    const int... /*unused*/) {
+					  return 0.0;
+				  },
 				  [=, this](auto& prog,
 					    const SubgraphOfConstraints& subgraph,
 					    const int phi_id,
@@ -398,14 +445,8 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 
 							  auto upper = prog.AddLinearConstraint(a_up, ninf, b_up, vars);
 							  auto lower = prog.AddLinearConstraint(a_lo, ninf, b_lo, vars);
-
-							  auto pulls = make_pulls_for_agent_i(i, dim);
-							  _constraints_per_phi[phi_id].push_back(PhiConstraint{upper, pulls});
-							  _constraints_per_phi[phi_id].push_back(PhiConstraint{lower, pulls});
 						  }
 					  }
-
-		
 				  });
 }
 
@@ -427,6 +468,40 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 	const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
 
 	return _add_op(DeferredOpKind::kNonlinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+
+			       using drake::math::RigidTransform;
+			       using drake::symbolic::Expression;
+			       using drake::symbolic::Evaluate;
+
+			       const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
+			       const auto& cube_body  = plant->GetBodyByName("cb_body",  cube_mi);
+
+			       Eigen::VectorX<Expression> q_all = x.cast<Expression>();
+
+			       auto context = plant->CreateDefaultContext();
+			       plant->SetPositions(context.get(), q_all);
+
+			       const RigidTransform<Expression> X_WR =
+				       plant->EvalBodyPoseInWorld(*context, robot_body);
+			       const RigidTransform<Expression> X_WC =
+				       plant->EvalBodyPoseInWorld(*context, cube_body);
+
+			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
+			       Eigen::Vector3<Expression> g;
+			       g << (X_WR.translation().x() - X_WC.translation().x()),
+				       (X_WR.translation().y() - X_WC.translation().y()),
+				       (X_WR.translation().z() - X_WC.translation().z() - delta_z);
+
+			       // dp_expr has no free symbols (only constants), so Evaluate(...) -> double works.
+			       double violation = 0.0;
+			       for (int i = 0; i < 3; ++i) {
+				       const double gi = g[i].Evaluate();
+				       violation = std::max(violation, std::abs(gi));
+			       }
+			       return violation;
+		       },
 		       [=, this](auto& prog,
 				 const SubgraphOfConstraints& subgraph,
 				 const int phi_id,
@@ -468,55 +543,104 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 		);
 }
 
-// void GraphOfConstraints::add_link_above_point_constraint(
-// 	int k,
-// 	int agent,
-// 	drake::multibody::ModelInstanceIndex robot_mi,
-// 	drake::multibody::ModelInstanceIndex cube_mi,
-// 	double delta_z) {
 
-// 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
 
-// 	// const DoFIndices r = GetXYZIndicesFor(*plant, robot_mi);
-// 	// const DoFIndices c = GetXYZIndicesFor(*plant, cube_mi);
 
-// 	_add_op(DeferredOpKind::kLinearEq, k,
-// 		[=, this](auto& prog,
-// 			  const SubgraphOfConstraints& subgraph,
-// 			  const int phi_id,
-// 			  const auto& X,
-// 			  const auto&) {
-// 			const int node_k = subgraph.subgraph_id(k);
+// EDGE-CONSTRAINTS
 
-// 			// // Returns the decision variable (at node_k) for a given plant q-index,
-// 			// // using your precomputed maps q_to_agent_col_ / q_to_object_col_.
-// 			// auto var_for_q = [&](int q_idx) -> drake::solvers::DecisionVariable {
-// 			// 	if (auto it = q_to_agent_col_.find(q_idx); it != q_to_agent_col_.end())
-// 			// 		return X(node_k, it->second);
-// 			// 	auto jt = q_to_object_col_.find(q_idx);
-// 			// 	DRAKE_DEMAND(jt != q_to_object_col_.end());
-// 			// 	return Objects(node_k, jt->second);
-// 			// };
+int GraphOfConstraints::add_robot_holding_cube_constraint(
+	int u,
+	int v,
+	int robot_id,
+	int cube_id,
+	double holding_distance_max) {
 
-// 			// auto add_eq = [&](int q_r, int q_c, double rhs) {
-// 			// 	// Build: [1, -1] * [q_r; q_c] = rhs
-// 			// 	drake::solvers::VectorXDecisionVariable v(2);
-// 			// 	v(0) = var_for_q(q_r);
-// 			// 	v(1) = var_for_q(q_c);
-// 			// 	Eigen::RowVector2d a; a << 1.0, -1.0;
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	// If you track num_objects, you can also check cube_i bounds here.
 
-// 			// 	auto binding = prog.AddLinearEqualityConstraint(a, rhs, v);
+	const std::string& robot_model_name = _robot_names.at(robot_id);
+	const std::string& cube_model_name = _object_names.at(cube_id);
 
-// 			// 	// Optional: bookkeeping (adjust to your PhiConstraint / pulls API).
-// 			// 	// Here we record which plant q indices this row touched.
-// 			// 	// Replace `make_pulls_for_vars(...)` with your actual helper.
-// 			// 	auto pulls = make_pulls_for_vars({q_r, q_c});
-// 			// 	_constraints_per_phi[phi_id].push_back(PhiConstraint{binding, pulls});
-// 			// };
+	const ModelInstanceIndex robot_mi = plant->GetModelInstanceByName(robot_model_name);
+	const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
 
-// 			// // x, y, z rows:
-// 			// add_eq(r.ix, c.ix, 0.0);
-// 			// add_eq(r.iy, c.iy, 0.0);
-// 			// add_eq(r.iz, c.iz, delta_z);
-// 		});
-// }
+	return _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({cube_id}),
+			    [=, this](const Eigen::VectorXd& x,
+				      const Eigen::VectorXi&/*unused*/) {
+				    using drake::math::RigidTransform;
+				    using drake::symbolic::Expression;
+				    using drake::symbolic::Evaluate;
+
+				    const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
+				    const auto& cube_body  = plant->GetBodyByName("cb_body",  cube_mi);
+
+				    Eigen::VectorX<Expression> q_all = x.cast<Expression>();
+
+				    auto context = plant->CreateDefaultContext();
+				    plant->SetPositions(context.get(), q_all);
+
+				    const RigidTransform<Expression> X_WR =
+					    plant->EvalBodyPoseInWorld(*context, robot_body);
+				    const RigidTransform<Expression> X_WC =
+					    plant->EvalBodyPoseInWorld(*context, cube_body);
+
+				    const Eigen::Vector3<Expression> dp_expr =
+					    X_WR.translation() - X_WC.translation();
+
+				    // dp_expr has no free symbols (only constants), so Evaluate(...) -> double works.
+				    double violation = 0.0;
+				    for (int i = 0; i < 3; ++i) {
+					    const double dpi = dp_expr[i].Evaluate();
+					    violation = std::max(violation, std::abs(dpi) - holding_distance_max);
+				    }
+				    return violation;
+			    },
+			    [=, this](drake::solvers::MathematicalProgram& prog,
+				      const SubgraphOfConstraints& subgraph,
+				      const int phi_id,
+				      const drake::solvers::MatrixXDecisionVariable& X,
+				      const drake::solvers::MatrixXDecisionVariable& /*unused*/) {
+				    using drake::math::RigidTransform;
+				    using drake::symbolic::Expression;
+
+				    const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
+				    const auto& cube_body  = plant->GetBodyByName("cb_body",  cube_mi);
+
+				    const int npos = plant->num_positions();
+				    Eigen::VectorX<Expression> q_all(npos);
+
+				    const double d = holding_distance_max;
+				    auto add_box_proximity = [&](int graph_row) {
+					    for (int j = 0; j < npos; ++j) q_all(j) = Expression(X(graph_row, j));
+
+					    auto context = plant->CreateDefaultContext();
+					    plant->SetPositions(context.get(), q_all);
+
+					    const RigidTransform<Expression> X_WR =
+						    plant->EvalBodyPoseInWorld(*context, robot_body);
+					    const RigidTransform<Expression> X_WC =
+						    plant->EvalBodyPoseInWorld(*context, cube_body);
+
+					    const Eigen::Vector3<Expression> dp = X_WR.translation() - X_WC.translation();
+
+					    // Box: |dx| <= d, |dy| <= d, |dz| <= d  (no squares, no quadratic)
+					    for (int i = 0; i < 3; ++i) {
+						    auto c_i = prog.AddConstraint(dp(i), -d, d);
+					    }
+				    };
+
+				    if (subgraph.structure.contains_node(u)) {
+					    add_box_proximity(subgraph.structure.subgraph_id(u));
+				    }
+				    if (subgraph.structure.contains_node(v)) {
+					    add_box_proximity(subgraph.structure.subgraph_id(v));
+				    }
+			    },
+			    [](drake::solvers::MathematicalProgram& prog,
+			       const int phi_id,
+			       const Eigen::VectorXi& var_assignments,
+			       const drake::solvers::MatrixXDecisionVariable& Xi) {
+				    // std::cout << "adding edge op for short path" << std::endl;
+			    });
+}

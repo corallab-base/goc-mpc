@@ -8,10 +8,13 @@ using namespace pybind11::literals;
 namespace py = pybind11;
 
 ShortPathProblem build_short_path_problem(
+	const GraphOfConstraints* graph,
 	const Eigen::MatrixXd& ref_points,
 	const Eigen::MatrixXd& ref_velocities,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
+	const Eigen::VectorXi& var_assignments,
+	const std::vector<int> remaining_vertices,
 	double tau) {
 
 	using namespace drake::solvers;
@@ -22,15 +25,15 @@ ShortPathProblem build_short_path_problem(
 	// Create program
 	ShortPathProblem problem;
 
-	MatrixXDecisionVariable xi = problem.prog->NewContinuousVariables(num_steps, dim, "xi");
-	problem.xi = xi;
+	MatrixXDecisionVariable Xi = problem.prog->NewContinuousVariables(num_steps, dim, "xi");
+	problem.Xi = Xi;
 
-	MatrixXDecisionVariable v = problem.prog->NewContinuousVariables(num_steps, dim, "v");
-	problem.v = v;
+	MatrixXDecisionVariable V = problem.prog->NewContinuousVariables(num_steps, dim, "v");
+	problem.V = V;
 
 	// Set initial guess
-	problem.prog->SetInitialGuess(xi, ref_points);
-	problem.prog->SetInitialGuess(v, ref_velocities);
+	problem.prog->SetInitialGuess(Xi, ref_points);
+	problem.prog->SetInitialGuess(V, ref_velocities);
 
 	/*
 	 * OBJECTIVE FUNCTION
@@ -38,7 +41,7 @@ ShortPathProblem build_short_path_problem(
 
 	// 1. Tracking error objective
 	for (int i = 0; i < num_steps; ++i) {
-		VectorX<Expression> diff = xi.row(i) - ref_points.row(i);
+		VectorX<Expression> diff = Xi.row(i) - ref_points.row(i);
 		Expression dist = diff.squaredNorm();
 		problem.prog->AddQuadraticCost(dist);
 	}
@@ -51,19 +54,19 @@ ShortPathProblem build_short_path_problem(
 		if (i == 0) {
 			// only take elements for agent positions
 			const Eigen::VectorXd xKm1 = x0.segment(0, dim);
-			const Eigen::VectorX<Variable> xK = xi.row(i);
+			const Eigen::VectorX<Variable> xK = Xi.row(i);
 			const Eigen::VectorXd vKm1 = v0.segment(0, dim);
-			const Eigen::VectorX<Variable> vK = v.row(i);
+			const Eigen::VectorX<Variable> vK = V.row(i);
 
 			const Eigen::VectorX<Expression> a6_tau = 6.0 / tau2 * (-2.0 * (xK - xKm1) + tau * (vK + vKm1));
 			const Eigen::VectorX<Expression> b2 = 2.0 / tau2 * (3.0 * (xK - xKm1) - tau * (vK + 2.0 * vKm1));
 			const Expression acc_norm = (a6_tau + b2).squaredNorm();
 			problem.prog->AddQuadraticCost(acc_norm);
 		} else {
-			const Eigen::VectorX<Variable> xKm1 = xi.row(i-1);
-			const Eigen::VectorX<Variable> xK = xi.row(i);
-			const Eigen::VectorX<Variable> vKm1 = v.row(i-1);
-			const Eigen::VectorX<Variable> vK = v.row(i);
+			const Eigen::VectorX<Variable> xKm1 = Xi.row(i-1);
+			const Eigen::VectorX<Variable> xK = Xi.row(i);
+			const Eigen::VectorX<Variable> vKm1 = V.row(i-1);
+			const Eigen::VectorX<Variable> vK = V.row(i);
 
 			const Eigen::VectorX<Expression> a6_tau = 6.0 / tau2 * (-2.0 * (xK - xKm1) + tau * (vK + vKm1));
 			const Eigen::VectorX<Expression> b2 = 2.0 / tau2 * (3.0 * (xK - xKm1) - tau * (vK + 2.0 * vKm1));
@@ -73,6 +76,9 @@ ShortPathProblem build_short_path_problem(
 	}
 
 	// TODO: Add path constraint
+	for (const auto& [edge_phi_id, edge_op] : graph->get_next_edge_ops(remaining_vertices)) {
+		edge_op.short_path_builder(*(problem.prog), edge_phi_id, var_assignments, Xi);
+	}
 
 	return std::move(problem);
 }
@@ -82,11 +88,13 @@ ShortPathProblem build_short_path_problem(
  * Short Path MPC
  */
 
-GraphShortPathMPC::GraphShortPathMPC(unsigned int num_steps,
+GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
+				     unsigned int num_steps,
 				     unsigned int num_agents,
 				     unsigned int dim,
 				     double time_per_step)
-	: _num_steps(num_steps),
+	: _graph(&graph),
+	  _num_steps(num_steps),
 	  _num_agents(num_agents),
 	  _dim(dim),
 	  _time_per_step(time_per_step) {
@@ -114,7 +122,11 @@ GraphShortPathMPC::GraphShortPathMPC(unsigned int num_steps,
 	}
 }
 
-bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& v0, const std::vector<CubicSpline>& references) {
+bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
+			      const Eigen::VectorXd& v0,
+			      const Eigen::VectorXi& var_assignments,
+			      const std::vector<int>& remaining_vertices,
+			      const std::vector<CubicSpline>& references) {
 
 	Eigen::MatrixXd ref_points(_num_steps, _num_agents * _dim);
 	Eigen::MatrixXd ref_velocities(_num_steps, _num_agents * _dim);
@@ -124,16 +136,20 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0, const Eigen::VectorXd& 
 		ref_velocities.block(0, ag * _dim, _num_steps, _dim) = references[ag].eval_multiple(_times, 1);
 	}
 
-	struct ShortPathProblem problem = build_short_path_problem(ref_points,
+	struct ShortPathProblem problem = build_short_path_problem(_graph,
+								   ref_points,
 								   ref_velocities,
-								   x0, v0, _time_per_step);
+								   x0, v0,
+								   var_assignments,
+								   remaining_vertices,
+								   _time_per_step);
 
 	// Solve
 	auto result = drake::solvers::Solve(*problem.prog);
 
 	if (result.is_success()) {
-		_points = result.GetSolution(problem.xi);
-		_vels = result.GetSolution(problem.v);
+		_points = result.GetSolution(problem.Xi);
+		_vels = result.GetSolution(problem.V);
 		return true;
 	} else {
 		return false;

@@ -12,6 +12,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
+#include "graph_of_constraints.hpp"
 #include "../splines.hpp"
 #include "../utils.hpp"
 
@@ -22,8 +23,8 @@ namespace py = pybind11;
 struct ShortPathProblem {
 	// Necessary to use a unique_ptr for movability. Weird...
 	std::unique_ptr<drake::solvers::MathematicalProgram> prog;
-	drake::solvers::MatrixXDecisionVariable xi;
-	drake::solvers::MatrixXDecisionVariable v;
+	drake::solvers::MatrixXDecisionVariable Xi;
+	drake::solvers::MatrixXDecisionVariable V;
 
 	ShortPathProblem()
 		: prog(std::make_unique<drake::solvers::MathematicalProgram>()) {}
@@ -37,15 +38,19 @@ struct ShortPathProblem {
 
 
 ShortPathProblem build_short_path_problem(
-	const Eigen::VectorXd& ref_points,
-	const Eigen::VectorXd& ref_velocities,
+	const GraphOfConstraints* graph,
+	const Eigen::MatrixXd& ref_points,
+	const Eigen::MatrixXd& ref_velocities,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
+	const Eigen::VectorXi& var_assignments,
+	const std::vector<int> remaining_vertices,
 	double tau);
 
 
 struct GraphShortPathMPC {
-	// Inputs, number of steps, dimension, reference traj
+	// Inputs: graph, number of steps, dimension, reference traj
+	const GraphOfConstraints* _graph;
 	unsigned int _num_steps, _num_agents, _dim;
 	double _time_per_step;
 	Eigen::VectorXd _times;
@@ -55,7 +60,8 @@ struct GraphShortPathMPC {
 	Eigen::MatrixXd _vels;
 
 	// Constructor
-	GraphShortPathMPC(unsigned int num_steps,
+	GraphShortPathMPC(const GraphOfConstraints& graph,
+			  unsigned int num_steps,
 			  unsigned int num_agents,
 			  unsigned int dim,
 			  double time_per_step);
@@ -63,7 +69,9 @@ struct GraphShortPathMPC {
 	// Core solve routine
 	bool solve(const Eigen::VectorXd& x0,
 		   const Eigen::VectorXd& v0,
-		   const std::vector<CubicSpline>& reference);
+		   const Eigen::VectorXi& var_assignments,
+		   const std::vector<int>& remaining_vertices,
+		   const std::vector<CubicSpline>& references);
 
 	const Eigen::MatrixXd &view_points() { return _points; }
 	const Eigen::MatrixXd &view_vels() { return _vels; }

@@ -81,6 +81,34 @@ template <typename LabelT>
 std::vector<typename Graph<LabelT>::Edge>& Graph<LabelT>::neighbors(int u) { check_node(u); return _adj[u]; }
 
 template <typename LabelT>
+std::vector<std::pair<int,int>> Graph<LabelT>::incoming_cut_edges(const std::vector<int>& S) const
+{
+	const int n = num_nodes();
+	std::vector<char> in_S(n, 0);
+	for (int u : S) {
+		if (u >= 0 && u < n && alive(u)) {
+			in_S[u] = 1;
+		}
+	}
+
+	std::vector<std::pair<int,int>> out;
+
+	// incoming edges (from V \ S to S).
+	for (int u = 0; u < n; ++u) {
+		if (!alive(u) || in_S[u]) continue; // u in complement
+		for (const auto& e : neighbors(u)) {
+			int v = e.to;
+			if (v < 0 || v >= n || !alive(v)) continue;
+			if (in_S[v]) {
+				out.emplace_back(u, v);
+			}
+		}
+	}
+
+	return out;
+}
+
+template <typename LabelT>
 typename Graph<LabelT>::BFSResult Graph<LabelT>::bfs(int s) const {
 	check_node(s);
 	const int INF = std::numeric_limits<int>::max();

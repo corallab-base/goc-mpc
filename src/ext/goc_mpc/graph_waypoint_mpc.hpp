@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <algorithm>
 
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/ipopt_solver.h>
@@ -51,6 +52,8 @@ struct GraphWaypointMPC {
 	Eigen::MatrixXd _waypoints;
 	// _assignments is (_graph.num_phis,)
 	Eigen::VectorXi _assignments;
+	// _var_assignments is (_graph.num_variables,)
+	Eigen::VectorXi _var_assignments;
 
 	// Constructor
 	GraphWaypointMPC(GraphOfConstraints& graph);
@@ -66,4 +69,5 @@ struct GraphWaypointMPC {
 
 	const Eigen::MatrixXd &view_waypoints() { return _waypoints; }
 	const Eigen::VectorXi &view_assignments() { return _assignments; }
+	const Eigen::VectorXi &view_var_assignments() { return _var_assignments; }
 };

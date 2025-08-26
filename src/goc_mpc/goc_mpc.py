@@ -44,7 +44,7 @@ class GraphOfConstraintsMPC():
         # solvers
         self.waypoint_mpc = GraphWaypointMPC(graph)
         self.timing_mpc = GraphTimingMPC(graph, 1.0, 1.0, max_vel, max_acc, max_jerk)
-        self.short_path_mpc = GraphShortPathMPC(short_path_length, num_agents, dim, short_path_time_per_step)
+        self.short_path_mpc = GraphShortPathMPC(graph, short_path_length, num_agents, dim, short_path_time_per_step)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         success = self.waypoint_mpc.solve(self.remaining_phases, x)
@@ -55,6 +55,7 @@ class GraphOfConstraintsMPC():
         # get references to the stored waypoints and assignments solutions from waypoint_mpc
         waypoints = self.waypoint_mpc.view_waypoints()
         assignments = self.waypoint_mpc.view_assignments()
+        var_assignments = self.waypoint_mpc.view_var_assignments()
 
         # PROGRESSION: progress time and potentially change phase
         # shift timing
@@ -63,27 +64,36 @@ class GraphOfConstraintsMPC():
 
             for node in passed_nodes:
                 all_phis_satisfied = all(
-                    [self.graph.evaluate_phi(phi_id, x, assignments[phi_id], 0.2)
+                    [self.graph.evaluate_phi(phi_id, x, assignments, 0.03)
                      for phi_id in self.graph.get_phi_ids(node)])
 
                 if all_phis_satisfied:
+                    print(f"Completed {node}")
+                    # breakpoint()
                     self.completed_phases |= {node}
                     self.remaining_phases.remove(node)
                     self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
 
         # BACKTRACKING: if the task has been finished
-        # if len(self.remaining_phases) == 0:
-        #     # and if any of the final constraint are violated
-        #     if phi.maxError(C, timingMPC.phase+subSeqStart) > opt.precision):
-        #         # back track appropriately
-        #         self.timing_mpc.update_backtrack();
-        #         phase_changed = True
-        # else:
-        #     # otherwise,
-        #     while not self.timing_mpc.at_the_start() and phi.maxError(C, 0.5+timingMPC.phase+subSeqStart) > opt.precision:
-        #         back track  appropriately
-        #         self.timing_mpc.update_backtrack();
-        #         phase_changed = True
+        if len(self.remaining_phases) == 0:
+            # TODO: support final edge phis
+            pass
+        else:
+            # otherwise,
+            for edge_phi_id, op in self.graph.get_next_edge_ops(self.remaining_phases).items():
+                if not self.graph.evaluate_edge_phi(edge_phi_id, x, var_assignments, 0.03):
+                    print(f"violated path constraint! backtracking node {op.u_node}")
+                    self.completed_phases -= {op.u_node}
+                    self.remaining_phases.append(op.u_node)
+
+                # TODO: more serious backtracking
+
+
+            # while not self.timing_mpc.at_the_start() and phi.maxError(C, 0.5+timingMPC.phase+subSeqStart) > opt.precision:
+            #     # back track appropriately
+            #     self.timing_mpc.update_backtrack();
+            #     phase_changed = True
+
 
         # if not self.timing_mpc.done():
         #     # if the closest next phase is further than time_delta_cutoff seconds into the future
@@ -99,7 +109,12 @@ class GraphOfConstraintsMPC():
             return False
 
     def _solve_for_short_path(self, x, x_dot):
-        success = self.short_path_mpc.solve(x, x_dot, self.last_cycle_splines)
+        var_assignments = self.waypoint_mpc.view_var_assignments()
+
+        success = self.short_path_mpc.solve(x, x_dot,
+                                            var_assignments,
+                                            self.remaining_phases,
+                                            self.last_cycle_splines)
 
         if success:
             points = self.short_path_mpc.view_points()
@@ -124,8 +139,23 @@ class GraphOfConstraintsMPC():
         self.last_grasp_commands = []
 
         success = self._solve_for_waypoints(x)
+
+        if not success:
+            print("Waypoints Failed!")
+            breakpoint()
+
         success = self._solve_for_timing(delta, x, x_dot)
+
+        if not success:
+            print("Waypoints Failed!")
+            breakpoint()
+
         success = self._solve_for_short_path(x, x_dot)
+
+        if not success:
+            print("Waypoints Failed!")
+            breakpoint()
+
         
         return self.last_cycle_short_path
 

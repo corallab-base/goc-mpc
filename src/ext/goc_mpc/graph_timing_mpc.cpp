@@ -426,6 +426,7 @@ GraphTimingProblem build_graph_timing_problem(
 
 	for (const struct AgentInteraction& p : agent_interactions) {
 		if (p.type == AgentInteraction::Type::LESS_THAN) {
+			// taus
 			Eigen::VectorX<Expression> taus_i = problem.time_deltas_list[p.agent_i].head(p.agent_i_depth+1);
 			Eigen::VectorX<Expression> taus_j = problem.time_deltas_list[p.agent_j].head(p.agent_j_depth+1);
 			problem.prog->AddLinearConstraint(taus_i.sum() <= taus_j.sum());
@@ -615,6 +616,7 @@ std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutof
 				if (_agent_nodes_list[i].size() > 0) {
 					// std::cout << "node should be passed!" << std::endl;
 					passed_nodes.insert(_agent_nodes_list[i][0]);
+					std::cout << "passed " << _agent_nodes_list[i][0] << std::endl;
 				}
 			}
 		}
