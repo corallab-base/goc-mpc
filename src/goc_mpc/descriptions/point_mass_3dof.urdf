@@ -53,4 +53,35 @@
     <axis xyz="0 0 1"/>
     <limit lower="-10" upper="10" effort="1000" velocity="5"/>
   </joint>
+
+  <!-- Actuators -->
+  <transmission name="trans_jx">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="jx">
+      <hardwareInterface>EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="act_jx">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="trans_jy">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="jy">
+      <hardwareInterface>EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="act_jy">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="trans_jz">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="jz">
+      <hardwareInterface>EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="act_jz">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
 </robot>

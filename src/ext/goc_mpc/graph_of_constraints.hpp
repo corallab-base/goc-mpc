@@ -14,6 +14,7 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/eigen.h>
 
 #include "../graphs.hpp"
 #include "../utils.hpp"
@@ -129,8 +130,8 @@ struct GraphOfConstraints {
 	GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 			   const std::vector<std::string> robots,
 			   const std::vector<std::string> objects,
-			   const Eigen::VectorXd& global_x_lb,
-			   const Eigen::VectorXd& global_x_ub);
+			   double global_x_lb,
+			   double global_x_ub);
 
 	int add_variable();
 

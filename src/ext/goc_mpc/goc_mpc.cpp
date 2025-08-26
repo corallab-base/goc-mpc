@@ -27,8 +27,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def(py::init<const MultibodyPlant<Expression>*,
 		     const std::vector<std::string>,
 		     const std::vector<std::string>,
-		     const Eigen::VectorXd&,
-		     const Eigen::VectorXd&>())
+		     double,
+		     double>())
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("num_objects", &GraphOfConstraints::num_objects)

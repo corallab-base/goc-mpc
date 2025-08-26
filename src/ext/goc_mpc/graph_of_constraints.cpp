@@ -10,8 +10,8 @@ using drake::math::RigidTransform;
 GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 				       const std::vector<std::string> robots,
 				       const std::vector<std::string> objects,
-				       const Eigen::VectorXd& global_x_lb,
-				       const Eigen::VectorXd& global_x_ub)
+				       double global_x_lb,
+				       double global_x_ub)
 	: plant(plant),
 	  _robot_names(robots),
 	  _object_names(objects),
@@ -22,15 +22,12 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 	  num_agents(robots.size()),
 	  num_objects(objects.size()),
 	  dim(0),
-	  non_robot_dim(0),
-	  _global_x_lb(global_x_lb),
-	  _global_x_ub(global_x_ub) {
+	  non_robot_dim(0) {
 
 	for (const std::string& s : robots) {
 		ModelInstanceIndex robot = plant->GetModelInstanceByName(s);
-		int robot_qdim = plant->num_positions(robot);
-		int robot_qddim = plant->num_velocities(robot);
-		if (dim == 0 && robot_qdim == robot_qddim) {
+		int robot_qdim = plant->num_actuated_dofs(robot);
+		if (dim == 0) {
 			dim = robot_qdim;
 		} else if (dim != robot_qdim) {
 			throw std::runtime_error("Only supporting robots with the same dimension.");
@@ -39,6 +36,7 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 
 	for (const std::string& s : objects) {
 		ModelInstanceIndex obj = plant->GetModelInstanceByName(s);
+		/* silly check because these should be 3dof points, but whatever */
 		int obj_qdim = plant->num_positions(obj);
 		int obj_qddim = plant->num_velocities(obj);
 		if (non_robot_dim == 0 && obj_qdim == obj_qddim) {
@@ -49,6 +47,9 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 	}
 
 	total_dim = num_agents * dim + num_objects * non_robot_dim;
+
+	_global_x_lb = Eigen::VectorXd::Constant(total_dim, global_x_lb);
+	_global_x_ub = Eigen::VectorXd::Constant(total_dim, global_x_ub);
 }
 
 // add variable
