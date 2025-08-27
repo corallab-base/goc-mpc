@@ -24,11 +24,17 @@ void init_submodule_goc_mpc(py::module_& m) {
 
 
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
-		.def(py::init<const MultibodyPlant<Expression>*,
+		.def(py::init<MultibodyPlant<Expression>&,
 		     const std::vector<std::string>,
 		     const std::vector<std::string>,
 		     double,
-		     double>())
+		     double>(),
+		     py::keep_alive<1, 2>(),
+		     py::arg("plant"),
+		     py::arg("robot_names"),
+		     py::arg("cube_names"),
+		     py::arg("state_lower_bound"),
+		     py::arg("state_upper_bound"))
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("num_objects", &GraphOfConstraints::num_objects)
@@ -44,6 +50,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("evaluate_edge_phi", &GraphOfConstraints::evaluate_edge_phi)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
+		.def("add_agents_linear_eq", &GraphOfConstraints::add_agents_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
 		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint)
 		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint);

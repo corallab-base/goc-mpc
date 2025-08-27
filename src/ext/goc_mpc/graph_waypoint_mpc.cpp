@@ -162,11 +162,13 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 	// Add constraints/costs from registry
 	for (const auto& [phi_id, op] : subgraph.get_subgraph_ops()) {
+		std::cout << "adding phi " << phi_id << std::endl;
 		op.builder(*(problem.prog), subgraph, phi_id, X, Assignments);
 	}
 
 	// Add constraints/costs from edge registry
 	for (const auto& [edge_phi_id, edge_op] : subgraph.get_subgraph_edge_ops()) {
+		std::cout << "adding edge phi " << edge_phi_id << std::endl;
 		edge_op.waypoint_builder(*(problem.prog), subgraph, edge_phi_id, X, Assignments);
 	}
 

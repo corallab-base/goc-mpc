@@ -96,7 +96,7 @@ struct AgentInteraction {
 
 struct GraphOfConstraints {
 
-	const MultibodyPlant<Expression> *plant;
+	std::shared_ptr<MultibodyPlant<Expression>> _plant;
 	const std::vector<std::string> _robot_names;
 	const std::vector<std::string> _object_names;
 	Graph<py::object> structure;
@@ -127,7 +127,7 @@ struct GraphOfConstraints {
 	// 		   const Eigen::VectorXd& global_x_lb,
 	// 		   const Eigen::VectorXd& global_x_ub);
 
-	GraphOfConstraints(const MultibodyPlant<Expression> *plant,
+	GraphOfConstraints(MultibodyPlant<Expression>& plant,
 			   const std::vector<std::string> robots,
 			   const std::vector<std::string> objects,
 			   double global_x_lb,
@@ -168,15 +168,17 @@ struct GraphOfConstraints {
 
 	// lb <= x <= ub on node k
 	int add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
-
 	// Ax = b on node k
 	int add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
-
 	// lb <= A x <= ub on node k
 	int add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
-
 	// 0.5 x'Qx + b'x + c on node k
 	int add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c = 0.0);
+
+	// Ax = b on node k
+	int add_agents_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	// lb <= A x <= ub on node k
+	int add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
 
 	// Multi-Agent Constraint Adders (typed)
 
@@ -202,6 +204,11 @@ struct GraphOfConstraints {
 
 
 private:
+	template <typename T>
+	void _set_configuration(
+		std::unique_ptr<drake::systems::Context<T>>& context,
+		Eigen::VectorX<T>& q_all);
+
 	template <typename EF, typename F>
 	int _add_op(DeferredOpKind kind, int node, EF&& eval_f, F&& f) {
 		const int id = num_phis++;

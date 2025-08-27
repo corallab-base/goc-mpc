@@ -7,12 +7,12 @@ using drake::symbolic::Expression;
 using drake::math::RigidTransform;
 
 // Constructor
-GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
+GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
 				       const std::vector<std::string> robots,
 				       const std::vector<std::string> objects,
 				       double global_x_lb,
 				       double global_x_ub)
-	: plant(plant),
+	: _plant(&plant),
 	  _robot_names(robots),
 	  _object_names(objects),
 	  num_phis(0),
@@ -25,8 +25,8 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 	  non_robot_dim(0) {
 
 	for (const std::string& s : robots) {
-		ModelInstanceIndex robot = plant->GetModelInstanceByName(s);
-		int robot_qdim = plant->num_actuated_dofs(robot);
+		ModelInstanceIndex robot = _plant->GetModelInstanceByName(s);
+		int robot_qdim = _plant->num_actuated_dofs(robot);
 		if (dim == 0) {
 			dim = robot_qdim;
 		} else if (dim != robot_qdim) {
@@ -35,10 +35,10 @@ GraphOfConstraints::GraphOfConstraints(const MultibodyPlant<Expression> *plant,
 	}
 
 	for (const std::string& s : objects) {
-		ModelInstanceIndex obj = plant->GetModelInstanceByName(s);
+		ModelInstanceIndex obj = _plant->GetModelInstanceByName(s);
 		/* silly check because these should be 3dof points, but whatever */
-		int obj_qdim = plant->num_positions(obj);
-		int obj_qddim = plant->num_velocities(obj);
+		int obj_qdim = _plant->num_positions(obj);
+		int obj_qddim = _plant->num_velocities(obj);
 		if (non_robot_dim == 0 && obj_qdim == obj_qddim) {
 			non_robot_dim = obj_qdim;
 		} else if (non_robot_dim != obj_qdim) {
@@ -307,15 +307,8 @@ int GraphOfConstraints::add_linear_eq(int k, const Eigen::MatrixXd& A, const Eig
 				 const auto& X,
 				 const auto&) {
 			       const int node_k = subgraph.subgraph_id(k);
-
-			       VectorXDecisionVariable joint_config_k(num_agents * dim);
-			       for (int ag = 0; ag < num_agents; ++ag) {
-				       for (int i = 0; i < dim; ++i) {
-					       joint_config_k(ag * dim + i) = X(node_k, ag * dim + i);
-				       }
-			       }
-
-			       auto beq = prog.AddLinearEqualityConstraint(A, b, joint_config_k);
+			       VectorXDecisionVariable config_k = X.row(node_k);
+			       auto beq = prog.AddLinearEqualityConstraint(A, b, config_k);
 		       });
 }
 
@@ -332,13 +325,8 @@ int GraphOfConstraints::add_linear_ineq(int k, const Eigen::MatrixXd& A, const E
 				 const auto& X,
 				 const auto&) {
 			       const int node_k = subgraph.subgraph_id(k);
-
-			       VectorXDecisionVariable joint_config_k(num_agents * dim);
-			       for (int ag = 0; ag < num_agents; ++ag) {
-				       joint_config_k << X.row(node_k).segment(ag * dim, dim);
-			       }
-
-			       auto constraint = prog.AddLinearConstraint(A, lb, ub, joint_config_k);
+			       VectorXDecisionVariable config_k = X.row(node_k);
+			       auto constraint = prog.AddLinearConstraint(A, lb, ub, config_k);
 		       });
 }
 
@@ -355,13 +343,45 @@ int GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd&
 				 const auto& X,
 				 const auto&) {
 			       const int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable config_k = X.row(node_k);
+			       auto constraint = prog.AddQuadraticCost(Q, b, c, config_k);
+		       });
+}
 
-			       VectorXDecisionVariable joint_config_k(num_agents * dim);
-			       for (int ag = 0; ag < num_agents; ++ag) {
-				       joint_config_k << X.row(node_k).segment(ag * dim, dim);
-			       }
 
-			       auto constraint = prog.AddQuadraticCost(Q, b, c, joint_config_k);
+// Ax = b on node k
+int GraphOfConstraints::add_agents_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+			       const int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable agents_config_k = X.row(node_k).segment(0, num_agents * dim);
+			       auto beq = prog.AddLinearEqualityConstraint(A, b, agents_config_k);
+		       });
+}
+
+// lb <= A x <= ub on node k
+int GraphOfConstraints::add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
+	return _add_op(DeferredOpKind::kLinearIneq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+			       const int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable agents_config_k = X.row(node_k).segment(0, num_agents * dim);
+			       auto constraint = prog.AddLinearConstraint(A, lb, ub, agents_config_k);
 		       });
 }
 
@@ -451,6 +471,43 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 				  });
 }
 
+template <typename T>
+void GraphOfConstraints::_set_configuration(
+	std::unique_ptr<drake::systems::Context<T>>& context,
+	Eigen::VectorX<T>& q_all) {
+
+	using drake::multibody::JointIndex;
+	using drake::multibody::ModelInstanceIndex;
+
+	// VectorX<T> q = plant->GetPositions(*context);
+
+	// for (ModelInstanceIndex i : plant ->
+	int i = 0;
+	for (std::string r_name : _robot_names) {
+		std::cout << "robot_name: " << r_name << std::endl;
+		const auto& mi = _plant->GetModelInstanceByName(r_name);
+		const std::vector<JointIndex> joint_indices = _plant->GetActuatedJointIndices(mi);
+		std::cout << "joint_indices: " << joint_indices.size() << std::endl;
+		for (JointIndex j : joint_indices) {
+			const auto& joint = _plant->get_joint(j);
+			DRAKE_DEMAND(joint.num_positions() == 1);  // Only supporting 1-dof joints
+			// Set position for this joint in context.
+			joint.SetPositions(context.get(), q_all.segment(i, 1));
+			i++;
+		}
+	}
+
+	DRAKE_DEMAND(i == num_agents * dim);
+
+	for (std::string o_name : _object_names) {
+		const auto& mi = _plant->GetModelInstanceByName(o_name);
+		_plant->SetPositions(context.get(), mi, q_all.segment(i, non_robot_dim));
+		i += non_robot_dim;
+	}
+
+	DRAKE_DEMAND(i == total_dim);
+}
+
 int GraphOfConstraints::add_robot_above_cube_constraint(
 	int k,
 	int robot_id, // std::string robot_model_name,
@@ -465,8 +522,8 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 	const std::string& robot_model_name = _robot_names.at(robot_id);
 	const std::string& cube_model_name = _object_names.at(cube_id);
 
-	const ModelInstanceIndex robot_mi = plant->GetModelInstanceByName(robot_model_name);
-	const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
+	const ModelInstanceIndex robot_mi = _plant->GetModelInstanceByName(robot_model_name);
+	const ModelInstanceIndex cube_mi  = _plant->GetModelInstanceByName(cube_model_name);
 
 	return _add_op(DeferredOpKind::kNonlinearEq, k,
 		       [=, this](const Eigen::VectorXd& x,
@@ -476,18 +533,18 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 			       using drake::symbolic::Expression;
 			       using drake::symbolic::Evaluate;
 
-			       const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
-			       const auto& cube_body  = plant->GetBodyByName("cb_body",  cube_mi);
+			       const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
+			       const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
 
 			       Eigen::VectorX<Expression> q_all = x.cast<Expression>();
 
-			       auto context = plant->CreateDefaultContext();
-			       plant->SetPositions(context.get(), q_all);
+			       auto context = _plant->CreateDefaultContext();
+			       _plant->SetPositions(context.get(), q_all);
 
 			       const RigidTransform<Expression> X_WR =
-				       plant->EvalBodyPoseInWorld(*context, robot_body);
+				       _plant->EvalBodyPoseInWorld(*context, robot_body);
 			       const RigidTransform<Expression> X_WC =
-				       plant->EvalBodyPoseInWorld(*context, cube_body);
+				       _plant->EvalBodyPoseInWorld(*context, cube_body);
 
 			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
 			       Eigen::Vector3<Expression> g;
@@ -509,29 +566,31 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 				 const auto& X,
 				 const auto&... /*unused*/) {
 
+			       using drake::multibody::JointIndex;
+			       using drake::systems::Context;
+
 			       // record that this constraint is statically assigned to this robot.
 			       _phi_to_static_assignment_map[phi_id] = robot_id;
 
 			       const int node_k = subgraph.subgraph_id(k);
 
 			       // Convert X[row] decision variables to Expressions.
-			       const int npos = plant->num_positions();
-			       Eigen::VectorX<Expression> q_all(npos);
-			       for (int j = 0; j < npos; ++j) {
+			       Eigen::VectorX<Expression> q_all(total_dim);
+			       for (int j = 0; j < total_dim; ++j) {
 				       q_all(j) = Expression(X(node_k, j));
 			       }
 
 			       // Context<Expression> with these positions.
-			       auto context = plant->CreateDefaultContext();
-			       plant->SetPositions(context.get(), q_all);
+			       auto context = _plant->CreateDefaultContext();
+			       _set_configuration(context, q_all);
 
 			       // World poses of each model's body.
-			       const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
-			       const auto& cube_body  = plant->GetBodyByName("cb_body", cube_mi);
+			       const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
+			       const auto& cube_body  = _plant->GetBodyByName("cb_body", cube_mi);
 			       const RigidTransform<Expression> X_WR =
-				       plant->EvalBodyPoseInWorld(*context, robot_body);
+				       _plant->EvalBodyPoseInWorld(*context, robot_body);
 			       const RigidTransform<Expression> X_WC =
-				       plant->EvalBodyPoseInWorld(*context, cube_body);
+				       _plant->EvalBodyPoseInWorld(*context, cube_body);
 
 			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
 			       Eigen::Vector3<Expression> g;
@@ -563,8 +622,8 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	const std::string& robot_model_name = _robot_names.at(robot_id);
 	const std::string& cube_model_name = _object_names.at(cube_id);
 
-	const ModelInstanceIndex robot_mi = plant->GetModelInstanceByName(robot_model_name);
-	const ModelInstanceIndex cube_mi  = plant->GetModelInstanceByName(cube_model_name);
+	const ModelInstanceIndex robot_mi = _plant->GetModelInstanceByName(robot_model_name);
+	const ModelInstanceIndex cube_mi  = _plant->GetModelInstanceByName(cube_model_name);
 
 	return _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({cube_id}),
 			    [=, this](const Eigen::VectorXd& x,
@@ -573,18 +632,18 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				    using drake::symbolic::Expression;
 				    using drake::symbolic::Evaluate;
 
-				    const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
-				    const auto& cube_body  = plant->GetBodyByName("cb_body",  cube_mi);
+				    const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
+				    const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
 
 				    Eigen::VectorX<Expression> q_all = x.cast<Expression>();
 
-				    auto context = plant->CreateDefaultContext();
-				    plant->SetPositions(context.get(), q_all);
+				    auto context = _plant->CreateDefaultContext();
+				    _plant->SetPositions(context.get(), q_all);
 
 				    const RigidTransform<Expression> X_WR =
-					    plant->EvalBodyPoseInWorld(*context, robot_body);
+					    _plant->EvalBodyPoseInWorld(*context, robot_body);
 				    const RigidTransform<Expression> X_WC =
-					    plant->EvalBodyPoseInWorld(*context, cube_body);
+					    _plant->EvalBodyPoseInWorld(*context, cube_body);
 
 				    const Eigen::Vector3<Expression> dp_expr =
 					    X_WR.translation() - X_WC.translation();
@@ -605,23 +664,22 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				    using drake::math::RigidTransform;
 				    using drake::symbolic::Expression;
 
-				    const auto& robot_body = plant->GetBodyByName("pm_body", robot_mi);
-				    const auto& cube_body  = plant->GetBodyByName("cb_body",  cube_mi);
+				    const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
+				    const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
 
-				    const int npos = plant->num_positions();
-				    Eigen::VectorX<Expression> q_all(npos);
+				    Eigen::VectorX<Expression> q_all(total_dim);
 
 				    const double d = holding_distance_max;
 				    auto add_box_proximity = [&](int graph_row) {
-					    for (int j = 0; j < npos; ++j) q_all(j) = Expression(X(graph_row, j));
+					    for (int j = 0; j < total_dim; ++j) q_all(j) = Expression(X(graph_row, j));
 
-					    auto context = plant->CreateDefaultContext();
-					    plant->SetPositions(context.get(), q_all);
+					    auto context = _plant->CreateDefaultContext();
+					    _set_configuration(context, q_all);
 
 					    const RigidTransform<Expression> X_WR =
-						    plant->EvalBodyPoseInWorld(*context, robot_body);
+						    _plant->EvalBodyPoseInWorld(*context, robot_body);
 					    const RigidTransform<Expression> X_WC =
-						    plant->EvalBodyPoseInWorld(*context, cube_body);
+						    _plant->EvalBodyPoseInWorld(*context, cube_body);
 
 					    const Eigen::Vector3<Expression> dp = X_WR.translation() - X_WC.translation();
 

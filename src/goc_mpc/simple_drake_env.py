@@ -229,7 +229,7 @@ class SimpleDrakeGym:
         self,
         robot_name: str,
         object_name: str,
-        grasp_frame_on_robot: str = "pm_body",
+        grasp_frame_on_robot: str = "ee_link",
         object_base_body: str = "cb_body",
     ) -> None:
         """Start rigidly attaching `object_name` to `robot_name` at the current pose."""
