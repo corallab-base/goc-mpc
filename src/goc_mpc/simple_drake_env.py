@@ -14,6 +14,7 @@ from pydrake.systems.framework import DiagramBuilder
 from pydrake.systems.analysis import Simulator
 from pydrake.math import RigidTransform
 
+import corallab_assets
 import goc_mpc
 
 
@@ -90,6 +91,14 @@ class SimpleDrakeGym:
         if not robot_path.exists():
             raise FileNotFoundError(f"Robot file not found: {robot_path}")
 
+        free_body_robot_path = Path(files(goc_mpc) / "descriptions" / "free_body_6dof.urdf")
+        if not free_body_robot_path.exists():
+            raise FileNotFoundError(f"Robot file not found: {free_body_robot_path}")
+
+        ur5e_robot_path = Path(files(corallab_assets) / "ur5e" / "ur5e.urdf")
+        if not ur5e_robot_path.exists():
+            raise FileNotFoundError(f"Robot file not found: {ur5e_robot_path}")
+
         # Cubes: try a few common names; edit if yours differs.
         cube_candidates = [
             Path(files(goc_mpc) / "descriptions" / "cube_3dof.urdf"),
@@ -111,7 +120,15 @@ class SimpleDrakeGym:
         _add_ground(self.plant)
 
         for name in self._controlled_names:
-            mis = parser.AddModels(str(robot_path))
+            if "point_mass" in name:
+                mis = parser.AddModels(str(robot_path))
+            elif "free_body" in name:
+                mis = parser.AddModels(str(free_body_robot_path))
+            elif "ur5e" in name:
+                mis = parser.AddModels(str(ur5e_robot_path))
+            else:
+                raise NotImplementedError("Currently implemented robots are point_mass and free_body.")
+
             # assuming mis is just one model instance
             self.plant.RenameModelInstance(mis[0], name)
             self.plant.set_gravity_enabled(mis[0], False)
@@ -181,10 +198,10 @@ class SimpleDrakeGym:
             self.plant.SetPositions(self.plant_context, mi, q_i)
 
         for i, mi in enumerate(self._controlled):
-            _place_free_or_q(mi, (i * spacing + 0.5, 0.0, 1.0))
+            _place_free_or_q(mi, (i * spacing + 0.5, 0.1, 1.0))
 
         for i, mi in enumerate(self._passive):
-            _place_free_or_q(mi, (i * spacing, 0.0, 0.1))
+            _place_free_or_q(mi, (i * spacing + 0.25, 0.5, 0.1))
 
         # --- Cache defaults & show initial frame ---
         self._q_default = self.plant.GetPositions(self.plant_context).copy()

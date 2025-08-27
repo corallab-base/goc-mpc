@@ -127,7 +127,7 @@ struct GraphTimingMPC {
 	// py::array_t<double> get_waypoints() const;
 	// py::array_t<double> get_time_deltas() const;
 	// py::array_t<double> get_times() const;
-	// py::array_t<double> get_vels() const;
+	const std::vector<double> get_next_taus() const;
 
 	// State updates
 	// bool set_progressed_time(double time_delta, double time_delta_cutoff);

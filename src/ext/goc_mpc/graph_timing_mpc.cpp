@@ -685,6 +685,20 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicSpline*>& splines,
 
 
 // Safe indexing and accessors
+const std::vector<double> GraphTimingMPC::get_next_taus() const {
+	std::vector<double> result;
+	for (int i = 0; i < _graph->num_agents; ++i) {
+		const int spline_length_i = _agent_spline_length_map.at(i);
+
+		if (spline_length_i > 1) {
+			double tau = _time_deltas_list[i](0);
+			result.push_back(tau);
+		}
+	}
+	return result;
+}
+
+
 // py::array_t<double> GraphTimingMPC::get_waypoints() const {
 // 	if (done()) {
 // 		return remainder_slice_2d(_waypoints, 0);
