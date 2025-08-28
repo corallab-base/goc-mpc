@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 from mujoco import viewer
 
-from goc_mpc.plants import build_1pm_2cube_plant
+from goc_mpc.splines import Block
 from goc_mpc.systems import OnePointMassEnv
 from goc_mpc.goc_mpc import GraphOfConstraints, GraphOfConstraintsMPC
 from goc_mpc.utils.mesh_cat_mirror import MeshCatMirror
@@ -51,14 +51,13 @@ def visualize_last_cycle(goc_mpc):
     return fig
 
 
-def main():
+def two_pm_block_stacking():
+
     # env and visualization
     env = SimpleDrakeGym(["point_mass_0", "point_mass_1"], ["cube_0", "cube_1", "cube_2"])
 
-    # see if this can be improved
-    dim = env.plant.num_positions()
-    state_lower_bound = np.ones(dim) * -100.0
-    state_upper_bound = np.ones(dim) * 100.0
+    state_lower_bound = -100.0
+    state_upper_bound =  100.0
 
     symbolic_plant = env.plant.ToSymbolic()
     graph = GraphOfConstraints(symbolic_plant, ["point_mass_0", "point_mass_1"], ["cube_0", "cube_1", "cube_2"],
@@ -72,41 +71,135 @@ def main():
     phi0 = graph.add_robot_above_cube_constraint(0, 0, 0, 0.1);
     graph.add_grasp_change(phi0, "grab", 0, 0);
 
+    graspPhi0 = graph.add_robot_holding_cube_constraint(0, 1, 0, 0, 0.1);
+
     phi1 = graph.add_robot_above_cube_constraint(1, 0, 1, 0.2);
     graph.add_grasp_change(phi1, "release", 0, 0);
 
     phi2 = graph.add_robot_above_cube_constraint(2, 1, 2, 0.1);
     graph.add_grasp_change(phi2, "grab", 1, 2);
 
+    graspPhi1 = graph.add_robot_holding_cube_constraint(2, 3, 1, 2, 0.1);
+
     phi3 = graph.add_robot_above_cube_constraint(3, 1, 0, 0.2);
     graph.add_grasp_change(phi3, "release", 1, 2);
 
     # GoC-MPC
-    goc_mpc = GraphOfConstraintsMPC(graph, short_path_time_per_step = 0.1)
-                                    # max_vel = 0.1,  # maximum velocity for every joint
-                                    # max_acc = 0.1,  # maximum acceleration for every joint
-                                    # max_jerk = 0.1) # maximum jerk for every joint
+    spline_spec = [Block.R(3)]
+    goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1)
+    return env, graph, goc_mpc
 
+def two_gripper_block_stacking():
+    # env and visualization
+    env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"])
+
+    state_lower_bound = -100.0
+    state_upper_bound =  100.0
+
+    symbolic_plant = env.plant.ToSymbolic()
+    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"],
+                               state_lower_bound, state_upper_bound)
+
+    graph.structure.add_nodes(4)
+    graph.structure.add_edge(0, 1, True)
+    graph.structure.add_edge(2, 3, True)
+    graph.structure.add_edge(1, 3, True)
+
+    phi0 = graph.add_robot_above_cube_constraint(0, 0, 0, 0.1);
+    graph.add_grasp_change(phi0, "grab", 0, 0);
+
+    graspPhi0 = graph.add_robot_holding_cube_constraint(0, 1, 0, 0, 0.1);
+
+    phi1 = graph.add_robot_above_cube_constraint(1, 0, 1, 0.2);
+    graph.add_grasp_change(phi1, "release", 0, 0);
+
+    phi2 = graph.add_robot_above_cube_constraint(2, 1, 2, 0.1);
+    graph.add_grasp_change(phi2, "grab", 1, 2);
+
+    graspPhi1 = graph.add_robot_holding_cube_constraint(2, 3, 1, 2, 0.1);
+
+    phi3 = graph.add_robot_above_cube_constraint(3, 1, 0, 0.2);
+    graph.add_grasp_change(phi3, "release", 1, 2);
+
+    # GoC-MPC
+    spline_spec = [Block.R(3), Block.SO3()]
+    goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1)
+    return env, graph, goc_mpc
+
+
+def two_ur5e_block_stacking():
+    # env and visualization
+    env = SimpleDrakeGym(["ur5e_0", "ur5e_1"], ["cube_0", "cube_1", "cube_2"])
+
+    state_lower_bound = -100.0
+    state_upper_bound =  100.0
+
+    symbolic_plant = env.plant.ToSymbolic()
+    graph = GraphOfConstraints(symbolic_plant, ["ur5e_0", "ur5e_1"], ["cube_0", "cube_1", "cube_2"],
+                               state_lower_bound, state_upper_bound)
+
+    graph.structure.add_nodes(4)
+    graph.structure.add_edge(0, 1, True)
+    graph.structure.add_edge(2, 3, True)
+    graph.structure.add_edge(1, 3, True)
+
+    phi0 = graph.add_robot_above_cube_constraint(0, 0, 0, 0.1);
+    graph.add_grasp_change(phi0, "grab", 0, 0);
+
+    graspPhi0 = graph.add_robot_holding_cube_constraint(0, 1, 0, 0, 0.1);
+
+    phi1 = graph.add_robot_above_cube_constraint(1, 0, 1, 0.2);
+    graph.add_grasp_change(phi1, "release", 0, 0);
+
+    phi2 = graph.add_robot_above_cube_constraint(2, 1, 2, 0.1);
+    graph.add_grasp_change(phi2, "grab", 1, 2);
+
+    graspPhi1 = graph.add_robot_holding_cube_constraint(2, 3, 1, 2, 0.1);
+
+    phi3 = graph.add_robot_above_cube_constraint(3, 1, 0, 0.2);
+    graph.add_grasp_change(phi3, "release", 1, 2);
+
+    # GoC-MPC
+    spline_spec = [Block.T(6)]
+    goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1)
+    return env, graph, goc_mpc
+
+def main():
+    env, graph, goc_mpc = two_gripper_block_stacking()
+    
     observed_qs = []
 
     dt = 1.0 / 30
 
     # do it again?
     env._diagram.ForcedPublish(env._context)
-    input("Continue?")
+    # input("Continue?")
+
+    breakpoint()
 
     while True:
         obs, _ = env.reset()
         goc_mpc.reset()
 
         for k in range(1000):
-            x, x_dot = obs[:graph.total_dim], obs[graph.total_dim:]
+            x, x_dot = obs
             xi_h, _, _ = goc_mpc.step(k * dt, x, x_dot)
+            
+            # print("real cube 0 q:", x[6:9])
+            # ag0_next_node = goc_mpc.timing_mpc.get_agent_spline_nodes(0)[0]
+            # print("agent 0 next spline node:", ag0_next_node)
+            # print("agent 0 next goal:", goc_mpc.waypoint_mpc.view_waypoints()[ag0_next_node, 6:9])
 
-            if k % 200 == 0:
-                fig = visualize_last_cycle(goc_mpc)
-                input("Continue?")
-                plt.close(fig)
+            if k == 250:
+                # detach grasp to see if backtracking is possible.
+                assert "cube_0" in env._grasps
+                env.release_grasp("cube_0")
+
+            # if k % 200 == 0:
+            #     fig = visualize_last_cycle(goc_mpc)
+            #     breakpoint()
+            #     input("Continue?")
+            #     plt.close(fig)
 
             qpos = xi_h[0]
             obs, rew, done, trunc, info = env.step(qpos, grasp_cmds=goc_mpc.last_grasp_commands)
