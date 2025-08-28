@@ -14,6 +14,7 @@
 #include <pybind11/numpy.h>
 
 #include "graph_of_constraints.hpp"
+#include "../configuration_spline.hpp"
 #include "../utils.hpp"
 
 using namespace pybind11::literals;
@@ -40,12 +41,14 @@ struct GraphWaypointProblem {
 
 GraphWaypointProblem build_graph_waypoint_problem(
 	const GraphOfConstraints& graph,
+	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
 	const std::vector<int>& remaining_vertices,
 	Eigen::VectorXd x0);
 
 struct GraphWaypointMPC {
 	// reference to graph of constraints object.
 	GraphOfConstraints* _graph;
+	std::shared_ptr<std::vector<CubicConfigurationSpline>> _splines;
 
 	// persistent output buffers;
 	// _waypoints is (_graph.num_nodes, _graph.num_agents * _graph.dim)
@@ -56,7 +59,8 @@ struct GraphWaypointMPC {
 	Eigen::VectorXi _var_assignments;
 
 	// Constructor
-	GraphWaypointMPC(GraphOfConstraints& graph);
+	GraphWaypointMPC(GraphOfConstraints& graph,
+			 std::vector<CubicConfigurationSpline> splines);
 
 	// std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXi>>
 

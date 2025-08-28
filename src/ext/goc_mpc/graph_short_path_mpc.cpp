@@ -20,15 +20,16 @@ ShortPathProblem build_short_path_problem(
 	using namespace drake::solvers;
 
 	const int num_steps = ref_points.rows();
-	const int dim = ref_points.cols();
+	const int ambient_dim = ref_points.cols();
+	const int tangent_dim = ref_velocities.cols();
 
 	// Create program
 	ShortPathProblem problem;
 
-	MatrixXDecisionVariable Xi = problem.prog->NewContinuousVariables(num_steps, dim, "xi");
+	MatrixXDecisionVariable Xi = problem.prog->NewContinuousVariables(num_steps, ambient_dim, "xi");
 	problem.Xi = Xi;
 
-	MatrixXDecisionVariable V = problem.prog->NewContinuousVariables(num_steps, dim, "v");
+	MatrixXDecisionVariable V = problem.prog->NewContinuousVariables(num_steps, tangent_dim, "v");
 	problem.V = V;
 
 	// Set initial guess
@@ -53,9 +54,9 @@ ShortPathProblem build_short_path_problem(
 	for (int i = 0; i < num_steps; ++i) {
 		if (i == 0) {
 			// only take elements for agent positions
-			const Eigen::VectorXd xKm1 = x0.segment(0, dim);
+			const Eigen::VectorXd xKm1 = x0.segment(0, ambient_dim);
 			const Eigen::VectorX<Variable> xK = Xi.row(i);
-			const Eigen::VectorXd vKm1 = v0.segment(0, dim);
+			const Eigen::VectorXd vKm1 = v0.segment(0, tangent_dim);
 			const Eigen::VectorX<Variable> vK = V.row(i);
 
 			const Eigen::VectorX<Expression> a6_tau = 6.0 / tau2 * (-2.0 * (xK - xKm1) + tau * (vK + vKm1));
@@ -126,14 +127,18 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 			      const Eigen::VectorXd& v0,
 			      const Eigen::VectorXi& var_assignments,
 			      const std::vector<int>& remaining_vertices,
-			      const std::vector<CubicSpline>& references) {
+			      const std::vector<CubicConfigurationSpline>& references) {
 
-	Eigen::MatrixXd ref_points(_num_steps, _num_agents * _dim);
-	Eigen::MatrixXd ref_velocities(_num_steps, _num_agents * _dim);
+	int a_dim = references.at(0).ambient_dim();
+	int t_dim = references.at(0).tangent_dim();
+
+	Eigen::MatrixXd ref_points(_num_steps, _num_agents * a_dim);
+	Eigen::MatrixXd ref_velocities(_num_steps, _num_agents * t_dim);
 
 	for (int ag = 0; ag < _num_agents; ++ag) {
-		ref_points.block(0, ag * _dim, _num_steps, _dim) = references[ag].eval_multiple(_times, 0);
-		ref_velocities.block(0, ag * _dim, _num_steps, _dim) = references[ag].eval_multiple(_times, 1);
+		const auto& [q_ag, qdot_ag] = references[ag].eval_multiple(_times);
+		ref_points.block(0, ag * a_dim, _num_steps, a_dim) = q_ag;
+		ref_velocities.block(0, ag * t_dim, _num_steps, t_dim) = qdot_ag;
 	}
 
 	struct ShortPathProblem problem = build_short_path_problem(_graph,

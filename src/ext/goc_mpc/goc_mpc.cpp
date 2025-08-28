@@ -56,14 +56,16 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint);
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
-                .def(py::init<GraphOfConstraints&>())
+                .def(py::init<GraphOfConstraints&, std::vector<CubicConfigurationSpline>>(),
+		     py::keep_alive<1, 3>())
 		.def("solve", &GraphWaypointMPC::solve)
 		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
 		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal)
 		.def("view_var_assignments", &GraphWaypointMPC::view_var_assignments, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
-                .def(py::init<const GraphOfConstraints&, double, double, double, double, double>())
+                .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double>(),
+		     py::keep_alive<1, 3>())
 		.def("solve", &GraphTimingMPC::solve)
 		.def("get_agent_spline_length", &GraphTimingMPC::get_agent_spline_length)
 		.def("get_agent_spline_nodes", &GraphTimingMPC::get_agent_spline_nodes)

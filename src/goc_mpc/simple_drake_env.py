@@ -4,6 +4,7 @@ from importlib.resources import files
 from pathlib import Path
 from dataclasses import dataclass
 
+from pydrake.common.eigen_geometry import Quaternion
 from pydrake.multibody.plant import MultibodyPlant_, AddMultibodyPlantSceneGraph
 from pydrake.multibody.plant import CoulombFriction
 from pydrake.multibody.tree import ModelInstanceIndex, Body, Frame
@@ -12,7 +13,7 @@ from pydrake.multibody.math import SpatialVelocity
 from pydrake.geometry import HalfSpace, Box, Rgba, SceneGraph, StartMeshcat, MeshcatVisualizer
 from pydrake.systems.framework import DiagramBuilder
 from pydrake.systems.analysis import Simulator
-from pydrake.math import RigidTransform
+from pydrake.math import RollPitchYaw, RigidTransform
 
 import corallab_assets
 import goc_mpc
@@ -155,14 +156,18 @@ class SimpleDrakeGym:
         self._sim.set_publish_every_time_step(False)
 
         # --- Sizes for obs/action bookkeeping (same as before) ---
-        self._nq = self.plant.num_positions()
-        self._nv = self.plant.num_velocities()
-        self._ctrl_nq = [self.plant.num_positions(mi) for mi in self._controlled]
-        self._ctrl_nv = [self.plant.num_velocities(mi) for mi in self._controlled]
+        self._passive_nq = [self.plant.num_positions(mi) for mi in self._passive]
+        self._passive_nv = [self.plant.num_velocities(mi) for mi in self._passive]
+        self._ctrl_nq = [self._get_q_dim(name) for name in self._controlled_names]
+        self._ctrl_nv = [self._get_qdot_dim(name) for name in self._controlled_names]
         self._ctrl_q_slices = self._compute_slices(self._ctrl_nq)
         self._ctrl_v_slices = self._compute_slices(self._ctrl_nv)
+        self._nq = sum(self._passive_nq) + sum(self._ctrl_nq)
+        self._nv = sum(self._passive_nv) + sum(self._ctrl_nv)
         self._action_q_size = sum(self._ctrl_nq)
         self._action_v_size = sum(self._ctrl_nv)
+        self._passive_q_slices = self._compute_slices(self._passive_nq, start=self._action_q_size)
+        self._passive_v_slices = self._compute_slices(self._passive_nv, start=self._action_v_size)
 
         # --- Place models along x-axis: robots @ z=1.0, cubes @ z=0.1. ---
         # We do it *in the context* so we don't remove any DOFs (no welding).
@@ -204,9 +209,155 @@ class SimpleDrakeGym:
             _place_free_or_q(mi, (i * spacing + 0.25, 0.5, 0.1))
 
         # --- Cache defaults & show initial frame ---
-        self._q_default = self.plant.GetPositions(self.plant_context).copy()
-        self._v_default = self.plant.GetVelocities(self.plant_context).copy()
+        self._q_default = self._get_q()
+        self._v_default = self._get_qdot()
         self._diagram.ForcedPublish(self._context)
+
+    def _get_model_q(self, name):
+        mi = self.plant.GetModelInstanceByName(name)
+        if "free_body" in name:
+            body = self.plant.GetBodyByName("ee_link", mi)
+            pose = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
+            return np.concatenate((pose.translation(), pose.rotation().ToQuaternion().wxyz()))
+        elif "cube" in name:
+            return self.plant.GetPositions(self.plant_context, mi)
+        else:
+            q = []
+            joint_indices = self.plant.GetActuatedJointIndices(mi)
+            for ji in joint_indices:
+                joint = self.plant.get_joint(ji)
+                q.append(joint.GetOnePosition(self.plant_context))
+            return np.array(q)
+
+    def _get_model_qdot(self, name):
+        mi = self.plant.GetModelInstanceByName(name)
+        if "free_body" in name:
+            body = self.plant.GetBodyByName("ee_link", mi)
+            spatial_velocity = self.plant.EvalBodySpatialVelocityInWorld(self.plant_context, body)
+            return np.concatenate((spatial_velocity.translational(), spatial_velocity.rotational()))
+        elif "cube" in name:
+            return self.plant.GetVelocities(self.plant_context, mi)
+        else:
+            qdot = []
+            joint_indices = self.plant.GetActuatedJointIndices(mi)
+            for ji in joint_indices:
+                joint = self.plant.get_joint(ji)
+                q.append(joint.GetOneVelocity(self.plant_context))
+            return np.array(qdot)
+
+    def _get_q(self):
+        q = []
+        for name in self._controlled_names:
+            q.append(self._get_model_q(name))
+        for name in self._passive_names:
+            q.append(self._get_model_q(name))
+        return np.concatenate(q)
+
+    def _get_qdot(self):
+        qdot = []
+        for name in self._controlled_names:
+            qdot.append(self._get_model_qdot(name))
+        for name in self._passive_names:
+            qdot.append(self._get_model_qdot(name))
+        return np.concatenate(qdot)
+
+    def _get_q_dim(self, name):
+        if "free_body" in name:
+            return 7
+        else:
+            mi = self.plant.GetModelInstanceByName(name)
+            return self.plant.get_actuated_dofs(mi)
+
+    def _get_qdot_dim(self, name):
+        if "free_body" in name:
+            return 6
+        else:
+            mi = self.plant.GetModelInstanceByName(name)
+            return self.plant.get_actuated_dofs(mi)
+
+    def _set_q(self, q: np.ndarray):
+        for i, name in enumerate(self._controlled_names):
+            q_slice = self._ctrl_q_slices[i]
+            self._set_model_q(name, q[q_slice])
+        for i, name in enumerate(self._passive_names):
+            q_slice = self._passive_q_slices[i]
+            self._set_model_q(name, q[q_slice])
+
+    def _set_qdot(self, qdot: np.ndarray):
+        for i, name in enumerate(self._controlled_names):
+            qdot_slice = self._ctrl_v_slices[i]
+            self._set_model_qdot(name, qdot[qdot_slice])
+        for i, name in enumerate(self._passive_names):
+            qdot_slice = self._passive_v_slices[i]
+            self._set_model_qdot(name, qdot[qdot_slice])
+
+    def _set_model_q(self, name, q):
+        mi = self.plant.GetModelInstanceByName(name)
+        if "free_body" in name:
+            quat = Quaternion(q[3:])
+            rpy = RollPitchYaw(quat).vector()
+
+            joint_indices = self.plant.GetActuatedJointIndices(mi)
+            for i, ji in enumerate(joint_indices[:3]):
+                joint = self.plant.get_joint(ji)
+                joint.set_translation(self.plant_context, q[i:i+1])
+            for i, ji in enumerate(joint_indices[3:]):
+                joint = self.plant.get_joint(ji)
+                joint.set_angle(self.plant_context, rpy[i])
+        elif "cube" in name:
+            return self.plant.SetPositions(self.plant_context, mi, q)
+        else:
+            joint_indices = self.plant.GetActuatedJointIndices(mi)
+            for i, ji in enumerate(joint_indices):
+                joint = self.plant.get_joint(ji)
+                joint.SetPositions(self.plant_context, q[i:i+1])
+
+    def _set_model_qdot(self, name, qdot):
+        mi = self.plant.GetModelInstanceByName(name)
+        if "free_body" in name:
+            q = self._get_model_q(name)
+            quat = Quaternion(q[3:])
+            rpy = RollPitchYaw(quat)
+            joint_indices = self.plant.GetActuatedJointIndices(mi)
+            for i, ji in enumerate(joint_indices[:3]):
+                joint = self.plant.get_joint(ji)
+                joint.set_translation_rate(self.plant_context, qdot[i:i+1])
+            omega_W = qdot[3:]
+            rpy_dot = rpy.CalcRpyDtFromAngularVelocityInParent(omega_W)
+            for i, ji in enumerate(joint_indices[3:]):
+                joint = self.plant.get_joint(ji)
+                joint.set_angular_rate(self.plant_context, rpy_dot[i])
+        elif "cube" in name:
+            return self.plant.SetVelocities(self.plant_context, mi, qdot)
+        else:
+            joint_indices = self.plant.GetActuatedJointIndices(mi)
+            for i, ji in enumerate(joint_indices):
+                joint = self.plant.get_joint(ji)
+                joint.SetVelocities(self.plant_context, q[i:i+1])
+
+    def _set_controlled_q(self, q: np.ndarray):
+        for i, name in enumerate(self._controlled_names):
+            q_slice = self._ctrl_q_slices[i]
+            self._set_model_q(name, q[q_slice])
+
+    def _set_controlled_qdot(self, qdot: np.ndarray):
+        for i, name in enumerate(self._controlled_names):
+            qdot_slice = self._ctrl_v_slices[i]
+            self._set_model_qdot(name, qdot[qdot_slice])
+
+    # def _apply_controlled_qv(self, action_q: np.ndarray, action_v: Optional[np.ndarray]):
+    #     # For each controlled model, set q (and v) in its own coordinates.
+    #     for i, mi in enumerate(self._controlled):
+    #         q_slice = self._ctrl_q_slices[i]
+    #         q_i = action_q[q_slice]
+    #         self.plant.SetPositions(self.plant_context, mi, q_i)
+    #         if action_v is not None:
+    #             v_slice = self._ctrl_v_slices[i]
+    #             v_i = action_v[v_slice]
+    #         else:
+    #             v_i = np.zeros(self._ctrl_nv[i])
+    #         self.plant.SetVelocities(self.plant_context, mi, v_i)
+
 
     # ---- Gym-ish API ---------------------------------------------------------
 
@@ -220,8 +371,8 @@ class SimpleDrakeGym:
         v = self._v_default if v0 is None else v0
         if q.shape != (self._nq,) or v.shape != (self._nv,):
             raise ValueError(f"q must be ({self._nq},), v must be ({self._nv},)")
-        self.plant.SetPositions(self.plant_context, q)
-        self.plant.SetVelocities(self.plant_context, v)
+        self._set_q(q)
+        self._set_qdot(v)
         self._diagram.ForcedPublish(self._context)
         return self._observe(), {}
 
@@ -295,7 +446,11 @@ class SimpleDrakeGym:
             raise ValueError(f"action_q must be shape ({self._action_q_size},)")
         if action_v is not None and action_v.shape != (self._action_v_size,):
             raise ValueError(f"action_v must be shape ({self._action_v_size},)")
-        self._apply_controlled_qv(action_q, action_v)
+
+        self._set_controlled_q(action_q)
+        if action_v is None:
+            action_v = np.zeros((self._action_v_size,))
+        self._set_controlled_qdot(action_v)
 
         # 2) Enforce grasps *before* physics step (prevents big impulses)
         self._enforce_all_grasps_(match_velocity=True)
@@ -333,6 +488,7 @@ class SimpleDrakeGym:
             # Desired object world pose
             X_WO = X_WR.multiply(g.X_Ro)
             p_WO = X_WO.translation()
+
             # self.set_cube_xyz_fast("cube_1", p_WO)
             self.plant.SetPositions(self.plant_context, g.object_body.model_instance(), p_WO)
             # self.plant._set_cube_xyz_fast
@@ -373,13 +529,13 @@ class SimpleDrakeGym:
         """Total length of action_v (sum of v sizes across controlled models)."""
         return self._action_v_size
 
-    @property
-    def nq(self) -> int:
-        return self._nq
+    # @property
+    # def nq(self) -> int:
+    #     return self._nq
 
-    @property
-    def nv(self) -> int:
-        return self._nv
+    # @property
+    # def nv(self) -> int:
+    #     return self._nv
 
     def pack_action(
         self,
@@ -412,30 +568,51 @@ class SimpleDrakeGym:
     # Internal:
 
     def _observe(self) -> np.ndarray:
-        q = self.plant.GetPositions(self.plant_context)
-        v = self.plant.GetVelocities(self.plant_context)
-        return np.concatenate([q, v])
+        q = []
+        qdot = []
+        for name in self._controlled_names:
+            mi = self.plant.GetModelInstanceByName(name)
+            if "free_body" in name:
+                body = self.plant.GetBodyByName("ee_link", mi)
+                X_WE = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
+                q.append(X_WE.translation())
+                q.append(X_WE.rotation().ToQuaternion().wxyz())
+
+                Xdot_WE = self.plant.EvalBodySpatialVelocityInWorld(self.plant_context, body)
+                qdot.append(Xdot_WE.translational())
+                qdot.append(Xdot_WE.rotational())
+            else:
+                # TODO: check if this is correct for some robots, if necessary
+                q.append(self.plant.GetPositions(self.plant_context, mi))
+                qdot.append(self.plant.GetVelocities(self.plant_context, mi))
+
+        for name in self._passive_names:
+            mi = self.plant.GetModelInstanceByName(name)
+            q.append(self.plant.GetPositions(self.plant_context, mi))
+            qdot.append(self.plant.GetVelocities(self.plant_context, mi))
+
+        return (np.concatenate(q), np.concatenate(qdot))
 
     @staticmethod
-    def _compute_slices(lengths: List[int]) -> List[slice]:
+    def _compute_slices(lengths: List[int], start=0) -> List[slice]:
         """Return contiguous slices [0:n0), [n0:n0+n1), ... for given lengths."""
-        s = 0
+        s = start
         out = []
         for L in lengths:
             out.append(slice(s, s + L))
             s += L
         return out
 
-    def _apply_controlled_qv(self, action_q: np.ndarray, action_v: Optional[np.ndarray]):
-        # For each controlled model, set q (and v) in its own coordinates.
-        for i, mi in enumerate(self._controlled):
-            q_slice = self._ctrl_q_slices[i]
-            q_i = action_q[q_slice]
-            self.plant.SetPositions(self.plant_context, mi, q_i)
+    # def _apply_controlled_qv(self, action_q: np.ndarray, action_v: Optional[np.ndarray]):
+    #     # For each controlled model, set q (and v) in its own coordinates.
+    #     for i, mi in enumerate(self._controlled):
+    #         q_slice = self._ctrl_q_slices[i]
+    #         q_i = action_q[q_slice]
+    #         self.plant.SetPositions(self.plant_context, mi, q_i)
 
-            if action_v is not None:
-                v_slice = self._ctrl_v_slices[i]
-                v_i = action_v[v_slice]
-            else:
-                v_i = np.zeros(self._ctrl_nv[i])
-            self.plant.SetVelocities(self.plant_context, mi, v_i)
+    #         if action_v is not None:
+    #             v_slice = self._ctrl_v_slices[i]
+    #             v_i = action_v[v_slice]
+    #         else:
+    #             v_i = np.zeros(self._ctrl_nv[i])
+    #         self.plant.SetVelocities(self.plant_context, mi, v_i)

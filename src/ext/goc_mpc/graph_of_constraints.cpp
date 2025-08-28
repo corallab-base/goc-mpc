@@ -26,7 +26,15 @@ GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
 
 	for (const std::string& s : robots) {
 		ModelInstanceIndex robot = _plant->GetModelInstanceByName(s);
-		int robot_qdim = _plant->num_actuated_dofs(robot);
+
+		int robot_qdim;
+		if (s.find("free_body") != std::string::npos) {
+			// special case because I want quaternion state space.
+			robot_qdim = 7;
+		} else {
+			robot_qdim = _plant->num_actuated_dofs(robot);
+		}
+
 		if (dim == 0) {
 			dim = robot_qdim;
 		} else if (dim != robot_qdim) {
@@ -478,22 +486,47 @@ void GraphOfConstraints::_set_configuration(
 
 	using drake::multibody::JointIndex;
 	using drake::multibody::ModelInstanceIndex;
+	using drake::math::RollPitchYaw;
 
 	// VectorX<T> q = plant->GetPositions(*context);
 
 	// for (ModelInstanceIndex i : plant ->
 	int i = 0;
 	for (std::string r_name : _robot_names) {
-		std::cout << "robot_name: " << r_name << std::endl;
 		const auto& mi = _plant->GetModelInstanceByName(r_name);
-		const std::vector<JointIndex> joint_indices = _plant->GetActuatedJointIndices(mi);
-		std::cout << "joint_indices: " << joint_indices.size() << std::endl;
-		for (JointIndex j : joint_indices) {
-			const auto& joint = _plant->get_joint(j);
-			DRAKE_DEMAND(joint.num_positions() == 1);  // Only supporting 1-dof joints
-			// Set position for this joint in context.
-			joint.SetPositions(context.get(), q_all.segment(i, 1));
-			i++;
+
+		if (r_name.find("free_body") != std::string::npos) {
+			// special case with setting from quaternion instead of joint angles
+			Eigen::Vector3<T> p_W;
+			p_W << q_all.segment(i, 3);
+			i+=3;
+
+			// w, x, y, z
+			Eigen::Quaternion<T> q_W(q_all(i), q_all(i+1), q_all(i+2), q_all(i+3));
+			i+=4;
+
+			RollPitchYaw<T> rpy(q_W);
+			Eigen::Vector<T, 6> joint_angles;
+			joint_angles << p_W, rpy;
+
+			const std::vector<JointIndex> joint_indices = _plant->GetActuatedJointIndices(mi);
+			int k = 0;
+			for (JointIndex j : joint_indices) {
+				const auto& joint = _plant->get_joint(j);
+				DRAKE_DEMAND(joint.num_positions() == 1);  // Only supporting 1-dof joints
+				// Set position for this joint in context.
+				joint.SetPositions(context.get(), joint_angles.segment(k, 1));
+				k++;
+			}
+		} else {
+			const std::vector<JointIndex> joint_indices = _plant->GetActuatedJointIndices(mi);
+			for (JointIndex j : joint_indices) {
+				const auto& joint = _plant->get_joint(j);
+				DRAKE_DEMAND(joint.num_positions() == 1);  // Only supporting 1-dof joints
+				// Set position for this joint in context.
+				joint.SetPositions(context.get(), q_all.segment(i, 1));
+				i++;
+			}
 		}
 	}
 
@@ -539,7 +572,7 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 			       Eigen::VectorX<Expression> q_all = x.cast<Expression>();
 
 			       auto context = _plant->CreateDefaultContext();
-			       _plant->SetPositions(context.get(), q_all);
+			       _set_configuration(context, q_all);
 
 			       const RigidTransform<Expression> X_WR =
 				       _plant->EvalBodyPoseInWorld(*context, robot_body);
@@ -638,7 +671,7 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				    Eigen::VectorX<Expression> q_all = x.cast<Expression>();
 
 				    auto context = _plant->CreateDefaultContext();
-				    _plant->SetPositions(context.get(), q_all);
+				    _set_configuration(context, q_all);
 
 				    const RigidTransform<Expression> X_WR =
 					    _plant->EvalBodyPoseInWorld(*context, robot_body);

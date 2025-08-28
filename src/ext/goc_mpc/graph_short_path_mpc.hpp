@@ -13,6 +13,7 @@
 #include <pybind11/numpy.h>
 
 #include "graph_of_constraints.hpp"
+#include "../configuration_spline.hpp"
 #include "../splines.hpp"
 #include "../utils.hpp"
 
@@ -71,7 +72,7 @@ struct GraphShortPathMPC {
 		   const Eigen::VectorXd& v0,
 		   const Eigen::VectorXi& var_assignments,
 		   const std::vector<int>& remaining_vertices,
-		   const std::vector<CubicSpline>& references);
+		   const std::vector<CubicConfigurationSpline>& references);
 
 	const Eigen::MatrixXd &view_points() { return _points; }
 	const Eigen::MatrixXd &view_vels() { return _vels; }

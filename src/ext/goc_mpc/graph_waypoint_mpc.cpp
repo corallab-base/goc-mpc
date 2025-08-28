@@ -12,6 +12,7 @@ namespace py = pybind11;
 
 GraphWaypointProblem build_graph_waypoint_problem(
 	GraphOfConstraints* graph,
+	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
 	const std::vector<int>& remaining_vertices,
 	Eigen::VectorXd x0) {
 
@@ -66,8 +67,11 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		// First, costs to minimize across transitions from x0 to the source
 		// nodes in the subgraph.
 		for (int ag = 0; ag < num_agents; ++ag) {
-			VectorX<Expression> diff = x0.segment(ag * robot_dim, robot_dim) - X.row(sg_v).segment(ag * robot_dim, robot_dim);
-			Expression dist = diff.squaredNorm();
+			VectorX<Expression> x0_exps(robot_dim);
+			for (int k = 0; k < robot_dim; ++k) {
+				x0_exps(k) = Expression(x0(ag * robot_dim + k));
+			}
+			Expression dist = splines->at(ag).squared_distance(x0_exps, X.row(sg_v).segment(ag * robot_dim, robot_dim));
 			problem.prog->AddQuadraticCost(dist);
 		}
 
@@ -87,13 +91,12 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			Eigen::VectorXd x0_seg = x0.segment(start, non_robot_dim);
 
 			if (!possibly_manipulated_cubes_for_initial_layer.contains(obj)) {
-				std::cout << "added for " << v << ", " << obj << std::endl;
+				// std::cout << "added for " << v << ", " << obj << std::endl;
 				// Enforce X_seg == x0_seg (all objects not effected by an edge constraint)
 				problem.prog->AddLinearEqualityConstraint(X_seg, x0_seg);
 			}
 		}
 	}
-
 
 	std::map<int, std::set<int>> possibly_manipulated_cubes_during_each_layer;
 	const auto& layers = subgraph.structure.topological_layer_cut_snapshot(
@@ -122,8 +125,8 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		int v = edge.e->to;
 		int sg_v = subgraph.subgraph_id(v);
 		for (int ag = 0; ag < num_agents; ++ag) {
-			VectorX<Expression> diff = X.row(sg_u).segment(ag * robot_dim, robot_dim) - X.row(sg_v).segment(ag * robot_dim, robot_dim);
-			Expression dist = diff.squaredNorm();
+			Expression dist = splines->at(ag).squared_distance(X.row(sg_u).segment(ag * robot_dim, robot_dim),
+									   X.row(sg_v).segment(ag * robot_dim, robot_dim));
 			problem.prog->AddQuadraticCost(dist);
 		}
 
@@ -145,12 +148,12 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			const int layer = layers.node_to_level.at(u);
 			if (possibly_manipulated_cubes_during_each_layer.contains(layer)) {
 				if (!possibly_manipulated_cubes_during_each_layer.at(layer).contains(obj)) {
-					std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;
+					// std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;
 					problem.prog->AddLinearEqualityConstraint(
 						X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim));
 				}
 			} else {
-				std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;
+				// std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;
 				problem.prog->AddLinearEqualityConstraint(
 					X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim));
 			}
@@ -162,13 +165,13 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 	// Add constraints/costs from registry
 	for (const auto& [phi_id, op] : subgraph.get_subgraph_ops()) {
-		std::cout << "adding phi " << phi_id << std::endl;
+		// std::cout << "adding phi " << phi_id << std::endl;
 		op.builder(*(problem.prog), subgraph, phi_id, X, Assignments);
 	}
 
 	// Add constraints/costs from edge registry
 	for (const auto& [edge_phi_id, edge_op] : subgraph.get_subgraph_edge_ops()) {
-		std::cout << "adding edge phi " << edge_phi_id << std::endl;
+		// std::cout << "adding edge phi " << edge_phi_id << std::endl;
 		edge_op.waypoint_builder(*(problem.prog), subgraph, edge_phi_id, X, Assignments);
 	}
 
@@ -179,8 +182,10 @@ GraphWaypointProblem build_graph_waypoint_problem(
  * Waypoint MPC
  */
 
-GraphWaypointMPC::GraphWaypointMPC(GraphOfConstraints& graph)
-	: _graph(&graph) {
+GraphWaypointMPC::GraphWaypointMPC(GraphOfConstraints& graph,
+				   std::vector<CubicConfigurationSpline> splines)
+	: _graph(&graph),
+	  _splines(std::make_shared<std::vector<CubicConfigurationSpline>>(std::move(splines))) {
 	// Allocate persistent output buffers.
 	_waypoints = Eigen::MatrixXd::Zero(_graph->structure.num_nodes(), _graph->total_dim);
 	_assignments = Eigen::VectorXi::Zero(_graph->num_phis);
@@ -288,7 +293,7 @@ bool GraphWaypointMPC::solve(
 	const Eigen::VectorXd& x0) {
 
 	// TODO: use x0
-	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, remaining_vertices, x0);
+	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0);
 
 	// Solve
 	drake::solvers::MosekSolver solver;

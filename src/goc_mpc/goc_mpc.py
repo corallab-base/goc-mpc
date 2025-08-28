@@ -3,6 +3,7 @@ import numpy as np
 from goc_mpc.graphs import Graph
 
 from ._ext.splines import CubicSpline
+from ._ext.configuration_spline import CubicConfigurationSpline, Block
 from ._ext.goc_mpc import (
     GraphOfConstraints,
     GraphWaypointMPC,
@@ -16,6 +17,7 @@ class GraphOfConstraintsMPC():
     def __init__(
             self,
             graph: GraphOfConstraints,
+            spline_spec: list[Block],
             time_delta_cutoff: float = 0.5,
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
@@ -30,7 +32,7 @@ class GraphOfConstraintsMPC():
         # persistent data
         self.graph = graph
         self.last_cycle_time = 0.0
-        self.last_cycle_splines = [CubicSpline() for _ in range(num_agents)]
+        self.last_cycle_splines = [CubicConfigurationSpline(spline_spec) for _ in range(num_agents)]
         self.last_cycle_waypoints = None
         self.last_cycle_short_path = None
         self.completed_phases = set()
@@ -42,8 +44,8 @@ class GraphOfConstraintsMPC():
         self.ctrl_cost = 1.0
 
         # solvers
-        self.waypoint_mpc = GraphWaypointMPC(graph)
-        self.timing_mpc = GraphTimingMPC(graph, 1.0, 1.0, max_vel, max_acc, max_jerk)
+        self.waypoint_mpc = GraphWaypointMPC(graph, self.last_cycle_splines)
+        self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines, 1.0, 1.0, max_vel, max_acc, max_jerk)
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length, num_agents, dim, short_path_time_per_step)
 
     def _solve_for_waypoints(self, x: np.ndarray):

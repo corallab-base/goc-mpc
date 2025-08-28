@@ -13,6 +13,7 @@
 #include <pybind11/numpy.h>
 
 #include "graph_of_constraints.hpp"
+#include "../configuration_spline.hpp"
 #include "../splines.hpp"
 #include "../utils.hpp"
 
@@ -72,6 +73,7 @@ GraphTimingProblem build_graph_timing_problem(
 struct GraphTimingMPC {
 	// Input: reference to graph of constraints
 	const GraphOfConstraints* _graph;
+	std::shared_ptr<std::vector<CubicConfigurationSpline>> _splines;
 
 	// Persistent Output Buffers
 	std::vector<Eigen::MatrixXd> _wps_list;
@@ -95,6 +97,7 @@ struct GraphTimingMPC {
 
 	// Constructor
 	GraphTimingMPC(const GraphOfConstraints& graph,
+		       std::vector<CubicConfigurationSpline> splines,
 		       double time_cost = 1e0,
 		       double ctrl_cost = 1e0,
 		       double max_vel = -1.0,
@@ -114,7 +117,7 @@ struct GraphTimingMPC {
 	std::set<int> set_progressed_time(double delta, double tau_cutoff);
 
 	// Spline generator
-	void fill_cubic_splines(std::vector<CubicSpline*>& splines,
+	void fill_cubic_splines(std::vector<CubicConfigurationSpline*>& splines,
 				const Eigen::VectorXd& x0,
 				const Eigen::VectorXd& v0) const;
 

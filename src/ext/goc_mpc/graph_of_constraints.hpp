@@ -11,6 +11,7 @@
 #include <drake/solvers/solve.h>
 #include <drake/multibody/plant/multibody_plant.h>
 #include <drake/multibody/tree/multibody_tree_indexes.h>
+#include <drake/math/quaternion.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
