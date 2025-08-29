@@ -294,16 +294,15 @@ class SimpleDrakeGym:
     def _set_model_q(self, name, q):
         mi = self.plant.GetModelInstanceByName(name)
         if "free_body" in name:
-            quat = Quaternion(q[3:])
-            rpy = RollPitchYaw(quat).vector()
+            # Interpret q as [x y z w x y z]
+            x_W = q[:3]
+            q_W = Quaternion(q[3:])
 
-            joint_indices = self.plant.GetActuatedJointIndices(mi)
-            for i, ji in enumerate(joint_indices[:3]):
-                joint = self.plant.get_joint(ji)
-                joint.set_translation(self.plant_context, q[i:i+1])
-            for i, ji in enumerate(joint_indices[3:]):
-                joint = self.plant.get_joint(ji)
-                joint.set_angle(self.plant_context, rpy[i])
+            # Pick the actual free base body in this model instance.
+            body = self.plant.GetBodyByName("ee_link", mi)
+
+            X_WB = RigidTransform(q_W, x_W)
+            self.plant.SetFreeBodyPose(self.plant_context, body, X_WB)
         elif "cube" in name:
             return self.plant.SetPositions(self.plant_context, mi, q)
         else:
@@ -314,19 +313,17 @@ class SimpleDrakeGym:
 
     def _set_model_qdot(self, name, qdot):
         mi = self.plant.GetModelInstanceByName(name)
+
         if "free_body" in name:
-            q = self._get_model_q(name)
-            quat = Quaternion(q[3:])
-            rpy = RollPitchYaw(quat)
-            joint_indices = self.plant.GetActuatedJointIndices(mi)
-            for i, ji in enumerate(joint_indices[:3]):
-                joint = self.plant.get_joint(ji)
-                joint.set_translation_rate(self.plant_context, qdot[i:i+1])
-            omega_W = qdot[3:]
-            rpy_dot = rpy.CalcRpyDtFromAngularVelocityInParent(omega_W)
-            for i, ji in enumerate(joint_indices[3:]):
-                joint = self.plant.get_joint(ji)
-                joint.set_angular_rate(self.plant_context, rpy_dot[i])
+            # Interpret qdot as [v_W, ω_W]; never convert ω→rpẏ
+            v_W = qdot[:3]
+            w_W = qdot[3:]
+
+            # Pick the actual free base body in this model instance.
+            body = self.plant.GetBodyByName("ee_link", mi)
+
+            V_WB = SpatialVelocity(w_W, v_W) # expressed in World
+            self.plant.SetFreeBodySpatialVelocity(body, V_WB, self.plant_context)
         elif "cube" in name:
             return self.plant.SetVelocities(self.plant_context, mi, qdot)
         else:

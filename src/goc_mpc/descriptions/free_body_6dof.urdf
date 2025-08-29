@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<robot name="free_body_6dof_actuated" xmlns:xacro="http://ros.org/wiki/xacro">
+  <!-- End-effector body (your actual body) -->
+  <link name="ee_link">
+    <inertial><mass value="1.0"/><origin xyz="0 0 0"/>
+      <inertia ixx="1e-4" iyy="1e-4" izz="1e-4" ixy="0" ixz="0" iyz="0"/></inertial>
+    <visual><origin xyz="0 0 0"/>
+      <geometry><box size="0.03 0.03 0.06"/></geometry>
+      <material name="gray"><color rgba="0.5 0.5 0.5 1"/></material>
+    </visual>
+    <collision><origin xyz="0 0 0"/>
+      <geometry><sphere radius="0.06"/></geometry>
+    </collision>
+  </link>
+
+  <!-- Spacer links -->
+  <joint name="free_joint" type="floating">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="world"/>
+    <child link="ee_link"/>
+  </joint>
+</robot>

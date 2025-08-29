@@ -5,6 +5,7 @@ using drake::solvers::Constraint;
 using drake::solvers::VectorXDecisionVariable;
 using drake::symbolic::Expression;
 using drake::math::RigidTransform;
+using drake::multibody::RigidBody;
 
 // Constructor
 GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
@@ -496,7 +497,7 @@ void GraphOfConstraints::_set_configuration(
 		const auto& mi = _plant->GetModelInstanceByName(r_name);
 
 		if (r_name.find("free_body") != std::string::npos) {
-			// special case with setting from quaternion instead of joint angles
+
 			Eigen::Vector3<T> p_W;
 			p_W << q_all.segment(i, 3);
 			i+=3;
@@ -505,19 +506,11 @@ void GraphOfConstraints::_set_configuration(
 			Eigen::Quaternion<T> q_W(q_all(i), q_all(i+1), q_all(i+2), q_all(i+3));
 			i+=4;
 
-			RollPitchYaw<T> rpy(q_W);
-			Eigen::Vector<T, 6> joint_angles;
-			joint_angles << p_W, rpy;
+			// Pick the actual free base body in this model instance.
+			const auto& body = _plant->GetBodyByName("ee_link", mi);
 
-			const std::vector<JointIndex> joint_indices = _plant->GetActuatedJointIndices(mi);
-			int k = 0;
-			for (JointIndex j : joint_indices) {
-				const auto& joint = _plant->get_joint(j);
-				DRAKE_DEMAND(joint.num_positions() == 1);  // Only supporting 1-dof joints
-				// Set position for this joint in context.
-				joint.SetPositions(context.get(), joint_angles.segment(k, 1));
-				k++;
-			}
+			const RigidTransform<T> X_WB(q_W, p_W);
+			_plant->SetFreeBodyPose(context.get(), body, X_WB);
 		} else {
 			const std::vector<JointIndex> joint_indices = _plant->GetActuatedJointIndices(mi);
 			for (JointIndex j : joint_indices) {
