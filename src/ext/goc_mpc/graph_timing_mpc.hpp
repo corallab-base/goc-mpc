@@ -132,6 +132,12 @@ struct GraphTimingMPC {
 	// py::array_t<double> get_times() const;
 	const std::vector<double> get_next_taus() const;
 
+	const std::vector<Eigen::MatrixXd> &view_wps_list() const { return _wps_list; }
+	const std::vector<Eigen::MatrixXd> &view_vs_list() const { return _vs_list; }
+	const std::vector<Eigen::VectorXd> &view_time_deltas_list() const { return _time_deltas_list; }
+	const std::vector<std::vector<int>> &view_agent_nodes_list() const { return _agent_nodes_list; }
+	const std::map<int, int> &view_agent_spline_length_map() const { return _agent_spline_length_map; }
+
 	// State updates
 	// bool set_progressed_time(double time_delta, double time_delta_cutoff);
 	// void set_updated_waypoints(const py::array_t<double>& _waypoints,

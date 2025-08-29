@@ -1,3 +1,4 @@
+import pickle
 import numpy as np
 
 from goc_mpc.graphs import Graph
@@ -18,7 +19,7 @@ class GraphOfConstraintsMPC():
             self,
             graph: GraphOfConstraints,
             spline_spec: list[Block],
-            time_delta_cutoff: float = 0.5,
+            time_delta_cutoff: float = 0.4,
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
             max_vel: float = -1.0,
@@ -35,6 +36,7 @@ class GraphOfConstraintsMPC():
         self.last_cycle_splines = [CubicConfigurationSpline(spline_spec) for _ in range(num_agents)]
         self.last_cycle_waypoints = None
         self.last_cycle_short_path = None
+        self.last_grasp_commands = []
         self.completed_phases = set()
         self.remaining_phases = list(range(graph.structure.num_nodes))
         
@@ -75,6 +77,8 @@ class GraphOfConstraintsMPC():
                     self.completed_phases |= {node}
                     self.remaining_phases.remove(node)
                     self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
+                else:
+                    print(f"Did not complete {node}")
 
         # BACKTRACKING: if the task has been finished
         if len(self.remaining_phases) == 0:
@@ -143,27 +147,39 @@ class GraphOfConstraintsMPC():
         success = self._solve_for_waypoints(x)
 
         if not success:
-            print("Waypoints Failed!")
+            print("WaypointsMPC Failed!")
             breakpoint()
+            return self.last_cycle_short_path
 
         success = self._solve_for_timing(delta, x, x_dot)
 
         if not success:
-            print("Waypoints Failed!")
+            print("TimingMPC Failed!")
             breakpoint()
+            return self.last_cycle_short_path
 
         success = self._solve_for_short_path(x, x_dot)
 
         if not success:
-            print("Waypoints Failed!")
+            print("ShortPathMPC Failed!")
             breakpoint()
+            return self.last_cycle_short_path
 
         
         return self.last_cycle_short_path
 
     #
-    # task definition helpers
+    # utils
     #
 
-    def add_linear_eq(self, node: int, A: np.ndarray, b: np.ndarray):
-        return self.waypoint_mpc.add_linear_eq(node, A, b)
+    def dump(self, f, x, x_dot):
+        pickle.dump({
+            "x": x,
+            "x_dot": x_dot,
+            "whole_waypoints": self.waypoint_mpc.view_waypoints(),
+            "wps_list": self.timing_mpc.view_wps_list(),
+            "vs_list": self.timing_mpc.view_vs_list(),
+            "time_deltas_list": self.timing_mpc.view_time_deltas_list(),
+            "agent_nodes_list": self.timing_mpc.view_agent_nodes_list(),
+            "agent_spline_length_map": self.timing_mpc.view_agent_spline_length_map(),
+        }, f)

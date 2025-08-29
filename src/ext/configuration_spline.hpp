@@ -292,8 +292,8 @@ public:
 			tan_dim_ += t_sz;
 			blocks_.push_back(b);
 			block_offsets_.emplace_back(a_off, t_off, a_sz, t_sz, b.type);
-			std::cout << "a_off: " << a_off << std::endl;
-			std::cout << "a_sz: " << a_sz << std::endl;
+			// std::cout << "a_off: " << a_off << std::endl;
+			// std::cout << "a_sz: " << a_sz << std::endl;
 		}
 		clear();
 	}

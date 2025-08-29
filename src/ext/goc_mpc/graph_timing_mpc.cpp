@@ -217,7 +217,7 @@ GraphTimingProblem build_graph_timing_problem(
 				const Eigen::MatrixXd Q = time_cost2 * Eigen::MatrixXd::Identity(agent_spline_length, agent_spline_length);
 				const Eigen::VectorXd b = Eigen::VectorXd::Zero(agent_spline_length);
 				problem.prog->AddQuadraticCost(Q, b, time_deltas_i);
-			}			
+			}
 
 			// 3. Control costs
 			if (ctrl_cost > 0) {
@@ -621,7 +621,7 @@ std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutof
 		// const int agent_spline_length = taus.size() + 1;
 		if (_agent_spline_length_map[i] > 0) {
 			const double tau0 = _time_deltas_list[i](0);
-			if (delta < tau0) {
+			if (delta < tau0 - tau_cutoff) {
 				; // TODO: (changing initialization of solver)
 				// _time_deltas_list[i](0) -= delta;
 			} else {

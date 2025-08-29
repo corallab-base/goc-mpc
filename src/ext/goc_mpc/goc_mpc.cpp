@@ -71,7 +71,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("get_agent_spline_nodes", &GraphTimingMPC::get_agent_spline_nodes)
 		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)
 		.def("fill_cubic_splines", &GraphTimingMPC::fill_cubic_splines)
-		.def("get_next_taus", &GraphTimingMPC::get_next_taus);
+		.def("get_next_taus", &GraphTimingMPC::get_next_taus)
+		.def("view_wps_list", &GraphTimingMPC::view_wps_list)
+		.def("view_vs_list", &GraphTimingMPC::view_vs_list)
+		.def("view_time_deltas_list", &GraphTimingMPC::view_time_deltas_list)
+		.def("view_agent_nodes_list", &GraphTimingMPC::view_agent_nodes_list)
+		.def("view_agent_spline_length_map", &GraphTimingMPC::view_agent_spline_length_map);
 
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
                 .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double>(),

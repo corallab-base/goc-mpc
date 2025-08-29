@@ -24,6 +24,7 @@ find_package(drake CONFIG REQUIRED)
 pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc.cpp"
     "src/ext/splines.cpp"
+    "src/ext/configuration_spline.cpp"
     "src/ext/graphs.cpp"
     "src/ext/utils.cpp"
     "src/ext/sec_mpc/timing_mpc_problem.cpp"
