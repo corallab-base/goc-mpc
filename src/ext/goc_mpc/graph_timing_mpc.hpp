@@ -131,6 +131,7 @@ struct GraphTimingMPC {
 	// py::array_t<double> get_time_deltas() const;
 	// py::array_t<double> get_times() const;
 	const std::vector<double> get_next_taus() const;
+	const std::vector<int> get_next_nodes() const;
 
 	const std::vector<Eigen::MatrixXd> &view_wps_list() const { return _wps_list; }
 	const std::vector<Eigen::MatrixXd> &view_vs_list() const { return _vs_list; }

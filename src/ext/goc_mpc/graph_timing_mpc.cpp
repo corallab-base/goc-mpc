@@ -712,6 +712,20 @@ const std::vector<double> GraphTimingMPC::get_next_taus() const {
 	return result;
 }
 
+// Safe indexing and accessors
+const std::vector<int> GraphTimingMPC::get_next_nodes() const {
+	std::vector<int> result;
+	for (int i = 0; i < _graph->num_agents; ++i) {
+		const int spline_length_i = _agent_spline_length_map.at(i);
+
+		if (spline_length_i > 1) {
+			int node = _agent_nodes_list[i].at(0);
+			result.push_back(node);
+		}
+	}
+	return result;
+}
+
 
 // py::array_t<double> GraphTimingMPC::get_waypoints() const {
 // 	if (done()) {

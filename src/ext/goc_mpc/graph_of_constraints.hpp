@@ -181,6 +181,12 @@ struct GraphOfConstraints {
 	// lb <= A x <= ub on node k
 	int add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
 
+	// Ax = b on node k
+	int add_agent_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	// lb <= A x <= ub on node k
+	int add_agent_linear_ineq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
+
+
 	// Multi-Agent Constraint Adders (typed)
 
 	// Ax_i = b on node k for some agent i
@@ -192,7 +198,9 @@ struct GraphOfConstraints {
 	int add_robot_above_cube_constraint(int k,
 					    int robot_id,
 					    int cube_id,
-					    double delta_z);
+					    double delta_z,
+					    double x_offset = 0.0,
+					    double y_offset = 0.0);
 
 	// EDGE CONSTRAINTS
 

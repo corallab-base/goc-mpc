@@ -51,8 +51,15 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("evaluate_edge_phi", &GraphOfConstraints::evaluate_edge_phi)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
 		.def("add_agents_linear_eq", &GraphOfConstraints::add_agents_linear_eq)
+		.def("add_agent_linear_eq", &GraphOfConstraints::add_agent_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
-		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint)
+		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,
+		     py::arg("k"),
+		     py::arg("robot_id"),
+		     py::arg("cube_id"),
+		     py::arg("delta_z"),
+		     py::arg("x_offset") = 0.0,
+		     py::arg("y_offset") = 0.0)
 		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint);
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
@@ -72,6 +79,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)
 		.def("fill_cubic_splines", &GraphTimingMPC::fill_cubic_splines)
 		.def("get_next_taus", &GraphTimingMPC::get_next_taus)
+		.def("get_next_nodes", &GraphTimingMPC::get_next_nodes)
 		.def("view_wps_list", &GraphTimingMPC::view_wps_list)
 		.def("view_vs_list", &GraphTimingMPC::view_vs_list)
 		.def("view_time_deltas_list", &GraphTimingMPC::view_time_deltas_list)

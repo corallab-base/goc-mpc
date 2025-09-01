@@ -394,6 +394,51 @@ int GraphOfConstraints::add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, 
 		       });
 }
 
+// Ax = b on node k
+int GraphOfConstraints::add_agent_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+
+			       // record that this constraint is statically assigned to this robot.
+			       _phi_to_static_assignment_map[phi_id] = robot_id;
+
+			       const int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
+			       auto beq = prog.AddLinearEqualityConstraint(A, b, agent_config_k);
+		       });
+}
+
+// lb <= A x <= ub on node k
+int GraphOfConstraints::add_agent_linear_ineq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
+	return _add_op(DeferredOpKind::kLinearIneq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+
+			       // record that this constraint is statically assigned to this robot.
+			       _phi_to_static_assignment_map[phi_id] = robot_id;
+
+			       const int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
+			       auto constraint = prog.AddLinearConstraint(A, lb, ub, agent_config_k);
+		       });
+}
+
+
 // Single-Agent Constraint Adders (typed)
 // Note: these copy the numpy array's passed to them, but they're called
 // once so it's fine.
@@ -538,7 +583,9 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 	int k,
 	int robot_id, // std::string robot_model_name,
 	int cube_id, // std::string cube_model_name,
-	double delta_z) {
+	double delta_z,
+	double x_offset,
+	double y_offset) {
 
 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
 	// DRAKE_DEMAND(agent_i >= 0 && agent_i < num_agents);
@@ -574,8 +621,8 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 
 			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
 			       Eigen::Vector3<Expression> g;
-			       g << (X_WR.translation().x() - X_WC.translation().x()),
-				       (X_WR.translation().y() - X_WC.translation().y()),
+			       g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
+				       (X_WR.translation().y() - X_WC.translation().y() - y_offset),
 				       (X_WR.translation().z() - X_WC.translation().z() - delta_z);
 
 			       // dp_expr has no free symbols (only constants), so Evaluate(...) -> double works.
@@ -620,8 +667,8 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 
 			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
 			       Eigen::Vector3<Expression> g;
-			       g << (X_WR.translation().x() - X_WC.translation().x()),
-				       (X_WR.translation().y() - X_WC.translation().y()),
+			       g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
+				       (X_WR.translation().y() - X_WC.translation().y() - y_offset),
 				       (X_WR.translation().z() - X_WC.translation().z() - delta_z);
 
 			       prog.AddConstraint(g, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
