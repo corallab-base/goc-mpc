@@ -711,6 +711,12 @@ bool GraphWaypointMPC::solve(
 		// best.best_agent_of_row holds the optimal assignment pattern.
 		// best.best_X holds the continuous solution for that pattern.
 
+		// For mosek specifically
+		// Get the SNOPT-specific solver details.
+		const drake::solvers::MosekSolverDetails& details =
+			result.get_solver_details<drake::solvers::MosekSolver>();
+		_last_solve_time = details.optimizer_time;
+
 		const int num_remaining_nodes = remaining_vertices.size();
 		const int num_subgraph_assignables = problem.Assignments.rows();
 		const int num_phis = _graph->num_phis;

@@ -20,6 +20,7 @@ class GraphOfConstraintsMPC():
             graph: GraphOfConstraints,
             spline_spec: list[Block],
             time_delta_cutoff: float = 0.4,
+            phi_tolerance: float = 0.03,
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
             max_vel: float = -1.0,
@@ -42,6 +43,7 @@ class GraphOfConstraintsMPC():
         
         # configuration
         self.time_delta_cutoff = time_delta_cutoff
+        self.phi_tolerance = phi_tolerance
         self.time_cost = 1.0
         self.ctrl_cost = 1.0
 
@@ -68,7 +70,7 @@ class GraphOfConstraintsMPC():
 
             for node in passed_nodes:
                 all_phis_satisfied = all(
-                    [self.graph.evaluate_phi(phi_id, x, assignments, 0.03)
+                    [self.graph.evaluate_phi(phi_id, x, assignments, self.phi_tolerance)
                      for phi_id in self.graph.get_phi_ids(node)])
 
                 if all_phis_satisfied:

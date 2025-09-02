@@ -61,6 +61,9 @@ struct GraphWaypointMPC {
 	// _var_assignments is (_graph.num_variables,)
 	Eigen::VectorXi _var_assignments;
 
+	// Recording Metrics
+	double _last_solve_time;
+
 	// Constructor
 	GraphWaypointMPC(GraphOfConstraints& graph,
 			 std::vector<CubicConfigurationSpline> splines);
@@ -77,4 +80,6 @@ struct GraphWaypointMPC {
 	const Eigen::MatrixXd &view_waypoints() { return _waypoints; }
 	const Eigen::VectorXi &view_assignments() { return _assignments; }
 	const Eigen::VectorXi &view_var_assignments() { return _var_assignments; }
+	const double get_last_solve_time() { return _last_solve_time; }
+
 };

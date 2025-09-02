@@ -52,6 +52,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
 		.def("add_agents_linear_eq", &GraphOfConstraints::add_agents_linear_eq)
 		.def("add_agent_linear_eq", &GraphOfConstraints::add_agent_linear_eq)
+		.def("add_agent_pos_linear_eq", &GraphOfConstraints::add_agent_pos_linear_eq)
+		.def("add_agent_quat_linear_eq", &GraphOfConstraints::add_agent_quat_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
 		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,
 		     py::arg("k"),
@@ -60,6 +62,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("delta_z"),
 		     py::arg("x_offset") = 0.0,
 		     py::arg("y_offset") = 0.0)
+		.def("add_point_to_point_displacement_constraint", &GraphOfConstraints::add_point_to_point_displacement_constraint)
+		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint)
 		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint);
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
@@ -68,7 +72,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("solve", &GraphWaypointMPC::solve)
 		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
 		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal)
-		.def("view_var_assignments", &GraphWaypointMPC::view_var_assignments, py::return_value_policy::reference_internal);
+		.def("view_var_assignments", &GraphWaypointMPC::view_var_assignments, py::return_value_policy::reference_internal)
+		.def("get_last_solve_time", &GraphWaypointMPC::get_last_solve_time);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
                 .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double>(),

@@ -448,6 +448,48 @@ int GraphOfConstraints::add_agent_linear_ineq(int k, int robot_id, const Eigen::
 		       });
 }
 
+int GraphOfConstraints::add_agent_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+
+			       // record that this constraint is statically assigned to this robot.
+			       _phi_to_static_assignment_map[phi_id] = robot_id;
+
+			       const int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable agent_pos_k = X.row(node_k).segment(robot_id*dim, 3);
+			       auto beq = prog.AddLinearEqualityConstraint(A, b, agent_pos_k);
+		       });
+}
+
+int GraphOfConstraints::add_agent_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       return 0.0;
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&) {
+
+			       // record that this constraint is statically assigned to this robot.
+			       _phi_to_static_assignment_map[phi_id] = robot_id;
+
+			       const int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable agent_quat_k = X.row(node_k).segment(robot_id*dim + 3, 4);
+			       auto beq = prog.AddLinearEqualityConstraint(A, b, agent_quat_k);
+		       });
+}
+
 
 // Single-Agent Constraint Adders (typed)
 // Note: these copy the numpy array's passed to them, but they're called
@@ -723,7 +765,107 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 }
 
 
+int GraphOfConstraints::add_point_to_point_displacement_constraint(
+	int k,
+	int point_a,
+	int point_b,
+	Eigen::Vector3d& disp) {
 
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(point_a >= 0 && point_a < num_objects);
+	DRAKE_DEMAND(point_b >= 0 && point_b < num_objects);
+
+	const int objs_start = num_agents * dim;
+	const int startA = objs_start + point_a * non_robot_dim;
+	const int startB = objs_start + point_b * non_robot_dim;
+
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       Eigen::Vector3d pA = x.segment(startA, 3);
+			       Eigen::Vector3d pB = x.segment(startB, 3);
+			       Eigen::Vector3d r  = (pB - pA) - disp;   // want r == 0
+			       std::cout << "pA: " << pA << std::endl;
+			       std::cout << "pB: " << pB << std::endl;
+			       std::cout << "r: " << r << std::endl;
+			       return r.norm();
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&... /*unused*/) {
+			       const unsigned int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable row = X.row(node_k);
+
+			       VectorXDecisionVariable pA = row.segment(startA, 3);
+			       VectorXDecisionVariable pB = row.segment(startB, 3);
+
+			       // Enforce pB - pA = disp  (3 scalar equalities)
+			       prog.AddLinearEqualityConstraint(pB - pA, disp);
+		       }
+		);
+}
+
+int GraphOfConstraints::add_point_to_point_alignment_constraint(
+	int k,
+	int point_a,
+	int point_b,
+	const Eigen::Vector3d& dir_W) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(point_a >= 0 && point_a < num_objects);
+	DRAKE_DEMAND(point_b >= 0 && point_b < num_objects);
+	DRAKE_DEMAND(dir_W.norm() > 1e-12 && "Alignment direction must be nonzero.");
+
+	const int objs_start = num_agents * dim;
+	const int startA = objs_start + point_a * non_robot_dim;
+	const int startB = objs_start + point_b * non_robot_dim;
+
+	// Build an orthonormal basis {u1,u2,û} with û = dir/||dir||.
+	const Eigen::Vector3d uhat = dir_W.normalized();
+
+	// Pick a helper axis not (near-)parallel to û for stable cross product.
+	Eigen::Vector3d a;
+	if (std::abs(uhat.x()) <= std::abs(uhat.y()) && std::abs(uhat.x()) <= std::abs(uhat.z()))
+		a = Eigen::Vector3d::UnitX();
+	else if (std::abs(uhat.y()) <= std::abs(uhat.x()) && std::abs(uhat.y()) <= std::abs(uhat.z()))
+		a = Eigen::Vector3d::UnitY();
+	else
+		a = Eigen::Vector3d::UnitZ();
+
+	const Eigen::Vector3d u1 = (uhat.cross(a)).normalized();
+	const Eigen::Vector3d u2 =  uhat.cross(u1);  // already unit, orthogonal to u1
+
+	return _add_op(DeferredOpKind::kNonlinearEq, k,
+		       [=, this](const Eigen::VectorXd& x, const int... /*unused*/) {
+			       const Eigen::Vector3d pA = x.segment(startA, 3);
+			       const Eigen::Vector3d pB = x.segment(startB, 3);
+			       const Eigen::Vector3d d  = (pB - pA);
+			       Eigen::Vector2d r;
+			       r << u1.dot(d), u2.dot(d);
+			       return r.norm();
+		       }, [=, this](auto& prog,
+				    const SubgraphOfConstraints& subgraph,
+				    const int /*phi_id*/,
+				    const auto& X,
+				    const auto&... /*unused*/) {
+			       const int sg_k = subgraph.subgraph_id(k);
+			       Eigen::RowVectorX<Expression> row = X.row(sg_k).template cast<Expression>();
+
+			       const Eigen::Matrix<Expression,3,1> pA = row.segment(startA, 3).transpose();
+			       const Eigen::Matrix<Expression,3,1> pB = row.segment(startB, 3).transpose();
+			       const Eigen::Matrix<Expression,3,1> d  = (pB - pA);
+
+			       prog.AddLinearEqualityConstraint(u1.transpose().cast<Expression>() * d, 0.0);
+			       prog.AddLinearEqualityConstraint(u2.transpose().cast<Expression>() * d, 0.0);
+
+			       // OPTIONAL (if you want to forbid the opposite direction and enforce same orientation):
+			       //    uhatᵀ (pB - pA) ≥ 0   (also linear)
+			       // prog.AddLinearConstraint(uhat.transpose().cast<Expression>() * d, 0.0,
+			       //                          std::numeric_limits<double>::infinity());
+		       });
+}
 
 // EDGE-CONSTRAINTS
 
