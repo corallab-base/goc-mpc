@@ -75,8 +75,6 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			problem.prog->AddQuadraticCost(dist);
 		}
 
-		// TODO: Acknowledge when they move with the robot
-
 		// Second, for the source nodes, add CONSTRAINTS saything that a block
 		// does not move from x0 unless it is moved.
 		for (int obj = 0; obj < num_objects; ++obj) {
@@ -105,14 +103,15 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			// this callback is called for all u, v where u is in
 			// the layers less than or equal to k (the current) to
 			// any layer greater than k, before moving on to
-			// processing layer k+1.  Therefore, is can be used to
+			// processing layer k+1.  Therefore, it can be used to
 			// accumulate all the possibly manipulated cubes before
 			// nodes in layer k+1.
-			if (graph->edge_to_phi_map.contains(std::make_pair(u, v))) {
-				int edge_phi_id = graph->edge_to_phi_map.at(std::make_pair(u, v));
-				DeferredEdgeOp& op = graph->edge_ops.at(edge_phi_id);
-				possibly_manipulated_cubes_during_each_layer[level_k].insert(
-					op.cubes.begin(), op.cubes.end());
+			if (graph->edge_to_phis_map.contains(std::make_pair(u, v))) {
+				for (int edge_phi_id : graph->edge_to_phis_map.at(std::make_pair(u, v))) {
+					DeferredEdgeOp& op = graph->edge_ops.at(edge_phi_id);
+					possibly_manipulated_cubes_during_each_layer[level_k].insert(
+						op.cubes.begin(), op.cubes.end());
+				}
 			}
 		});
 
@@ -151,6 +150,9 @@ GraphWaypointProblem build_graph_waypoint_problem(
 					// std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;
 					problem.prog->AddLinearEqualityConstraint(
 						X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim));
+				} else {
+					// TODO: enforce rigidity among robot and other manipulated points
+					;
 				}
 			} else {
 				// std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;

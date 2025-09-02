@@ -101,15 +101,15 @@ struct GraphOfConstraints {
 	const std::vector<std::string> _robot_names;
 	const std::vector<std::string> _object_names;
 	Graph<py::object> structure;
-	std::map<int, int> node_to_phi_map;
-	std::map<std::pair<int, int>, int> edge_to_phi_map;
+	std::map<int, std::vector<int>> node_to_phis_map;
+	std::map<std::pair<int, int>, std::vector<int>> edge_to_phis_map;
 
 	// Node Phi maps
 	std::map<int, int> phi_to_variable_map;
 	std::map<int, int> _phi_to_static_assignment_map;
 	std::map<int, struct DeferredOp> ops;
-	std::map<int, std::tuple<std::string, std::string, std::string>> _grasp_change_map;
-	std::map<int, std::pair<std::string, std::string>> _assignable_grasp_change_map;
+	std::map<int, std::vector<std::tuple<std::string, std::string, std::string>>> _grasp_change_map;
+	std::map<int, std::vector<std::pair<std::string, std::string>>> _assignable_grasp_change_map;
 
 	// Edge phi maps
 	// std::map<int, int> edge_phi_to_variable_map;
@@ -221,7 +221,7 @@ private:
 	template <typename EF, typename F>
 	int _add_op(DeferredOpKind kind, int node, EF&& eval_f, F&& f) {
 		const int id = num_phis++;
-		node_to_phi_map[node] = id;
+		node_to_phis_map[node].push_back(id);
 		ops[id] = DeferredOp{kind, id, node, std::forward<EF>(eval_f), std::forward<F>(f)};
 		return id;
 	}
@@ -229,7 +229,7 @@ private:
 	template <typename EF, typename F>
 	int _add_assignable_op(DeferredOpKind kind, int node, int var, EF&& eval_f, F&& f) {
 		const int id = num_phis++;
-		node_to_phi_map[node] = id;
+		node_to_phis_map[node].push_back(id);
 		phi_to_variable_map[id] = var;
 		ops[id] = DeferredOp{kind, id, node, std::forward<EF>(eval_f), std::forward<F>(f)};
 		return id;
@@ -238,7 +238,7 @@ private:
 	template <typename EF, typename WF, typename SF>
 	int _add_edge_op(DeferredOpKind kind, int u, int v, std::set<int> cubes, EF&& eval_f, WF&& wp_f, SF&& sp_f) {
 		const int id = num_edge_phis++;
-		edge_to_phi_map[std::make_pair(u, v)] = id;
+		edge_to_phis_map[std::make_pair(u, v)].push_back(id);
 		edge_ops[id] = DeferredEdgeOp{kind, id, u, v, cubes,
 			std::forward<EF>(eval_f), std::forward<WF>(wp_f), std::forward<SF>(sp_f)};
 		return id;
@@ -247,7 +247,7 @@ private:
 	// template <typename F>
 	// int _add_assignable_edge_op(DeferredOpKind kind, int u, int v, int var, F&& f) {
 	// 	const int id = num_edge_phis++;
-	// 	edge_to_phi_map[std::make_pair(u, v)] = id;
+	// 	edge_to_phis_map[std::make_pair(u, v)].push_back(id);
 	// 	phi_to_variable_map[id] = var;
 	// 	edge_ops[id] = DeferredEdgeOp{kind, id, u, v, std::forward<F>(f)};
 	// 	return id;
@@ -275,19 +275,19 @@ struct SubgraphOfConstraints {
 		
 		for (int u : vertices) {
 			// if there is/are phi associated with v
-			if (graph->node_to_phi_map.contains(u)) {
-				// Store the relevant ops so they can be applied
-				const int phi_id = graph->node_to_phi_map.at(u);
-				_subgraph_ops[phi_id] = graph->ops.at(phi_id);
+			if (graph->node_to_phis_map.contains(u)) {
+				for (int phi_id : graph->node_to_phis_map.at(u)) {
+					_subgraph_ops[phi_id] = graph->ops.at(phi_id);
 
-				// Record the mapping from phi id to subgraph node and assignable var idxs.
-				if (graph->phi_to_variable_map.contains(phi_id)) {
-					const int variable_id = graph->phi_to_variable_map.at(phi_id);
-					
-					if (!_variable_to_subgraph_variable_id.contains(variable_id)) {
-						_variable_to_subgraph_variable_id[variable_id] = num_subgraph_variables++;
+					// Record the mapping from phi id to subgraph node and assignable var idxs.
+					if (graph->phi_to_variable_map.contains(phi_id)) {
+						const int variable_id = graph->phi_to_variable_map.at(phi_id);
+
+						if (!_variable_to_subgraph_variable_id.contains(variable_id)) {
+							_variable_to_subgraph_variable_id[variable_id] = num_subgraph_variables++;
+						}
+
 					}
-					
 				}
 			}
 		}
@@ -297,10 +297,11 @@ struct SubgraphOfConstraints {
 			int v = edge.e->to;
 			if (structure.contains_node(u) || structure.contains_node(v)) {
 				std::pair<int, int> e = std::make_pair(u, v);
-				if (graph->edge_to_phi_map.contains(e)) {
+				if (graph->edge_to_phis_map.contains(e)) {
 					// Store the relevant edge ops so they can be applied
-					const int edge_phi_id = graph->edge_to_phi_map.at(e);
-					_subgraph_edge_ops[edge_phi_id] = graph->edge_ops.at(edge_phi_id);
+					for (int edge_phi_id : graph->edge_to_phis_map.at(e)) {
+						_subgraph_edge_ops[edge_phi_id] = graph->edge_ops.at(edge_phi_id);
+					}
 				}
 			}
 		}

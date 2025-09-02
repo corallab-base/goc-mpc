@@ -98,36 +98,38 @@ std::tuple<std::vector<std::optional<int>>,
 	std::vector<std::optional<int>> parents = sg.bfs_visit_from_sources(
 		[this, &assignments, &agent_nodes, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
 		(int node, int depth, std::optional<int> parent) {
-			int assignment = -1;
-			if (node_to_phi_map.contains(node)) {
-				const int phi_id = node_to_phi_map.at(node);
-				assignment = assignments(phi_id);
+			if (node_to_phis_map.contains(node)) {
+				for (int phi_id : node_to_phis_map.at(node)) {
+					int assignment = -1;
 
-				// std::cout << phi_id << " belonging to " << node << " is dynamically assigned to " << assignment << std::endl;
+					assignment = assignments(phi_id);
 
-				if (_phi_to_static_assignment_map.contains(phi_id) && assignment != -1) {
-					std::cout << "_phi_to_static_assignment_map for " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
-					throw std::runtime_error("conflicting assignment");
-				} else if (_phi_to_static_assignment_map.contains(phi_id)) {
-					assignment = _phi_to_static_assignment_map.at(phi_id);
-					// std::cout << phi_id << " belonging to " << node << " is statically assigned to " << assignment << std::endl;
-				}
+					// std::cout << phi_id << " belonging to " << node << " is dynamically assigned to " << assignment << std::endl;
 
-				// TODO: Clean this up for the case where there
-				// might be multiple phi's on a single node and
-				// we should add the nodes multiple times.
-				if (assignment == -1) {
-					// std::cout << "adding node for all by default" << std::endl;
-					for (int ag = 0; ag < num_agents; ++ag) {
-						int depth = agent_nodes[ag].size();
-						agent_nodes[ag].push_back(node);
-						node_to_agent_and_depth_pairs_map[node].emplace_back(ag, depth);
+					if (_phi_to_static_assignment_map.contains(phi_id) && assignment != -1) {
+						std::cout << "_phi_to_static_assignment_map for " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
+						throw std::runtime_error("conflicting assignment");
+					} else if (_phi_to_static_assignment_map.contains(phi_id)) {
+						assignment = _phi_to_static_assignment_map.at(phi_id);
+						// std::cout << phi_id << " belonging to " << node << " is statically assigned to " << assignment << std::endl;
 					}
-				} else {
-					int depth = agent_nodes[assignment].size();
-					// std::cout << "adding node " << node << " for " << assignment << std::endl;
-					agent_nodes[assignment].push_back(node);
-					node_to_agent_and_depth_pairs_map[node].emplace_back(assignment, depth);
+
+					// TODO: Clean this up for the case where there
+					// might be multiple phi's on a single node and
+					// we should add the nodes multiple times.
+					if (assignment == -1) {
+						// std::cout << "adding node for all by default" << std::endl;
+						for (int ag = 0; ag < num_agents; ++ag) {
+							int depth = agent_nodes[ag].size();
+							agent_nodes[ag].push_back(node);
+							node_to_agent_and_depth_pairs_map[node].emplace_back(ag, depth);
+						}
+					} else {
+						int depth = agent_nodes[assignment].size();
+						// std::cout << "adding node " << node << " for " << assignment << std::endl;
+						agent_nodes[assignment].push_back(node);
+						node_to_agent_and_depth_pairs_map[node].emplace_back(assignment, depth);
+					}
 				}
 			}
 
@@ -186,9 +188,10 @@ std::map<int, struct DeferredEdgeOp> GraphOfConstraints::get_next_edge_ops(const
 	std::map<int, struct DeferredEdgeOp> e_ops;
 
 	for (const auto& e : structure.incoming_cut_edges(remaining_vertices)) {
-		if (this->edge_to_phi_map.contains(e)) {
-			int edge_phi_id = this->edge_to_phi_map.at(e);
-			e_ops[edge_phi_id] = this->edge_ops.at(edge_phi_id);
+		if (this->edge_to_phis_map.contains(e)) {
+			for (int edge_phi_id : this->edge_to_phis_map.at(e)) {
+				e_ops[edge_phi_id] = this->edge_ops.at(edge_phi_id);
+			}
 		}
 	}
 
@@ -197,8 +200,10 @@ std::map<int, struct DeferredEdgeOp> GraphOfConstraints::get_next_edge_ops(const
 
 std::vector<int> GraphOfConstraints::get_phi_ids(int node) const {
 	// TODO: Maybe expand if nodes in the future support multiple phi ids (probably will).
-	std::vector<int> phi_ids = { node_to_phi_map.at(node) };
-	return phi_ids;
+	if (node_to_phis_map.contains(node)) {
+		return node_to_phis_map.at(node);
+	}
+	return std::vector<int>();
 }
 
 bool GraphOfConstraints::evaluate_phi(int phi_id,
@@ -240,7 +245,7 @@ void GraphOfConstraints::add_grasp_change(int phi_id,
 
 	std::string robot_model_name = _robot_names.at(robot_id);
 	std::string cube_model_name = _object_names.at(cube_id);
-	_grasp_change_map[phi_id] = std::make_tuple(command, robot_model_name, cube_model_name);
+	_grasp_change_map[phi_id].emplace_back(command, robot_model_name, cube_model_name);
 }
 
 
@@ -249,7 +254,7 @@ void GraphOfConstraints::add_assignable_grasp_change(int phi_id,
 						     std::string command,
 						     int cube_id) {
 	std::string cube_model_name = _object_names.at(cube_id);
-	_assignable_grasp_change_map[phi_id] = std::make_pair(command, cube_model_name);
+	_assignable_grasp_change_map[phi_id].emplace_back(command, cube_model_name);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraints::get_grasp_changes(int k, Eigen::VectorXi assignments) const {
@@ -257,7 +262,9 @@ std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraint
 
 	for (int phi_id : get_phi_ids(k)) {
 		if (_grasp_change_map.contains(phi_id)) {
-			changes.push_back(_grasp_change_map.at(phi_id));
+			for (const auto& change : _grasp_change_map.at(phi_id)) {
+				changes.push_back(change);
+			}
 		}
 
 		if (_assignable_grasp_change_map.contains(phi_id)) {
@@ -268,8 +275,11 @@ std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraint
 				throw std::runtime_error("Somehow constraint was not assigned.");
 			} else {
 				const std::string& robot_model_name = _robot_names.at(robot_id);
-				const auto& [command, cube_model_name] = _assignable_grasp_change_map.at(phi_id);
-				changes.push_back(std::make_tuple(command, robot_model_name, cube_model_name));
+				for (const auto& assignable_change : _assignable_grasp_change_map.at(phi_id)) {
+					const std::string& command = assignable_change.first;
+					const std::string& cube_model_name = assignable_change.second;
+					changes.push_back(std::make_tuple(command, robot_model_name, cube_model_name));
+				}
 			}
 		}
 	}
