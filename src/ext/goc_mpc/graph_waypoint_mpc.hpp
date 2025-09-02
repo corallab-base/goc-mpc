@@ -6,6 +6,7 @@
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/ipopt_solver.h>
 #include <drake/solvers/branch_and_bound.h>
+#include <drake/solvers/snopt_solver.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
 #include "drake/solvers/solve.h"
@@ -27,10 +28,12 @@ struct GraphWaypointProblem {
 	std::unique_ptr<SubgraphOfConstraints> subgraph;
 	drake::solvers::MatrixXDecisionVariable Assignments;
 	drake::solvers::MatrixXDecisionVariable X;
+	std::unique_ptr<drake::solvers::Binding<drake::solvers::BoundingBoxConstraint>> A_bounds;
 
 	GraphWaypointProblem()
 		: prog(nullptr),
-		  subgraph(nullptr) {}
+		  subgraph(nullptr),
+		  A_bounds(nullptr) {}
 
 	GraphWaypointProblem(const GraphWaypointProblem&) = delete;
 	GraphWaypointProblem& operator=(const GraphWaypointProblem&) = delete;

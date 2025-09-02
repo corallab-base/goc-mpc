@@ -536,9 +536,9 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 }
 
 template <typename T>
-void GraphOfConstraints::_set_configuration(
+void GraphOfConstraints::set_configuration(
 	std::unique_ptr<drake::systems::Context<T>>& context,
-	Eigen::VectorX<T>& q_all) {
+	const Eigen::VectorX<T>& q_all) const {
 
 	using drake::multibody::JointIndex;
 	using drake::multibody::ModelInstanceIndex;
@@ -552,6 +552,42 @@ void GraphOfConstraints::_set_configuration(
 		const auto& mi = _plant->GetModelInstanceByName(r_name);
 
 		if (r_name.find("free_body") != std::string::npos) {
+
+
+			// Eigen::Vector3<T> p_W;
+			// p_W << q_all.segment(i, 3);
+			// i += 3;
+
+			// const T w = q_all(i + 0);
+			// const T x = q_all(i + 1);
+			// const T y = q_all(i + 2);
+			// const T z = q_all(i + 3);
+			// i += 4;
+
+			// // Normalize without branches (smooth except at norm2 = 0).
+			// const T norm2 = w*w + x*x + y*y + z*z;
+			// // Strongly recommend: add equality constraint norm2 == 1 in the program.
+			// const T s  = T(1) / norm2;   // 1 / |q|^2
+			// const T s2 = T(2) * s;       // 2 / |q|^2
+
+			// Eigen::Matrix<T,3,3> Rm;
+			// Rm(0,0) = T(1) - s2*(y*y + z*z);
+			// Rm(0,1) =       s2*(x*y - w*z);
+			// Rm(0,2) =       s2*(x*z + w*y);
+
+			// Rm(1,0) =       s2*(x*y + w*z);
+			// Rm(1,1) = T(1) - s2*(x*x + z*z);
+			// Rm(1,2) =       s2*(y*z - w*x);
+
+			// Rm(2,0) =       s2*(x*z - w*y);
+			// Rm(2,1) =       s2*(y*z + w*x);
+			// Rm(2,2) = T(1) - s2*(x*x + y*y);
+
+			// drake::math::RotationMatrix<T> R_WB(Rm);
+			// const drake::math::RigidTransform<T> X_WB(R_WB, p_W);
+
+			// const auto& body = _plant->GetBodyByName("ee_link", mi);
+			// _plant->SetFreeBodyPose(context.get(), body, X_WB);
 
 			Eigen::Vector3<T> p_W;
 			p_W << q_all.segment(i, 3);
@@ -622,7 +658,7 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 			       Eigen::VectorX<Expression> q_all = x.cast<Expression>();
 
 			       auto context = _plant->CreateDefaultContext();
-			       _set_configuration(context, q_all);
+			       set_configuration(context, q_all);
 
 			       const RigidTransform<Expression> X_WR =
 				       _plant->EvalBodyPoseInWorld(*context, robot_body);
@@ -665,7 +701,7 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 
 			       // Context<Expression> with these positions.
 			       auto context = _plant->CreateDefaultContext();
-			       _set_configuration(context, q_all);
+			       set_configuration(context, q_all);
 
 			       // World poses of each model's body.
 			       const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
@@ -708,7 +744,7 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	const ModelInstanceIndex robot_mi = _plant->GetModelInstanceByName(robot_model_name);
 	const ModelInstanceIndex cube_mi  = _plant->GetModelInstanceByName(cube_model_name);
 
-	return _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({cube_id}),
+	int edge_phi_id = _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({cube_id}),
 			    [=, this](const Eigen::VectorXd& x,
 				      const Eigen::VectorXi&/*unused*/) {
 				    using drake::math::RigidTransform;
@@ -721,7 +757,7 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				    Eigen::VectorX<Expression> q_all = x.cast<Expression>();
 
 				    auto context = _plant->CreateDefaultContext();
-				    _set_configuration(context, q_all);
+				    set_configuration(context, q_all);
 
 				    const RigidTransform<Expression> X_WR =
 					    _plant->EvalBodyPoseInWorld(*context, robot_body);
@@ -757,7 +793,7 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 					    for (int j = 0; j < total_dim; ++j) q_all(j) = Expression(X(graph_row, j));
 
 					    auto context = _plant->CreateDefaultContext();
-					    _set_configuration(context, q_all);
+					    set_configuration(context, q_all);
 
 					    const RigidTransform<Expression> X_WR =
 						    _plant->EvalBodyPoseInWorld(*context, robot_body);
@@ -785,4 +821,9 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 			       const drake::solvers::MatrixXDecisionVariable& Xi) {
 				    // std::cout << "adding edge op for short path" << std::endl;
 			    });
+
+	// record that this constraint is statically assigned to this robot.
+	_edge_phi_to_static_assignment_map[edge_phi_id] = robot_id;
+
+	return edge_phi_id;
 }

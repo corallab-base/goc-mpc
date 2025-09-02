@@ -114,6 +114,7 @@ struct GraphOfConstraints {
 	// Edge phi maps
 	// std::map<int, int> edge_phi_to_variable_map;
 	std::map<int, struct DeferredEdgeOp> edge_ops;
+	std::map<int, int> _edge_phi_to_static_assignment_map;
 
 	// Rest
 	int num_phis, num_edge_phis, num_variables, _num_total_assignables;
@@ -210,13 +211,20 @@ struct GraphOfConstraints {
 					      int cube_id,
 					      double holding_distance_max = 0.1);
 
+	int add_robot_holding_points_constraint(int u,
+						int v,
+						int robot_id,
+						int point_ids,
+						double holding_distance_max = 0.1);
 
+
+
+	template <typename T>
+	void set_configuration(
+		std::unique_ptr<drake::systems::Context<T>>& context,
+		const Eigen::VectorX<T>& q_all) const;
 
 private:
-	template <typename T>
-	void _set_configuration(
-		std::unique_ptr<drake::systems::Context<T>>& context,
-		Eigen::VectorX<T>& q_all);
 
 	template <typename EF, typename F>
 	int _add_op(DeferredOpKind kind, int node, EF&& eval_f, F&& f) {
