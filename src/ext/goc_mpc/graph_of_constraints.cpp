@@ -99,6 +99,8 @@ std::tuple<std::vector<std::optional<int>>,
 		[this, &assignments, &agent_nodes, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
 		(int node, int depth, std::optional<int> parent) {
 			if (node_to_phis_map.contains(node)) {
+				std::set<int> assignments_for_node;
+
 				for (int phi_id : node_to_phis_map.at(node)) {
 					int assignment = -1;
 
@@ -120,16 +122,17 @@ std::tuple<std::vector<std::optional<int>>,
 					if (assignment == -1) {
 						// std::cout << "adding node for all by default" << std::endl;
 						for (int ag = 0; ag < num_agents; ++ag) {
-							int depth = agent_nodes[ag].size();
-							agent_nodes[ag].push_back(node);
-							node_to_agent_and_depth_pairs_map[node].emplace_back(ag, depth);
+							assignments_for_node.insert(ag);
 						}
 					} else {
-						int depth = agent_nodes[assignment].size();
-						// std::cout << "adding node " << node << " for " << assignment << std::endl;
-						agent_nodes[assignment].push_back(node);
-						node_to_agent_and_depth_pairs_map[node].emplace_back(assignment, depth);
+						assignments_for_node.insert(assignment);
 					}
+				}
+
+				for (int assignment : assignments_for_node) {
+					int depth = agent_nodes[assignment].size();
+					agent_nodes[assignment].push_back(node);
+					node_to_agent_and_depth_pairs_map[node].emplace_back(assignment, depth);
 				}
 			}
 
