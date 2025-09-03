@@ -7,7 +7,8 @@
 #include <drake/solvers/branch_and_bound.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
-#include "drake/solvers/solve.h"
+#include <drake/solvers/solve.h>
+#include <drake/common/timer.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -60,6 +61,10 @@ struct GraphShortPathMPC {
 	Eigen::MatrixXd _points;
 	Eigen::MatrixXd _vels;
 
+	// Recording Metrics
+	drake::SteadyTimer _timer;
+	double _last_solve_time;
+
 	// Constructor
 	GraphShortPathMPC(const GraphOfConstraints& graph,
 			  unsigned int num_steps,
@@ -77,4 +82,5 @@ struct GraphShortPathMPC {
 	const Eigen::MatrixXd &view_points() { return _points; }
 	const Eigen::MatrixXd &view_vels() { return _vels; }
 	const Eigen::VectorXd &view_times() { return _times; }
+	const double get_last_solve_time() { return _last_solve_time; }
 };

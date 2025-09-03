@@ -89,7 +89,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_vs_list", &GraphTimingMPC::view_vs_list)
 		.def("view_time_deltas_list", &GraphTimingMPC::view_time_deltas_list)
 		.def("view_agent_nodes_list", &GraphTimingMPC::view_agent_nodes_list)
-		.def("view_agent_spline_length_map", &GraphTimingMPC::view_agent_spline_length_map);
+		.def("view_agent_spline_length_map", &GraphTimingMPC::view_agent_spline_length_map)
+		.def("get_last_solve_time", &GraphTimingMPC::get_last_solve_time);
 
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
                 .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double>(),
@@ -97,5 +98,6 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("solve", &GraphShortPathMPC::solve)
 		.def("view_points", &GraphShortPathMPC::view_points, py::return_value_policy::reference_internal)
 		.def("view_vels", &GraphShortPathMPC::view_vels, py::return_value_policy::reference_internal)
-		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal);
+		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal)
+		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time);
 }

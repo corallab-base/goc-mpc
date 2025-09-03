@@ -7,7 +7,8 @@
 #include <drake/solvers/branch_and_bound.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
-#include "drake/solvers/solve.h"
+#include <drake/solvers/solve.h>
+#include <drake/common/timer.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -95,6 +96,10 @@ struct GraphTimingMPC {
 	// py::array_t<unsigned int> back_tracking_table;
 	// bool never_done = false;
 
+	// Recording Metrics
+	drake::SteadyTimer _timer;
+	double _last_solve_time;
+
 	// Constructor
 	GraphTimingMPC(const GraphOfConstraints& graph,
 		       std::vector<CubicConfigurationSpline> splines,
@@ -138,6 +143,7 @@ struct GraphTimingMPC {
 	const std::vector<Eigen::VectorXd> &view_time_deltas_list() const { return _time_deltas_list; }
 	const std::vector<std::vector<int>> &view_agent_nodes_list() const { return _agent_nodes_list; }
 	const std::map<int, int> &view_agent_spline_length_map() const { return _agent_spline_length_map; }
+	const double get_last_solve_time() { return _last_solve_time; }
 
 	// State updates
 	// bool set_progressed_time(double time_delta, double time_delta_cutoff);

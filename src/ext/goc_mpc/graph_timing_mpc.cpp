@@ -502,6 +502,8 @@ bool GraphTimingMPC::solve(
 	const Eigen::MatrixXd& waypoints,
 	const Eigen::VectorXi& assignments) {
 
+	_timer.Start();
+
 	/* after the individual agents' positions are totally ordered we
 	 * construct each agent's spline. */
 
@@ -566,9 +568,14 @@ bool GraphTimingMPC::solve(
 	_agent_nodes_list = problem.agent_nodes_list;
 
 	// Solve
+	// drake::solvers::IpoptSolver solver;
+	// auto result = solver.Solve(*problem.prog);
 	auto result = drake::solvers::Solve(*problem.prog);
 
 	if (result.is_success()) {
+
+		_last_solve_time = _timer.Tick();
+
 		for (int i = 0; i < _graph->num_agents; ++i) {
 			Eigen::MatrixXd vs = result.GetSolution(problem.vs_list[i]);
 			Eigen::VectorXd taus = result.GetSolution(problem.time_deltas_list[i]);

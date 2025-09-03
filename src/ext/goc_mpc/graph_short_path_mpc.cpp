@@ -129,6 +129,8 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 			      const std::vector<int>& remaining_vertices,
 			      const std::vector<CubicConfigurationSpline>& references) {
 
+	_timer.Start();
+
 	int a_dim = references.at(0).ambient_dim();
 	int t_dim = references.at(0).tangent_dim();
 
@@ -153,6 +155,8 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 	auto result = drake::solvers::Solve(*problem.prog);
 
 	if (result.is_success()) {
+		_last_solve_time = _timer.Tick();
+
 		_points = result.GetSolution(problem.Xi);
 		_vels = result.GetSolution(problem.V);
 		return true;

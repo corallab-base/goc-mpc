@@ -9,7 +9,8 @@
 #include <drake/solvers/snopt_solver.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
-#include "drake/solvers/solve.h"
+#include <drake/solvers/solve.h>
+#include <drake/common/timer.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -62,6 +63,7 @@ struct GraphWaypointMPC {
 	Eigen::VectorXi _var_assignments;
 
 	// Recording Metrics
+	drake::SteadyTimer _timer;
 	double _last_solve_time;
 
 	// Constructor

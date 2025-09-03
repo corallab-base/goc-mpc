@@ -687,6 +687,8 @@ bool GraphWaypointMPC::solve(
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
+	_timer.Start();
+
 	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0);
 
 	// // Enumerate per-row choices (all agents, or pruned)
@@ -707,15 +709,8 @@ bool GraphWaypointMPC::solve(
 	// if (best.success) {
 
 	if (result.is_success()) {
-		// std::cout << "Best cost: " << best.best_cost << "\n";
-		// best.best_agent_of_row holds the optimal assignment pattern.
-		// best.best_X holds the continuous solution for that pattern.
 
-		// For mosek specifically
-		// Get the SNOPT-specific solver details.
-		const drake::solvers::MosekSolverDetails& details =
-			result.get_solver_details<drake::solvers::MosekSolver>();
-		_last_solve_time = details.optimizer_time;
+		_last_solve_time = _timer.Tick();
 
 		const int num_remaining_nodes = remaining_vertices.size();
 		const int num_subgraph_assignables = problem.Assignments.rows();
