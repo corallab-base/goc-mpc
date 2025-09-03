@@ -13,7 +13,7 @@ from pydrake.multibody.math import SpatialVelocity
 from pydrake.geometry import HalfSpace, Box, Rgba, SceneGraph, StartMeshcat, MeshcatVisualizer
 from pydrake.systems.framework import DiagramBuilder
 from pydrake.systems.analysis import Simulator
-from pydrake.math import RollPitchYaw, RigidTransform
+from pydrake.math import RollPitchYaw, RigidTransform, RotationMatrix
 
 import corallab_assets
 import goc_mpc
@@ -176,8 +176,9 @@ class SimpleDrakeGym:
         spacing = 1.0
 
         # Helpers
-        def _place_free_or_q(mi, xyz):
+        def _place_free_or_q(mi, xyz, quat=[1.0, 0.0, 0.0, 0.0]):
             x, y, z = xyz
+            matrix = RotationMatrix(Quaternion(quat))
             # Try to set a free-body pose on a likely root body (named "anchor" if present).
             body = None
             try:
@@ -190,7 +191,7 @@ class SimpleDrakeGym:
 
             if body is not None:
                 try:
-                    self.plant.SetFreeBodyPose(self.plant_context, body, RigidTransform([x, y, z]))
+                    self.plant.SetFreeBodyPose(self.plant_context, body, RigidTransform(matrix, [x, y, z]))
                     return
                 except Exception:
                     pass  # not a free body; fall through
@@ -203,10 +204,10 @@ class SimpleDrakeGym:
             self.plant.SetPositions(self.plant_context, mi, q_i)
 
         for i, mi in enumerate(self._controlled):
-            _place_free_or_q(mi, (i * spacing + 0.5, 0.1, 1.0))
+            _place_free_or_q(mi, (i * spacing + 0.5, 0.1, 1.0), quat=[0.0, 0.0, 1.0, 0.0])
 
         for i, mi in enumerate(self._passive):
-            _place_free_or_q(mi, (i * spacing + 0.25, 0.5, 0.1))
+            _place_free_or_q(mi, (i * spacing + 0.25, 0.5, 0.1), quat=[1.0, 0.0, 0.0, 0.0])
 
         # --- Cache defaults & show initial frame ---
         self._q_default = self._get_q()
