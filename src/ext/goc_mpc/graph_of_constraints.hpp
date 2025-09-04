@@ -206,6 +206,16 @@ struct GraphOfConstraints {
 					    double x_offset = 0.0,
 					    double y_offset = 0.0);
 
+	int add_assignable_robot_to_point_displacement_constraint(int k,
+								  int var,
+								  int point_id,
+								  const Eigen::Vector3d& disp);
+
+	int add_robot_to_point_displacement_constraint(int k,
+						       int robot_id,
+						       int point_id,
+						       Eigen::Vector3d& disp);
+
 	int add_point_to_point_displacement_constraint(int k,
 						       int point_a,
 						       int point_b,
@@ -217,6 +227,12 @@ struct GraphOfConstraints {
 						    const Eigen::Vector3d& dir_W);
 
 	// EDGE CONSTRAINTS
+
+	// int add_assignable_robot_holding_point_constraint(int u,
+	// 						  int v,
+	// 						  int var,
+	// 						  std::vector<int> points,
+	// 						  double max_distance = 0.1);
 
 	int add_robot_holding_cube_constraint(int u,
 					      int v,

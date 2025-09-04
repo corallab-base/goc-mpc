@@ -3,6 +3,7 @@
 using Eigen::VectorX;
 using drake::symbolic::Expression;
 using drake::symbolic::Variable;
+using drake::solvers::MathematicalProgramResult;
 
 using namespace pybind11::literals;
 namespace py = pybind11;
@@ -143,22 +144,37 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 		ref_velocities.block(0, ag * t_dim, _num_steps, t_dim) = qdot_ag;
 	}
 
-	struct ShortPathProblem problem = build_short_path_problem(_graph,
-								   ref_points,
-								   ref_velocities,
-								   x0, v0,
-								   var_assignments,
-								   remaining_vertices,
-								   _time_per_step);
+	std::unique_ptr<ShortPathProblem> problem;
+	try {
+		problem = std::make_unique<ShortPathProblem>(
+			build_short_path_problem(_graph,
+						 ref_points,
+						 ref_velocities,
+						 x0, v0,
+						 var_assignments,
+						 remaining_vertices,
+						 _time_per_step));
+	} catch (const std::exception& e) {
+		std::cout << "Caught exception in short path problem construction" << std::endl;
+		return false;
+	}
+
+
 
 	// Solve
-	auto result = drake::solvers::Solve(*problem.prog);
+	MathematicalProgramResult result;
+	try {
+		result = drake::solvers::Solve(*problem->prog);
+	} catch (const std::exception& e) {
+		std::cout << "Caught exception in solver" << std::endl;
+		return false;
+	}
 
 	if (result.is_success()) {
 		_last_solve_time = _timer.Tick();
 
-		_points = result.GetSolution(problem.Xi);
-		_vels = result.GetSolution(problem.V);
+		_points = result.GetSolution(problem->Xi);
+		_vels = result.GetSolution(problem->V);
 		return true;
 	} else {
 		return false;

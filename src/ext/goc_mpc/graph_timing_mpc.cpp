@@ -7,6 +7,100 @@ using namespace pybind11::literals;
 namespace py = pybind11;
 
 
+using drake::solvers::MathematicalProgram;
+using drake::solvers::MathematicalProgramResult;
+using drake::solvers::IpoptSolverDetails;
+
+inline void PrintSolverReport(const MathematicalProgram& prog,
+                              const MathematicalProgramResult& result,
+                              double tol = 1e-6) {
+	using std::cout;
+	using std::endl;
+
+	cout << "=== Drake Solve() Report ===\n";
+	cout << "Solver:           " << result.get_solver_id().name() << "\n";
+	// to_string(SolutionResult) is supported; if your Drake is older, cast to int.
+	cout << "SolutionResult:   " << to_string(result.get_solution_result()) << "\n";
+	cout << "Success?          " << (result.is_success() ? "yes" : "no") << "\n";
+
+	// Print optimal cost if available.
+	if (std::isfinite(result.get_optimal_cost())) {
+		cout << "Optimal cost:     " << result.get_optimal_cost() << "\n";
+	}
+
+	// Try to obtain a decision vector to evaluate constraints.
+	Eigen::VectorXd x;
+	bool have_x = false;
+	try {
+		x = result.GetSolution(prog.decision_variables());
+		have_x = true;
+	} catch (const std::exception&) {
+		// Fall back to initial guess (may be zero) if solver did not return x.
+		if (prog.decision_variables().size() > 0) {
+			x = prog.initial_guess();
+			have_x = true;
+			cout << "(No returned solution vector; using initial guess for diagnostics.)\n";
+		}
+	}
+
+	// Constraint violation scan.
+	if (have_x) {
+		auto print_binding_violation = [&](const auto& bindings, const char* kind) {
+			for (const auto& b : bindings) {
+				const auto& c = *b.evaluator();
+				double tol = 0.05;
+				if (!c.CheckSatisfied(x, tol)) {
+					cout << "Violation [" << kind << "]: "
+					     << " (constraint: " << c.get_description() << ")\n";
+				}
+			}
+		};
+
+		cout << "--- Constraint violations (inf-norm > " << tol << ") ---\n";
+		print_binding_violation(prog.bounding_box_constraints(),   "BoundingBox");
+		print_binding_violation(prog.linear_equality_constraints(),"LinEq");
+		print_binding_violation(prog.linear_constraints(),         "LinIneq");
+		print_binding_violation(prog.lorentz_cone_constraints(),   "Lorentz");
+		print_binding_violation(prog.rotated_lorentz_cone_constraints(),"RotLorentz");
+		print_binding_violation(prog.quadratic_constraints(),      "Quadratic");
+		print_binding_violation(prog.exponential_cone_constraints(),"ExpCone");
+		print_binding_violation(prog.generic_constraints(),        "Generic");
+		// print_binding_violation(prog.polynomial_constraints(),     "Polynomial");
+	} else {
+		cout << "(No decision vector available to evaluate constraints.)\n";
+	}
+
+	// Try to print some solver-specific details (best-effort).
+	try {
+		const auto& sid = result.get_solver_id().name();
+		if (sid == "Ipopt") {
+			struct IpoptDetails {
+				int status; int iterations; double objective; double dual_inf;
+				double constr_viol; double comp_viol; double primal_step; double dual_step;
+			};
+			// If your Drake provides IpoptSolver::Details, use that exact type.
+			// Example (adjust to your Drake version):
+			// const auto& d = result.get_solver_details<IpoptSolver>();
+			// cout << "Ipopt status: " << d.status << ", iters: " << d.iterations
+			//      << ", constr_viol: " << d.constr_viol << "\n";
+		} else if (sid == "OSQP") {
+			// Example (adjust to your Drake version):
+			// const auto& d = result.get_solver_details<OsqpSolver>();
+			// cout << "OSQP status: " << d.status_val << ", iters: " << d.iter
+			//      << ", obj: " << d.obj_val << "\n";
+		} else if (sid == "Gurobi") {
+			// const auto& d = result.get_solver_details<GurobiSolver>();
+			// cout << "Gurobi status: " << d.optimization_status << ", iters: "
+			//      << d.iteration_count << ", mip_gap: " << d.mip_relative_gap << "\n";
+		}
+	} catch (const std::exception& e) {
+		cout << "(Could not print solver-specific details: " << e.what() << ")\n";
+	}
+
+	cout << "=== End Report ===\n";
+}
+
+
 // GraphOrderingProblem build_graph_ordering_problem(
 // 	const Eigen::MatrixXd& wps,
 // 	const Eigen::MatrixXi& graph,
@@ -557,28 +651,44 @@ bool GraphTimingMPC::solve(
 	// 	}
 	// }
 
-	GraphTimingProblem problem = build_graph_timing_problem(
-		*_graph, *_splines, remaining_vertices, waypoints, assignments, x0, v0,
-		_time_cost, 0.0, _ctrl_cost, _max_vel, _max_acc, _max_jerk);
+	std::unique_ptr<GraphTimingProblem> problem;
+	try {
+		problem = std::make_unique<GraphTimingProblem>(
+			build_graph_timing_problem(
+				*_graph, *_splines, remaining_vertices, waypoints, assignments, x0, v0,
+				_time_cost, 0.0, _ctrl_cost, _max_vel, _max_acc, _max_jerk));
+	} catch (const std::exception& e) {
+		std::cout << "Caught exception in timing problem construction" << std::endl;
+		return false;
+	}
+
+
 
 	// Store ordered waypoints used in problem
-	_wps_list = problem.wps_list;
+	_wps_list = problem->wps_list;
 
 	// Store nodes on each spline
-	_agent_nodes_list = problem.agent_nodes_list;
+	_agent_nodes_list = problem->agent_nodes_list;
 
 	// Solve
 	// drake::solvers::IpoptSolver solver;
 	// auto result = solver.Solve(*problem.prog);
-	auto result = drake::solvers::Solve(*problem.prog);
+
+	MathematicalProgramResult result;
+	try {
+		result = drake::solvers::Solve(*(problem->prog));
+	} catch (const std::exception& e) {
+		std::cout << "Caught exception in solver" << std::endl;
+		return false;
+	}
 
 	if (result.is_success()) {
 
 		_last_solve_time = _timer.Tick();
 
 		for (int i = 0; i < _graph->num_agents; ++i) {
-			Eigen::MatrixXd vs = result.GetSolution(problem.vs_list[i]);
-			Eigen::VectorXd taus = result.GetSolution(problem.time_deltas_list[i]);
+			Eigen::MatrixXd vs = result.GetSolution(problem->vs_list[i]);
+			Eigen::VectorXd taus = result.GetSolution(problem->time_deltas_list[i]);
 
 			const int agent_spline_length = taus.size() + 1;
 			_agent_spline_length_map[i] = agent_spline_length;
@@ -593,6 +703,9 @@ bool GraphTimingMPC::solve(
 		}
 		return true;
 	} else {
+
+		PrintSolverReport(*(problem->prog), result, 1e-6);
+
 		return false;
 	}
 }
@@ -622,8 +735,8 @@ std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutof
 	std::set<int> passed_nodes;
 	
 	for (int i = 0; i < _graph->num_agents; ++i) {
-		// Eigen::MatrixXd vs = result.GetSolution(problem.vs_list[i]);
-		// Eigen::VectorXd taus = result.GetSolution(problem.time_deltas_list[i]);
+		// Eigen::MatrixXd vs = result.GetSolution(problem->vs_list[i]);
+		// Eigen::VectorXd taus = result.GetSolution(problem->time_deltas_list[i]);
 
 		// const int agent_spline_length = taus.size() + 1;
 		if (_agent_spline_length_map[i] > 0) {

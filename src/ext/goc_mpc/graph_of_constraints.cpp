@@ -77,7 +77,8 @@ GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
 
 int GraphOfConstraints::add_variable()
 {
-	return ++num_variables;
+	int next_variable_id = num_variables;
+	return num_variables++;
 }
 
 std::tuple<std::vector<std::optional<int>>,
@@ -530,8 +531,10 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 
 	return _add_assignable_op(DeferredOpKind::kAgentLinearEq, k, var,
 				  [=, this](const Eigen::VectorXd& x,
-					    const int... /*unused*/) {
-					  return 0.0;
+					    const int robot_id) {
+					  const int robot_start = robot_id * dim;
+					  Eigen::VectorXd robot_q = x.segment(robot_start, dim);
+					  return ((A * robot_q) - b).norm();
 				  },
 				  [=, this](auto& prog,
 					    const SubgraphOfConstraints& subgraph,
@@ -767,6 +770,109 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 		);
 }
 
+
+int GraphOfConstraints::add_assignable_robot_to_point_displacement_constraint(
+	int k,
+	int var,
+	int point_id,
+	const Eigen::Vector3d& disp) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	const int objs_start  = num_agents * dim;                         // start of object coords
+	const int point_start = objs_start + point_id * non_robot_dim;    // start of this point's coords
+
+	// M = 2 * half_extent + |disp|
+	Eigen::Vector3d M;
+	for (int ax = 0; ax < 3; ++ax) {
+		const double half_extent =
+			(_global_x_ub(ax) - _global_x_lb(ax)) * 0.5;
+		M(ax) = 2.0 * half_extent + std::abs(disp(ax));
+	}
+
+	_num_total_assignables++;
+
+	return _add_assignable_op(
+		DeferredOpKind::kLinearEq, k, var,
+		[=, this](const Eigen::VectorXd& x, const int robot_id) {
+			const int robot_start = robot_id * dim;
+			Eigen::Vector3d p_WE = x.segment(robot_start, 3);
+			Eigen::Vector3d p_WP = x.segment(point_start, 3);
+			Eigen::Vector3d r = (p_WP - p_WE) - disp;
+			return r.norm();
+		},
+		// ---- builder: add gated equalities with big-M ----
+		[=, this](auto& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int /*phi_id*/,
+			  const auto& X,                 // decision matrix for X
+			  const auto& Assignments) {     // binary assignment matrix A
+
+			const int node_k     = subgraph.subgraph_id(k);
+			const int variable_k = subgraph.subgraph_variable_id(var);
+
+			const double neg_inf = -std::numeric_limits<double>::infinity();
+
+			for (int i = 0; i < num_agents; ++i) {
+				const auto s = Assignments(variable_k, i);   // binary: 0/1
+				const int robot_start = i * dim;
+
+				for (int ax = 0; ax < 3; ++ax) {
+					const drake::symbolic::Expression e =
+						X(node_k, point_start + ax)   // point position component
+						- X(node_k, robot_start + ax)   // robot position component
+						- disp(ax);
+
+					// e <= M*(1 - s)  <=>  e + M*s - M <= 0
+					prog.AddLinearConstraint(e + M(ax) * s - M(ax), neg_inf, 0.0);
+
+					// -e <= M*(1 - s) <=> -e + M*s - M <= 0
+					prog.AddLinearConstraint(-e + M(ax) * s - M(ax), neg_inf, 0.0);
+				}
+			}
+		});
+}
+
+int GraphOfConstraints::add_robot_to_point_displacement_constraint(
+	int k,
+	int robot_id,
+	int point_id,
+	Eigen::Vector3d& disp) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	const int robot_start = robot_id * dim;
+	const int objs_start = num_agents * dim;
+	const int point_start = objs_start + point_id * non_robot_dim;
+
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       Eigen::Vector3d p_WE = x.segment(robot_start, 3);
+			       Eigen::Vector3d p_WP = x.segment(point_start, 3);
+			       Eigen::Vector3d r  = (p_WP - p_WE) - disp;   // want r == 0
+			       return r.norm();
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&... /*unused*/) {
+			       const unsigned int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable row = X.row(node_k);
+
+			       VectorXDecisionVariable p_WE = row.segment(robot_start, 3);
+			       VectorXDecisionVariable p_WP = row.segment(point_start, 3);
+
+			       // Enforce pB - pA = disp  (3 scalar equalities)
+			       prog.AddLinearEqualityConstraint(p_WP - p_WE, disp);
+		       }
+		);
+}
 
 int GraphOfConstraints::add_point_to_point_displacement_constraint(
 	int k,
