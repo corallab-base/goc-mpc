@@ -69,6 +69,9 @@ class GraphOfConstraintsMPC():
             passed_nodes = self.timing_mpc.set_progressed_time(time_delta, self.time_delta_cutoff)
 
             for node in passed_nodes:
+                if node in self.graph.unpassable_nodes:
+                    continue
+
                 all_phis_satisfied = all(
                     [self.graph.evaluate_phi(phi_id, x, assignments, self.phi_tolerance)
                      for phi_id in self.graph.get_phi_ids(node)])

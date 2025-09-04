@@ -103,6 +103,7 @@ struct GraphOfConstraints {
 	Graph<py::object> structure;
 	std::map<int, std::vector<int>> node_to_phis_map;
 	std::map<std::pair<int, int>, std::vector<int>> edge_to_phis_map;
+	std::set<int> unpassable_nodes;
 
 	// Node Phi maps
 	std::map<int, int> phi_to_variable_map;
@@ -163,6 +164,9 @@ struct GraphOfConstraints {
 	void add_grasp_change(int phi_id, std::string command, int robot_id, int cube_id);
 	void add_assignable_grasp_change(int phi_id, std::string command, int cube_id);
 	std::vector<std::tuple<std::string, std::string, std::string>> get_grasp_changes(int k, Eigen::VectorXi assignments) const;
+
+	// Unpassable node util
+	void make_node_unpassable(int k);
 	
 	// Plain Constraint Adders (typed)
 	// Note: these copy the numpy array's passed to them, but they're called

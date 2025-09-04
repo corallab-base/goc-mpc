@@ -291,6 +291,9 @@ std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraint
 	return changes;
 }
 
+void GraphOfConstraints::make_node_unpassable(int k) {
+	unpassable_nodes.insert(k);
+}
 
 // Joint-Agent Constraint Adders (typed)
 
