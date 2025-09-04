@@ -10,6 +10,7 @@
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
 #include <drake/solvers/solve.h>
+#include <drake/solvers/solver_options.h>
 #include <drake/common/timer.h>
 
 #include <pybind11/pybind11.h>
@@ -84,4 +85,11 @@ struct GraphWaypointMPC {
 	const Eigen::VectorXi &view_var_assignments() { return _var_assignments; }
 	const double get_last_solve_time() { return _last_solve_time; }
 
+private:
+	bool _solve_with_mosek(const std::vector<int>& remaining_vertices,
+			       const Eigen::VectorXd& x0);
+	bool _solve_with_gurobi(const std::vector<int>& remaining_vertices,
+				const Eigen::VectorXd& x0);
+	bool _solve_with_enumeration_and_ipopt(const std::vector<int>& remaining_vertices,
+					       const Eigen::VectorXd& x0);
 };

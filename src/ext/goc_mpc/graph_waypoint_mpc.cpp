@@ -144,19 +144,39 @@ static void AddHoldRigidityStaticToX0(
 		R_WE_v = X_WE_v.rotation().matrix();
 	}
 
+	for (size_t i = 0; i < spec.held_point_ids.size(); ++i) {
+		for (size_t j = i + 1; j < spec.held_point_ids.size(); ++j) {
+			const int id_i = spec.held_point_ids[i];
+			const int id_j = spec.held_point_ids[j];
+
+			const Eigen::Matrix<Expression,3,1> p_i_0 =
+				PointWorldFromRow(x0_expr, objs_start, non_robot_dim, id_i);
+			const Eigen::Matrix<Expression,3,1> p_i_v =
+				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_i);
+			const Eigen::Matrix<Expression,3,1> p_j_0 =
+				PointWorldFromRow(x0_expr, objs_start, non_robot_dim, id_j);
+			const Eigen::Matrix<Expression,3,1> p_j_v =
+				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_j);
+
+			const Eigen::Matrix<Expression,3,1> d_0 = p_i_0 - p_j_0;
+			const Eigen::Matrix<Expression,3,1> d_v = p_i_v - p_j_v;
+			Expression e = d_v.squaredNorm() - d_0.squaredNorm();
+			prog->AddQuadraticConstraint(e, 0.0, 0.0);
+		}
+	}
+
+
 	for (int obj_id : spec.held_point_ids) {
-		const Eigen::Vector3<Expression> p_WP_v =
+		const Eigen::Matrix<Expression,3,1> p_WP_0 =
+			PointWorldFromRow(x0_expr,   objs_start, non_robot_dim, obj_id);
+		const Eigen::Matrix<Expression,3,1> p_WP_v =
 			PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id);
-		const Eigen::Vector3<Expression> p_WP_0 =
-			PointWorldFromRow(x0_expr, objs_start, non_robot_dim, obj_id);
 
-		const Eigen::Vector3<Expression> rel_v =
-			R_WE_v.transpose() * (p_WP_v - p_WE_v);
-		const Eigen::Vector3<Expression> rel_0 =
-			R_WE_0.transpose() * (p_WP_0 - p_WE_0);
+		const Eigen::Matrix<Expression,3,1> d_0 = p_WP_0 - p_WE_0;
+		const Eigen::Matrix<Expression,3,1> d_v = p_WP_v - p_WE_v;
 
-		prog->AddConstraint(rel_v - rel_0,
-				    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+		Expression e = d_v.squaredNorm() - d_0.squaredNorm();
+		prog->AddQuadraticConstraint(e, 0.0, 0.0);
 	}
 }
 
@@ -214,28 +234,63 @@ static void AddHoldRigidityStatic(
 		R_WE_v = X_WE_v.rotation().matrix();
 	}
 
+	for (size_t i = 0; i < spec.held_point_ids.size(); ++i) {
+		for (size_t j = i + 1; j < spec.held_point_ids.size(); ++j) {
+			const int id_i = spec.held_point_ids[i];
+			const int id_j = spec.held_point_ids[j];
+
+			const Eigen::Matrix<Expression,3,1> p_i_u =
+				PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, id_i);
+			const Eigen::Matrix<Expression,3,1> p_i_v =
+				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_i);
+			const Eigen::Matrix<Expression,3,1> p_j_u =
+				PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, id_j);
+			const Eigen::Matrix<Expression,3,1> p_j_v =
+				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_j);
+
+			const Eigen::Matrix<Expression,3,1> d_u = p_i_u - p_j_u;
+			const Eigen::Matrix<Expression,3,1> d_v = p_i_v - p_j_v;
+			Expression e = d_v.squaredNorm() - d_u.squaredNorm();
+			prog->AddQuadraticConstraint(e, 0.0, 0.0);
+		}
+	}
+
+
 	for (int obj_id : spec.held_point_ids) {
-		const Eigen::Vector3<Expression> p_WP_u =
+		const Eigen::Matrix<Expression,3,1> p_WP_u =
 			PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, obj_id);
-		const Eigen::Vector3<Expression> p_WP_v =
+		const Eigen::Matrix<Expression,3,1> p_WP_v =
 			PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id);
 
-		const Eigen::Vector3<Expression> rel_u =
-			R_WE_u.transpose() * (p_WP_u - p_WE_u);
-		const Eigen::Vector3<Expression> rel_v =
-			R_WE_v.transpose() * (p_WP_v - p_WE_v);
+		const Eigen::Matrix<Expression,3,1> d_u = p_WP_u - p_WE_u;
+		const Eigen::Matrix<Expression,3,1> d_v = p_WP_v - p_WE_v;
 
-		// Enforce rel_u == rel_v  (3 scalar equalities).
-		prog->AddConstraint(rel_u - rel_v,
-				    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+		Expression e = d_v.squaredNorm() - d_u.squaredNorm();
+		prog->AddQuadraticConstraint(e, 0.0, 0.0);
 	}
+
+	// for (int obj_id : spec.held_point_ids) {
+	// 	const Eigen::Matrix<Expression,3,1> p_WP_u =
+	// 		PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, obj_id);
+	// 	const Eigen::Matrix<Expression,3,1> p_WP_v =
+	// 		PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id);
+
+	// 	const Eigen::Matrix<Expression,3,1> rel_u =
+	// 		R_WE_u.transpose() * (p_WP_u - p_WE_u);
+	// 	const Eigen::Matrix<Expression,3,1> rel_v =
+	// 		R_WE_v.transpose() * (p_WP_v - p_WE_v);
+
+	// 	prog->AddConstraint(rel_u - rel_v,
+	// 			    Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+	// }
 }
 
 GraphWaypointProblem build_graph_waypoint_problem(
 	GraphOfConstraints* graph,
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
 	const std::vector<int>& remaining_vertices,
-	Eigen::VectorXd x0) {
+	Eigen::VectorXd x0,
+	bool enforce_rigidity) {
 
 	const int num_agents = graph->num_agents;
 	const int num_objects = graph->num_objects;
@@ -251,36 +306,37 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	// record the subgraph
 	problem.subgraph = std::make_unique<SubgraphOfConstraints>(subgraph);
 
-	// a: binary assignment variables (z x m).
-	MatrixXDecisionVariable Assignments =
-		problem.prog->NewContinuousVariables(subgraph.num_variables(),
-						     num_agents, "Assignments");
-	problem.Assignments = Assignments;
+	MatrixXDecisionVariable Assignments;
+	if (enforce_rigidity) {
+		// Continuous (relaxed) assignment variables (z x m).
+		Assignments = problem.prog->NewContinuousVariables(subgraph.num_variables(),
+								   num_agents, "Assignments");
+		problem.Assignments = Assignments;
 
-	Eigen::MatrixXd lb = Eigen::MatrixXd::Zero(Assignments.rows(), Assignments.cols());
-	Eigen::MatrixXd ub = Eigen::MatrixXd::Ones(Assignments.rows(), Assignments.cols());
-	problem.A_bounds = std::make_unique<drake::solvers::Binding<drake::solvers::BoundingBoxConstraint>>(problem.prog->AddBoundingBoxConstraint(lb, ub, problem.Assignments));
+		Eigen::MatrixXd lb = Eigen::MatrixXd::Zero(Assignments.rows(), Assignments.cols());
+		Eigen::MatrixXd ub = Eigen::MatrixXd::Ones(Assignments.rows(), Assignments.cols());
+		problem.A_bounds = std::make_unique<drake::solvers::Binding<drake::solvers::BoundingBoxConstraint>>(problem.prog->AddBoundingBoxConstraint(lb, ub, problem.Assignments));
 
-        // Keep your one-hot equality: sum_k A(i,k) = 1  (unchanged)
-	for (int i = 0; i < subgraph.num_variables(); ++i) {
-		problem.prog->AddLinearEqualityConstraint(
-			Eigen::RowVectorXd::Ones(num_agents), 1.0, Assignments.row(i));
+		// Keep your one-hot equality: sum_k A(i,k) = 1  (unchanged)
+		for (int i = 0; i < subgraph.num_variables(); ++i) {
+			problem.prog->AddLinearEqualityConstraint(
+				Eigen::RowVectorXd::Ones(num_agents), 1.0, Assignments.row(i));
+		}
+	} else {
+		// Binary assignment variables (z x m).
+		Assignments = problem.prog->NewBinaryVariables(subgraph.num_variables(),
+							       num_agents, "Assignments");
+		problem.Assignments = Assignments;
+
+		// One-hot per row (each task gets exactly one agent): sum_k a(row,k) = 1.
+		for (int i = 0; i < subgraph.num_variables(); ++i) {
+			problem.prog->AddLinearEqualityConstraint(
+				Eigen::RowVectorXd::Ones(num_agents),
+				1.0, Assignments.row(i));
+		}
 	}
 
-	// MatrixXDecisionVariable Assignments = problem.prog->NewBinaryVariables(subgraph.num_variables(), num_agents, "Assignments");
-	// problem.Assignments = Assignments;
 
-	// // One-hot per row (each task gets exactly one agent): sum_k a(row,k) = 1.
-	// for (int i = 0; i < subgraph.num_variables(); ++i) {
-	// 	problem.prog->AddLinearEqualityConstraint(
-	// 		Eigen::RowVectorXd::Ones(num_agents),
-	// 		1.0, Assignments.row(i));
-	// }
-
-	// // Add a single 0/1 box on ALL entries and keep the binding.
-	// Eigen::MatrixXd lb = Eigen::MatrixXd::Zero(problem.Assignments.rows(), problem.Assignments.cols());
-	// Eigen::MatrixXd ub = Eigen::MatrixXd::Ones(problem.Assignments.rows(), problem.Assignments.cols());
-	// problem.A_bounds = std::make_unique<drake::solvers::Binding<drake::solvers::BoundingBoxConstraint>>(problem.prog->AddBoundingBoxConstraint(lb, ub, problem.Assignments));
 
 	const int robot_dim = graph->dim;
 	const int objs_start = graph->num_agents * graph->dim;
@@ -348,17 +404,19 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			}
 		}
 
-		// for (const HoldSpec& hold_spec : hold_specs_for_initial_layer) {
-		// 	// std::cout << "ADDING HOLD SPEC FOR INITIAL LAYER" << std::endl;
+		if (enforce_rigidity) {
+			for (const HoldSpec& hold_spec : hold_specs_for_initial_layer) {
+				std::cout << "ADDING HOLD SPEC FOR INITIAL LAYER" << std::endl;
 
-		// 	AddHoldRigidityStaticToX0(
-		// 		problem.prog.get(), subgraph, graph, *graph->_plant, X,
-		// 		v, hold_spec,
-		// 		/*robot_dim=*/robot_dim,
-		// 		/*objs_start=*/objs_start,
-		// 		/*non_robot_dim=*/non_robot_dim,
-		// 		x0);
-		// }
+				AddHoldRigidityStaticToX0(
+					problem.prog.get(), subgraph, graph, *graph->_plant, X,
+					v, hold_spec,
+					/*robot_dim=*/robot_dim,
+					/*objs_start=*/objs_start,
+					/*non_robot_dim=*/non_robot_dim,
+					x0);
+			}
+		}
 	}
 
 	std::map<int, std::set<int>> possibly_manipulated_cubes_during_each_layer;
@@ -429,9 +487,6 @@ GraphWaypointProblem build_graph_waypoint_problem(
 					// std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;
 					problem.prog->AddLinearEqualityConstraint(
 						X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim));
-				} else {
-					// TODO: enforce rigidity among robot and other manipulated points
-					;
 				}
 			} else {
 				// std::cout << "added for " << u << "->" << v << ", " << obj << std::endl;
@@ -439,18 +494,20 @@ GraphWaypointProblem build_graph_waypoint_problem(
 					X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim));
 			}
 
-			// if (hold_specs_during_each_layer.contains(layer)) {
-			// 	for (const HoldSpec& hold_spec : hold_specs_during_each_layer.at(layer)) {
-			// 		// std::cout << "ADDING HOLD SPEC FOR LAYER " << layer << std::endl;
+			if (enforce_rigidity) {
+				if (hold_specs_during_each_layer.contains(layer)) {
+					for (const HoldSpec& hold_spec : hold_specs_during_each_layer.at(layer)) {
+						std::cout << "ADDING HOLD SPEC FOR " << u << "->" << v << " IN LAYER " << layer << std::endl;
 
-			// 		AddHoldRigidityStatic(
-			// 			problem.prog.get(), subgraph, graph, *graph->_plant, X,
-			// 			u, v, hold_spec,
-			// 			/*robot_dim=*/robot_dim,
-			// 			/*objs_start=*/objs_start,
-			// 			/*non_robot_dim=*/non_robot_dim);
-			// 	}
-			// }
+						AddHoldRigidityStatic(
+							problem.prog.get(), subgraph, graph, *graph->_plant, X,
+							u, v, hold_spec,
+							/*robot_dim=*/robot_dim,
+							/*objs_start=*/objs_start,
+							/*non_robot_dim=*/non_robot_dim);
+					}
+				}
+			}
 		}
 	}
 
@@ -689,24 +746,25 @@ bool GraphWaypointMPC::solve(
 
 	_timer.Start();
 
-	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0);
+	const bool enforce_rigidity = true;
 
-	// // Enumerate per-row choices (all agents, or pruned)
-	// std::vector<std::vector<int>> choices_per_row(problem.Assignments.rows());
-	// for (auto& v : choices_per_row) {
-	// 	v.resize(_graph->num_agents);
-	// 	std::iota(v.begin(), v.end(), 0);  // {0,1,...,M-1}
-	// }
+	if (enforce_rigidity) {
+		return _solve_with_enumeration_and_ipopt(remaining_vertices, x0);
+		// return _solve_with_gurobi(remaining_vertices, x0);
+	} else {
+		return _solve_with_mosek(remaining_vertices, x0);
+	}
+}
 
-	// EnumSolveResult best = EnumerateAllAssignmentsAndSolve(&problem, choices_per_row);
+bool GraphWaypointMPC::_solve_with_mosek(
+	const std::vector<int>& remaining_vertices,
+	const Eigen::VectorXd& x0) {
+
+	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, false);
 
 	// Solve
 	drake::solvers::MosekSolver solver;
-	// drake::solvers::GurobiSolver solver;
 	const auto result = solver.Solve(*problem.prog);
-	// auto result = drake::solvers::Solve(*problem.prog);
-
-	// if (best.success) {
 
 	if (result.is_success()) {
 
@@ -723,9 +781,6 @@ bool GraphWaypointMPC::solve(
 				int variable_id = _graph->phi_to_variable_map.at(i);
 				int subgraph_variable_id = problem.subgraph->subgraph_variable_id(variable_id);
 				if (subgraph_variable_id != -1) {
-					// int j = best.best_agent_of_row.at(subgraph_variable_id);
-					// _assignments(i) = j;
-					// _var_assignments(variable_id) = j;
 					for (int j = 0; j < num_agents; ++j) {
 						const double val = result.GetSolution(problem.Assignments(subgraph_variable_id, j));
 						if (val > 0.5) {
@@ -744,7 +799,169 @@ bool GraphWaypointMPC::solve(
 		}
 
 		Eigen::MatrixXd X_flat = result.GetSolution(problem.X);
-		// Eigen::MatrixXd X_flat = best.best_X;
+		for (int v : remaining_vertices) {
+			const int i = problem.subgraph->subgraph_id(v);
+			_waypoints.row(v) = X_flat.row(i);
+		}
+		return true;
+	}
+
+	return false;
+}
+
+bool GraphWaypointMPC::_solve_with_gurobi(
+	const std::vector<int>& remaining_vertices,
+	const Eigen::VectorXd& x0) {
+
+	std::cout << "here0" << std::endl;
+
+	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, true);
+
+	// Solve
+	drake::solvers::GurobiSolver solver;
+
+	drake::solvers::SolverOptions options;
+	options.SetOption(solver.id(), "NonConvex", 2);
+
+	auto result = solver.Solve(*problem.prog, std::nullopt, options);
+
+	if (result.is_success()) {
+
+		_last_solve_time = _timer.Tick();
+
+		const int num_remaining_nodes = remaining_vertices.size();
+		const int num_subgraph_assignables = problem.Assignments.rows();
+		const int num_phis = _graph->num_phis;
+		const int num_agents = _graph->num_agents;
+		const int dim = _graph->dim;
+
+		for (int i = 0; i < num_phis; ++i) {
+			if (_graph->phi_to_variable_map.contains(i)) {
+				int variable_id = _graph->phi_to_variable_map.at(i);
+				int subgraph_variable_id = problem.subgraph->subgraph_variable_id(variable_id);
+				if (subgraph_variable_id != -1) {
+					for (int j = 0; j < num_agents; ++j) {
+						const double val = result.GetSolution(problem.Assignments(subgraph_variable_id, j));
+						if (val > 0.5) {
+							_assignments(i) = j;
+							_var_assignments(variable_id) = j;
+							break;
+						}
+					}
+				} else {
+					_assignments(i) = -1;
+					_var_assignments(variable_id) = -1;
+				}
+			} else {
+				_assignments(i) = -1;
+			}
+		}
+
+		Eigen::MatrixXd X_flat = result.GetSolution(problem.X);
+		for (int v : remaining_vertices) {
+			const int i = problem.subgraph->subgraph_id(v);
+			// Eigen::RowVectorXd row(num_agents * dim + );
+			// for (int j = 0; j < num_agents; ++j) {
+			// 	row.segment(j * dim, dim) = X_flat.row(i).segment(j * dim * num_agents + j);
+			// }
+			_waypoints.row(v) = X_flat.row(i);
+		}
+		return true;
+	}
+
+	std::cerr << "No feasible solution across all assignments.\n";
+
+	// if (result.is_success()) {
+	// } else {
+	// 	// PrintSolverReport(*(problem.prog), result, 1e-6);
+	// 	return false;
+	// }
+
+	return false;
+}
+
+bool GraphWaypointMPC::_solve_with_enumeration_and_ipopt(
+	const std::vector<int>& remaining_vertices,
+	const Eigen::VectorXd& x0) {
+
+	GraphWaypointProblem problem;
+	try {
+		problem = std::build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, true);
+	} catch (const std::exception& e) {
+		std::cout << "Caught exception in waypoint problem construction" << std::endl;
+		return false;
+	}
+
+	// Enumerate per-row choices (all agents, or pruned)
+	std::vector<std::vector<int>> choices_per_row(problem.Assignments.rows());
+	for (auto& v : choices_per_row) {
+		v.resize(_graph->num_agents);
+		std::iota(v.begin(), v.end(), 0);  // {0,1,...,M-1}
+	}
+
+	// Warm start assignments
+	// for (int i = 0; i < num_phis; ++i) {
+	// 	if (_graph->phi_to_variable_map.contains(i)) {
+	// 		int variable_id = _graph->phi_to_variable_map.at(i);
+	// 		int subgraph_variable_id = problem.subgraph->subgraph_variable_id(variable_id);
+	// 		if (subgraph_variable_id != -1) {
+	// 			int j = best.best_agent_of_row.at(subgraph_variable_id);
+	// 			_assignments(i) = j;
+	// 			_var_assignments(variable_id) = j;
+	// 		} else {
+	// 			_assignments(i) = -1;
+	// 			_var_assignments(variable_id) = -1;
+	// 		}
+	// 	} else {
+	// 		_assignments(i) = -1;
+	// 	}
+	// }
+
+	// Warm start configurations
+	for (int v : remaining_vertices) {
+		const int i = problem.subgraph->subgraph_id(v);
+		problem.prog->SetInitialGuess(problem.X.row(i), _waypoints.row(v));
+	}
+	
+
+	// Solve
+
+	EnumSolveResult best;
+	try {
+		best = EnumerateAllAssignmentsAndSolve(&problem, choices_per_row);
+	} catch (const std::exception& e) {
+		std::cout << "Caught exception in waypoint solver" << std::endl;
+		return false;
+	}
+
+	if (best.success) {
+
+		_last_solve_time = _timer.Tick();
+
+		const int num_remaining_nodes = remaining_vertices.size();
+		const int num_subgraph_assignables = problem.Assignments.rows();
+		const int num_phis = _graph->num_phis;
+		const int num_agents = _graph->num_agents;
+		const int dim = _graph->dim;
+
+		for (int i = 0; i < num_phis; ++i) {
+			if (_graph->phi_to_variable_map.contains(i)) {
+				int variable_id = _graph->phi_to_variable_map.at(i);
+				int subgraph_variable_id = problem.subgraph->subgraph_variable_id(variable_id);
+				if (subgraph_variable_id != -1) {
+					int j = best.best_agent_of_row.at(subgraph_variable_id);
+					_assignments(i) = j;
+					_var_assignments(variable_id) = j;
+				} else {
+					_assignments(i) = -1;
+					_var_assignments(variable_id) = -1;
+				}
+			} else {
+				_assignments(i) = -1;
+			}
+		}
+
+		Eigen::MatrixXd X_flat = best.best_X;
 		for (int v : remaining_vertices) {
 			const int i = problem.subgraph->subgraph_id(v);
 			// Eigen::RowVectorXd row(num_agents * dim + );
