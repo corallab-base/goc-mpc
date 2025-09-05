@@ -371,6 +371,7 @@ class SimpleDrakeGym:
             raise ValueError(f"q must be ({self._nq},), v must be ({self._nv},)")
         self._set_q(q)
         self._set_qdot(v)
+        self._grasps = {}
         self._diagram.ForcedPublish(self._context)
         return self._observe(), {}
 
