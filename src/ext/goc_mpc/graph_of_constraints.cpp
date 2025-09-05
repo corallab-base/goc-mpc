@@ -134,9 +134,8 @@ std::tuple<std::vector<std::optional<int>>,
 					}
 				}
 
-				// std::cout << "assignments " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
-
 				for (int assignment : assignments_for_node) {
+					// std::cout << "assignment for node[" << node << "]: " << assignment << std::endl;
 					int depth = agent_nodes[assignment].size();
 					agent_nodes[assignment].push_back(node);
 					node_to_agent_and_depth_pairs_map[node].emplace_back(assignment, depth);
@@ -429,9 +428,6 @@ int GraphOfConstraints::add_agent_linear_eq(int k, int robot_id, const Eigen::Ma
 				       const int phi_id,
 				       const auto& X,
 				       const auto&) {
-
-				     // record that this constraint is statically assigned to this robot.
-				     _phi_to_static_assignment_map[phi_id] = robot_id;
 
 				     const int node_k = subgraph.subgraph_id(k);
 				     VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
@@ -896,7 +892,7 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 	// record that this constraint is statically assigned to this robot.
 	_phi_to_static_assignment_map[phi_id] = robot_id;
 
-	return robot_id;
+	return phi_id;
 }
 
 int GraphOfConstraints::add_robot_to_point_alignment_constraint(
