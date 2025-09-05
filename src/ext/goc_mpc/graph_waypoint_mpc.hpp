@@ -62,6 +62,7 @@ struct GraphWaypointMPC {
 	Eigen::VectorXi _assignments;
 	// _var_assignments is (_graph.num_variables,)
 	Eigen::VectorXi _var_assignments;
+	bool _first_cycle;
 
 	// Recording Metrics
 	drake::SteadyTimer _timer;

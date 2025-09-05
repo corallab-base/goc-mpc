@@ -358,6 +358,22 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	problem.X = X;
 
 	//
+	// QUATERNION CONSTRAINTS
+	//
+
+	for (int ag = 0; ag < num_agents; ++ag) {
+		if (graph->robot_is_free_body(ag)) {
+			for (int node = 0; node < subgraph.num_nodes(); ++node) {
+				VectorX<Expression> ag_quat = AsExprRow(X.row(node).segment(ag * robot_dim + 3, 4));
+				Expression ag_quat_norm = ag_quat.squaredNorm();
+				const double tol = 0.001;
+				problem.prog->AddQuadraticConstraint(ag_quat_norm, 1.0-tol, 1.0+tol)
+					.evaluator()->set_description("unit quaternion constraint");
+			}
+		}
+	}
+
+	//
 	// OBJECTIVE FUNCTION
 	//
 
@@ -599,8 +615,9 @@ GraphWaypointMPC::GraphWaypointMPC(GraphOfConstraints& graph,
 	  _splines(std::make_shared<std::vector<CubicConfigurationSpline>>(std::move(splines))) {
 	// Allocate persistent output buffers.
 	_waypoints = Eigen::MatrixXd::Zero(_graph->structure.num_nodes(), _graph->total_dim);
-	_assignments = Eigen::VectorXi::Zero(_graph->num_phis);
-	_var_assignments = Eigen::VectorXi::Zero(_graph->num_variables);
+	_assignments = Eigen::VectorXi::Constant(_graph->num_phis, -1);
+	_var_assignments = Eigen::VectorXi::Constant(_graph->num_variables, -1);
+	_first_cycle = true;
 }
 
 
@@ -993,11 +1010,18 @@ bool GraphWaypointMPC::_solve_with_enumeration_and_ipopt(
 	// }
 
 	// Warm start configurations
-	for (int v : remaining_vertices) {
-		const int i = problem->subgraph->subgraph_id(v);
-		problem->prog->SetInitialGuess(problem->X.row(i), _waypoints.row(v));
+	if (_first_cycle) {
+		for (int v : remaining_vertices) {
+			const int i = problem->subgraph->subgraph_id(v);
+			problem->prog->SetInitialGuess(problem->X.row(i), x0.transpose());
+		}
+		_first_cycle = false;
+	} else {
+		for (int v : remaining_vertices) {
+			const int i = problem->subgraph->subgraph_id(v);
+			problem->prog->SetInitialGuess(problem->X.row(i), _waypoints.row(v));
+		}
 	}
-	
 
 	// Solve
 
