@@ -36,7 +36,7 @@ static inline Expression wrap_to_pi(const Expression& delta) {
 static inline drake::math::RotationMatrix<Expression>
 RotFromQuatWxyz(const Eigen::Matrix<Expression,4,1>& qwxyz) {
 	Eigen::Quaternion<Expression> q(qwxyz(0), qwxyz(1), qwxyz(2), qwxyz(3));
-	return drake::math::RotationMatrix<Expression>(q);
+	return drake::math::RotationMatrix<Expression>(q.normalized());
 }
 
 // hat(·) operator: φ -> φ^ (skew)
