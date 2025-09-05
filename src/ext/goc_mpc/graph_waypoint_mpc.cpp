@@ -23,73 +23,6 @@ struct HoldSpec {
 	std::string ee_frame_name;  // e.g., "tool0"
 };
 
-static Eigen::Matrix<drake::symbolic::Expression,3,3>
-RotFromQuatBranchless(const drake::symbolic::Expression& w,
-                      const drake::symbolic::Expression& x,
-                      const drake::symbolic::Expression& y,
-                      const drake::symbolic::Expression& z) {
-  const Expression n2 = 1.0; // w*w + x*x + y*y + z*z;   // enforce n2 == 1 separately
-  const Expression s2 = 2.0; // / n2;                // 2 / |q|^2
-
-  Eigen::Matrix<Expression,3,3> R;
-  R(0,0) = 1 - s2*(y*y + z*z);
-  R(0,1) =     s2*(x*y - w*z);
-  R(0,2) =     s2*(x*z + w*y);
-
-  R(1,0) =     s2*(x*y + w*z);
-  R(1,1) = 1 - s2*(x*x + z*z);
-  R(1,2) =     s2*(y*z - w*x);
-
-  R(2,0) =     s2*(x*z - w*y);
-  R(2,1) =     s2*(y*z + w*x);
-  R(2,2) = 1 - s2*(x*x + y*y);
-  return R;
-}
-
-static bool RobotIsFreeBody(const GraphOfConstraints* graph, int ag) {
-  // Or whatever positive test you already use; this follows your pattern.
-  return graph->_robot_names.at(ag).find("free_body") != std::string::npos;
-}
-
-static void PoseFromRow_FreeBody(const Eigen::VectorX<drake::symbolic::Expression>& row,
-                                 int robot_offset,
-                                 Eigen::Matrix<drake::symbolic::Expression,3,1>* p_WE,
-                                 Eigen::Matrix<drake::symbolic::Expression,3,3>* R_WE) {
-  *p_WE = row.segment(robot_offset + 0, 3).transpose();
-  const Expression w = row(robot_offset + 3);
-  const Expression x = row(robot_offset + 4);
-  const Expression y = row(robot_offset + 5);
-  const Expression z = row(robot_offset + 6);
-  *R_WE = RotFromQuatBranchless(w,x,y,z);
-}
-
-// Templated row→Expression helper (safe for Eigen blocks).
-template <class Derived>
-static Eigen::RowVectorX<Expression> AsExprRow(const Eigen::MatrixBase<Derived>& row) {
-	return row.template cast<Expression>();
-}
-
-// World position of a "point" from a row of X (first 3 coords of the object block).
-template <class DerivedRow>
-static Eigen::Vector3<Expression> PointWorldFromRow(
-	const Eigen::MatrixBase<DerivedRow>& row_in,
-	int objs_start, int non_robot_dim, int obj_id) {
-
-	Eigen::RowVectorX<Expression> row = AsExprRow(row_in);
-	return row.segment(objs_start + obj_id * non_robot_dim, 3).transpose();
-}
-
-// World position of a "point" from x0 (as Expression).
-static Eigen::Vector3<Expression> PointWorldFromX0(
-	const Eigen::VectorXd& x0,
-	int objs_start, int non_robot_dim, int obj_id) {
-
-	Eigen::Vector3<Expression> p;
-	for (int k = 0; k < 3; ++k) {
-		p[k] = Expression(x0[objs_start + obj_id * non_robot_dim + k]);
-	}
-	return p;
-}
 
 // === NEW: single-vertex rigidity anchored to x0 ===
 //
@@ -120,7 +53,7 @@ static void AddHoldRigidityStaticToX0(
 	Eigen::Matrix<Expression,3,1> p_WE_0, p_WE_v;
 	Eigen::Matrix<Expression,3,3> R_WE_0, R_WE_v;
 
-	if (RobotIsFreeBody(graph, spec.robot_ag)) {
+	if (graph->robot_is_free_body(spec.robot_ag)) {
 		const int rob_off = spec.robot_ag * robot_dim;
 		PoseFromRow_FreeBody(x0_expr, rob_off, &p_WE_0, &R_WE_0);
 		PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);
@@ -210,7 +143,7 @@ static void AddHoldRigidityStatic(
 	Eigen::Matrix<Expression,3,1> p_WE_u, p_WE_v;
 	Eigen::Matrix<Expression,3,3> R_WE_u, R_WE_v;
 
-	if (RobotIsFreeBody(graph, spec.robot_ag)) {
+	if (graph->robot_is_free_body(spec.robot_ag)) {
 		const int rob_off = spec.robot_ag * robot_dim;
 		PoseFromRow_FreeBody(X_u_expr, rob_off, &p_WE_u, &R_WE_u);
 		PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);

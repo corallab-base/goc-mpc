@@ -1,6 +1,5 @@
 #include "utils.hpp"
 
-
 py::array_t<double> remainder_slice_1d(const py::array_t<double>& arr, unsigned int i) {
 	// Extract shape info
 	auto info = arr.request();
@@ -19,7 +18,7 @@ py::array_t<double> remainder_slice_1d(const py::array_t<double>& arr, unsigned 
 		{sizeof(double)},               // stride
 		start_ptr,                      // pointer to start
 		arr                             // base object to keep alive
-	);
+		);
 }
 
 py::array_t<double> remainder_slice_2d(const py::array_t<double>& arr, unsigned int i) {
@@ -40,7 +39,7 @@ py::array_t<double> remainder_slice_2d(const py::array_t<double>& arr, unsigned 
 		{sizeof(double) * D, sizeof(double)},   // strides: row-major
 		start_ptr,
 		arr // keep original array alive
-	);
+		);
 }
 
 /* reimann integral with a step size of 1. (a cumulative sum) */
@@ -157,4 +156,16 @@ py::array_t<double> prepend_row_2d(const py::array_t<double>& a, const py::array
 			result_(i + 1, j) = a_(i, j);
 
 	return result;
+}
+
+// World position of a "point" from x0 (as Expression).
+Eigen::Vector3<Expression> PointWorldFromX0(
+	const Eigen::VectorXd& x0,
+	int objs_start, int non_robot_dim, int obj_id) {
+
+	Eigen::Vector3<Expression> p;
+	for (int k = 0; k < 3; ++k) {
+		p[k] = Expression(x0[objs_start + obj_id * non_robot_dim + k]);
+	}
+	return p;
 }

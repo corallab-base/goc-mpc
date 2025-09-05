@@ -138,6 +138,8 @@ struct GraphOfConstraints {
 
 	int add_variable();
 
+	bool robot_is_free_body(int ag) const;
+
 	Graph<py::object> get_structure() const { return structure; }
 
 	std::tuple<std::vector<std::optional<int>>,

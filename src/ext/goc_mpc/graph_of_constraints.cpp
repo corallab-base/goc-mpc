@@ -81,6 +81,10 @@ int GraphOfConstraints::add_variable()
 	return num_variables++;
 }
 
+bool GraphOfConstraints::robot_is_free_body(int ag) const {
+	return _robot_names.at(ag).find("free_body") != std::string::npos;
+}
+
 std::tuple<std::vector<std::optional<int>>,
 	   std::vector<std::vector<int>>,
 	   std::vector<struct AgentInteraction>> GraphOfConstraints::get_agent_paths(
