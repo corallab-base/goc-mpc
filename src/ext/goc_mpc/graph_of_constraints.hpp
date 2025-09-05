@@ -113,7 +113,7 @@ struct GraphOfConstraints {
 	std::map<int, std::vector<std::pair<std::string, std::string>>> _assignable_grasp_change_map;
 
 	// Edge phi maps
-	// std::map<int, int> edge_phi_to_variable_map;
+	std::map<int, int> edge_phi_to_variable_map;
 	std::map<int, struct DeferredEdgeOp> edge_ops;
 	std::map<int, int> _edge_phi_to_static_assignment_map;
 
@@ -222,10 +222,22 @@ struct GraphOfConstraints {
 						       int point_id,
 						       Eigen::Vector3d& disp);
 
+	int add_robot_to_point_alignment_constraint(int k,
+						    int robot_id,
+						    int point_id,
+						    const Eigen::Vector3d& ee_ray_body,
+						    // optional for roll disambiguation:
+						    std::optional<Eigen::Vector3d> u_body_opt = std::nullopt,         // u_b (must be ⟂ ee_ray_body)
+						    std::optional<Eigen::Vector3d> roll_ref_world = std::nullopt,     // t (any, not necessarily ⟂ d)
+						    bool roll_ref_flat = false,
+						    bool require_positive_pointing = true,
+						    double eps_d = 0.05, double tau_tperp = 0.05);
+
 	int add_point_to_point_displacement_constraint(int k,
 						       int point_a,
 						       int point_b,
-						       Eigen::Vector3d& disp);
+						       Eigen::Vector3d& disp,
+						       double tol = 0.05);
 
 	int add_point_to_point_alignment_constraint(int k,
 						    int point_a,
@@ -252,7 +264,11 @@ struct GraphOfConstraints {
 						int point_ids,
 						double holding_distance_max = 0.1);
 
-
+	int add_assignable_robot_holding_point_constraint(int u,
+							  int v,
+							  int var,
+							  int point_id,
+							  double holding_distance_max);
 
 	template <typename T>
 	void set_configuration(
@@ -287,14 +303,15 @@ private:
 		return id;
 	}
 
-	// template <typename F>
-	// int _add_assignable_edge_op(DeferredOpKind kind, int u, int v, int var, F&& f) {
-	// 	const int id = num_edge_phis++;
-	// 	edge_to_phis_map[std::make_pair(u, v)].push_back(id);
-	// 	phi_to_variable_map[id] = var;
-	// 	edge_ops[id] = DeferredEdgeOp{kind, id, u, v, std::forward<F>(f)};
-	// 	return id;
-	// }
+	template <typename EF, typename WF, typename SF>
+	int _add_assignable_edge_op(DeferredOpKind kind, int u, int v, int var, std::set<int> cubes, EF&& eval_f, WF&& wp_f, SF&& sp_f) {
+		const int id = num_edge_phis++;
+		edge_to_phis_map[std::make_pair(u, v)].push_back(id);
+		edge_phi_to_variable_map[id] = var;
+		edge_ops[id] = DeferredEdgeOp{kind, id, u, v, cubes,
+			std::forward<EF>(eval_f), std::forward<WF>(wp_f), std::forward<SF>(sp_f)};
+		return id;
+	}
 };
 
 /*

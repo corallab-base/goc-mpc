@@ -134,6 +134,8 @@ std::tuple<std::vector<std::optional<int>>,
 					}
 				}
 
+				// std::cout << "assignments " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
+
 				for (int assignment : assignments_for_node) {
 					int depth = agent_nodes[assignment].size();
 					agent_nodes[assignment].push_back(node);
@@ -417,29 +419,34 @@ int GraphOfConstraints::add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, 
 
 // Ax = b on node k
 int GraphOfConstraints::add_agent_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-	return _add_op(DeferredOpKind::kLinearEq, k,
-		       [=, this](const Eigen::VectorXd& x,
-				 const int... /*unused*/) {
-			       return 0.0;
-		       },
-		       [=, this](auto& prog,
-				 const SubgraphOfConstraints& subgraph,
-				 const int phi_id,
-				 const auto& X,
-				 const auto&) {
+	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
+			     [=, this](const Eigen::VectorXd& x,
+				       const int... /*unused*/) {
+				     return 0.0;
+			     },
+			     [=, this](auto& prog,
+				       const SubgraphOfConstraints& subgraph,
+				       const int phi_id,
+				       const auto& X,
+				       const auto&) {
 
-			       // record that this constraint is statically assigned to this robot.
-			       _phi_to_static_assignment_map[phi_id] = robot_id;
+				     // record that this constraint is statically assigned to this robot.
+				     _phi_to_static_assignment_map[phi_id] = robot_id;
 
-			       const int node_k = subgraph.subgraph_id(k);
-			       VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
-			       auto beq = prog.AddLinearEqualityConstraint(A, b, agent_config_k);
-		       });
+				     const int node_k = subgraph.subgraph_id(k);
+				     VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
+				     auto beq = prog.AddLinearEqualityConstraint(A, b, agent_config_k);
+			     });
+
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+	return phi_id;
 }
 
 // lb <= A x <= ub on node k
 int GraphOfConstraints::add_agent_linear_ineq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
-	return _add_op(DeferredOpKind::kLinearIneq, k,
+	int phi_id = _add_op(DeferredOpKind::kLinearIneq, k,
 		       [=, this](const Eigen::VectorXd& x,
 				 const int... /*unused*/) {
 			       return 0.0;
@@ -449,56 +456,60 @@ int GraphOfConstraints::add_agent_linear_ineq(int k, int robot_id, const Eigen::
 				 const int phi_id,
 				 const auto& X,
 				 const auto&) {
-
-			       // record that this constraint is statically assigned to this robot.
-			       _phi_to_static_assignment_map[phi_id] = robot_id;
-
 			       const int node_k = subgraph.subgraph_id(k);
 			       VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
 			       auto constraint = prog.AddLinearConstraint(A, lb, ub, agent_config_k);
 		       });
+
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+	return phi_id;
 }
 
 int GraphOfConstraints::add_agent_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-	return _add_op(DeferredOpKind::kLinearEq, k,
-		       [=, this](const Eigen::VectorXd& x,
-				 const int... /*unused*/) {
-			       return 0.0;
-		       },
-		       [=, this](auto& prog,
-				 const SubgraphOfConstraints& subgraph,
-				 const int phi_id,
-				 const auto& X,
-				 const auto&) {
+	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
+			     [=, this](const Eigen::VectorXd& x,
+				       const int... /*unused*/) {
+				     return 0.0;
+			     },
+			     [=, this](auto& prog,
+				       const SubgraphOfConstraints& subgraph,
+				       const int phi_id,
+				       const auto& X,
+				       const auto&) {
+				     const int node_k = subgraph.subgraph_id(k);
+				     VectorXDecisionVariable agent_pos_k = X.row(node_k).segment(robot_id*dim, 3);
+				     auto beq = prog.AddLinearEqualityConstraint(A, b, agent_pos_k);
+			     });
 
-			       // record that this constraint is statically assigned to this robot.
-			       _phi_to_static_assignment_map[phi_id] = robot_id;
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
 
-			       const int node_k = subgraph.subgraph_id(k);
-			       VectorXDecisionVariable agent_pos_k = X.row(node_k).segment(robot_id*dim, 3);
-			       auto beq = prog.AddLinearEqualityConstraint(A, b, agent_pos_k);
-		       });
+	return phi_id;
 }
 
 int GraphOfConstraints::add_agent_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-	return _add_op(DeferredOpKind::kLinearEq, k,
-		       [=, this](const Eigen::VectorXd& x,
-				 const int... /*unused*/) {
-			       return 0.0;
-		       },
-		       [=, this](auto& prog,
-				 const SubgraphOfConstraints& subgraph,
-				 const int phi_id,
-				 const auto& X,
-				 const auto&) {
+	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
+			     [=, this](const Eigen::VectorXd& x,
+				       const int... /*unused*/) {
+				     return 0.0;
+			     },
+			     [=, this](auto& prog,
+				       const SubgraphOfConstraints& subgraph,
+				       const int phi_id,
+				       const auto& X,
+				       const auto&) {
 
-			       // record that this constraint is statically assigned to this robot.
-			       _phi_to_static_assignment_map[phi_id] = robot_id;
+				     const int node_k = subgraph.subgraph_id(k);
+				     VectorXDecisionVariable agent_quat_k = X.row(node_k).segment(robot_id*dim + 3, 4);
+				     auto beq = prog.AddLinearEqualityConstraint(A, b, agent_quat_k);
+			     });
 
-			       const int node_k = subgraph.subgraph_id(k);
-			       VectorXDecisionVariable agent_quat_k = X.row(node_k).segment(robot_id*dim + 3, 4);
-			       auto beq = prog.AddLinearEqualityConstraint(A, b, agent_quat_k);
-		       });
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+	return phi_id;
 }
 
 
@@ -541,7 +552,7 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 					    const int robot_id) {
 					  const int robot_start = robot_id * dim;
 					  Eigen::VectorXd robot_q = x.segment(robot_start, dim);
-					  return ((A * robot_q) - b).norm();
+					  return ((A * robot_q) - b).lpNorm<Eigen::Infinity>();
 				  },
 				  [=, this](auto& prog,
 					    const SubgraphOfConstraints& subgraph,
@@ -699,82 +710,84 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 	const ModelInstanceIndex robot_mi = _plant->GetModelInstanceByName(robot_model_name);
 	const ModelInstanceIndex cube_mi  = _plant->GetModelInstanceByName(cube_model_name);
 
-	return _add_op(DeferredOpKind::kNonlinearEq, k,
-		       [=, this](const Eigen::VectorXd& x,
-				 const int... /*unused*/) {
+	int phi_id = _add_op(DeferredOpKind::kNonlinearEq, k,
+			     [=, this](const Eigen::VectorXd& x,
+				       const int... /*unused*/) {
 
-			       using drake::math::RigidTransform;
-			       using drake::symbolic::Expression;
-			       using drake::symbolic::Evaluate;
+				     using drake::math::RigidTransform;
+				     using drake::symbolic::Expression;
+				     using drake::symbolic::Evaluate;
 
-			       const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
-			       const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
+				     const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
+				     const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
 
-			       Eigen::VectorX<Expression> q_all = x.cast<Expression>();
+				     Eigen::VectorX<Expression> q_all = x.cast<Expression>();
 
-			       auto context = _plant->CreateDefaultContext();
-			       set_configuration(context, q_all);
+				     auto context = _plant->CreateDefaultContext();
+				     set_configuration(context, q_all);
 
-			       const RigidTransform<Expression> X_WR =
-				       _plant->EvalBodyPoseInWorld(*context, robot_body);
-			       const RigidTransform<Expression> X_WC =
-				       _plant->EvalBodyPoseInWorld(*context, cube_body);
+				     const RigidTransform<Expression> X_WR =
+					     _plant->EvalBodyPoseInWorld(*context, robot_body);
+				     const RigidTransform<Expression> X_WC =
+					     _plant->EvalBodyPoseInWorld(*context, cube_body);
 
-			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
-			       Eigen::Vector3<Expression> g;
-			       g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
-				       (X_WR.translation().y() - X_WC.translation().y() - y_offset),
-				       (X_WR.translation().z() - X_WC.translation().z() - delta_z);
+				     // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
+				     Eigen::Vector3<Expression> g;
+				     g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
+					     (X_WR.translation().y() - X_WC.translation().y() - y_offset),
+					     (X_WR.translation().z() - X_WC.translation().z() - delta_z);
 
-			       // dp_expr has no free symbols (only constants), so Evaluate(...) -> double works.
-			       double violation = 0.0;
-			       for (int i = 0; i < 3; ++i) {
-				       const double gi = g[i].Evaluate();
-				       violation = std::max(violation, std::abs(gi));
-			       }
-			       return violation;
-		       },
-		       [=, this](auto& prog,
-				 const SubgraphOfConstraints& subgraph,
-				 const int phi_id,
-				 const auto& X,
-				 const auto&... /*unused*/) {
+				     // dp_expr has no free symbols (only constants), so Evaluate(...) -> double works.
+				     double violation = 0.0;
+				     for (int i = 0; i < 3; ++i) {
+					     const double gi = g[i].Evaluate();
+					     violation = std::max(violation, std::abs(gi));
+				     }
+				     return violation;
+			     },
+			     [=, this](auto& prog,
+				       const SubgraphOfConstraints& subgraph,
+				       const int phi_id,
+				       const auto& X,
+				       const auto&... /*unused*/) {
 
-			       using drake::multibody::JointIndex;
-			       using drake::systems::Context;
+				     using drake::multibody::JointIndex;
+				     using drake::systems::Context;
 
-			       // record that this constraint is statically assigned to this robot.
-			       _phi_to_static_assignment_map[phi_id] = robot_id;
+				     const int node_k = subgraph.subgraph_id(k);
 
-			       const int node_k = subgraph.subgraph_id(k);
+				     // Convert X[row] decision variables to Expressions.
+				     Eigen::VectorX<Expression> q_all(total_dim);
+				     for (int j = 0; j < total_dim; ++j) {
+					     q_all(j) = Expression(X(node_k, j));
+				     }
 
-			       // Convert X[row] decision variables to Expressions.
-			       Eigen::VectorX<Expression> q_all(total_dim);
-			       for (int j = 0; j < total_dim; ++j) {
-				       q_all(j) = Expression(X(node_k, j));
-			       }
+				     // Context<Expression> with these positions.
+				     auto context = _plant->CreateDefaultContext();
+				     set_configuration(context, q_all);
 
-			       // Context<Expression> with these positions.
-			       auto context = _plant->CreateDefaultContext();
-			       set_configuration(context, q_all);
+				     // World poses of each model's body.
+				     const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
+				     const auto& cube_body  = _plant->GetBodyByName("cb_body", cube_mi);
+				     const RigidTransform<Expression> X_WR =
+					     _plant->EvalBodyPoseInWorld(*context, robot_body);
+				     const RigidTransform<Expression> X_WC =
+					     _plant->EvalBodyPoseInWorld(*context, cube_body);
 
-			       // World poses of each model's body.
-			       const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
-			       const auto& cube_body  = _plant->GetBodyByName("cb_body", cube_mi);
-			       const RigidTransform<Expression> X_WR =
-				       _plant->EvalBodyPoseInWorld(*context, robot_body);
-			       const RigidTransform<Expression> X_WC =
-				       _plant->EvalBodyPoseInWorld(*context, cube_body);
+				     // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
+				     Eigen::Vector3<Expression> g;
+				     g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
+					     (X_WR.translation().y() - X_WC.translation().y() - y_offset),
+					     (X_WR.translation().z() - X_WC.translation().z() - delta_z);
 
-			       // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
-			       Eigen::Vector3<Expression> g;
-			       g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
-				       (X_WR.translation().y() - X_WC.translation().y() - y_offset),
-				       (X_WR.translation().z() - X_WC.translation().z() - delta_z);
-
-			       prog.AddConstraint(g, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-		       }
+				     prog.AddConstraint(g, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+			     }
 		);
+
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+	return phi_id;
 }
 
 
@@ -808,7 +821,7 @@ int GraphOfConstraints::add_assignable_robot_to_point_displacement_constraint(
 			Eigen::Vector3d p_WE = x.segment(robot_start, 3);
 			Eigen::Vector3d p_WP = x.segment(point_start, 3);
 			Eigen::Vector3d r = (p_WP - p_WE) - disp;
-			return r.norm();
+			return r.lpNorm<Eigen::Infinity>();
 		},
 		// ---- builder: add gated equalities with big-M ----
 		[=, this](auto& prog,
@@ -856,36 +869,209 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 	const int objs_start = num_agents * dim;
 	const int point_start = objs_start + point_id * non_robot_dim;
 
-	return _add_op(DeferredOpKind::kLinearEq, k,
-		       [=, this](const Eigen::VectorXd& x,
-				 const int... /*unused*/) {
-			       Eigen::Vector3d p_WE = x.segment(robot_start, 3);
-			       Eigen::Vector3d p_WP = x.segment(point_start, 3);
-			       Eigen::Vector3d r  = (p_WP - p_WE) - disp;   // want r == 0
-			       return r.norm();
-		       },
-		       [=, this](auto& prog,
-				 const SubgraphOfConstraints& subgraph,
-				 const int phi_id,
-				 const auto& X,
-				 const auto&... /*unused*/) {
-			       const unsigned int node_k = subgraph.subgraph_id(k);
-			       VectorXDecisionVariable row = X.row(node_k);
+	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
+			     [=, this](const Eigen::VectorXd& x,
+				       const int... /*unused*/) {
+				     Eigen::Vector3d p_WE = x.segment(robot_start, 3);
+				     Eigen::Vector3d p_WP = x.segment(point_start, 3);
+				     Eigen::Vector3d r  = (p_WP - p_WE) - disp;   // want r == 0
+				     return r.norm();
+			     },
+			     [=, this](auto& prog,
+				       const SubgraphOfConstraints& subgraph,
+				       const int phi_id,
+				       const auto& X,
+				       const auto&... /*unused*/) {
+				     const unsigned int node_k = subgraph.subgraph_id(k);
+				     VectorXDecisionVariable row = X.row(node_k);
 
-			       VectorXDecisionVariable p_WE = row.segment(robot_start, 3);
-			       VectorXDecisionVariable p_WP = row.segment(point_start, 3);
+				     VectorXDecisionVariable p_WE = row.segment(robot_start, 3);
+				     VectorXDecisionVariable p_WP = row.segment(point_start, 3);
 
-			       // Enforce pB - pA = disp  (3 scalar equalities)
-			       prog.AddLinearEqualityConstraint(p_WP - p_WE, disp);
-		       }
+				     // Enforce pB - pA = disp  (3 scalar equalities)
+				     prog.AddLinearEqualityConstraint(p_WP - p_WE, disp);
+			     }
 		);
+
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+	return robot_id;
 }
+
+int GraphOfConstraints::add_robot_to_point_alignment_constraint(
+	int k, int robot_id, int point_id, const Eigen::Vector3d& ee_ray_body,
+	// optional for roll disambiguation:
+	std::optional<Eigen::Vector3d> u_body_opt,         // u_b (must be ⟂ ee_ray_body)
+	std::optional<Eigen::Vector3d> roll_ref_world,     // t (any, not necessarily ⟂ d)
+	bool roll_ref_flat,
+	bool require_positive_pointing,
+	double eps_d, double tau_tperp) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	const int robot_start = robot_id * dim;
+	const int objs_start  = num_agents * dim;
+
+	int phi_id = _add_op(DeferredOpKind::kNonlinearEq, k,
+			     [=, this](const Eigen::VectorXd& x, const int...) {
+				     using Eigen::Vector3d;
+				     using Eigen::Matrix3d;
+
+				     // --- Small helpers (hinge and squared hinge) ---
+				     auto hinge = [](double a){ return std::max(0.0, a); };
+				     auto sqhinge = [&](double a){ const double h = hinge(a); return h*h; };
+
+				     // --- Extract pose & point from the numeric state ---
+				     Vector3d p_WE;
+				     Matrix3d R_WE;
+				     {
+					     // robot pose at node k
+					     const int robot_offset = robot_start;  // already captured from outer scope
+					     PoseFromRow_FreeBody<double>(x, robot_offset, &p_WE, &R_WE);
+				     }
+
+				     const Vector3d p_WP = x.segment(objs_start + point_id * non_robot_dim, 3);
+
+				     // --- Build r, d ---
+				     const Vector3d r = R_WE * ee_ray_body;    // body ray in world
+				     const Vector3d d = p_WP - p_WE;           // displacement to target
+
+				     std::cout << "r:\n" << r << std::endl;
+
+				     std::cout << "d:\n" << d << std::endl;
+
+				     double residual = 0.0;
+
+				     // (1) Point-at: r × d = 0  → use squared norm
+				     const Vector3d rc = r.cross(d);
+
+				     std::cout << "rc:\n" << rc << std::endl;
+
+				     residual += rc.squaredNorm();
+
+				     // (1b) Optional positive-facing: r·d >= 0  → penalize only if negative
+				     if (require_positive_pointing) {
+					     residual += sqhinge(-r.dot(d));  // (max(0, -r·d))^2
+				     }
+
+				     // (1c) Degeneracy guard: ||d||^2 >= eps_d^2 → penalize only if below threshold
+				     const double d2 = d.squaredNorm();
+				     if (d2 < eps_d*eps_d) {
+					     residual += (eps_d*eps_d - d2) * (eps_d*eps_d - d2);
+				     }
+
+				     // (2) Roll disambiguation branch A: world roll reference vector
+				     if (roll_ref_world && u_body_opt) {
+					     const Eigen::Vector3d& t   = *roll_ref_world;
+					     const Eigen::Vector3d& u_b = *u_body_opt;  // u_b ⟂ ee_ray_body guaranteed by caller
+					     const Vector3d u = R_WE * u_b;
+
+					     // Projection t_perp = t - (t·d)/(d·d) d  (robust to t not ⟂ d)
+					     // Guard d·d near zero already handled above
+					     Vector3d t_perp = t;
+					     if (d2 > 0.0) {
+						     const double t_dot_d = t.dot(d);
+						     t_perp -= (t_dot_d / d2) * d;
+					     }
+					     // Enforce u × t_perp = 0
+					     const Vector3d cx = u.cross(t_perp);
+					     residual += cx.squaredNorm();
+
+					     // Optional stabilizer u·d = 0
+					     residual += (u.dot(d)) * (u.dot(d));
+
+					     // Optional guard ||t_perp|| >= tau_tperp
+					     const double tperp2 = t_perp.squaredNorm();
+					     if (tperp2 < tau_tperp * tau_tperp) {
+						     const double viol = (tau_tperp * tau_tperp - tperp2);
+						     residual += viol * viol;
+					     }
+				     }
+				     // (2) Roll disambiguation branch B: "flat" (z=0 plane) for u
+				     else if (roll_ref_flat && u_body_opt) {
+					     const Eigen::Vector3d& u_b = *u_body_opt;
+					     const Vector3d u = R_WE * u_b;
+
+					     // Mirror the constraint u(2) ∈ [-tol, tol] with a squared hinge on excess
+					     const double tol = 1e-2;  // keep in sync with builder
+					     residual += sqhinge(std::abs(u.z()) - tol);
+				     }
+
+				     return residual;
+			     },
+			     [=, this](auto& prog, const SubgraphOfConstraints& subgraph, const int /*phi_id*/,
+				       const auto& X, const auto&...) {
+				     const unsigned int node_k = subgraph.subgraph_id(k);
+				     Eigen::RowVectorX<Expression> row = AsExprRow(X.row(node_k));
+
+				     Eigen::Matrix<Expression,3,1> p_WE;
+				     Eigen::Matrix<Expression,3,3> R_WE;
+				     PoseFromRow_FreeBody<Expression>(row, robot_start, &p_WE, &R_WE);
+
+				     const Eigen::Matrix<Expression,3,1> p_WP =
+					     PointWorldFromRow(row, objs_start, non_robot_dim, point_id);
+
+				     // r = R * v_b, d = P - E
+				     Eigen::Matrix<Expression,3,1> r = R_WE * ee_ray_body;
+				     Eigen::Matrix<Expression,3,1> d = p_WP - p_WE;
+
+				     // (1) Point-at: r × d = 0
+				     auto rc = r.cross(d);
+				     for (int i = 0; i < 3; ++i) prog.AddConstraint(rc(i) == 0);
+
+				     // (1b) Optional: positive facing
+				     if (require_positive_pointing) prog.AddConstraint(r.dot(d) >= 0)
+									    .evaluator()->set_description("positive pointing");
+			       
+				     // (1c) Degeneracy guard: ||d|| >= eps_d
+				     Expression d2 = d.dot(d);
+				     prog.AddConstraint(d2 >= eps_d*eps_d)
+					     .evaluator()->set_description("degeneracy guard");
+
+				     // (2) Optional roll disambiguation
+				     if (roll_ref_world && u_body_opt) {
+					     const Eigen::Vector3d& t = *roll_ref_world;
+					     const Eigen::Vector3d& u_b = *u_body_opt;  // caller ensures u_b ⟂ ee_ray_body
+					     Eigen::Matrix<Expression,3,1> u = R_WE * u_b;
+
+					     // Either projection-based:
+					     Expression t_dot_d = t(0)*d(0) + t(1)*d(1) + t(2)*d(2);
+					     Expression d_dot_d = d2;
+					     Eigen::Matrix<Expression,3,1> t_perp;
+					     t_perp << t(0) - (t_dot_d / d_dot_d) * d(0),
+						     t(1) - (t_dot_d / d_dot_d) * d(1),
+						     t(2) - (t_dot_d / d_dot_d) * d(2);
+
+					     auto cx = u.cross(t_perp);
+					     for (int i = 0; i < 3; ++i) prog.AddConstraint(cx(i) == 0);
+					     prog.AddConstraint(u.dot(d) == 0);                // optional stabilizer
+					     Expression tperp2 = t_perp.dot(t_perp);
+					     prog.AddConstraint(tperp2 >= tau_tperp*tau_tperp); // optional guard
+				     } else if (roll_ref_flat && u_body_opt) {
+					     const double tol = 1e-2;
+					     const Eigen::Vector3d& u_b = *u_body_opt;
+					     Eigen::Matrix<Expression,3,1> u = R_WE * u_b;
+
+					     prog.AddQuadraticConstraint(u(2), -tol, tol);
+				     }
+			     });
+
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+	return phi_id;
+}
+
 
 int GraphOfConstraints::add_point_to_point_displacement_constraint(
 	int k,
 	int point_a,
 	int point_b,
-	Eigen::Vector3d& disp) {
+	Eigen::Vector3d& disp,
+	double tol) {
 
 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
 	DRAKE_DEMAND(point_a >= 0 && point_a < num_objects);
@@ -894,6 +1080,9 @@ int GraphOfConstraints::add_point_to_point_displacement_constraint(
 	const int objs_start = num_agents * dim;
 	const int startA = objs_start + point_a * non_robot_dim;
 	const int startB = objs_start + point_b * non_robot_dim;
+
+	Eigen::VectorXd lb = Eigen::VectorXd::Constant(3, -tol);
+	Eigen::VectorXd ub = Eigen::VectorXd::Constant(3,  tol);
 
 	return _add_op(DeferredOpKind::kLinearEq, k,
 		       [=, this](const Eigen::VectorXd& x,
@@ -904,7 +1093,7 @@ int GraphOfConstraints::add_point_to_point_displacement_constraint(
 			       std::cout << "pA: " << pA << std::endl;
 			       std::cout << "pB: " << pB << std::endl;
 			       std::cout << "r: " << r << std::endl;
-			       return r.norm();
+			       return r.lpNorm<Eigen::Infinity>() - tol;
 		       },
 		       [=, this](auto& prog,
 				 const SubgraphOfConstraints& subgraph,
@@ -917,8 +1106,11 @@ int GraphOfConstraints::add_point_to_point_displacement_constraint(
 			       VectorXDecisionVariable pA = row.segment(startA, 3);
 			       VectorXDecisionVariable pB = row.segment(startB, 3);
 
+			       // residual = (pB - pA) - disp
+			       prog.AddLinearConstraint((pB - pA) - disp, lb, ub);
+
 			       // Enforce pB - pA = disp  (3 scalar equalities)
-			       prog.AddLinearEqualityConstraint(pB - pA, disp);
+			       // prog.AddLinearEqualityConstraint(pB - pA, disp);
 		       }
 		);
 }
@@ -1084,4 +1276,37 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	_edge_phi_to_static_assignment_map[edge_phi_id] = robot_id;
 
 	return edge_phi_id;
+}
+
+int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
+	int u,
+	int v,
+	int var,
+	int point_id,
+	double holding_distance_max) {
+
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	return _add_assignable_edge_op(
+		DeferredOpKind::kAgentLinearEq, u, v, var, std::set<int>({point_id}),
+		[=, this](const Eigen::VectorXd& x,
+			  const Eigen::VectorXi&/*unused*/) {
+			return 0;
+		},
+		[=, this](drake::solvers::MathematicalProgram& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int phi_id,
+			  const drake::solvers::MatrixXDecisionVariable& X,
+			  const drake::solvers::MatrixXDecisionVariable& /*unused*/) {
+			return;
+		},
+		[](drake::solvers::MathematicalProgram& prog,
+		   const int phi_id,
+		   const Eigen::VectorXi& var_assignments,
+		   const drake::solvers::MatrixXDecisionVariable& Xi) {
+			return;
+		});
 }

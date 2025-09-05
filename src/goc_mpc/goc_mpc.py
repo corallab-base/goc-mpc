@@ -152,20 +152,17 @@ class GraphOfConstraintsMPC():
         success = self._solve_for_waypoints(x)
 
         if not success:
-            print("WaypointsMPC Failed!")
-            return self.last_cycle_short_path
+            raise RuntimeError("WaypointsMPC Failed!")
 
         success = self._solve_for_timing(delta, x, x_dot)
 
         if not success:
-            print("TimingMPC Failed!")
-            return self.last_cycle_short_path
+            raise RuntimeError("TimingMPC Failed!")
 
         success = self._solve_for_short_path(x, x_dot)
 
         if not success:
-            print("ShortPathMPC Failed!")
-            return self.last_cycle_short_path
+            raise RuntimeError("ShortPathMPC Failed!")
 
         
         return self.last_cycle_short_path

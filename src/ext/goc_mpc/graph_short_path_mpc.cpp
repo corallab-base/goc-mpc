@@ -77,6 +77,25 @@ ShortPathProblem build_short_path_problem(
 		}
 	}
 
+	// 3. Collision cost
+	const int num_agents = graph->num_agents;
+	const int dim = graph->dim;
+	for (int i = 0; i < num_steps; ++i) {
+		for (int ag_i = 0; ag_i < num_agents; ++ag_i) {
+			const Eigen::VectorX<Variable> p_WE_i = Xi.row(i).segment(ag_i * dim, 3);
+			for (int ag_j = ag_i + 1; ag_j < num_agents; ++ag_j) {
+				const Eigen::VectorX<Variable> p_WE_j = Xi.row(i).segment(ag_j * dim, 3);
+
+				const Expression d_ij = (p_WE_j - p_WE_i).squaredNorm();
+
+				// problem.prog->AddQuadraticConstraint(d_ij,
+				// 				     0.0144,
+				// 				     10.0);
+			}
+		}
+	}
+
+
 	// TODO: Add path constraint
 	for (const auto& [edge_phi_id, edge_op] : graph->get_next_edge_ops(remaining_vertices)) {
 		edge_op.short_path_builder(*(problem.prog), edge_phi_id, var_assignments, Xi);
