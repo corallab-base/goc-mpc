@@ -980,6 +980,49 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 	return phi_id;
 }
 
+int GraphOfConstraints::add_robot_to_point_displacement_cost(
+	int k,
+	int robot_id,
+	int point_id,
+	Eigen::Vector3d& disp) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	const int robot_start = robot_id * dim;
+	const int objs_start = num_agents * dim;
+	const int point_start = objs_start + point_id * non_robot_dim;
+
+	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
+			     [=, this](const Eigen::VectorXd& x,
+				       const int... /*unused*/) {
+				     Eigen::Vector3d p_WE = x.segment(robot_start, 3);
+				     Eigen::Vector3d p_WP = x.segment(point_start, 3);
+				     Eigen::Vector3d r  = (p_WP - p_WE) - disp;   // want r == 0
+				     return r.squaredNorm();
+			     },
+			     [=, this](auto& prog,
+				       const SubgraphOfConstraints& subgraph,
+				       const int phi_id,
+				       const auto& X,
+				       const auto&... /*unused*/) {
+				     const unsigned int node_k = subgraph.subgraph_id(k);
+				     VectorXDecisionVariable row = X.row(node_k);
+
+				     VectorXDecisionVariable p_WE = row.segment(robot_start, 3);
+				     VectorXDecisionVariable p_WP = row.segment(point_start, 3);
+
+				     prog.AddQuadraticCost(((p_WP - p_WE) - disp).squaredNorm());
+			     }
+		);
+
+	// record that this constraint is statically assigned to this robot.
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+
+	return phi_id;
+}
+
 int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 	int k, int robot_id, int point_id, const Eigen::Vector3d& ee_ray_body,
 	// optional for roll disambiguation:
@@ -1101,7 +1144,8 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 
 				     // (1) Point-at: r × d = 0
 				     auto rc = r.cross(d);
-				     for (int i = 0; i < 3; ++i) prog.AddConstraint(rc(i) == 0);
+				     for (int i = 0; i < 3; ++i) prog.AddConstraint(rc(i) == 0)
+									 .evaluator()->set_description("pointing at constraint");
 
 				     // (1b) Optional: positive facing
 				     if (require_positive_pointing) prog.AddConstraint(r.dot(d) >= 0)
@@ -1136,7 +1180,8 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 					     const Eigen::Vector3d& u_b = *u_body_opt;
 					     Eigen::Matrix<Expression,3,1> u = R_WE * u_b;
 
-					     prog.AddQuadraticConstraint(u(2), -tol, tol);
+					     prog.AddQuadraticConstraint(u(2), -tol, tol)
+						     .evaluator()->set_description("flat roll constraint");;
 				     }
 			     });
 
@@ -1192,6 +1237,44 @@ int GraphOfConstraints::add_point_to_point_displacement_constraint(
 
 			       // Enforce pB - pA = disp  (3 scalar equalities)
 			       // prog.AddLinearEqualityConstraint(pB - pA, disp);
+		       }
+		);
+}
+
+int GraphOfConstraints::add_point_to_point_displacement_cost(
+	int k,
+	int point_a,
+	int point_b,
+	Eigen::Vector3d& disp) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(point_a >= 0 && point_a < num_objects);
+	DRAKE_DEMAND(point_b >= 0 && point_b < num_objects);
+
+	const int objs_start = num_agents * dim;
+	const int startA = objs_start + point_a * non_robot_dim;
+	const int startB = objs_start + point_b * non_robot_dim;
+
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		       [=, this](const Eigen::VectorXd& x,
+				 const int... /*unused*/) {
+			       Eigen::Vector3d pA = x.segment(startA, 3);
+			       Eigen::Vector3d pB = x.segment(startB, 3);
+			       Eigen::Vector3d r  = (pB - pA) - disp;   // want r == 0
+			       return r.squaredNorm();
+		       },
+		       [=, this](auto& prog,
+				 const SubgraphOfConstraints& subgraph,
+				 const int phi_id,
+				 const auto& X,
+				 const auto&... /*unused*/) {
+			       const unsigned int node_k = subgraph.subgraph_id(k);
+			       VectorXDecisionVariable row = X.row(node_k);
+
+			       VectorXDecisionVariable pA = row.segment(startA, 3);
+			       VectorXDecisionVariable pB = row.segment(startB, 3);
+
+			       prog.AddQuadraticCost(((pB - pA) - disp).squaredNorm());
 		       }
 		);
 }
@@ -1449,6 +1532,61 @@ int GraphOfConstraints::add_robot_relative_rotation_constraint(
 	return edge_phi_id;
 }
 
+int GraphOfConstraints::add_robot_relative_displacement_constraint(
+	int u,
+	int v,
+	int robot_id,
+	Eigen::Vector3d& disp) {
+
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+
+	const int robot_start = robot_id * dim;
+
+	int edge_phi_id = _add_edge_op(
+		DeferredOpKind::kLinearEq, u, v, std::set<int>{},
+		// ---------- Evaluation: always satisfied. no backtracking ----------
+		[=, this](const Eigen::VectorXd& x, const Eigen::VectorXi& /*unused*/) {
+			return 0.0;
+		},
+		// ---------- Add constraints to Drake ----------
+		[=, this](drake::solvers::MathematicalProgram& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int /*phi_id*/,
+			  const drake::solvers::MatrixXDecisionVariable& X,
+			  const drake::solvers::MatrixXDecisionVariable& /*unused*/,
+			  const Eigen::VectorXd& x_u) {
+			const unsigned int sg_u = subgraph.subgraph_id(u);
+			const unsigned int sg_v = subgraph.subgraph_id(v);
+
+			if (sg_u == -1 && sg_v != -1) {
+				// When x_u is passed, it is in x_u
+				Eigen::RowVectorXd row_u = x_u;
+				Eigen::RowVectorX<Expression> row_v = AsExprRow(X.row(sg_v));
+
+				Eigen::Vector3d p_WE_u = row_u.segment(robot_start, 3);
+				Eigen::Vector3<Expression> p_WE_v = row_v.segment(robot_start, 3);
+
+				prog.AddLinearEqualityConstraint(p_WE_v - p_WE_u, disp);
+			} else if (sg_u != -1 && sg_v != -1) {
+				Eigen::RowVectorX<Expression> row_u = AsExprRow(X.row(sg_u));
+				Eigen::RowVectorX<Expression> row_v = AsExprRow(X.row(sg_v));
+
+				Eigen::Vector3<Expression> p_WE_u = row_u.segment(robot_start, 3);
+				Eigen::Vector3<Expression> p_WE_v = row_v.segment(robot_start, 3);
+
+				prog.AddLinearEqualityConstraint(p_WE_v - p_WE_u, disp);
+			}
+		},
+		// Short-path variant (unused)
+		[](drake::solvers::MathematicalProgram&, const int, const Eigen::VectorXi&,
+		   const drake::solvers::MatrixXDecisionVariable&) { return; });
+
+	// Statically assigned to this robot.
+	_edge_phi_to_static_assignment_map[edge_phi_id] = robot_id;
+	return edge_phi_id;
+}
 
 int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 	int u,

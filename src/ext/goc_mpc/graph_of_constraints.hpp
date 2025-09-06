@@ -207,6 +207,10 @@ struct GraphOfConstraints {
 						       int robot_id,
 						       int point_id,
 						       Eigen::Vector3d& disp);
+	int add_robot_to_point_displacement_cost(int k,
+						 int robot_id,
+						 int point_id,
+						 Eigen::Vector3d& disp);
 
 	int add_robot_to_point_alignment_constraint(int k,
 						    int robot_id,
@@ -224,6 +228,10 @@ struct GraphOfConstraints {
 						       int point_b,
 						       Eigen::Vector3d& disp,
 						       double tol = 0.05);
+	int add_point_to_point_displacement_cost(int k,
+						 int point_a,
+						 int point_b,
+						 Eigen::Vector3d& disp);
 
 	int add_point_to_point_alignment_constraint(int k,
 						    int point_a,
@@ -248,6 +256,11 @@ struct GraphOfConstraints {
 						   int v,
 						   int robot_id,
 						   Eigen::Quaternion<double>& quat);
+
+	int add_robot_relative_displacement_constraint(int u,
+						       int v,
+						       int robot_id,
+						       Eigen::Vector3d& disp);
 
 	int add_robot_holding_points_constraint(int u,
 						int v,

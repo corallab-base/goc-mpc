@@ -81,10 +81,16 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("point_b"),
 		     py::arg("disp"),
 		     py::arg("tol") = 0.05)
+		.def("add_point_to_point_displacement_cost", &GraphOfConstraints::add_point_to_point_displacement_cost,
+		     py::arg("k"),
+		     py::arg("point_a"),
+		     py::arg("point_b"),
+		     py::arg("disp"))
 		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint)
 		.def("add_assignable_robot_holding_point_constraint", &GraphOfConstraints::add_assignable_robot_holding_point_constraint)
 		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint)
 		.def("add_robot_relative_rotation_constraint", &GraphOfConstraints::add_robot_relative_rotation_constraint)
+		.def("add_robot_relative_displacement_constraint", &GraphOfConstraints::add_robot_relative_displacement_constraint)
 		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,
 		     py::arg("k"),
 		     py::arg("robot_id"),
