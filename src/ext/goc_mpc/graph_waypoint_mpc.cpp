@@ -627,7 +627,7 @@ using drake::solvers::MathematicalProgram;
 using drake::solvers::MathematicalProgramResult;
 using drake::solvers::IpoptSolverDetails;
 
-void PrintSolverReport(const MathematicalProgram& prog,
+void PrintSolverReport(GraphWaypointProblem* problem,
 		       const MathematicalProgramResult& result,
 		       double tol = 1e-6) {
 	using std::cout;
@@ -648,12 +648,12 @@ void PrintSolverReport(const MathematicalProgram& prog,
 	Eigen::VectorXd x;
 	bool have_x = false;
 	try {
-		x = result.GetSolution(prog.decision_variables());
+		x = result.GetSolution(problem->prog->decision_variables());
 		have_x = true;
 	} catch (const std::exception&) {
 		// Fall back to initial guess (may be zero) if solver did not return x.
-		if (prog.decision_variables().size() > 0) {
-			x = prog.initial_guess();
+		if (problem->prog->decision_variables().size() > 0) {
+			x = problem->prog->initial_guess();
 			have_x = true;
 			cout << "(No returned solution vector; using initial guess for diagnostics.)\n";
 		}
@@ -665,24 +665,29 @@ void PrintSolverReport(const MathematicalProgram& prog,
 			auto print_binding_violation = [&](const auto& bindings, const char* kind) {
 				for (const auto& b : bindings) {
 					const auto& c = *b.evaluator();
+					const auto& vars = b.variables();
+					Eigen::VectorXd x_b = result.GetSolution(vars);
+
 					double tol = 0.05;
-					if (!c.CheckSatisfied(x, tol)) {
+					if (!c.CheckSatisfied(x_b, tol)) {
 						cout << "Violation [" << kind << "]: "
+						     << " (constraint: " << c.get_description() << ")\n";
+					} else {
+						cout << "Satisfied [" << kind << "]: "
 						     << " (constraint: " << c.get_description() << ")\n";
 					}
 				}
 			};
 
 			cout << "--- Constraint violations (inf-norm > " << tol << ") ---\n";
-			print_binding_violation(prog.bounding_box_constraints(),   "BoundingBox");
-			print_binding_violation(prog.linear_equality_constraints(),"LinEq");
-			print_binding_violation(prog.linear_constraints(),         "LinIneq");
-			print_binding_violation(prog.lorentz_cone_constraints(),   "Lorentz");
-			print_binding_violation(prog.rotated_lorentz_cone_constraints(),"RotLorentz");
-			print_binding_violation(prog.quadratic_constraints(),      "Quadratic");
-			print_binding_violation(prog.exponential_cone_constraints(),"ExpCone");
-			print_binding_violation(prog.generic_constraints(),        "Generic");
-			// print_binding_violation(prog.polynomial_constraints(),     "Polynomial");
+			print_binding_violation(problem->prog->bounding_box_constraints(),   "BoundingBox");
+			print_binding_violation(problem->prog->linear_equality_constraints(),"LinEq");
+			print_binding_violation(problem->prog->linear_constraints(),         "LinIneq");
+			print_binding_violation(problem->prog->lorentz_cone_constraints(),   "Lorentz");
+			print_binding_violation(problem->prog->rotated_lorentz_cone_constraints(),"RotLorentz");
+			print_binding_violation(problem->prog->quadratic_constraints(),      "Quadratic");
+			print_binding_violation(problem->prog->exponential_cone_constraints(),"ExpCone");
+			print_binding_violation(problem->prog->generic_constraints(),        "Generic");
 		} catch (const std::exception& e) {
 			cout << "Exception in printing binding violations: " << e.what() << endl;
 		}
@@ -699,7 +704,7 @@ void PrintSolverReport(const MathematicalProgram& prog,
 				double constr_viol; double comp_viol; double primal_step; double dual_step;
 			};
 
-			for (const std::string& s : result.GetInfeasibleConstraintNames(prog, tol)) {
+			for (const std::string& s : result.GetInfeasibleConstraintNames(*problem->prog, tol)) {
 				cout << "infeasible constraint: " << s << std::endl;
 			}
 
@@ -707,6 +712,9 @@ void PrintSolverReport(const MathematicalProgram& prog,
 			// Example (adjust to your Drake version):
 			const auto& d = result.get_solver_details<drake::solvers::IpoptSolver>();
 			cout << "Ipopt status: " << d.ConvertStatusToString() << endl;
+		} else if (sid == "NLopt") {
+			const auto& d = result.get_solver_details<drake::solvers::NloptSolver>();
+			cout << "TODO: Print nlopt information" << endl;
 		} else if (sid == "OSQP") {
 			// Example (adjust to your Drake version):
 			// const auto& d = result.get_solver_details<OsqpSolver>();
@@ -774,6 +782,7 @@ EnumSolveResult EnumerateAllAssignmentsAndSolve(
 	const Eigen::MatrixXd* warmstart_X = nullptr) {
 
 	using drake::solvers::IpoptSolver;
+	using drake::solvers::NloptSolver;
 	IpoptSolver solver;
 	if (!solver.available()) throw std::runtime_error("IPOPT not available.");
 
@@ -821,7 +830,7 @@ EnumSolveResult EnumerateAllAssignmentsAndSolve(
 			problem->prog->SetInitialGuess(problem->X, res.GetSolution(problem->X));
 		} else {
 			std::cout << "NO SUCCESS FOR ASSIGNMENTS:\n" << A0 << std::endl;
-			PrintSolverReport(*(problem->prog), res, 1e-6);
+			PrintSolverReport(problem, res, 1e-6);
 		}
 
 		first = false;
