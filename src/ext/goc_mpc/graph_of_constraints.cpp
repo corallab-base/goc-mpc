@@ -381,7 +381,7 @@ int GraphOfConstraints::add_quadratic_cost_on_node(int k, const Eigen::MatrixXd&
 
 
 // Ax = b on node k
-int GraphOfConstraints::add_agents_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+int GraphOfConstraints::add_robots_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
 	return _add_op(DeferredOpKind::kLinearEq, k,
 		       [=, this](const Eigen::VectorXd& x,
 				 const int... /*unused*/) {
@@ -399,7 +399,7 @@ int GraphOfConstraints::add_agents_linear_eq(int k, const Eigen::MatrixXd& A, co
 }
 
 // lb <= A x <= ub on node k
-int GraphOfConstraints::add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
+int GraphOfConstraints::add_robots_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
 	return _add_op(DeferredOpKind::kLinearIneq, k,
 		       [=, this](const Eigen::VectorXd& x,
 				 const int... /*unused*/) {
@@ -417,7 +417,7 @@ int GraphOfConstraints::add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, 
 }
 
 // Ax = b on node k
-int GraphOfConstraints::add_agent_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+int GraphOfConstraints::add_robot_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
 				       const int... /*unused*/) {
@@ -441,7 +441,7 @@ int GraphOfConstraints::add_agent_linear_eq(int k, int robot_id, const Eigen::Ma
 }
 
 // lb <= A x <= ub on node k
-int GraphOfConstraints::add_agent_linear_ineq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
+int GraphOfConstraints::add_robot_linear_ineq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub) {
 	int phi_id = _add_op(DeferredOpKind::kLinearIneq, k,
 		       [=, this](const Eigen::VectorXd& x,
 				 const int... /*unused*/) {
@@ -463,7 +463,8 @@ int GraphOfConstraints::add_agent_linear_ineq(int k, int robot_id, const Eigen::
 	return phi_id;
 }
 
-int GraphOfConstraints::add_agent_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+
+int GraphOfConstraints::add_robot_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
 				       const int... /*unused*/) {
@@ -485,7 +486,7 @@ int GraphOfConstraints::add_agent_pos_linear_eq(int k, int robot_id, const Eigen
 	return phi_id;
 }
 
-int GraphOfConstraints::add_agent_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+int GraphOfConstraints::add_robot_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
 				       const int... /*unused*/) {

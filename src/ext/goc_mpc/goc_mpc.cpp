@@ -52,13 +52,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("evaluate_edge_phi", &GraphOfConstraints::evaluate_edge_phi)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
-		.def("add_agents_linear_eq", &GraphOfConstraints::add_agents_linear_eq)
-		.def("add_agent_linear_eq", &GraphOfConstraints::add_agent_linear_eq)
-		.def("add_agent_pos_linear_eq", &GraphOfConstraints::add_agent_pos_linear_eq)
-		.def("add_agent_quat_linear_eq", &GraphOfConstraints::add_agent_quat_linear_eq)
+		.def("add_robots_linear_eq", &GraphOfConstraints::add_robots_linear_eq)
+		.def("add_robot_linear_eq", &GraphOfConstraints::add_robot_linear_eq)
+		.def("add_robot_pos_linear_eq", &GraphOfConstraints::add_robot_pos_linear_eq)
+		.def("add_robot_quat_linear_eq", &GraphOfConstraints::add_robot_quat_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
 		.def("add_assignable_robot_to_point_displacement_constraint", &GraphOfConstraints::add_assignable_robot_to_point_displacement_constraint)
 		.def("add_robot_to_point_displacement_constraint", &GraphOfConstraints::add_robot_to_point_displacement_constraint)
+		.def("add_robot_to_point_displacement_cost", &GraphOfConstraints::add_robot_to_point_displacement_cost)
 		.def("add_robot_to_point_alignment_constraint", &GraphOfConstraints::add_robot_to_point_alignment_constraint,
 		     py::arg("k"),
 		     py::arg("robot_id"),

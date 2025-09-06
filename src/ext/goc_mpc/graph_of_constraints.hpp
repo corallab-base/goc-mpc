@@ -171,41 +171,24 @@ struct GraphOfConstraints {
 	// Unpassable node util
 	void make_node_unpassable(int k);
 	
-	// Plain Constraint Adders (typed)
-	// Note: these copy the numpy array's passed to them, but they're called
-	// once so it's fine.
-
-	// lb <= x <= ub on node k
+	// Adding Constraints
 	int add_bounding_box(int k, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
-	// Ax = b on node k
 	int add_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
-	// lb <= A x <= ub on node k
 	int add_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
-	// 0.5 x'Qx + b'x + c on node k
 	int add_quadratic_cost_on_node(int k, const Eigen::MatrixXd& Q, const Eigen::VectorXd& b, double c = 0.0);
 
-	// Ax = b on node k
-	int add_agents_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
-	// lb <= A x <= ub on node k
-	int add_agents_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
+	int add_robots_linear_eq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_robots_linear_ineq(int k, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
 
-	// Ax = b on node k
-	int add_agent_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
-	// lb <= A x <= ub on node k
-	int add_agent_linear_ineq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
+	int add_robot_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_robot_linear_ineq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
 
-	int add_agent_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
-	int add_agent_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_robot_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_robot_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
 
-	// Multi-Agent Constraint Adders (typed)
-
-	// Ax_i = b on node k for some agent i
 	int add_assignable_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
-	// Temp Plant-Based Constraint Adders
-
-	// Sort of hard-coded
 	int add_robot_above_cube_constraint(int k,
 					    int robot_id,
 					    int cube_id,
@@ -245,7 +228,7 @@ struct GraphOfConstraints {
 						    int point_b,
 						    const Eigen::Vector3d& dir_W);
 
-	// EDGE CONSTRAINTS
+	// Edge Constraints
 
 	// int add_assignable_robot_holding_point_constraint(int u,
 	// 						  int v,
