@@ -36,7 +36,7 @@ static inline Expression wrap_to_pi(const Expression& delta) {
 static inline drake::math::RotationMatrix<Expression>
 RotFromQuatWxyz(const Eigen::Matrix<Expression,4,1>& qwxyz) {
 	Eigen::Quaternion<Expression> q(qwxyz(0), qwxyz(1), qwxyz(2), qwxyz(3));
-	return drake::math::RotationMatrix<Expression>(q.normalized());
+	return drake::math::RotationMatrix<Expression>(q);
 }
 
 // hat(·) operator: φ -> φ^ (skew)
@@ -558,7 +558,10 @@ public:
 				// const auto R2 = RotFromQuatWxyz(q2wxyz).matrix();
 
 				// total += (R2 - R1).squaredNorm();                // squared frobenius norm (chordal distance)
-				total += (q2wxyz - q1wxyz).squaredNorm();
+				// total += (q2wxyz - q1wxyz).squaredNorm();
+				// total += (1 - drake::symbolic::abs(q1wxyz.dot(q2wxyz)));
+				// total += drake::symbolic::min((q1wxyz - q2wxyz).squaredNorm(), (q1wxyz + q2wxyz).squaredNorm());
+				total += (1 - (q1wxyz.dot(q2wxyz))*(q1wxyz.dot(q2wxyz)));
 				break;
 			}
 

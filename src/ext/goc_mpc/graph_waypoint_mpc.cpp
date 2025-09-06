@@ -424,7 +424,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 				x0_exps(k) = Expression(x0(ag * robot_dim + k));
 			}
 			Expression dist = splines->at(ag).squared_distance(x0_exps, X.row(sg_v).segment(ag * robot_dim, robot_dim));
-			problem.prog->AddQuadraticCost(dist);
+			problem.prog->AddCost(dist);
 		}
 
 		// Second, for the source nodes, add CONSTRAINTS saything that a block
@@ -534,7 +534,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		for (int ag = 0; ag < num_agents; ++ag) {
 			Expression dist = splines->at(ag).squared_distance(X.row(sg_u).segment(ag * robot_dim, robot_dim),
 									   X.row(sg_v).segment(ag * robot_dim, robot_dim));
-			problem.prog->AddQuadraticCost(dist);
+			problem.prog->AddCost(dist);
 		}
 
 		for (int obj = 0; obj < num_objects; ++obj) {
