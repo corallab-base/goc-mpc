@@ -956,7 +956,7 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 				     Eigen::Vector3d p_WE = x.segment(robot_start, 3);
 				     Eigen::Vector3d p_WP = x.segment(point_start, 3);
 				     Eigen::Vector3d r  = (p_WP - p_WE) - disp;   // want r == 0
-				     return r.norm();
+				     return r.lpNorm<Eigen::Infinity>();
 			     },
 			     [=, this](auto& prog,
 				       const SubgraphOfConstraints& subgraph,
