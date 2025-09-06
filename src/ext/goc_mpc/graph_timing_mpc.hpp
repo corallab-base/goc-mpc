@@ -4,6 +4,7 @@
 
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/ipopt_solver.h>
+#include <drake/solvers/nlopt_solver.h>
 #include <drake/solvers/branch_and_bound.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>

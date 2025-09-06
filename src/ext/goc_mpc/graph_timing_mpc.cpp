@@ -11,9 +11,9 @@ using drake::solvers::MathematicalProgram;
 using drake::solvers::MathematicalProgramResult;
 using drake::solvers::IpoptSolverDetails;
 
-inline void PrintSolverReport(const MathematicalProgram& prog,
-                              const MathematicalProgramResult& result,
-                              double tol = 1e-6) {
+static void PrintSolverReport(GraphTimingProblem* problem,
+			      const MathematicalProgramResult& result,
+			      double tol = 1e-6) {
 	using std::cout;
 	using std::endl;
 
@@ -32,12 +32,12 @@ inline void PrintSolverReport(const MathematicalProgram& prog,
 	Eigen::VectorXd x;
 	bool have_x = false;
 	try {
-		x = result.GetSolution(prog.decision_variables());
+		x = result.GetSolution(problem->prog->decision_variables());
 		have_x = true;
 	} catch (const std::exception&) {
 		// Fall back to initial guess (may be zero) if solver did not return x.
-		if (prog.decision_variables().size() > 0) {
-			x = prog.initial_guess();
+		if (problem->prog->decision_variables().size() > 0) {
+			x = problem->prog->initial_guess();
 			have_x = true;
 			cout << "(No returned solution vector; using initial guess for diagnostics.)\n";
 		}
@@ -45,27 +45,36 @@ inline void PrintSolverReport(const MathematicalProgram& prog,
 
 	// Constraint violation scan.
 	if (have_x) {
-		auto print_binding_violation = [&](const auto& bindings, const char* kind) {
-			for (const auto& b : bindings) {
-				const auto& c = *b.evaluator();
-				double tol = 0.05;
-				if (!c.CheckSatisfied(x, tol)) {
-					cout << "Violation [" << kind << "]: "
-					     << " (constraint: " << c.get_description() << ")\n";
-				}
-			}
-		};
+		try {
+			auto print_binding_violation = [&](const auto& bindings, const char* kind) {
+				for (const auto& b : bindings) {
+					const auto& c = *b.evaluator();
+					const auto& vars = b.variables();
+					Eigen::VectorXd x_b = result.GetSolution(vars);
 
-		cout << "--- Constraint violations (inf-norm > " << tol << ") ---\n";
-		print_binding_violation(prog.bounding_box_constraints(),   "BoundingBox");
-		print_binding_violation(prog.linear_equality_constraints(),"LinEq");
-		print_binding_violation(prog.linear_constraints(),         "LinIneq");
-		print_binding_violation(prog.lorentz_cone_constraints(),   "Lorentz");
-		print_binding_violation(prog.rotated_lorentz_cone_constraints(),"RotLorentz");
-		print_binding_violation(prog.quadratic_constraints(),      "Quadratic");
-		print_binding_violation(prog.exponential_cone_constraints(),"ExpCone");
-		print_binding_violation(prog.generic_constraints(),        "Generic");
-		// print_binding_violation(prog.polynomial_constraints(),     "Polynomial");
+					double tol = 0.05;
+					if (!c.CheckSatisfied(x_b, tol)) {
+						cout << "Violation [" << kind << "]: "
+						     << " (constraint: " << c.get_description() << ")\n";
+					} else {
+						cout << "Satisfied [" << kind << "]: "
+						     << " (constraint: " << c.get_description() << ")\n";
+					}
+				}
+			};
+
+			cout << "--- Constraint violations (inf-norm > " << tol << ") ---\n";
+			print_binding_violation(problem->prog->bounding_box_constraints(),   "BoundingBox");
+			print_binding_violation(problem->prog->linear_equality_constraints(),"LinEq");
+			print_binding_violation(problem->prog->linear_constraints(),         "LinIneq");
+			print_binding_violation(problem->prog->lorentz_cone_constraints(),   "Lorentz");
+			print_binding_violation(problem->prog->rotated_lorentz_cone_constraints(),"RotLorentz");
+			print_binding_violation(problem->prog->quadratic_constraints(),      "Quadratic");
+			print_binding_violation(problem->prog->exponential_cone_constraints(),"ExpCone");
+			print_binding_violation(problem->prog->generic_constraints(),        "Generic");
+		} catch (const std::exception& e) {
+			cout << "Exception in printing binding violations: " << e.what() << endl;
+		}
 	} else {
 		cout << "(No decision vector available to evaluate constraints.)\n";
 	}
@@ -78,11 +87,18 @@ inline void PrintSolverReport(const MathematicalProgram& prog,
 				int status; int iterations; double objective; double dual_inf;
 				double constr_viol; double comp_viol; double primal_step; double dual_step;
 			};
+
+			for (const std::string& s : result.GetInfeasibleConstraintNames(*problem->prog, tol)) {
+				cout << "infeasible constraint: " << s << std::endl;
+			}
+
 			// If your Drake provides IpoptSolver::Details, use that exact type.
 			// Example (adjust to your Drake version):
-			// const auto& d = result.get_solver_details<IpoptSolver>();
-			// cout << "Ipopt status: " << d.status << ", iters: " << d.iterations
-			//      << ", constr_viol: " << d.constr_viol << "\n";
+			const auto& d = result.get_solver_details<drake::solvers::IpoptSolver>();
+			cout << "Ipopt status: " << d.ConvertStatusToString() << endl;
+		} else if (sid == "NLopt") {
+			const auto& d = result.get_solver_details<drake::solvers::NloptSolver>();
+			cout << "TODO: Print nlopt information" << endl;
 		} else if (sid == "OSQP") {
 			// Example (adjust to your Drake version):
 			// const auto& d = result.get_solver_details<OsqpSolver>();
@@ -703,9 +719,7 @@ bool GraphTimingMPC::solve(
 		}
 		return true;
 	} else {
-
-		PrintSolverReport(*(problem->prog), result, 1e-6);
-
+		PrintSolverReport(problem.get(), result, 1e-6);
 		return false;
 	}
 }
