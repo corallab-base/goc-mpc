@@ -54,6 +54,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
 		.def("add_robots_linear_eq", &GraphOfConstraints::add_robots_linear_eq)
 		.def("add_robot_linear_eq", &GraphOfConstraints::add_robot_linear_eq)
+		.def("add_point_linear_eq", &GraphOfConstraints::add_point_linear_eq)
+		.def("add_point_linear_ineq", &GraphOfConstraints::add_point_linear_ineq)
 		.def("add_robot_pos_linear_eq", &GraphOfConstraints::add_robot_pos_linear_eq)
 		.def("add_robot_quat_linear_eq", &GraphOfConstraints::add_robot_quat_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)

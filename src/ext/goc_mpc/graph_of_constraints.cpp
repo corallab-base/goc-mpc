@@ -463,6 +463,91 @@ int GraphOfConstraints::add_robot_linear_ineq(int k, int robot_id, const Eigen::
 	return phi_id;
 }
 
+int GraphOfConstraints::add_point_linear_eq(
+	int k, int point_id,
+	const Eigen::MatrixXd& A,
+	const Eigen::VectorXd& b) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	// Expect A is (m x 3) if the point is 3D, and b is (m).
+	DRAKE_DEMAND(A.cols() == 3);
+	DRAKE_DEMAND(b.size() == A.rows());
+
+	const int objs_start  = num_agents * dim;
+	const int point_start = objs_start + point_id * non_robot_dim;
+
+	int phi_id = _add_op(
+		DeferredOpKind::kLinearEq, k,
+		// ---- Evaluation: max absolute residual (0 means satisfied) ----
+		[=, this](const Eigen::VectorXd& x, const int... /*unused*/) {
+			const Eigen::Vector3d point_config_k = x.segment(point_start, 3);
+			const Eigen::VectorXd r = A * point_config_k - b;  // residual
+			return r.lpNorm<Eigen::Infinity>();                // max |residual|
+		},
+		// ---- Definition in Drake ----
+		[=, this](auto& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int /*phi_id*/,
+			  const auto& X,
+			  const auto& /*unused*/) {
+			const int node_k = subgraph.subgraph_id(k);
+			VectorXDecisionVariable point_config_k =
+				X.row(node_k).segment(point_start, 3);
+
+			// Enforces A * point_config_k == b
+			prog.AddLinearEqualityConstraint(A, b, point_config_k);
+		});
+
+	return phi_id;
+}
+
+int GraphOfConstraints::add_point_linear_ineq(
+	int k, int point_id,
+	const Eigen::MatrixXd& A,
+	const Eigen::VectorXd& lb,
+	const Eigen::VectorXd& ub) {
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	// A is (m x 3), lb/ub are (m)
+	DRAKE_DEMAND(A.cols() == 3);
+	DRAKE_DEMAND(lb.size() == A.rows());
+	DRAKE_DEMAND(ub.size() == A.rows());
+
+	const int objs_start  = num_agents * dim;
+	const int point_start = objs_start + point_id * non_robot_dim;
+
+	int phi_id = _add_op(
+		DeferredOpKind::kLinearIneq, k,
+		// ---- Evaluation: returns max violation (0 if satisfied) ----
+		[=, this](const Eigen::VectorXd& x, const int... /*unused*/) {
+			const Eigen::Vector3d point_config_k = x.segment(point_start, 3);
+
+			const Eigen::ArrayXd ax  = (A * point_config_k).array();
+			const Eigen::ArrayXd v1  = (lb.array() - ax).max(0.0);   // lb - Ax > 0 ⇒ lower-bound violation
+			const Eigen::ArrayXd v2  = (ax - ub.array()).max(0.0);   // Ax - ub > 0 ⇒ upper-bound violation
+			const Eigen::ArrayXd vio = v1.max(v2);                   // per-row violation
+			return vio.matrix().lpNorm<Eigen::Infinity>();           // max violation
+		},
+		// ---- Definition in Drake ----
+		[=, this](auto& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int /*phi_id*/,
+			  const auto& X,
+			  const auto& /*unused*/) {
+			const int node_k = subgraph.subgraph_id(k);
+			VectorXDecisionVariable point_config_k =
+				X.row(node_k).segment(point_start, 3);
+
+			// Imposes lb ≤ A * point_config_k ≤ ub elementwise
+			prog.AddLinearConstraint(A, lb, ub, point_config_k);
+		});
+
+	return phi_id;
+}
 
 int GraphOfConstraints::add_robot_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,

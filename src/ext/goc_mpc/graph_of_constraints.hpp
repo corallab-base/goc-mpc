@@ -186,6 +186,8 @@ struct GraphOfConstraints {
 	int add_robot_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 	int add_robot_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
+	int add_point_linear_eq(int k, int point_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_point_linear_ineq(int k, int point_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
 
 	int add_assignable_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
