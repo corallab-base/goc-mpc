@@ -4,11 +4,12 @@
 #include <algorithm>
 
 #include <drake/solvers/mathematical_program.h>
-#include <drake/solvers/ipopt_solver.h>
 #include <drake/solvers/branch_and_bound.h>
+#include <drake/solvers/ipopt_solver.h>
 #include <drake/solvers/snopt_solver.h>
-#include <drake/solvers/mosek_solver.h>
+#include <drake/solvers/nlopt_solver.h>
 #include <drake/solvers/gurobi_solver.h>
+#include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/solve.h>
 #include <drake/solvers/solver_options.h>
 #include <drake/common/timer.h>

@@ -299,6 +299,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
 	const std::vector<int>& remaining_vertices,
 	Eigen::VectorXd x0,
+	Eigen::MatrixXd previous_X,
 	bool enforce_rigidity) {
 
 	const int num_agents = graph->num_agents;
@@ -599,7 +600,8 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 	// Add constraints/costs from edge registry
 	for (const auto& [edge_phi_id, edge_op] : subgraph.get_subgraph_edge_ops()) {
-		edge_op.waypoint_builder(*(problem.prog), subgraph, edge_phi_id, X, Assignments);
+		edge_op.waypoint_builder(*(problem.prog), subgraph, edge_phi_id, X, Assignments,
+					 previous_X.row(edge_op.u_node));
 	}
 
 	return std::move(problem);
@@ -719,8 +721,6 @@ void PrintSolverReport(const MathematicalProgram& prog,
 		cout << "(Could not print solver-specific details: " << e.what() << ")\n";
 	}
 
-	cout << "here5" << std::endl;
-
 	cout << "=== End Report ===\n";
 }
 
@@ -839,6 +839,14 @@ bool GraphWaypointMPC::solve(
 
 	_timer.Start();
 
+	// Warm start configurations
+	if (_first_cycle) {
+		for (int v : remaining_vertices) {
+			_waypoints.row(v) = x0.transpose();
+		}
+		_first_cycle = false;
+	}
+
 	const bool enforce_rigidity = true;
 
 	if (enforce_rigidity) {
@@ -853,7 +861,7 @@ bool GraphWaypointMPC::_solve_with_mosek(
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
-	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, false);
+	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, _waypoints, false);
 
 	// Solve
 	drake::solvers::MosekSolver solver;
@@ -906,7 +914,7 @@ bool GraphWaypointMPC::_solve_with_gurobi(
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
-	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, true);
+	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, _waypoints, true);
 
 	// Solve
 	drake::solvers::GurobiSolver solver;
@@ -978,7 +986,7 @@ bool GraphWaypointMPC::_solve_with_enumeration_and_ipopt(
 	std::unique_ptr<GraphWaypointProblem> problem;
 	try {
 		problem = std::make_unique<GraphWaypointProblem>(
-			build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, true));
+			build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, _waypoints, true));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in waypoint problem construction: " << e.what() << std::endl;
 		return false;
@@ -1009,18 +1017,9 @@ bool GraphWaypointMPC::_solve_with_enumeration_and_ipopt(
 	// 	}
 	// }
 
-	// Warm start configurations
-	if (_first_cycle) {
-		for (int v : remaining_vertices) {
-			const int i = problem->subgraph->subgraph_id(v);
-			problem->prog->SetInitialGuess(problem->X.row(i), x0.transpose());
-		}
-		_first_cycle = false;
-	} else {
-		for (int v : remaining_vertices) {
-			const int i = problem->subgraph->subgraph_id(v);
-			problem->prog->SetInitialGuess(problem->X.row(i), _waypoints.row(v));
-		}
+	for (int v : remaining_vertices) {
+		const int i = problem->subgraph->subgraph_id(v);
+		problem->prog->SetInitialGuess(problem->X.row(i), _waypoints.row(v));
 	}
 
 	// Solve

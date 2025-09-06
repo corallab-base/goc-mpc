@@ -67,7 +67,8 @@ struct DeferredEdgeOp {
 			   const struct SubgraphOfConstraints&,
 			   const int,
 			   const drake::solvers::MatrixXDecisionVariable&,
-			   const drake::solvers::MatrixXDecisionVariable&)> waypoint_builder;
+			   const drake::solvers::MatrixXDecisionVariable&,
+			   const Eigen::VectorXd&)> waypoint_builder;
 	std::function<void(drake::solvers::MathematicalProgram&,
 			   const int,
 			   const Eigen::VectorXi&,
@@ -257,6 +258,11 @@ struct GraphOfConstraints {
 					      int robot_id,
 					      int cube_id,
 					      double holding_distance_max = 0.1);
+
+	int add_robot_relative_rotation_constraint(int u,
+						   int v,
+						   int robot_id,
+						   Eigen::Quaternion<double>& quat);
 
 	int add_robot_holding_points_constraint(int u,
 						int v,

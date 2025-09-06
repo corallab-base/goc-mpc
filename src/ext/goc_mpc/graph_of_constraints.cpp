@@ -711,7 +711,6 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 				       const int... /*unused*/) {
 
 				     using drake::math::RigidTransform;
-				     using drake::symbolic::Expression;
 				     using drake::symbolic::Evaluate;
 
 				     const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
@@ -1194,7 +1193,6 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 			    [=, this](const Eigen::VectorXd& x,
 				      const Eigen::VectorXi&/*unused*/) {
 				    using drake::math::RigidTransform;
-				    using drake::symbolic::Expression;
 				    using drake::symbolic::Evaluate;
 
 				    const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
@@ -1225,9 +1223,9 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				      const SubgraphOfConstraints& subgraph,
 				      const int phi_id,
 				      const drake::solvers::MatrixXDecisionVariable& X,
-				      const drake::solvers::MatrixXDecisionVariable& /*unused*/) {
+				      const drake::solvers::MatrixXDecisionVariable& /*unused*/,
+				      const Eigen::VectorXd& x_u) {
 				    using drake::math::RigidTransform;
-				    using drake::symbolic::Expression;
 
 				    const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
 				    const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
@@ -1274,6 +1272,98 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	return edge_phi_id;
 }
 
+int GraphOfConstraints::add_robot_relative_rotation_constraint(
+	int u,
+	int v,
+	int robot_id,
+	Eigen::Quaternion<double>& quat) {
+
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+
+	const int robot_start = robot_id * dim;
+
+	// Normalize and precompute the constant relative rotation matrix.
+	const Eigen::Quaternion<double> qrel = quat.normalized();
+	const double wr = qrel.w(), xr = qrel.x(), yr = qrel.y(), zr = qrel.z();
+
+	int edge_phi_id = _add_edge_op(
+		DeferredOpKind::kNonlinearEq, u, v, std::set<int>{},
+		// ---------- Evaluation: always satisfied. no backtracking ----------
+		[=, this](const Eigen::VectorXd& x, const Eigen::VectorXi& /*unused*/) {
+			return 0.0;
+		},
+		// ---------- Add constraints to Drake ----------
+		[=, this](drake::solvers::MathematicalProgram& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int /*phi_id*/,
+			  const drake::solvers::MatrixXDecisionVariable& X,
+			  const drake::solvers::MatrixXDecisionVariable& /*unused*/,
+			  const Eigen::VectorXd& x_u) {
+			const unsigned int sg_u = subgraph.subgraph_id(u);
+			const unsigned int sg_v = subgraph.subgraph_id(v);
+
+			if (sg_u == -1 && sg_v != -1) {
+				// When x_u is passed, it is in x_u
+				Eigen::RowVectorXd row_u = x_u;
+				Eigen::RowVectorX<Expression> row_v = AsExprRow(X.row(sg_v));
+
+				Eigen::Vector4d q_u = row_u.segment(robot_start + 3, 4);
+				Eigen::Vector4<Expression> q_v = row_v.segment(robot_start + 3, 4);
+
+				const double wr = qrel.w(), xr = qrel.x(), yr = qrel.y(), zr = qrel.z();
+
+				// Compose: q_expected = q_u cross q_rel  (body-fixed)
+				Eigen::Matrix<double,4,1> qexp;
+				qexp << q_u(0)*wr - q_u(1)*xr - q_u(2)*yr - q_u(3)*zr,
+					q_u(0)*xr + q_u(1)*wr + q_u(2)*zr - q_u(3)*yr,
+					q_u(0)*yr - q_u(1)*zr + q_u(2)*wr + q_u(3)*xr,
+					q_u(0)*zr + q_u(1)*yr - q_u(2)*xr + q_u(3)*wr;
+
+				// Enforce q_v == qexp (elementwise), with hemisphere fix:
+				// dot(q_v, qexp) >= 0 to avoid the -q ambiguity.
+				Expression dot = q_v(0)*qexp(0) + q_v(1)*qexp(1) + q_v(2)*qexp(2) + q_v(3)*qexp(3);
+				prog.AddConstraint(dot >= 0.0);
+				for (int i=0; i<4; ++i) {
+					prog.AddConstraint(q_v(i) - qexp(i) == 0);
+				}
+			} else if (sg_u != -1 && sg_v != -1) {
+				Eigen::RowVectorX<Expression> row_u = AsExprRow(X.row(sg_u));
+				Eigen::RowVectorX<Expression> row_v = AsExprRow(X.row(sg_v));
+
+				Eigen::Vector4<Expression> q_u, q_v;
+				q_u = row_u.segment(robot_start + 3, 4);
+				q_v = row_v.segment(robot_start + 3, 4);
+
+				const double wr = qrel.w(), xr = qrel.x(), yr = qrel.y(), zr = qrel.z();
+
+				// Compose: q_expected = q_u cross q_rel  (body-fixed)
+				Eigen::Matrix<Expression,4,1> qexp;
+				qexp << q_u(0)*wr - q_u(1)*xr - q_u(2)*yr - q_u(3)*zr,
+					q_u(0)*xr + q_u(1)*wr + q_u(2)*zr - q_u(3)*yr,
+					q_u(0)*yr - q_u(1)*zr + q_u(2)*wr + q_u(3)*xr,
+					q_u(0)*zr + q_u(1)*yr - q_u(2)*xr + q_u(3)*wr;
+
+				// Enforce q_v == qexp (elementwise), with hemisphere fix:
+				// dot(q_v, qexp) >= 0 to avoid the -q ambiguity.
+				Expression dot = q_v(0)*qexp(0) + q_v(1)*qexp(1) + q_v(2)*qexp(2) + q_v(3)*qexp(3);
+				prog.AddConstraint(dot >= 0.0);
+				for (int i=0; i<4; ++i) {
+					prog.AddConstraint(q_v(i) - qexp(i) == 0);
+				}
+			}
+		},
+		// Short-path variant (unused)
+		[](drake::solvers::MathematicalProgram&, const int, const Eigen::VectorXi&,
+		   const drake::solvers::MatrixXDecisionVariable&) { return; });
+
+	// Statically assigned to this robot.
+	_edge_phi_to_static_assignment_map[edge_phi_id] = robot_id;
+	return edge_phi_id;
+}
+
+
 int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 	int u,
 	int v,
@@ -1296,7 +1386,8 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 			  const SubgraphOfConstraints& subgraph,
 			  const int phi_id,
 			  const drake::solvers::MatrixXDecisionVariable& X,
-			  const drake::solvers::MatrixXDecisionVariable& /*unused*/) {
+			  const drake::solvers::MatrixXDecisionVariable& /*unused*/,
+			  const Eigen::VectorXd& x_u) {
 			return;
 		},
 		[](drake::solvers::MathematicalProgram& prog,
