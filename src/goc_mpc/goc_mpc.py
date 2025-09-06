@@ -23,6 +23,7 @@ class GraphOfConstraintsMPC():
             phi_tolerance: float = 0.03,
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
+            solve_for_waypoints_once: bool = False,
             max_vel: float = -1.0,
             max_acc: float = -1.0,
             max_jerk: float = -1.0,
@@ -40,12 +41,14 @@ class GraphOfConstraintsMPC():
         self.last_grasp_commands = []
         self.completed_phases = set()
         self.remaining_phases = list(range(graph.structure.num_nodes))
-        
+
         # configuration
         self.time_delta_cutoff = time_delta_cutoff
         self.phi_tolerance = phi_tolerance
+        self.solve_for_waypoints_once = solve_for_waypoints_once
         self.time_cost = 1.0
         self.ctrl_cost = 1.0
+        self.short_path_time_per_step = short_path_time_per_step
 
         # solvers
         self.waypoint_mpc = GraphWaypointMPC(graph, self.last_cycle_splines)
@@ -53,8 +56,17 @@ class GraphOfConstraintsMPC():
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length, num_agents, dim, short_path_time_per_step)
 
     def _solve_for_waypoints(self, x: np.ndarray):
-        success = self.waypoint_mpc.solve(self.remaining_phases, x)
-        return success
+        if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):
+            return True
+        else:
+            success = self.waypoint_mpc.solve(self.remaining_phases, x)
+            self.last_cycle_waypoints = self.waypoint_mpc.view_waypoints()
+            return success
+
+    def pass_node(self, node: int, assignments: np.ndarray):
+        self.completed_phases |= {node}
+        self.remaining_phases.remove(node)
+        self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
 
     def _solve_for_timing(self, time_delta, x, x_dot):
 
@@ -139,7 +151,7 @@ class GraphOfConstraintsMPC():
         self.last_cycle_time = 0.0
         self.remaining_phases = list(range(self.graph.structure.num_nodes))
 
-    def step(self, t, x, x_dot):
+    def step(self, t, x, x_dot, teleport=False):
         "Returns the short horizon for the controller to execute."
 
         assert x.size == self.graph.total_dim
@@ -155,6 +167,19 @@ class GraphOfConstraintsMPC():
             raise RuntimeError("WaypointsMPC Failed!")
 
         success = self._solve_for_timing(delta, x, x_dot)
+
+        if teleport:
+            wps = self.waypoint_mpc.view_waypoints()
+            next_agent_states = []
+            for i, agent_nodes in enumerate(self.timing_mpc.view_agent_nodes_list()):
+                next_agent_node = next(iter(agent_nodes), -1)
+                if next_agent_node == -1:
+                    next_agent_state = x[i*self.graph.dim:(i+1)*self.graph.dim].copy()
+                else:
+                    next_agent_state = wps[next_agent_node, i*self.graph.dim:(i+1)*self.graph.dim].copy()
+                next_agent_state[3:7] /= np.linalg.norm(next_agent_state[3:7])
+                next_agent_states.append(next_agent_state)
+            return np.expand_dims(np.concatenate(next_agent_states), 0), None, None
 
         if not success:
             raise RuntimeError("TimingMPC Failed!")
