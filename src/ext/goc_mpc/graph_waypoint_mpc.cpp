@@ -32,6 +32,68 @@ struct AssignableHoldSpec {
 	std::string ee_frame_name;  // e.g., "tool0"
 };
 
+inline VectorXDecisionVariable GetARowForVar(const SubgraphOfConstraints& subgraph,
+					     const MatrixXDecisionVariable& Assignments,
+					     int global_var_id) {
+	const int row = subgraph.subgraph_variable_id(global_var_id);
+	DRAKE_DEMAND(row >= 0 && row < Assignments.rows());
+	return Assignments.row(row);
+}
+
+inline Eigen::Vector3d seg_width3(const Eigen::VectorXd& lb,
+                                  const Eigen::VectorXd& ub,
+                                  int start3) {
+	return (ub.segment<3>(start3) - lb.segment<3>(start3)).cwiseAbs();
+}
+
+// Bound ||p_WP - p_WE||_2 on one “side” (0, u, or v).
+// If EE is free-body: ee_start3 = robot_ag * robot_dim (where the 3 pos live).
+// If articulated: pass ee_span_hint as a per-axis bound on EE motion; otherwise use a conservative constant.
+inline double bound_norm_obj_minus_ee_side(
+	const Eigen::VectorXd& lb, const Eigen::VectorXd& ub,
+	int obj_start3,
+	std::optional<int> ee_start3_in_X,              // std::nullopt if articulated
+	const Eigen::Vector3d& ee_span_hint /* meters */) {
+
+	const Eigen::Vector3d w_obj = seg_width3(lb, ub, obj_start3);
+	Eigen::Vector3d w_ee;
+	if (ee_start3_in_X) {
+		w_ee = seg_width3(lb, ub, *ee_start3_in_X);
+	} else {
+		w_ee = ee_span_hint.cwiseAbs();  // articulated, conservative workspace span
+	}
+	const Eigen::Vector3d w_sum = w_obj + w_ee;
+	return w_sum.norm();  // sqrt((wx+ex)^2 + (wy+ey)^2 + (wz+ez)^2)
+}
+
+// 0 -> v (initial-layer) exact-rigidity M (identical per component)
+inline Eigen::Vector3d M_exact_toX0_componentwise(
+	const Eigen::VectorXd& lb, const Eigen::VectorXd& ub,
+	int obj_start3,
+	std::optional<int> ee_start3_in_X,      // free-body -> pos segment start; else nullopt
+	const Eigen::Vector3d& ee_span_hint) {  // used when articulated
+	// Both “sides” are 0 and v; the bound structure is the same for both,
+	// so the worst-case 2-norm can be upper-bounded the same way on each side.
+	const double B0 = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, ee_start3_in_X, ee_span_hint);
+	const double Bv = B0;  // same bounding box globally
+	const double Mscalar = B0 + Bv;
+	return Eigen::Vector3d::Constant(Mscalar);
+}
+
+// u -> v exact-rigidity M (identical per component)
+inline Eigen::Vector3d M_exact_edge_componentwise(
+	const Eigen::VectorXd& lb, const Eigen::VectorXd& ub,
+	int obj_start3,
+	std::optional<int> ee_start3_u_in_X,    // free-body u; else nullopt
+	std::optional<int> ee_start3_v_in_X,    // free-body v; else nullopt
+	const Eigen::Vector3d& ee_span_hint_u,  // articulated u
+	const Eigen::Vector3d& ee_span_hint_v) {// articulated v
+	const double Bu = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, ee_start3_u_in_X, ee_span_hint_u);
+	const double Bv = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, ee_start3_v_in_X, ee_span_hint_v);
+	const double Mscalar = Bu + Bv;
+	return Eigen::Vector3d::Constant(Mscalar);
+}
+
 // === NEW: single-vertex rigidity anchored to x0 ===
 //
 // Enforce for node v:
@@ -99,8 +161,8 @@ static void AddHoldRigidityStaticToX0(
 				R_WE_v.transpose() * (p_WP_v - p_WE_v);
 
 			prog->AddConstraint(rel_0 - rel_v,
-					    Eigen::Vector3d::Constant(3, -0.02),
-					    Eigen::Vector3d::Constant(3, 0.02))
+					    Eigen::Vector3d::Constant(3, -0.01),
+					    Eigen::Vector3d::Constant(3, 0.01))
 				.evaluator()->set_description("0->v exact rigidity");
 		}
 	} else {
@@ -255,44 +317,242 @@ static void AddHoldRigidityStatic(
 }
 
 void AddHoldRigidityAssignableToX0(
-    MathematicalProgram* prog,
-    const SubgraphOfConstraints& subgraph,
-    const GraphOfConstraints* graph,
-    const drake::multibody::MultibodyPlant<Expression>& plant,
-    const MatrixXDecisionVariable& X,
-    int v,
-    const AssignableHoldSpec& spec,
-    int robot_dim, int objs_start, int non_robot_dim,
-    const Eigen::VectorXd& x0,
-    const VectorXDecisionVariable& A_row,
-    double big_M) {
-	std::cout << "ADDING ASSIGNABLE HOLD SPEC FOR INITIAL LAYER" << std::endl;
-	return;
+	MathematicalProgram* prog,
+	const SubgraphOfConstraints& subgraph,
+	const GraphOfConstraints* graph,
+	const drake::multibody::MultibodyPlant<Expression>& plant,
+	const MatrixXDecisionVariable& X,
+	int v,
+	const AssignableHoldSpec& spec,
+	int robot_dim, int objs_start, int non_robot_dim,
+	const Eigen::VectorXd& x0,
+	const VectorXDecisionVariable& A_row) {
+
+	using Eigen::Matrix;
+	using Eigen::Vector3d;
+
+	const int num_agents = graph->num_agents;
+	const int sg_v = subgraph.subgraph_id(v);
+
+	// Cast once.
+	Eigen::VectorX<Expression> x0_expr = x0.template cast<Expression>();
+	Eigen::VectorX<Expression> X_v_expr = X.row(sg_v).template cast<Expression>();
+
+	// Precompute object world points from x0 / X_v once per object.
+	struct ObjPts {
+		int id;
+		Matrix<Expression,3,1> p_WP_0;
+		Matrix<Expression,3,1> p_WP_v;
+	};
+	std::vector<ObjPts> objects;
+	objects.reserve(spec.held_point_ids.size());
+	for (int obj_id : spec.held_point_ids) {
+		ObjPts o;
+		o.id = obj_id;
+		o.p_WP_0 = PointWorldFromRow(x0_expr, objs_start, non_robot_dim, obj_id);
+		o.p_WP_v = PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id);
+		objects.push_back(std::move(o));
+	}
+
+	const double neg_inf = -std::numeric_limits<double>::infinity();
+	Eigen::Vector3d ee_span_hint(2.0, 2.0, 2.0);
+
+	// For each possible agent k, construct the same residual as static-HoldSpec(robot_ag=k),
+	// then gate with +/- M * (1 - A_row(k)).
+	for (int k = 0; k < num_agents; ++k) {
+		Matrix<Expression,3,1> p_WE_0, p_WE_v;
+		Matrix<Expression,3,3> R_WE_0, R_WE_v;
+
+		if (graph->robot_is_free_body(k)) {
+			const int rob_off = k * robot_dim;
+			PoseFromRow_FreeBody(x0_expr, rob_off, &p_WE_0, &R_WE_0);
+			PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);
+		} else {
+			// Build contexts for articulated robot k.
+			auto ctx_0 = plant.CreateDefaultContext();
+			auto ctx_v = plant.CreateDefaultContext();
+			graph->set_configuration(ctx_0, x0_expr);
+			graph->set_configuration(ctx_v, X_v_expr);
+
+			const auto& W = plant.world_frame();
+			const auto& E = plant.GetFrameByName(
+				spec.ee_frame_name,
+				plant.GetModelInstanceByName(graph->_robot_names.at(k)));
+
+			const auto X_WE_0 = plant.CalcRelativeTransform(*ctx_0, W, E);
+			const auto X_WE_v = plant.CalcRelativeTransform(*ctx_v, W, E);
+
+			p_WE_0 = X_WE_0.translation();
+			p_WE_v = X_WE_v.translation();
+			R_WE_0 = X_WE_0.rotation().matrix();
+			R_WE_v = X_WE_v.rotation().matrix();
+		}
+
+		// For free-body agent k:
+		const int ee_start3 = k * robot_dim;  // assuming first 3 are world position
+
+		// Gate each held point’s exact-rigidity residual.
+		for (size_t idx = 0; idx < spec.held_point_ids.size(); ++idx) {
+			const auto& p_WP_0 = objects[idx].p_WP_0;
+			const auto& p_WP_v = objects[idx].p_WP_v;
+
+			// For each held object (obj_id):
+			const int obj_start3 = objs_start + objects[idx].id * non_robot_dim;
+
+			const Eigen::Vector3d Mvec = M_exact_toX0_componentwise(
+				graph->_global_x_lb, graph->_global_x_ub,
+				obj_start3,
+				/*ee_start3_in_X=*/graph->robot_is_free_body(k) ? std::make_optional(ee_start3)
+				: std::nullopt,
+				/*ee_span_hint=*/ee_span_hint);
+
+			// Exact rigidity residual components:
+			// rel_0 = R_WE_0^T (p_WP_0 - p_WE_0)
+			// rel_v = R_WE_v^T (p_WP_v - p_WE_v)
+			// residual = rel_0 - rel_v   (should be ~ 0 when this agent is selected)
+			const Matrix<Expression,3,1> rel_0 = R_WE_0.transpose() * (p_WP_0 - p_WE_0);
+			const Matrix<Expression,3,1> rel_v = R_WE_v.transpose() * (p_WP_v - p_WE_v);
+			const Matrix<Expression,3,1> residual = rel_0 - rel_v;
+
+			// Big-M gating:
+			// -M*(1 - A_k) <= residual_i <= M*(1 - A_k)
+			// Move to LHS to keep constant bounds:
+			// residual_i - M*(1 - A_k) <= 0
+			// -residual_i - M*(1 - A_k) <= 0
+			for (int j = 0; j < 3; ++j) {
+				const Expression slack = Mvec(j) * (1.0 - A_row(k));
+
+				// Upper bound residual: residual - slack <= 0
+				prog->AddConstraint(residual(j) - slack, neg_inf, 0.0)
+					.evaluator()->set_description("0->v exact rigidity (assignable, +)");
+
+				// Lower bound residual: -residual - slack <= 0
+				prog->AddConstraint(-residual(j) - slack, neg_inf, 0.0)
+					.evaluator()->set_description("0->v exact rigidity (assignable, -)");
+			}
+		}
+	}
 }
 
 void AddHoldRigidityAssignable(
-    MathematicalProgram* prog,
-    const SubgraphOfConstraints& subgraph,
-    const GraphOfConstraints* graph,
-    const drake::multibody::MultibodyPlant<Expression>& plant,
-    const MatrixXDecisionVariable& X,
-    int u, int v,
-    const AssignableHoldSpec& spec,
-    int robot_dim, int objs_start, int non_robot_dim,
-    const VectorXDecisionVariable& A_row,
-    double big_M) {
-	// << " IN LAYER " << layer
-	std::cout << "ADDING ASSIGNABLE HOLD SPEC FOR " << u << "->" << v << std::endl;
-	return;
+	MathematicalProgram* prog,
+	const SubgraphOfConstraints& subgraph,
+	const GraphOfConstraints* graph,
+	const drake::multibody::MultibodyPlant<Expression>& plant,
+	const MatrixXDecisionVariable& X,
+	int u, int v,
+	const AssignableHoldSpec& spec,
+	int robot_dim, int objs_start, int non_robot_dim,
+	const VectorXDecisionVariable& A_row) {
+
+	using drake::symbolic::Expression;
+	using Eigen::Matrix;
+
+	// std::cout << "ADDING ASSIGNABLE HOLD SPEC FOR " << u << "->" << v << std::endl;
+
+	// Map original graph ids to subgraph row ids
+	const int sg_u = subgraph.subgraph_id(u);
+	const int sg_v = subgraph.subgraph_id(v);
+
+	// Cast Variables -> Expressions
+	Eigen::VectorX<Expression> X_u_expr = X.row(sg_u).template cast<Expression>();
+	Eigen::VectorX<Expression> X_v_expr = X.row(sg_v).template cast<Expression>();
+
+	const int num_agents = graph->num_agents;
+
+	// Precompute object world points for all held ids at u and v.
+	struct ObjPtsUV {
+		int id;
+		Matrix<Expression,3,1> p_WP_u;
+		Matrix<Expression,3,1> p_WP_v;
+	};
+	std::vector<ObjPtsUV> objects;
+	objects.reserve(spec.held_point_ids.size());
+	for (int obj_id : spec.held_point_ids) {
+		ObjPtsUV o;
+		o.id = obj_id;
+		o.p_WP_u = PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, obj_id);
+		o.p_WP_v = PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id);
+		objects.push_back(std::move(o));
+	}
+
+	const double neg_inf = -std::numeric_limits<double>::infinity();
+	Eigen::Vector3d ee_span_hint(2.0, 2.0, 2.0);
+
+	// For each possible agent k, construct the same residual as static-HoldSpec(robot_ag=k),
+	// then gate with +/- M * (1 - A_row(k)).
+	for (int k = 0; k < num_agents; ++k) {
+		Matrix<Expression,3,1> p_WE_u, p_WE_v;
+		Matrix<Expression,3,3> R_WE_u, R_WE_v;
+
+		if (graph->robot_is_free_body(k)) {
+			const int rob_off = k * robot_dim;
+			PoseFromRow_FreeBody(X_u_expr, rob_off, &p_WE_u, &R_WE_u);
+			PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);
+		} else {
+			auto ctx_u = plant.CreateDefaultContext();
+			auto ctx_v = plant.CreateDefaultContext();
+			graph->set_configuration(ctx_u, X_u_expr);
+			graph->set_configuration(ctx_v, X_v_expr);
+
+			const auto& W = plant.world_frame();
+			const auto& E = plant.GetFrameByName(
+				spec.ee_frame_name,
+				plant.GetModelInstanceByName(graph->_robot_names.at(k)));
+
+			const auto X_WE_u = plant.CalcRelativeTransform(*ctx_u, W, E);
+			const auto X_WE_v = plant.CalcRelativeTransform(*ctx_v, W, E);
+
+			p_WE_u = X_WE_u.translation();
+			p_WE_v = X_WE_v.translation();
+			R_WE_u = X_WE_u.rotation().matrix();
+			R_WE_v = X_WE_v.rotation().matrix();
+		}
+
+		// For free-body agent k:
+		const int ee_start3 = k * robot_dim;  // assuming first 3 are world position
+
+		for (size_t idx = 0; idx < spec.held_point_ids.size(); ++idx) {
+			const auto& p_WP_u = objects[idx].p_WP_u;
+			const auto& p_WP_v = objects[idx].p_WP_v;
+
+			// Exact rigidity residual across the edge:
+			// rel_u = R_WE_u^T (p_WP_u - p_WE_u)
+			// rel_v = R_WE_v^T (p_WP_v - p_WE_v)
+			// residual = rel_u - rel_v  ≈ 0 when this agent is selected
+			const Matrix<Expression,3,1> rel_u = R_WE_u.transpose() * (p_WP_u - p_WE_u);
+			const Matrix<Expression,3,1> rel_v = R_WE_v.transpose() * (p_WP_v - p_WE_v);
+			const Matrix<Expression,3,1> residual = rel_u - rel_v;
+
+			// For each held object (obj_id):
+			const int obj_start3 = objs_start + objects[idx].id * non_robot_dim;
+
+			// u->v:
+			const Eigen::Vector3d Mvec_uv = M_exact_edge_componentwise(
+				graph->_global_x_lb, graph->_global_x_ub,
+				obj_start3,
+				/*ee_start3_u_in_X=*/graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
+				/*ee_start3_v_in_X=*/graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
+				/*ee_span_hint_u=*/ee_span_hint,
+				/*ee_span_hint_v=*/ee_span_hint);
+
+			// Big-M gating per component:
+			// residual_j - M*(1 - A_k) <= 0
+			// -residual_j - M*(1 - A_k) <= 0
+			
+			for (int j = 0; j < 3; ++j) {
+				const Expression slack = Mvec_uv(j) * (1.0 - A_row(k));
+
+				prog->AddConstraint(residual(j) - slack, neg_inf, 0.0)
+					.evaluator()->set_description("u->v exact rigidity (assignable, +)");
+
+				prog->AddConstraint(-residual(j) - slack, neg_inf, 0.0)
+					.evaluator()->set_description("u->v exact rigidity (assignable, -)");
+			}
+		}
+	}
 }
 
-inline VectorXDecisionVariable GetARowForVar(const SubgraphOfConstraints& subgraph,
-					     const MatrixXDecisionVariable& Assignments,
-					     int global_var_id) {
-	const int row = subgraph.subgraph_variable_id(global_var_id);
-	DRAKE_DEMAND(row >= 0 && row < Assignments.rows());
-	return Assignments.row(row);
-}
 
 GraphWaypointProblem build_graph_waypoint_problem(
 	GraphOfConstraints* graph,
@@ -447,16 +707,16 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		}
 
 		if (enforce_rigidity) {
-			// for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_for_initial_layer) {
-			// 	auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
-			// 	AddHoldRigidityAssignableToX0(
-			// 		problem.prog.get(), subgraph, graph, *graph->_plant, X,
-			// 		v, hold_spec,
-			// 		/*robot_dim=*/robot_dim,
-			// 		/*objs_start=*/objs_start,
-			// 		/*non_robot_dim=*/non_robot_dim,
-			// 		x0, A_row, /*big_M=*/M_val);
-			// }
+			for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_for_initial_layer) {
+				auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
+				AddHoldRigidityAssignableToX0(
+					problem.prog.get(), subgraph, graph, *graph->_plant, X,
+					v, hold_spec,
+					/*robot_dim=*/robot_dim,
+					/*objs_start=*/objs_start,
+					/*non_robot_dim=*/non_robot_dim,
+					x0, A_row);
+			}
 
 			for (const HoldSpec& hold_spec : hold_specs_for_initial_layer) {
 				AddHoldRigidityStaticToX0(
@@ -565,18 +825,18 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			}
 
 			if (enforce_rigidity) {
-				// if (assignable_hold_specs_during_each_layer.contains(layer)) {
-				// 	for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_during_each_layer.at(layer)) {
-				// 		auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
-				// 		AddHoldRigidityAssignable(
-				// 			problem.prog.get(), subgraph, graph, *graph->_plant, X,
-				// 			v, hold_spec,
-				// 			/*robot_dim=*/robot_dim,
-				// 			/*objs_start=*/objs_start,
-				// 			/*non_robot_dim=*/non_robot_dim,
-				// 			x0, A_row, /*big_M=*/M_val);
-				// 	}
-				// }
+				if (assignable_hold_specs_during_each_layer.contains(layer)) {
+					for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_during_each_layer.at(layer)) {
+						auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
+						AddHoldRigidityAssignable(
+							problem.prog.get(), subgraph, graph, *graph->_plant, X,
+							u, v, hold_spec,
+							/*robot_dim=*/robot_dim,
+							/*objs_start=*/objs_start,
+							/*non_robot_dim=*/non_robot_dim,
+							A_row);
+					}
+				}
 
 				if (hold_specs_during_each_layer.contains(layer)) {
 					for (const HoldSpec& hold_spec : hold_specs_during_each_layer.at(layer)) {
