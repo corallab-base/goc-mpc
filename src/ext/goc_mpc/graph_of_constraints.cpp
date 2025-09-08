@@ -59,6 +59,17 @@ GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
 
 	_global_x_lb = Eigen::VectorXd::Constant(total_dim, global_x_lb);
 	_global_x_ub = Eigen::VectorXd::Constant(total_dim, global_x_ub);
+
+	int i = 0;
+	for (int ag = 0; ag < num_agents; ++ag) {
+		if (robot_is_free_body(ag)) {
+			for (int j = i+3; j < i+7; ++j) {
+				_global_x_lb(j) = -1;
+				_global_x_ub(j) = 1;
+			}
+		}
+		i += dim;
+	}
 }
 
 // add variable
