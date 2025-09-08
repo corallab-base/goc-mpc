@@ -30,7 +30,7 @@ public:
 	static Graph WithNodes(int n, bool directed = true);
 
         int add_node();
-	void add_nodes(int n);
+	std::vector<int> add_nodes(int n);
 	void remove_node(int u);
 
 	void add_edge(int u, int v, const LabelT &label);

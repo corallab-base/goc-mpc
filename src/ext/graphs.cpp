@@ -23,8 +23,12 @@ int Graph<LabelT>::add_node() {
 }
 
 template <typename LabelT>
-void Graph<LabelT>::add_nodes(int n) {
-	for (int i = 0; i < n; ++i) add_node();
+std::vector<int> Graph<LabelT>::add_nodes(int n) {
+	std::vector<int> new_nodes;
+	for (int i = 0; i < n; ++i) {
+		new_nodes.push_back(add_node());
+	}
+	return new_nodes;
 }
 
 template <typename LabelT>
