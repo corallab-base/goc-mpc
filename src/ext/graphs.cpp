@@ -265,11 +265,21 @@ std::vector<std::optional<int>> Graph<LabelT>::bfs_visit_from_sources(
 		q.pop();
 		if (u >= n || !_alive[u]) continue;
 
+		// if this node is not yet next in topological order, reinsert it into the queue and come back to it.
+		if (indeg[u] > 0) {
+			q.push(u);
+			continue;
+		}
+
 		cb(u, parent[u]);  // level-order visitation
 
 		const auto& nbrs = _adj[u];
 		for (const auto& e : nbrs) {
 			const int v = e.to;
+
+			// decrease in degree
+			indeg[v]--;
+
 			if (v < n && _alive[v] && !vis[v]) {
 				vis[v] = 1;
 				parent[v] = u;
@@ -696,10 +706,19 @@ std::vector<std::optional<int>> InducedSubgraphView<LabelT>::bfs_visit_from_sour
 		const int depth = depths[u];
 		if (u >= n || !contains_node(u)) continue;
 
+		if (indeg[u] > 0) {
+			q.push(u);
+			continue;
+		}
+
 		cb(u, depth, parent[u]);
 
 		for (const auto& e : neighbors(u)) {
 			const int v = e.to; // guaranteed in view
+
+			// decrease in degree
+			indeg[v]--;
+
 			if (v < n && !vis[v] && contains_node(v)) {
 				vis[v] = 1;
 				parent[v] = u;
