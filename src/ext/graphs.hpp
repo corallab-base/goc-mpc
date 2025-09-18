@@ -43,6 +43,21 @@ public:
 	const std::vector<Edge>& neighbors(int u) const;
 	std::vector<Edge>& neighbors(int u);
 
+	// In-degree
+	std::vector<int> in_degrees() const {
+		// Compute (in-)degree among alive nodes.
+		int n = num_nodes();
+		std::vector<int> indeg(n, 0);
+		for (int u = 0; u < n; ++u) {
+			if (!_alive[u]) continue;
+			for (const auto& e : _adj[u]) {
+				const int v = e.to;
+				if (v < n && _alive[v]) ++indeg[v];
+			}
+		}
+		return indeg;
+	}
+
 	// ------------------- Edge iteration API -------------------
 
 	struct EdgeRef {
@@ -345,16 +360,6 @@ public:
 			IncomingNeighborIter(_g, &_mask, &_node_list, u, /*node_idx=*/0),
 			IncomingNeighborIter(_g, &_mask, &_node_list, u, static_cast<int>(_node_list.size()))
 		};
-	}
-
-	// In-degree inside the view (counts edges with source and target in the view and target=u).
-	int in_degree(int u) const {
-		int deg = 0;
-		for (auto it = incoming_neighbors(u).begin(); it != incoming_neighbors(u).end(); ++it) {
-			(void)*it; // just counting
-			++deg;
-		}
-		return deg;
 	}
 
 	// --------

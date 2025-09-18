@@ -774,6 +774,7 @@ void init_submodule_graphs(py::module_& m) {
 	py::class_<GraphPy>(graphs, "Graph")
 		.def(py::init<bool>(), py::arg("directed")=true)
 		.def_static("with_nodes", &GraphPy::WithNodes, py::arg("n"), py::arg("directed")=true)
+		.def("in_degrees", &GraphPy::in_degrees)
 		.def("add_node", &GraphPy::add_node)
 		.def("add_nodes", &GraphPy::add_nodes)
 		.def("remove_node", &GraphPy::remove_node)
