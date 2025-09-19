@@ -2,6 +2,8 @@
 
 #include <iostream>
 
+#include <fmt/format.h>
+
 #include <drake/common/symbolic/expression.h>
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/ipopt_solver.h>
@@ -35,6 +37,7 @@ enum class DeferredOpKind {
 	kLinearEq,
 	kLinearIneq,
 	kBoundingBox,
+	kNonlinearCost,
 	kQuadraticCost,
 	kNonlinearEq,
 	kOther,
@@ -187,6 +190,7 @@ struct GraphOfConstraints {
 
 	int add_robot_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 	int add_robot_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
+	int add_assignable_robot_quat_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 
 	int add_point_linear_eq(int k, int point_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b);
 	int add_point_linear_ineq(int k, int point_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& lb, const Eigen::VectorXd& ub);
@@ -208,7 +212,8 @@ struct GraphOfConstraints {
 	int add_robot_to_point_displacement_constraint(int k,
 						       int robot_id,
 						       int point_id,
-						       Eigen::Vector3d& disp);
+						       Eigen::Vector3d& disp,
+						       double tol = 0.0);
 	int add_robot_to_point_displacement_cost(int k,
 						 int robot_id,
 						 int point_id,
@@ -224,6 +229,20 @@ struct GraphOfConstraints {
 						    bool roll_ref_flat = false,
 						    bool require_positive_pointing = true,
 						    double eps_d = 0.05, double tau_tperp = 0.05);
+
+	int add_robot_to_point_alignment_cost(int k, int robot_id, int point_id,
+					      const Eigen::Vector3d& ee_ray_body,
+					      std::optional<Eigen::Vector3d> u_body_opt,
+					      std::optional<Eigen::Vector3d> roll_ref_world,
+					      bool roll_ref_flat,
+					      bool require_positive_pointing,
+					      double w_point=1.0,
+					      double w_roll=0.1,
+					      double w_flat=0.05,
+					      double w_guard=0.0,
+					      double w_u_stab=0.01,
+					      double eps=1e-10,
+					      double eps_d=1e-3);
 
 	int add_point_to_point_displacement_constraint(int k,
 						       int point_a,
@@ -242,17 +261,12 @@ struct GraphOfConstraints {
 
 	// Edge Constraints
 
-	// int add_assignable_robot_holding_point_constraint(int u,
-	// 						  int v,
-	// 						  int var,
-	// 						  std::vector<int> points,
-	// 						  double max_distance = 0.1);
-
 	int add_robot_holding_cube_constraint(int u,
 					      int v,
 					      int robot_id,
 					      int cube_id,
-					      double holding_distance_max = 0.1);
+					      double holding_distance_max = 0.1,
+					      bool use_l2 = false);
 
 	int add_robot_relative_rotation_constraint(int u,
 						   int v,
@@ -274,7 +288,7 @@ struct GraphOfConstraints {
 							  int v,
 							  int var,
 							  int point_id,
-							  double holding_distance_max);
+							  double holding_distance_max = 0.1);
 
 	template <typename T>
 	void set_configuration(

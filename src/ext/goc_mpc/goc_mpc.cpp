@@ -55,13 +55,17 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
 		.def("add_robots_linear_eq", &GraphOfConstraints::add_robots_linear_eq)
 		.def("add_robot_linear_eq", &GraphOfConstraints::add_robot_linear_eq)
-		.def("add_point_linear_eq", &GraphOfConstraints::add_point_linear_eq)
-		.def("add_point_linear_ineq", &GraphOfConstraints::add_point_linear_ineq)
+		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
 		.def("add_robot_pos_linear_eq", &GraphOfConstraints::add_robot_pos_linear_eq)
 		.def("add_robot_quat_linear_eq", &GraphOfConstraints::add_robot_quat_linear_eq)
-		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
+		.def("add_assignable_robot_quat_linear_eq", &GraphOfConstraints::add_assignable_robot_quat_linear_eq)
+		.def("add_robot_to_point_displacement_constraint", &GraphOfConstraints::add_robot_to_point_displacement_constraint,
+		     py::arg("k"),
+		     py::arg("robot_id"),
+		     py::arg("point_id"),
+		     py::arg("disp"),
+		     py::arg("tol") = 0.0)
 		.def("add_assignable_robot_to_point_displacement_constraint", &GraphOfConstraints::add_assignable_robot_to_point_displacement_constraint)
-		.def("add_robot_to_point_displacement_constraint", &GraphOfConstraints::add_robot_to_point_displacement_constraint)
 		.def("add_robot_to_point_displacement_cost", &GraphOfConstraints::add_robot_to_point_displacement_cost)
 		.def("add_robot_to_point_alignment_constraint", &GraphOfConstraints::add_robot_to_point_alignment_constraint,
 		     py::arg("k"),
@@ -75,7 +79,46 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("require_positive_pointing") = true,
 		     py::arg("eps_d") = 0.05,
 		     py::arg("tau_tperp") = 0.05)
-
+		.def("add_robot_to_point_alignment_cost", &GraphOfConstraints::add_robot_to_point_alignment_cost,
+		     py::arg("k"),
+		     py::arg("robot_id"),
+		     py::arg("point_id"),
+		     py::arg("ee_ray_body"),
+		     py::arg("u_body_opt") = std::nullopt,
+		     py::arg("roll_ref_world") = std::nullopt,
+		     py::arg("roll_ref_flat") = false,
+		     py::arg("require_positive_pointing") = true,
+		     py::arg("w_point") = 1.0,
+		     py::arg("w_roll") = 0.1,
+		     py::arg("w_flat") = 0.05,
+		     py::arg("w_guard") = 0.0,
+		     py::arg("w_u_stab") = 0.01,
+		     py::arg("eps") = 1e-10,
+		     py::arg("eps_d") = 1e-3)
+		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("robot_id"),
+		     py::arg("point_ids"),
+		     py::arg("holding_distance_max") = 0.1,
+		     py::arg("use_l2") = false)
+		.def("add_assignable_robot_holding_point_constraint", &GraphOfConstraints::add_assignable_robot_holding_point_constraint,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("robot_id"),
+		     py::arg("point_ids"),
+		     py::arg("holding_distance_max") = 0.1)
+		.def("add_robot_relative_rotation_constraint", &GraphOfConstraints::add_robot_relative_rotation_constraint)
+		.def("add_robot_relative_displacement_constraint", &GraphOfConstraints::add_robot_relative_displacement_constraint)
+		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,
+		     py::arg("k"),
+		     py::arg("robot_id"),
+		     py::arg("cube_id"),
+		     py::arg("delta_z"),
+		     py::arg("x_offset") = 0.0,
+		     py::arg("y_offset") = 0.0)
+		.def("add_point_linear_eq", &GraphOfConstraints::add_point_linear_eq)
+		.def("add_point_linear_ineq", &GraphOfConstraints::add_point_linear_ineq)
 		.def("add_point_to_point_displacement_constraint", &GraphOfConstraints::add_point_to_point_displacement_constraint,
 		     py::arg("k"),
 		     py::arg("point_a"),
@@ -87,18 +130,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("point_a"),
 		     py::arg("point_b"),
 		     py::arg("disp"))
-		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint)
-		.def("add_assignable_robot_holding_point_constraint", &GraphOfConstraints::add_assignable_robot_holding_point_constraint)
-		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint)
-		.def("add_robot_relative_rotation_constraint", &GraphOfConstraints::add_robot_relative_rotation_constraint)
-		.def("add_robot_relative_displacement_constraint", &GraphOfConstraints::add_robot_relative_displacement_constraint)
-		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,
-		     py::arg("k"),
-		     py::arg("robot_id"),
-		     py::arg("cube_id"),
-		     py::arg("delta_z"),
-		     py::arg("x_offset") = 0.0,
-		     py::arg("y_offset") = 0.0);
+		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint);
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
                 .def(py::init<GraphOfConstraints&, std::vector<CubicConfigurationSpline>>(),

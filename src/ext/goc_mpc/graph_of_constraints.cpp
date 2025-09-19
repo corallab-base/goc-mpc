@@ -114,6 +114,8 @@ std::tuple<std::vector<std::optional<int>>,
 	std::vector<std::optional<int>> parents = sg.bfs_visit_from_sources(
 		[this, &assignments, &agent_nodes, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
 		(int node, int depth, std::optional<int> parent) {
+			// std::cout << "processing " << node << std::endl;
+
 			if (node_to_phis_map.contains(node)) {
 				std::set<int> assignments_for_node;
 
@@ -125,7 +127,7 @@ std::tuple<std::vector<std::optional<int>>,
 					// std::cout << phi_id << " belonging to " << node << " is dynamically assigned to " << assignment << std::endl;
 
 					if (_phi_to_static_assignment_map.contains(phi_id) && assignment != -1) {
-						std::cout << "_phi_to_static_assignment_map for " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
+						// std::cout << "_phi_to_static_assignment_map for " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
 						throw std::runtime_error("conflicting assignment");
 					} else if (_phi_to_static_assignment_map.contains(phi_id)) {
 						assignment = _phi_to_static_assignment_map.at(phi_id);
@@ -187,6 +189,7 @@ std::tuple<std::vector<std::optional<int>>,
 		},
 		[this, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
 		(int u, int u_depth, int v, int v_depth) {
+			// std::cout << "adding cross agent edge " << u << "->" << v << std::endl;
 			cross_agent_edges.emplace_back(u, v);
 		});
 
@@ -518,11 +521,53 @@ int GraphOfConstraints::add_point_linear_eq(
 				X.row(node_k).segment(point_start, 3);
 
 			// Enforces A * point_config_k == b
-			prog.AddLinearEqualityConstraint(A, b, point_config_k);
+			prog.AddLinearEqualityConstraint(A, b, point_config_k)
+				.evaluator()->set_description(fmt::v8::format("point {} linear constraint", point_id));
 		});
 
 	return phi_id;
 }
+
+// int GraphOfConstraints::add_point_linear_cost(
+// 	int k, int point_id,
+// 	const Eigen::MatrixXd& A,
+// 	const Eigen::VectorXd& b) {
+
+// 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+// 	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+// 	// Expect A is (m x 3) if the point is 3D, and b is (m).
+// 	DRAKE_DEMAND(A.cols() == 3);
+// 	DRAKE_DEMAND(b.size() == A.rows());
+
+// 	const int objs_start  = num_agents * dim;
+// 	const int point_start = objs_start + point_id * non_robot_dim;
+
+// 	int phi_id = _add_op(
+// 		DeferredOpKind::kLinearEq, k,
+// 		// ---- Evaluation: max absolute residual (0 means satisfied) ----
+// 		[=, this](const Eigen::VectorXd& x, const int... /*unused*/) {
+// 			const Eigen::Vector3d point_config_k = x.segment(point_start, 3);
+// 			const Eigen::VectorXd r = A * point_config_k - b;  // residual
+// 			return r.lpNorm<1>();                // max |residual|
+// 		},
+// 		// ---- Definition in Drake ----
+// 		[=, this](auto& prog,
+// 			  const SubgraphOfConstraints& subgraph,
+// 			  const int /*phi_id*/,
+// 			  const auto& X,
+// 			  const auto& /*unused*/) {
+// 			const int node_k = subgraph.subgraph_id(k);
+// 			VectorXDecisionVariable point_config_k =
+// 				X.row(node_k).segment(point_start, 3);
+
+// 			// Enforces A * point_config_k == b
+// 			prog.AddLinearEqualityConstraint(A, b, point_config_k)
+// 				.evaluator()->set_description(fmt::v8::format("point {} linear constraint", point_id));
+// 		});
+
+// 	return phi_id;
+// }
 
 int GraphOfConstraints::add_point_linear_ineq(
 	int k, int point_id,
@@ -571,6 +616,11 @@ int GraphOfConstraints::add_point_linear_ineq(
 }
 
 int GraphOfConstraints::add_robot_pos_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	DRAKE_DEMAND(A.cols() == 3);
+	DRAKE_DEMAND(b.size() == A.rows());
+
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
 				       const int... /*unused*/) {
@@ -593,6 +643,11 @@ int GraphOfConstraints::add_robot_pos_linear_eq(int k, int robot_id, const Eigen
 }
 
 int GraphOfConstraints::add_robot_quat_linear_eq(int k, int robot_id, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	DRAKE_DEMAND(A.cols() == 4);
+	DRAKE_DEMAND(b.size() == A.rows());
+
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
 				       const int... /*unused*/) {
@@ -603,7 +658,6 @@ int GraphOfConstraints::add_robot_quat_linear_eq(int k, int robot_id, const Eige
 				       const int phi_id,
 				       const auto& X,
 				       const auto&) {
-
 				     const int node_k = subgraph.subgraph_id(k);
 				     VectorXDecisionVariable agent_quat_k = X.row(node_k).segment(robot_id*dim + 3, 4);
 				     auto beq = prog.AddLinearEqualityConstraint(A, b, agent_quat_k);
@@ -615,6 +669,85 @@ int GraphOfConstraints::add_robot_quat_linear_eq(int k, int robot_id, const Eige
 	return phi_id;
 }
 
+int GraphOfConstraints::add_assignable_robot_quat_linear_eq(int k, int var, const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	DRAKE_DEMAND(A.cols() == 4);
+	DRAKE_DEMAND(b.size() == A.rows());
+
+	// ----- Build per-row big-M from bounds on quaternion entries -----
+	// Assume the quaternion block is contiguous: [robot_id*dim + 3 ... + 6]
+	// We conservatively bound |a^T q - b| ≤ sum_t |a_t| * max(|lb_t|, |ub_t|) + |b|
+	// Use the bounds from robot 0 (or take a max across robots if your bounds differ).
+	Eigen::VectorXd M(A.rows());
+	{
+		const int base0 = /* robot 0 */ 0 * dim + 3;
+		Eigen::Array4d max_abs_q;
+		for (int t = 0; t < 4; ++t) {
+			const double lb = _global_x_lb(base0 + t);
+			const double ub = _global_x_ub(base0 + t);
+			max_abs_q(t) = std::max(std::abs(lb), std::abs(ub));
+		}
+		for (int j = 0; j < A.rows(); ++j) {
+			double row_bound = 0.0;
+			for (int t = 0; t < 4; ++t) {
+				row_bound += std::abs(A(j, t)) * max_abs_q(t);
+			}
+			M(j) = row_bound + std::abs(b(j));
+			// Small safety inflation (optional):
+			M(j) *= 1.01;
+		}
+	}
+
+	_num_total_assignables++;
+
+	return _add_assignable_op(DeferredOpKind::kAgentLinearEq, k, var,
+				  [=, this](const Eigen::VectorXd& x,
+					    const int robot_id) {
+					  const int q_start = robot_id * dim + 3;
+					  Eigen::Vector4d q = x.segment(q_start, 4);
+					  /* TODO: FIX THIS CONSTRAINT SO THAT
+					   * IT IS A PROPER ORIENTATION
+					   * CONSTRAINT. FOR NOW I'M JUST
+					   * ASSUMING A IS IDENTITY MATRIX AND B
+					   * IS THE TARGET CONSTRAINT. */
+					  Eigen::Vector4d target_q = b;
+					  return 1 - std::abs(q.dot(target_q));
+				  },
+				  [=, this](auto& prog,
+					    const SubgraphOfConstraints& subgraph,
+					    const int phi_id,
+					    const auto& X,
+					    const auto& Assignments) {
+
+					  const int node_k     = subgraph.subgraph_id(k);
+					  const int variable_k = subgraph.subgraph_variable_id(var);
+					  const double neg_inf = -std::numeric_limits<double>::infinity();
+
+					  for (int i = 0; i < num_agents; ++i) {
+						  const auto s = Assignments(variable_k, i);        // binary 0/1
+						  const int q_start = i * dim + 3;
+
+						  // For each row j of A: e_j = A_j * q_i - b_j
+						  for (int j = 0; j < A.rows(); ++j) {
+							  Expression e = -b(j);
+							  // Add linear combination of the 4 quaternion vars
+							  for (int t = 0; t < 4; ++t) {
+								  const int col = q_start + t;
+								  if (A(j, t) != 0.0) {
+									  e += A(j, t) * X(node_k, col);
+								  }
+							  }
+
+							  // -M_j (1 - s) ≤ e ≤ M_j (1 - s)
+							  // Upper:   e - M_j*(1 - s) ≤ 0  => e + M_j*s - M_j ≤ 0
+							  prog.AddLinearConstraint(e + M(j) * s - M(j), neg_inf, 0.0);
+							  // Lower:  -e - M_j*(1 - s) ≤ 0  => -e + M_j*s - M_j ≤ 0
+							  prog.AddLinearConstraint(-e + M(j) * s - M(j), neg_inf, 0.0);
+						  }
+					  }
+				  });
+}
 
 // Single-Agent Constraint Adders (typed)
 // Note: these copy the numpy array's passed to them, but they're called
@@ -961,7 +1094,8 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 	int k,
 	int robot_id,
 	int point_id,
-	Eigen::Vector3d& disp) {
+	Eigen::Vector3d& disp,
+	double tol) {
 
 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
 	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
@@ -970,6 +1104,9 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 	const int robot_start = robot_id * dim;
 	const int objs_start = num_agents * dim;
 	const int point_start = objs_start + point_id * non_robot_dim;
+
+	Eigen::VectorXd lb = Eigen::VectorXd::Constant(3, -tol);
+	Eigen::VectorXd ub = Eigen::VectorXd::Constant(3,  tol);
 
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
@@ -991,7 +1128,9 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 				     VectorXDecisionVariable p_WP = row.segment(point_start, 3);
 
 				     // Enforce pB - pA = disp  (3 scalar equalities)
-				     prog.AddLinearEqualityConstraint(p_WP - p_WE, disp);
+				     prog.AddLinearConstraint((p_WP - p_WE) - disp, lb, ub);
+
+				     // prog.AddLinearEqualityConstraint(p_WP - p_WE, disp);
 			     }
 		);
 
@@ -1084,16 +1223,10 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 				     const Vector3d r = R_WE * ee_ray_body;    // body ray in world
 				     const Vector3d d = p_WP - p_WE;           // displacement to target
 
-				     std::cout << "r:\n" << r << std::endl;
-
-				     std::cout << "d:\n" << d << std::endl;
-
 				     double residual = 0.0;
 
 				     // (1) Point-at: r × d = 0  → use squared norm
 				     const Vector3d rc = r.cross(d);
-
-				     std::cout << "rc:\n" << rc << std::endl;
 
 				     residual += rc.squaredNorm();
 
@@ -1212,6 +1345,160 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 	return phi_id;
 }
 
+int GraphOfConstraints::add_robot_to_point_alignment_cost(
+	int k, int robot_id, int point_id,
+	const Eigen::Vector3d& ee_ray_body,                 // v_b
+	std::optional<Eigen::Vector3d> u_body_opt,          // u_b (must be ⟂ v_b if provided)
+	std::optional<Eigen::Vector3d> roll_ref_world,      // t (world)
+	bool roll_ref_flat,                                  // use flat alternative if no t
+	bool require_positive_pointing,                      // prefer r·d > 0
+	// --- weights & small constants (defaults are gentle) ---
+	double w_point    /*=1.0*/,
+	double w_roll     /*=0.1*/,
+	double w_flat     /*=0.05*/,
+	double w_guard    /*=0.0*/,      // set >0 if you want to discourage tiny ||d||
+	double w_u_stab   /*=0.01*/,     // small stabilizer for u·d ≈ 0 in roll mode
+	double eps        /*=1e-10*/,    // denom regularizer
+	double eps_d      /*=1e-3*/) {   // scale for guard
+
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	const int robot_start = robot_id * dim;
+	const int objs_start  = num_agents * dim;
+
+	// Optional: numeric evaluation for logging / debugging (returns cost value)
+	auto numeric_eval = [=, this](const Eigen::VectorXd& x, const int...) {
+		using Eigen::Vector3d; using Eigen::Matrix3d;
+
+		// Pose at node k
+		Vector3d p_WE; Matrix3d R_WE;
+		PoseFromRow_FreeBody<double>(x, robot_start, &p_WE, &R_WE);
+
+		const Vector3d p_WP = x.segment(objs_start + point_id * non_robot_dim, 3);
+
+		const Vector3d r = R_WE * ee_ray_body;       // body ray in world
+		const Vector3d d = p_WP - p_WE;
+		const double d2 = d.squaredNorm();
+		const double r_dot_d = r.dot(d);
+
+		double J = 0.0;
+
+		// Pointing cost
+		if (require_positive_pointing) {
+			const double d_norm = std::sqrt(d2 + eps);
+			const double val = 1.0 - r_dot_d / d_norm;
+			J += w_point * (val*val);
+		} else {
+			J += w_point * (1.0 - (r_dot_d*r_dot_d) / (d2 + eps));
+		}
+
+		// Roll disambiguation against world t
+		if (roll_ref_world && u_body_opt) {
+			const Vector3d& t   = *roll_ref_world;
+			const Vector3d& u_b = *u_body_opt;
+			const Vector3d u = R_WE * u_b;
+
+			Vector3d t_perp = t - (t.dot(d) / (d2 + eps)) * d;
+			const double tperp2 = t_perp.squaredNorm();
+			const double u_dot_tperp = u.dot(t_perp);
+			J += w_roll * (1.0 - (u_dot_tperp*u_dot_tperp) / (tperp2 + eps));
+
+			// small stabilizer to keep u ⟂ d (helps when t≈d)
+			J += w_u_stab * std::pow(u.dot(d), 2);
+		}
+		// Flat alternative: penalize u_z (smooth)
+		else if (roll_ref_flat && u_body_opt) {
+			const Vector3d& u_b = *u_body_opt;
+			const Vector3d u = R_WE * u_b;
+			std::cout << "u.z(): " << u.z() << std::endl;
+			J += w_flat * (u.z() * u.z());
+		}
+
+		// Optional soft guard against d≈0 (bounded, smooth; often can be 0)
+		if (w_guard > 0.0) {
+			const double s2 = eps_d*eps_d;
+			J += w_guard * (s2 / (d2 + s2));
+		}
+
+		return J;
+	};
+
+	// Symbolic builder: adds costs to the Drake program
+	auto builder = [=, this](auto& prog, const SubgraphOfConstraints& subgraph, const int /*phi_id*/,
+				 const auto& X, const auto&...) {
+		using drake::symbolic::Expression;
+		const unsigned int node_k = subgraph.subgraph_id(k);
+		Eigen::RowVectorX<Expression> row = AsExprRow(X.row(node_k));
+
+		// Pose
+		Eigen::Matrix<Expression,3,1> p_WE;
+		Eigen::Matrix<Expression,3,3> R_WE;
+		PoseFromRow_FreeBody<Expression>(row, robot_start, &p_WE, &R_WE);
+
+		const Eigen::Matrix<Expression,3,1> p_WP =
+			PointWorldFromRow(row, objs_start, non_robot_dim, point_id);
+
+		const Eigen::Matrix<Expression,3,1> r = R_WE * ee_ray_body;
+		const Eigen::Matrix<Expression,3,1> d = p_WP - p_WE;
+
+		Expression d2 = d.dot(d);
+		Expression r_dot_d = r.dot(d);
+
+		// Pointing cost
+		if (require_positive_pointing) {
+			Expression d_norm = drake::symbolic::sqrt(d2 + eps);
+			Expression val = 1.0 - r_dot_d / d_norm;
+			prog.AddCost(w_point * drake::symbolic::pow(val, 2.0));
+		} else {
+			prog.AddCost(w_point * (1.0 - (r_dot_d * r_dot_d) / (d2 + eps)));
+		}
+
+		// Roll disambiguation vs world t (projection)
+		if (roll_ref_world && u_body_opt) {
+			const Eigen::Vector3d& t   = *roll_ref_world;
+			const Eigen::Vector3d& u_b = *u_body_opt;
+			Eigen::Matrix<Expression,3,1> u = R_WE * u_b;
+
+			Expression t_dot_d = t(0)*d(0) + t(1)*d(1) + t(2)*d(2);
+			Eigen::Matrix<Expression,3,1> t_perp;
+			t_perp << t(0) - (t_dot_d / (d2 + eps)) * d(0),
+				t(1) - (t_dot_d / (d2 + eps)) * d(1),
+				t(2) - (t_dot_d / (d2 + eps)) * d(2);
+
+			Expression tperp2 = t_perp.dot(t_perp);
+			Expression u_dot_tperp = u(0)*t_perp(0) + u(1)*t_perp(1) + u(2)*t_perp(2);
+			prog.AddCost(w_roll * (1.0 - (u_dot_tperp * u_dot_tperp) / (tperp2 + eps)));
+
+			// small stabilizer u·d
+			prog.AddCost(w_u_stab * drake::symbolic::pow(u.dot(d), 2.0));
+		}
+		// Flat alternative
+		else if (roll_ref_flat && u_body_opt) {
+			const Eigen::Vector3d& u_b = *u_body_opt;
+			Eigen::Matrix<Expression,3,1> u = R_WE * u_b;
+			prog.AddCost(w_flat * (u(2) * u(2)));
+		}
+
+		// Optional guard against ||d||→0 (bounded, smooth)
+		if (w_guard > 0.0) {
+			Expression s2 = eps_d * eps_d;
+			prog.AddCost(w_guard * (s2 / (d2 + s2)));
+		}
+
+		// Note: keep ONLY unit-quaternion and joint/box constraints hard elsewhere.
+		// Do NOT add any equalities for alignment here.
+	};
+
+	// If your op system has a "cost" kind, use it; otherwise use whatever bucket you
+	// use for soft terms. If unavailable, you can also directly call `builder` on
+	// the active program instead of registering.
+	int phi_id = _add_op(DeferredOpKind::kNonlinearCost, k, numeric_eval, builder);
+
+	_phi_to_static_assignment_map[phi_id] = robot_id;
+	return phi_id;
+}
 
 int GraphOfConstraints::add_point_to_point_displacement_constraint(
 	int k,
@@ -1237,9 +1524,6 @@ int GraphOfConstraints::add_point_to_point_displacement_constraint(
 			       Eigen::Vector3d pA = x.segment(startA, 3);
 			       Eigen::Vector3d pB = x.segment(startB, 3);
 			       Eigen::Vector3d r  = (pB - pA) - disp;   // want r == 0
-			       std::cout << "pA: " << pA << std::endl;
-			       std::cout << "pB: " << pB << std::endl;
-			       std::cout << "r: " << r << std::endl;
 			       return r.lpNorm<Eigen::Infinity>() - tol;
 		       },
 		       [=, this](auto& prog,
@@ -1254,10 +1538,12 @@ int GraphOfConstraints::add_point_to_point_displacement_constraint(
 			       VectorXDecisionVariable pB = row.segment(startB, 3);
 
 			       // residual = (pB - pA) - disp
-			       prog.AddLinearConstraint((pB - pA) - disp, lb, ub);
-
-			       // Enforce pB - pA = disp  (3 scalar equalities)
-			       // prog.AddLinearEqualityConstraint(pB - pA, disp);
+			       if (tol == 0.0) {
+				       // Enforce pB - pA = disp  (3 scalar equalities)
+				       prog.AddLinearEqualityConstraint(pB - pA, disp);
+			       } else {
+				       prog.AddLinearConstraint((pB - pA) - disp, lb, ub);
+			       }
 		       }
 		);
 }
@@ -1366,47 +1652,38 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	int u,
 	int v,
 	int robot_id,
-	int cube_id,
-	double holding_distance_max) {
+	int point_id,
+	double holding_distance_max,
+	bool use_l2) {
 
 	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
 	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
 	// If you track num_objects, you can also check cube_i bounds here.
 
 	const std::string& robot_model_name = _robot_names.at(robot_id);
-	const std::string& cube_model_name = _object_names.at(cube_id);
+	const std::string& cube_model_name = _object_names.at(point_id);
 
 	const ModelInstanceIndex robot_mi = _plant->GetModelInstanceByName(robot_model_name);
 	const ModelInstanceIndex cube_mi  = _plant->GetModelInstanceByName(cube_model_name);
 
-	int edge_phi_id = _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({cube_id}),
+	const int robot_start = robot_id * dim;
+	const int objs_start = num_agents * dim;
+	const int point_start = objs_start + point_id * non_robot_dim;
+
+	int edge_phi_id = _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({point_id}),
 			    [=, this](const Eigen::VectorXd& x,
 				      const Eigen::VectorXi&/*unused*/) {
-				    using drake::math::RigidTransform;
-				    using drake::symbolic::Evaluate;
+				    Eigen::Vector3d p_WE = x.segment(robot_start, 3);
+				    Eigen::Vector3d p_WP = x.segment(point_start, 3);
+				    Eigen::Vector3d r = (p_WP - p_WE);
 
-				    const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
-				    const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
-
-				    Eigen::VectorX<Expression> q_all = x.cast<Expression>();
-
-				    auto context = _plant->CreateDefaultContext();
-				    set_configuration(context, q_all);
-
-				    const RigidTransform<Expression> X_WR =
-					    _plant->EvalBodyPoseInWorld(*context, robot_body);
-				    const RigidTransform<Expression> X_WC =
-					    _plant->EvalBodyPoseInWorld(*context, cube_body);
-
-				    const Eigen::Vector3<Expression> dp_expr =
-					    X_WR.translation() - X_WC.translation();
-
-				    // dp_expr has no free symbols (only constants), so Evaluate(...) -> double works.
 				    double violation = 0.0;
-				    for (int i = 0; i < 3; ++i) {
-					    const double dpi = dp_expr[i].Evaluate();
-					    violation = std::max(violation, std::abs(dpi) - holding_distance_max);
+				    if (use_l2) {
+					    violation = r.lpNorm<2>() - holding_distance_max;
+				    } else {
+					    violation = r.lpNorm<Eigen::Infinity>() - holding_distance_max;
 				    }
+				    std::cout << "holding constraint violation: " << violation << std::endl;
 				    return violation;
 			    },
 			    [=, this](drake::solvers::MathematicalProgram& prog,
@@ -1583,6 +1860,8 @@ int GraphOfConstraints::add_robot_relative_displacement_constraint(
 
 			if (sg_u == -1 && sg_v != -1) {
 				// When x_u is passed, it is in x_u
+				// std::cout << "HERE ADDING CONSTRAINT RELATIVE TO:\n" << x_u << std::endl;
+
 				Eigen::RowVectorXd row_u = x_u;
 				Eigen::RowVectorX<Expression> row_v = AsExprRow(X.row(sg_v));
 
