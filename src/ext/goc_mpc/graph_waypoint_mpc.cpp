@@ -618,6 +618,10 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(subgraph.num_nodes(), num_agents * robot_dim + num_objects * non_robot_dim, "X");
 	problem.X = X;
 
+	for (int i = 0; i < X.rows(); ++i) {
+		problem.prog->AddBoundingBoxConstraint(graph->_global_x_lb, graph->_global_x_ub, X.row(i).transpose());
+	}
+
 	//
 	// QUATERNION CONSTRAINTS
 	//
