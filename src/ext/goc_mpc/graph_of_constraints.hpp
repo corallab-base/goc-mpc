@@ -163,6 +163,8 @@ struct GraphOfConstraints {
 			       const Eigen::VectorXi& var_assignments,
 			       double tol) const;
 
+	int get_edge_phi_agent(int phi_id, const Eigen::VectorXi& var_assignments) const;
+
 	// Grasp change util
 	void add_grasp_change(int phi_id, std::string command, int robot_id, int cube_id);
 	void add_assignable_grasp_change(int phi_id, std::string command, int cube_id);

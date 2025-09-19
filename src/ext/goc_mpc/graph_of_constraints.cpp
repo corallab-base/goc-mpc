@@ -253,6 +253,16 @@ bool GraphOfConstraints::evaluate_edge_phi(int phi_id,
 	}
 }
 
+int GraphOfConstraints::get_edge_phi_agent(int phi_id, const Eigen::VectorXi& var_assignments) const {
+	if (_edge_phi_to_static_assignment_map.contains(phi_id)) {
+		return _edge_phi_to_static_assignment_map.at(phi_id);
+	} else if (edge_phi_to_variable_map.contains(phi_id)) {
+		int var = edge_phi_to_variable_map.at(phi_id);
+		return var_assignments(var);
+	}
+	return -1;
+}
+
 // Grasp util
 
 void GraphOfConstraints::add_grasp_change(int phi_id,
