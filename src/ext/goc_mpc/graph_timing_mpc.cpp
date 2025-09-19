@@ -686,13 +686,35 @@ bool GraphTimingMPC::solve(
 	// Store nodes on each spline
 	_agent_nodes_list = problem->agent_nodes_list;
 
+	// Warm start vs and taus per agent
+	// for (int i = 0; i < _graph->num_agents; ++i) {
+	// 	const int agent_spline_length = taus.size() + 1;
+
+	// 	for (int j = 0; j < vs.rows(); ++j) {
+	// 		problem->prog->SetInitialGuess(
+	// 			problem->vs_list[i], _vs_list[i].row(j));
+	// 	}
+
+	// 	for (int j = 0; j < taus.size(); ++j) {
+	// 		problem->prog->SetInitialGuess(
+	// 			problem->time_deltas_list[i](j), _time_deltas_list[i](j));
+	// 	}
+	// }
+
+	// for (int v : remaining_vertices) {
+	// 	const int i = problem->subgraph->subgraph_id(v);
+	// 	problem->prog->SetInitialGuess(problem->X.row(i), _waypoints.row(v));
+	// }
+
+
 	// Solve
-	// drake::solvers::IpoptSolver solver;
+	drake::solvers::IpoptSolver solver;
 	// auto result = solver.Solve(*problem.prog);
 
 	MathematicalProgramResult result;
 	try {
-		result = drake::solvers::Solve(*(problem->prog));
+		// result = drake::solvers::Solve(*(problem->prog));
+		result = solver.Solve(*(problem->prog));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in solver" << std::endl;
 		return false;
