@@ -567,9 +567,96 @@ public:
 		return res;
 	}
 
+	struct ConcurrentEdgesResult {
+		struct EdgeKey { int u; int v; };                // parent node ids
+		std::vector<EdgeKey> edges;                      // edge i = edges[i]
+		std::vector<std::vector<int>> concurrent;        // indices j concurrent with i
+	};
+
+	ConcurrentEdgesResult compute_concurrent_edges_overlap() const;
+
 private:
 	const GraphT* _g;               // parent graph (not owning)
 	std::vector<bool>   _mask;      // membership mask by node id
 	std::vector<int> _node_list; // compact node list (for fast outer loops)
 	std::map<int, int> _subgraph_id_map;
 };
+
+
+template <typename LabelT>
+typename InducedSubgraphView<LabelT>::ConcurrentEdgesResult
+InducedSubgraphView<LabelT>::compute_concurrent_edges_overlap() const {
+	using EdgeKey = typename ConcurrentEdgesResult::EdgeKey;
+	ConcurrentEdgesResult out;
+
+	const int N = static_cast<int>(_node_list.size());
+	if (N == 0) return out;
+
+	auto sg_id = [&](int u)->int {
+		auto it = _subgraph_id_map.find(u);
+		return (it == _subgraph_id_map.end()) ? -1 : it->second;
+	};
+
+	// 1) Collect edges (u->v) in view (preserve iteration order).
+	std::vector<EdgeKey> E;
+	E.reserve(N * 2);
+	for (auto er : edges()) {
+		const int u = er.u, v = er.e->to;
+		if (contains_node(u) && contains_node(v)) E.push_back({u, v});
+	}
+	const int M = static_cast<int>(E.size());
+	out.edges = E;
+	out.concurrent.assign(M, {});
+	if (M == 0) return out;
+
+	// 2) Topological order to guarantee DAG (within the view).
+	auto topo = this->topological_layer_cut_visit([](int, int){});
+	const std::vector<int>& order = topo.order;
+	if ((int)order.size() != N) {
+		throw std::runtime_error("compute_concurrent_edges_overlap(): subgraph is not a DAG.");
+	}
+
+	// 3) Forward reachability bitsets (within the view).
+	const int W = (N + 63) >> 6;
+	std::vector<std::vector<uint64_t>> reach(N, std::vector<uint64_t>(W, 0ULL));
+	auto set_bit = [](std::vector<uint64_t>& bs, int j){ bs[(unsigned)j >> 6] |= (1ULL << ((unsigned)j & 63)); };
+	auto test_bit = [](const std::vector<uint64_t>& bs, int j)->bool{ return (bs[(unsigned)j >> 6] >> ((unsigned)j & 63)) & 1ULL; };
+	auto or_eq_f   = [&](std::vector<uint64_t>& a, const std::vector<uint64_t>& b){ for (int k=0;k<W;++k) a[k] |= b[k]; };
+
+	for (int t = N - 1; t >= 0; --t) {
+		const int u = order[t];
+		const int iu = sg_id(u);
+		if (iu < 0) continue;
+		for (const auto& e : neighbors(u)) {
+			const int v  = e.to;
+			const int iv = sg_id(v);
+			if (iv < 0) continue;
+			or_eq_f(reach[iu], reach[iv]);
+			set_bit(reach[iu], iv);
+		}
+	}
+	auto reachable = [&](int x, int y)->bool {
+		const int ix = sg_id(x), iy = sg_id(y);
+		if (ix < 0 || iy < 0) return false;
+		return test_bit(reach[ix], iy);
+	};
+
+	// 4) Symmetric “overlap” concurrency:
+	//    concurrent iff  NOT (v -> a)  AND  NOT (b -> u).
+	for (int i = 0; i < M; ++i) {
+		const int a = E[i].u, b = E[i].v;
+		for (int j = i + 1; j < M; ++j) {
+			const int u = E[j].u, v = E[j].v;
+
+			const bool v_before_a = (v == a) || reachable(v, a);
+			const bool b_before_u = (b == u) || reachable(b, u);
+
+			if (!v_before_a && !b_before_u) {
+				out.concurrent[i].push_back(j);
+				out.concurrent[j].push_back(i);  // symmetric / double-count
+			}
+		}
+	}
+
+	return out;
+}
