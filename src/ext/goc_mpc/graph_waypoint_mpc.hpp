@@ -1,7 +1,10 @@
 #pragma once
 
+#include <limits>
 #include <iostream>
 #include <algorithm>
+
+#include <fmt/format.h>
 
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/branch_and_bound.h>
