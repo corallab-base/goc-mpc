@@ -736,11 +736,55 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		}
 	}
 
-	std::map<int, std::set<int>> possibly_manipulated_cubes_during_each_layer;
+	// Assume `subgraph` is your InducedSubgraphView<LabelT> instance
+	auto result = subgraph.structure.compute_concurrent_edges_overlap();
+
+	std::map<std::pair<int, int>, std::set<int>> possibly_manipulated_cubes_during_each_edge;
+
+	// Loop over all edges in the subgraph
+	for (std::size_t i = 0; i < result.edges.size(); ++i) {
+		const auto& e = result.edges[i];
+		int a = e.u;
+		int b = e.v;
+		const std::pair<int, int> e_pair = std::make_pair(a, b);
+
+		// std::cout << "checking: " << a << "->" << b << std::endl;
+
+		// Also consider the edge itself
+		if (graph->edge_to_phis_map.contains(e_pair)) {
+			for (int edge_phi_id : graph->edge_to_phis_map.at(e_pair)) {
+				DeferredEdgeOp& op = graph->edge_ops.at(edge_phi_id);
+
+				possibly_manipulated_cubes_during_each_edge[e_pair].insert(
+					op.cubes.begin(), op.cubes.end());
+			}
+		}
+
+		// Iterate over concurrent edges
+		for (int j : result.concurrent[i]) {
+			const auto& ce = result.edges[j];
+			int u = ce.u;
+			int v = ce.v;
+			const std::pair<int, int> ce_pair = std::make_pair(u, v);
+
+			// std::cout << "there is a concurrent edge: " << u << "->" << v << std::endl;
+
+			if (graph->edge_to_phis_map.contains(ce_pair)) {
+
+				for (int edge_phi_id : graph->edge_to_phis_map.at(ce_pair)) {
+					DeferredEdgeOp& op = graph->edge_ops.at(edge_phi_id);
+
+					possibly_manipulated_cubes_during_each_edge[e_pair].insert(
+						op.cubes.begin(), op.cubes.end());
+				}
+			}
+		}
+	}
+
 	std::map<int, std::vector<HoldSpec>> hold_specs_during_each_layer;
 	std::map<int, std::vector<AssignableHoldSpec>> assignable_hold_specs_during_each_layer;
 	const auto& layers = subgraph.structure.topological_layer_cut_snapshot(
-		[&graph, &possibly_manipulated_cubes_during_each_layer,
+		[&graph,
 		 &hold_specs_during_each_layer,
 		 &assignable_hold_specs_during_each_layer]
 		(int level_k, int u, int v) {
@@ -781,9 +825,6 @@ GraphWaypointProblem build_graph_waypoint_problem(
 							assignable_hold_specs_during_each_layer[level_k].push_back(spec);
 						}
 					}
-
-					possibly_manipulated_cubes_during_each_layer[level_k].insert(
-						op.cubes.begin(), op.cubes.end());
 				}
 			}
 		});
@@ -796,6 +837,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		int sg_u = subgraph.subgraph_id(u);
 		int v = edge.e->to;
 		int sg_v = subgraph.subgraph_id(v);
+		std::pair<int, int> e_pair = std::make_pair(u, v);
 		for (int ag = 0; ag < num_agents; ++ag) {
 			Expression dist = splines->at(ag).squared_distance(X.row(sg_u).segment(ag * robot_dim, robot_dim),
 									   X.row(sg_v).segment(ag * robot_dim, robot_dim));
@@ -816,19 +858,21 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 			// Only enforce stationary if there is no phi at this layer
 			// that interferes with this cube.
-			const int layer = layers.node_to_level.at(u);
-			if (possibly_manipulated_cubes_during_each_layer.contains(layer)) {
-				if (!possibly_manipulated_cubes_during_each_layer.at(layer).contains(obj)) {
+			if (possibly_manipulated_cubes_during_each_edge.contains(e_pair)) {
+
+				if (!possibly_manipulated_cubes_during_each_edge.at(e_pair).contains(obj)) {
 					problem.prog->AddLinearEqualityConstraint(
 						X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim))
 						.evaluator()->set_description(fmt::v8::format("{}->{} stationary point {}", u, v, obj));
 				}
 			} else {
-				problem.prog->AddLinearEqualityConstraint(
-					X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim))
-					.evaluator()->set_description("u->v stationary point");;
+				// std::cout << "no information about possibly manipulated cubes for " << e_pair.first << "->" << e_pair.second << "? shouldn't happen" << std::endl;
+			// 	problem.prog->AddLinearEqualityConstraint(
+			// 		X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim))
+			// 		.evaluator()->set_description(fmt::v8::format("{}->{} stationary point {}", u, v, obj));;
 			}
 
+			const int layer = layers.node_to_level.at(u);
 			if (enforce_rigidity) {
 				if (assignable_hold_specs_during_each_layer.contains(layer)) {
 					for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_during_each_layer.at(layer)) {
