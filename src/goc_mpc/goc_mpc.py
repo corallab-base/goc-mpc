@@ -37,7 +37,9 @@ class GraphOfConstraintsMPC():
         self.last_cycle_time = 0.0
         self.last_cycle_splines = [CubicConfigurationSpline(spline_spec) for _ in range(num_agents)]
         self.last_cycle_waypoints = None
+        self.last_cycle_var_assignments = None
         self.last_cycle_short_path = None
+        self.last_cycle_backtracked_phases = set()
         self.last_grasp_commands = []
         self.completed_phases = set()
         self.remaining_phases = list(range(graph.structure.num_nodes))
@@ -74,6 +76,7 @@ class GraphOfConstraintsMPC():
         waypoints = self.waypoint_mpc.view_waypoints()
         assignments = self.waypoint_mpc.view_assignments()
         var_assignments = self.waypoint_mpc.view_var_assignments()
+        self.last_cycle_var_assignments = var_assignments
 
         # PROGRESSION: progress time and potentially change phase
         # shift timing
@@ -96,27 +99,6 @@ class GraphOfConstraintsMPC():
                     self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
                 else:
                     print(f"Did not complete {node}")
-
-        # BACKTRACKING: if the task has been finished
-        if len(self.remaining_phases) == 0:
-            # TODO: support final edge phis
-            pass
-        else:
-            # otherwise,
-            for edge_phi_id, op in self.graph.get_next_edge_ops(self.remaining_phases).items():
-                if not self.graph.evaluate_edge_phi(edge_phi_id, x, var_assignments, 0.03):
-                    print(f"violated path constraint! backtracking node {op.u_node}")
-                    self.completed_phases -= {op.u_node}
-                    self.remaining_phases.append(op.u_node)
-
-                # TODO: more serious backtracking
-
-
-            # while not self.timing_mpc.at_the_start() and phi.maxError(C, 0.5+timingMPC.phase+subSeqStart) > opt.precision:
-            #     # back track appropriately
-            #     self.timing_mpc.update_backtrack();
-            #     phase_changed = True
-
 
         # if not self.timing_mpc.done():
         #     # if the closest next phase is further than time_delta_cutoff seconds into the future
@@ -147,6 +129,38 @@ class GraphOfConstraintsMPC():
 
         return success
 
+    def _backtrack(self, x, x_dot):
+        self.last_cycle_backtracked_phases = {}
+
+        # BACKTRACKING: if the task has been finished
+        if len(self.remaining_phases) == 0:
+            # TODO: support final edge phis
+            pass
+        else:
+            remaining_phases_changed = True
+
+            # otherwise,
+            while remaining_phases_changed:
+                remaining_phases_changed = False
+
+                for edge_phi_id, op in self.graph.get_next_edge_ops(self.remaining_phases).items():
+                    if not self.graph.evaluate_edge_phi(edge_phi_id, x, self.last_cycle_var_assignments, 0.00):
+                        print(f"violated path constraint on {op.u_node}->{op.v_node} ({edge_phi_id})! backtracking.")
+                        self.completed_phases -= {op.u_node}
+                        self.remaining_phases.append(op.u_node)
+
+                        backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
+                        self.last_cycle_backtracked_phases[backtracked_agent] = op.u_node
+
+                        remaining_phases_changed = True
+
+                # TODO: more serious backtracking
+
+            # while not self.timing_mpc.at_the_start() and phi.maxError(C, 0.5+timingMPC.phase+subSeqStart) > opt.precision:
+            #     # back track appropriately
+            #     self.timing_mpc.update_backtrack();
+            #     phase_changed = True
+
     def reset(self):
         self.last_cycle_time = 0.0
         self.remaining_phases = list(range(self.graph.structure.num_nodes))
@@ -160,6 +174,9 @@ class GraphOfConstraintsMPC():
         self.last_cycle_time = t
 
         self.last_grasp_commands = []
+
+        if self.last_cycle_var_assignments is not None:
+            self._backtrack(x, x_dot)
 
         success = self._solve_for_waypoints(x)
 
