@@ -1,9 +1,15 @@
 import os
+import argparse
 import time
+import pickle
+import datetime
+import itertools
 import imageio
 import numpy as np
 import mujoco as mj
 import matplotlib.pyplot as plt
+
+from collections import namedtuple
 
 from mujoco import viewer
 
@@ -18,6 +24,9 @@ from goc_mpc.utils.mesh_cat_mirror import MeshCatMirror
 from goc_mpc.simple_drake_env import SimpleDrakeGym
 
 from visualize_pose_spline import render_spline_to_html
+
+
+Disturbance = namedtuple('Disturbance', ['delay', 'func', 'agent'])
 
 
 def visualize_last_cycle(goc_mpc):
@@ -158,17 +167,94 @@ def n_gripper_n_block_stacking(n_grippers=3, n_blocks=5, quat=np.array([0.0, 0.0
 
         return pick_up, place
 
-    pick1, place1 = add_pick_and_place(0, 0, 1)
-    pick2, place2 = add_pick_and_place(1, 2, 0)
-    pick3, place3 = add_pick_and_place(2, 3, 2)
-    pick4, place4 = add_pick_and_place(0, 4, 3)
+    agent_cycle = itertools.cycle(range(n_grippers))
+    agent_prevs = {}
 
-    graph.structure.add_edge(place1, place2, True)
-    graph.structure.add_edge(place2, place3, True)
-    graph.structure.add_edge(place3, place4, True)
+    block = 0
+    while block < n_blocks - 1:
+        agent = next(agent_cycle)
+        pick, place = add_pick_and_place(agent, block+1, block)
 
-    graph.structure.add_edge(place1, pick4, True)
+        if agent in agent_prevs:
+            prev, _ = agent_prevs[agent]
+            graph.structure.add_edge(prev, pick, True)
 
+        agent_prevs[agent] = place, block+1
+
+        block += 1
+
+    spline_spec = [Block.R(3), Block.SO3()]
+    goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
+                                    solve_for_waypoints_once = False,
+                                    time_delta_cutoff = 0.0,
+                                    phi_tolerance = 0.03)
+    return env, graph, goc_mpc
+
+
+def n_gripper_n_block_sequence_stacking(n_grippers=3, n_blocks=5, quat=np.array([0.0, 0.0, 1.0, 0.0])):
+    agents = [f"free_body_{j}" for j in range(n_grippers)]
+    objects = [f"cube_{i}" for i in range(n_blocks)]
+    env = SimpleDrakeGym(agents, objects)
+
+    state_lower_bound = -10.0
+    state_upper_bound =  10.0
+
+    symbolic_plant = env.plant.ToSymbolic()
+    graph = GraphOfConstraints(symbolic_plant, agents, objects,
+                               state_lower_bound, state_upper_bound)
+
+    joint_agent_dim = graph.num_agents * graph.dim;
+
+    # def add_pick_and_place(agent, block_to_pick, destination):
+    #     pick_up, place = graph.structure.add_nodes(2)
+    #     graph.structure.add_edge(pick_up, place, True)
+
+    #     pick_phi = graph.add_robot_to_point_displacement_constraint(pick_up, agent, block_to_pick, np.array([0.0, 0.0, -0.14]))
+    #     graph.add_robot_quat_linear_eq(pick_up, agent, np.eye(4), quat)
+    #     graph.add_grasp_change(pick_phi, "grab", agent, block_to_pick);
+
+    #     graph.add_robot_holding_cube_constraint(pick_up, place, agent, block_to_pick, 0.25) # distance threshold
+
+    #     place_phi = graph.add_robot_to_point_displacement_constraint(place, agent, destination, np.array([0.0, 0.0, -0.20]));
+    #     graph.add_robot_quat_linear_eq(place, agent, np.eye(4), quat)
+    #     graph.add_grasp_change(place_phi, "release", agent, block_to_pick);
+
+    #     return pick_up, place
+
+    agent_to_block = {
+        0: 0,
+        1: 2
+    }
+
+    block_to_destination = {
+        0: 1,
+        2: 0
+    }
+
+    held_blocks = {}
+    block_to_agent_and_destination = {}
+
+    pick_up = graph.structure.add_node()
+    for agent, block in agent_to_block.items():
+        pick_phi = graph.add_robot_to_point_displacement_constraint(pick_up, agent, block, np.array([0.0, 0.0, -0.14]))
+        graph.add_robot_quat_linear_eq(pick_up, agent, np.eye(4), quat)
+        graph.add_grasp_change(pick_phi, "grab", agent, block);
+        held_blocks[agent] = block
+        block_to_agent_and_destination[block] = (agent, block_to_destination[block])
+
+    prev = pick_up
+    for pick_block, destination in block_to_destination.items():
+        place = graph.structure.add_node()
+        graph.structure.add_edge(prev, place, True)
+
+        for holding_agent, held_block in held_blocks.items():
+            graph.add_robot_holding_cube_constraint(prev, place, holding_agent, held_block, 0.25) # distance threshold
+
+        agent, _ = block_to_agent_and_destination[pick_block]
+        place_phi = graph.add_robot_to_point_displacement_constraint(place, agent, destination, np.array([0.0, 0.0, -0.20]));
+        graph.add_robot_quat_linear_eq(place, agent, np.eye(4), quat)
+        graph.add_grasp_change(place_phi, "release", agent, pick_block);
+        del held_blocks[agent]
 
     spline_spec = [Block.R(3), Block.SO3()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
@@ -558,16 +644,134 @@ def two_gripper_rotation_test():
 
 
 
-def main():
-    # meshcat = Meshcat(port=8080)
+def int_pair(arg_string):
+    """
+    Custom type function to parse a string into a pair of integers.
+    Expects input in the format "int1,int2".
+    """
+    try:
+        parts = arg_string.split(',')
+        if len(parts) != 2:
+            raise ValueError("Input must contain exactly two integers separated by a comma.")
+        return int(parts[0]), int(parts[1])
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid integer pair format: {e}")
 
-    # env, graph, goc_mpc = test_two_gripper_block_stacking(meshcat=meshcat)
-    # env, graph, goc_mpc = n_gripper_n_block_stacking(n_grippers=3, n_blocks=5)
-    # env, graph, goc_mpc = two_gripper_block_stacking()
-    # env, graph, goc_mpc = two_gripper_pick_and_pour()
-    # env, graph, goc_mpc = two_gripper_fold_sheet()
-    # env, graph, goc_mpc = two_gripper_pick_and_pour()
-    # env, graph, goc_mpc = two_gripper_assignable_move()
+
+
+
+def block_disturbance(env, agent):
+    # apply disturbance if the agent is grasping something (it should be grasping block 0)
+    is_agent_grasping = any(filter(lambda g: g.robot_name == env._controlled_names[agent], env._grasps.values()))
+    apply_disturbance = is_agent_grasping
+
+    point = "cube_0"
+
+    # disturbance sequence
+    pos = env._get_model_q(point)
+
+    new_pos = pos + np.array([-0.25, 0.5, 0.0])
+
+    def disturbance(counter):
+        if apply_disturbance:
+            if counter == 0:
+                env.release_grasp(point)
+            elif counter == 1:
+                env.release_grasp(point)
+                env._set_model_q(point, new_pos)
+
+    counter = 0
+    while True:
+        yield disturbance(counter)
+        counter += 1
+
+
+def pick_and_pour_disturbance(env, agent):
+    # apply disturbance if any end-effector is grasping
+    apply_disturbance = env.is_grasping(i=agent)
+
+    raise NotImplementedError()
+
+    cup = env.og_env.scene.object_registry("name", "block_3")
+
+    # disturbance sequence
+    pos0, orn0 = block.get_position_orientation()
+    pose0 = np.concatenate([pos0, orn0])
+    pose1 = np.array([-0.1, -0.3, pos0[2], *orn0])
+
+    control_points = np.array([pose0, pose1])
+    pose_seq = spline_interpolate_poses(control_points, num_steps=25)
+    def disturbance(counter):
+        if apply_disturbance:
+            if counter < 20:
+                if counter > 15:
+                    # 15 - 20
+                    print("last 5")
+                    env.robots[agent].release_grasp_immediately()  # force robot to release the block
+                else:
+                    print("first 15")
+                    pass  # do nothing for the first 15 steps
+            elif counter < len(pose_seq) + 20:
+                # 20 - pose_seq+20
+                env.robots[agent].release_grasp_immediately()  # force robot to release the block
+                pose = pose_seq[counter - 20]
+                pos, orn = pose[:3], pose[3:]
+                print("on traj: ", pos, orn)
+                block.set_position_orientation(pos, orn)
+                counter += 1
+        else:
+            print("NOT APPLYING")
+
+    counter = 0
+    while True:
+        yield disturbance(counter)
+        counter += 1
+
+
+def apply_randomization(env, task_randomization_seed, task):
+    if task_randomization_seed is not None:
+        np.random.seed(task_randomization_seed)
+
+        if "stack_blocks" in task:
+            size = 0.5
+            bounds_per_object = [(0.0, 0.0), (2.0, 2.0)]
+        elif task == "pick_and_pour":
+            size = 0.06
+            bounds_per_object = [(0, -0.4), (-0.1, -0.3)]
+
+
+        # Update to keep track of collisions
+        new_positions = []
+        for obj in env._passive_names:
+
+            current_position = env._get_model_q(env._passive_names[0])
+            current_z = current_position[2]
+
+            collision_free = False
+            while not collision_free:
+                position = np.concatenate((np.random.uniform(*bounds_per_object), np.array([current_z])))
+
+                collision_free = True
+                for pos in new_positions:
+                    if np.linalg.norm(np.array(position) - np.array(pos)) < size:
+                        collision_free = False
+
+            new_positions.append(position)
+
+        passive_q = np.concatenate(new_positions)
+        for i, name in enumerate(env._passive_names):
+            env._set_model_q(name, passive_q[i*3:(i+1)*3])
+
+
+def perform_task(task,
+                 plan_builder,
+                 task_randomization_seed=None,
+                 disturbance_seq=None,
+                 save_path=None):
+
+    os.makedirs(save_path, exist_ok=True)
+
+    env, graph, goc_mpc = plan_builder()
 
     dim = graph.dim
     num_agents = graph.num_agents
@@ -580,101 +784,306 @@ def main():
     env._diagram.ForcedPublish(env._context)
     input("Continue?")
 
+    total_cost = 0.0
     wp_sts = []
     timing_sts = []
     short_path_sts = []
 
-    while True:
-        # obs, _ = env.reset(
-        #     q0=np.array([ 0.1332869 ,  0.45878515,  0.07459005,  0.25109156,  0.66010387,
-        #                   0.66245582,  0.24973625,  2.26091005,  0.48135286,  0.10280809,
-        #                   0.25161163,  0.66336338, -0.65905311, -0.24957888,  0.25      ,
-        #                   0.5       ,  0.02496069,  1.25      ,  0.5       ,  0.02496069,
-        #                   2.19099191,  0.49969403,  0.03780399])
-        # )
-        obs, _ = env.reset()
-        goc_mpc.reset()
+    applied_disturbance = {
+        stage: False for stage in goc_mpc.remaining_phases
+    }
+    stage_counter = {
+        stage: 0 for stage in goc_mpc.remaining_phases
+    }
+    disturbance_funcs = []
 
-        # let settle
-        for _ in range(20):
-            qpos = obs[0][:num_agents * dim]
-            obs, _, _, _, _ = env.step(qpos)
+    def update_disturbance_seq(completed_phases):
+        if disturbance_seq is not None:
+            for stage, disturbance in disturbance_seq.items():
+                # if at a stage to apply a disturbance
+                if (stage in completed_phases and
+                    not applied_disturbance.get(stage, False) and
+                    stage_counter[stage] >= disturbance.delay):
 
-        # # for debugging, get assignments and pass a few nodes.
-        # x, x_dot = obs
-        # goc_mpc._solve_for_waypoints(x)
-        # assignments = goc_mpc.waypoint_mpc.view_assignments()
-        # goc_mpc.pass_node(0, assignments)
-        # goc_mpc.pass_node(2, assignments)
+                    # set the disturbance sequence, the generator will yield and instantiate one disturbance function for each env.step until it is exhausted
+                    disturbance_funcs.append(disturbance.func(env, disturbance.agent))
+                    applied_disturbance[stage] = True
 
-        disturbed = False
+                elif (stage in completed_phases and
+                      not applied_disturbance.get(stage, False)):
+                    stage_counter[stage] += 1
 
-        env._meshcat.StartRecording()
-        
-        step = 3
-        for k in range(0, 2000, step):
-            x, x_dot = obs
+    obs, _ = env.reset()
+    goc_mpc.reset()
 
-            # if k % 300 == 0:
-            #     breakpoint()
-            # time.sleep(0.5)
+    print("APPLYING RANDOMIZATION")
 
-            try:
-                xi_h, _, _ = goc_mpc.step(k * dt, x, x_dot, teleport=False)
-                wp_sts.append(goc_mpc.waypoint_mpc.get_last_solve_time())
-                timing_sts.append(goc_mpc.timing_mpc.get_last_solve_time())
-                short_path_sts.append(goc_mpc.short_path_mpc.get_last_solve_time())
-            except RuntimeError as e:
-                print(e)
-                breakpoint()
-                xi_h, _, _ = goc_mpc.last_cycle_short_path
-                if xi_h.shape[0] > 1:
-                    xi_h = xi_h[1:]
+    apply_randomization(env, task_randomization_seed, task)
 
-            # if len(goc_mpc.remaining_phases) < 2:
-            #     breakpoint()
+    print("APPLIED RANDOMIZATION")
 
-            # print("real cube 0 q:", x[6:9])
-            # ag0_next_node = goc_mpc.timing_mpc.get_agent_spline_nodes(0)[0]
-            # print("agent 0 next spline node:", ag0_next_node)
-            # print("agent 0 next goal:", goc_mpc.waypoint_mpc.view_waypoints()[ag0_next_node, 6:9])
+    # let settle
+    for _ in range(20):
+        qpos = obs[0][:num_agents * dim]
+        obs, _, _, _, _ = env.step(qpos)
 
-            # if k > 162:
-                # breakpoint()
-                # # detach grasp to see if backtracking is possible.
-                # assert "cube_0" in env._grasps
+    disturbed = False
 
-                # if "cube_0" in env._grasps and not disturbed:
-                #     env.release_grasp("cube_0")
-                #     disturbed = True
+    step = 3
+    n_steps = 0
+    for k in range(0, 2000, step):
+        x, x_dot = obs
 
-            if len(goc_mpc.last_cycle_backtracked_phases) > 0:
-                breakpoint()
-                    
-            # if k % 200 == 0:
-            #     visualize_last_cycle(goc_mpc)
-                # fig = visualize_last_cycle(goc_mpc)
-                # breakpoint()
-                # input("Continue?")
-                # plt.close(fig)
+        try:
+            xi_h, _, _ = goc_mpc.step(k * dt, x, x_dot, teleport=False)
+            wp_sts.append(goc_mpc.waypoint_mpc.get_last_solve_time())
+            timing_sts.append(goc_mpc.timing_mpc.get_last_solve_time())
+            short_path_sts.append(goc_mpc.short_path_mpc.get_last_solve_time())
+        except RuntimeError as e:
+            print(e)
+            xi_h, _, _ = goc_mpc.last_cycle_short_path
+            if xi_h.shape[0] > 1:
+                xi_h = xi_h[1:]
 
-            qpos = xi_h[step]
-            obs, rew, done, trunc, info = env.step(qpos, grasp_cmds=goc_mpc.last_grasp_commands)
+        # if block:
+        # go_up = graph.structure.add_node()
+        # graph.structure.add_edge(prev, go_up, True)
 
-        sts = np.array(wp_sts) + np.array(timing_sts) + np.array(short_path_sts)
-        print("Mean Solve Time", np.mean(sts))
-        print("Median Solve Time", np.median(sts))
-        print("Max Solve Time", np.max(sts))
+        # graph.add_robot_to_point_displacement_constraint(go_up, agent, block, np.array([0.0, 0.0, -0.30]))
 
-        breakpoint()
+        # if k > 162:
+        #     breakpoint()
+        #     # detach grasp to see if backtracking is possible.
+        #     assert "cube_0" in env._grasps
 
-        env._meshcat.StopRecording()
-        
-        resp = input("Repeat?")
-        if resp == 'q':
+        #     if "cube_0" in env._grasps and not disturbed:
+        #         env.release_grasp("cube_0")
+        #         disturbed = True
+
+        if len(goc_mpc.last_cycle_backtracked_phases) > 0:
+            if task == "stack_blocks_sequence":
+                points = list(env._grasps)
+                for point in points:
+                    env.release_grasp(point)
+
+        qpos = xi_h[step].copy()
+
+        # for ag in range(num_agents):
+        #     if goc_mpc.timing_mpc.get_agent_spline_length(ag) == 1:
+        #         qpos[7*ag + 2] += 0.01
+
+        obs, rew, done, trunc, info = env.step(qpos, grasp_cmds=goc_mpc.last_grasp_commands)
+        n_steps += 1
+
+        if len(disturbance_funcs) > 0:
+            for disturbance_func in disturbance_funcs:
+                next(disturbance_func)
+    
+        old_poses = x[:num_agents*dim].reshape(num_agents, dim)
+        agent_poses = qpos[:num_agents*dim].reshape(num_agents, dim)
+
+        old_positions = old_poses[:, :3]
+        agent_positions = agent_poses[:, :3]
+
+        total_cost += np.sum(np.linalg.norm(agent_positions - old_positions, axis=1))
+
+        update_disturbance_seq(goc_mpc.completed_phases)
+
+        if len(goc_mpc.remaining_phases) == 0:
             break
 
+    success = 1.0
+    obj_positions = x[num_agents*dim:]
+    for i in range(1, graph.num_objects):
+        if obj_positions[3*(i-1) + 2] + 0.01 < obj_positions[3*i + 2]:
+            continue
+        else:
+            success = 0.0
 
+    sts = np.array(wp_sts) + np.array(timing_sts) + np.array(short_path_sts)
+
+    print("Success", success)
+    print("Mean Solve Time", np.mean(sts))
+    print("Median Solve Time", np.median(sts))
+    print("Max Solve Time", np.max(sts))
+    print("Total Cost", total_cost)
+
+    metrics = {
+        'success': success,
+        'avg_time': np.mean(sts),
+        'median_time': np.median(sts),
+        'max_time': np.max(sts),
+        'total_cost': total_cost,
+        'total_simulation_steps': n_steps,
+        'waypoint_solve_times': wp_sts,
+        'timing_solve_times': timing_sts,
+        'short_path_solve_times': short_path_sts
+    }
+
+    # Save metrics to tasks dir
+    metrics_dir = os.path.join(save_path, 'metrics')
+    os.makedirs(metrics_dir, exist_ok=True)
+    metrics_file = f'{task}_{datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.pkl'
+    metrics_path = os.path.join(metrics_dir, metrics_file)
+    with open(metrics_path, 'wb') as f:
+        pickle.dump(metrics, f)
+
+    print("Finished Saving metrics to", metrics_path)
+    return env, graph, goc_mpc
+
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--task', type=str, default='stack_blocks', help='task to perform')
+    parser.add_argument('--seed_range', type=int_pair, default=(0, 1), help='seeds over which to evaluate')
+    parser.add_argument('--save_path', type=str, help='path to save files and data')
+    parser.add_argument('--use_cached_query', action='store_true', help='instead of querying the VLM, use the cached query')
+    parser.add_argument('--use_disturbance', action='store_true', help='use a disturbance')
+    parser.add_argument('--visualize', action='store_true', help='visualize each solution before executing (NOTE: this is blocking and needs to press "ESC" to continue)')
+    parser.add_argument('--randomize', '-r', action='store_true', help='randomize the setup environment for all tasks')
+    args = parser.parse_args()
+
+    # meshcat = Meshcat(port=8080)
+    # env, graph, goc_mpc = n_gripper_n_block_stacking(n_grippers=3, n_blocks=5)
+
+    # env, graph, goc_mpc = test_two_gripper_block_stacking(meshcat=meshcat)
+    # env, graph, goc_mpc = n_gripper_n_block_stacking(n_grippers=3, n_blocks=5)
+    # env, graph, goc_mpc = two_gripper_block_stacking()
+    # env, graph, goc_mpc = two_gripper_pick_and_pour()
+    # env, graph, goc_mpc = two_gripper_fold_sheet()
+    # env, graph, goc_mpc = two_gripper_pick_and_pour()
+    # env, graph, goc_mpc = two_gripper_assignable_move()
+
+    stack_blocks_task = {
+        'plan_builder': lambda: n_gripper_n_block_stacking(n_grippers=2, n_blocks=3),
+        'disturbance_seq': {0: Disturbance(delay=2, func=block_disturbance, agent=0)},
+    }
+
+    # ABLATION
+    stack_blocks_sequence_task = {
+        'plan_builder': lambda: n_gripper_n_block_sequence_stacking(n_grippers=2, n_blocks=3),
+        'disturbance_seq': {0: Disturbance(delay=2, func=block_disturbance, agent=0)},
+    }
+
+    stack_blocks_3x4_task = {
+        'plan_builder': lambda: n_gripper_n_block_stacking(n_grippers=3, n_blocks=4),
+        'disturbance_seq': {0: Disturbance(delay=2, func=block_disturbance, agent=0)},
+    }
+
+    pick_and_pour_task = {
+        'plan_builder': two_gripper_pick_and_pour,
+        'disturbance_seq': {0: Disturbance(delay=0, func=pick_and_pour_disturbance, agent=0)},
+    }
+
+    stack_blocks_2x2_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=2, n_blocks=2),
+    }
+
+    stack_blocks_2x5_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=2, n_blocks=5),
+    }
+
+    stack_blocks_2x8_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=2, n_blocks=8),
+    }
+
+    stack_blocks_2x11_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=2, n_blocks=11),
+    }
+
+    stack_blocks_2x12_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=2, n_blocks=12),
+    }
+
+    stack_blocks_3x5_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=3, n_blocks=5),
+    }
+
+    stack_blocks_3x8_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=3, n_blocks=8),
+    }
+
+    stack_blocks_3x11_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=3, n_blocks=11),
+    }
+
+    stack_blocks_3x12_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=3, n_blocks=12),
+    }
+
+    stack_blocks_4x5_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=4, n_blocks=5),
+    }
+
+    stack_blocks_4x8_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=4, n_blocks=8),
+    }
+
+    stack_blocks_4x11_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=4, n_blocks=11),
+    }
+
+    stack_blocks_4x12_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=4, n_blocks=12),
+    }
+
+    stack_blocks_5x5_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=5, n_blocks=5),
+    }
+
+    stack_blocks_5x8_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=5, n_blocks=8),
+    }
+
+    stack_blocks_5x11_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=5, n_blocks=11),
+    }
+
+    stack_blocks_5x12_task = {
+        "plan_builder": lambda: n_gripper_n_block_stacking(n_grippers=5, n_blocks=12),
+    }
+
+    tasks = {
+        "stack_blocks_2x2": stack_blocks_2x2_task,
+        # "stack_blocks": stack_blocks_task,
+        # "stack_blocks_sequence": stack_blocks_sequence_task,
+        "stack_blocks_2x5": stack_blocks_2x5_task,
+        "stack_blocks_2x8": stack_blocks_2x8_task,
+        "stack_blocks_2x11": stack_blocks_2x11_task,
+        "stack_blocks_2x12": stack_blocks_2x12_task,
+        "stack_blocks_3x5": stack_blocks_3x5_task,
+        "stack_blocks_3x8": stack_blocks_3x8_task,
+        "stack_blocks_3x11": stack_blocks_3x11_task,
+        "stack_blocks_3x12": stack_blocks_3x12_task,
+        "stack_blocks_4x5": stack_blocks_4x5_task,
+        "stack_blocks_4x8": stack_blocks_4x8_task,
+        "stack_blocks_4x11": stack_blocks_4x11_task,
+        "stack_blocks_4x12": stack_blocks_4x12_task,
+        "stack_blocks_5x5": stack_blocks_5x5_task,
+        "stack_blocks_5x8": stack_blocks_5x8_task,
+        "stack_blocks_5x11": stack_blocks_5x11_task,
+        "stack_blocks_5x12": stack_blocks_5x12_task,
+        "pick_and_pour": pick_and_pour_task,
+    }
+
+    task_name = args.task
+    task = tasks[args.task]
+
+    if args.randomize:
+        print(f"randomizing over seeds in range {args.seed_range}")
+        for i in range(*args.seed_range):
+            env, graph, goc_mpc = perform_task(task_name,
+                                               task["plan_builder"],
+                                               task_randomization_seed=i,
+                                               disturbance_seq=task.get('disturbance_seq', None) if args.use_disturbance else None,
+                                               save_path=os.path.join(args.save_path, args.task, str(i)))
+    else:
+        env, graph, goc_mpc = perform_task(task_name,
+                                           task["plan_builder"],
+                                           task_randomization_seed=None,
+                                           disturbance_seq=task.get('disturbance_seq', None) if args.use_disturbance else None,
+                                           save_path=os.path.join(args.save_path, args.task, "default"))
 
 
 if __name__ == "__main__":
