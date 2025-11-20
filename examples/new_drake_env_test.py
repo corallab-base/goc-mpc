@@ -227,6 +227,49 @@ def two_gripper_block_stacking():
                                     phi_tolerance = 0.03)
     return env, graph, goc_mpc
 
+def two_gripper_assignable_test():
+    env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"])
+
+    state_lower_bound = -100.0
+    state_upper_bound =  100.0
+
+    symbolic_plant = env.plant.ToSymbolic()
+    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"],
+                               state_lower_bound, state_upper_bound)
+
+    # 0: Pick cube_0
+    graph.structure.add_nodes(1)
+
+    # Which robot does the job
+    r1 = graph.add_variable()
+    r2 = graph.add_variable()
+
+    phi_pick = graph.add_assignable_robot_to_point_displacement_constraint(
+            0,  # Node Index
+            r2, # Robot variable
+            0,  # Cube Index
+            np.array([0.0, 0.0, -0.1])
+    )
+
+    phi_pick = graph.add_assignable_robot_to_point_displacement_constraint(
+            0,  # Node Index
+            r1, # Robot variable
+            2,  # Cube Index
+            np.array([0.0, 0.0, -0.1])
+    )
+
+    # GoC-MPC
+    spline_spec = [Block.R(3), Block.SO3()]
+    goc_mpc = GraphOfConstraintsMPC(
+            graph,
+            spline_spec,
+            short_path_time_per_step = 0.1,
+            time_delta_cutoff = 0.001,
+            phi_tolerance = 0.03
+    )
+    return env, graph, goc_mpc
+
+
 def two_gripper_assignable_block_stacking():
     env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"])
 
@@ -424,7 +467,8 @@ def main():
     # env, graph, goc_mpc = n_gripper_n_block_stacking(n_grippers=3, n_blocks=5)
     # env, graph, goc_mpc = two_gripper_block_stacking()
     # env, graph, goc_mpc = two_gripper_pick_and_pour()
-    env, graph, goc_mpc = two_gripper_assignable_block_stacking()
+    env, graph, goc_mpc = two_gripper_assignable_test()
+    # env, graph, goc_mpc = two_gripper_assignable_block_stacking()
     # env, graph, goc_mpc = two_gripper_rotate_in_place()
 
     observed_qs = []
