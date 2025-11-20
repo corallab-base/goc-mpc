@@ -452,7 +452,7 @@ def main():
 
         # let settle
         for _ in range(20):
-            qpos = obs[0][:num_agents * dim]
+            qpos = obs[0][:graph.num_agents * graph.dim]
             obs, _, _, _, _ = env.step(qpos)
 
         # # for debugging, get assignments and pass a few nodes.
