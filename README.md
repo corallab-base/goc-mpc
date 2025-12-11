@@ -1,1 +1,5 @@
-#+title: Graph-of-Constraints MPC
+# Graph-of-Constraints MPC
+
+## Setup
+
+    python -m pip install . --no-deps
