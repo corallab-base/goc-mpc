@@ -1,2 +1,4 @@
 __pycache__/
-.py-build-cmake_cache/
+.py-build-cmake_cache/# pixi environments
+.pixi/*
+!.pixi/config.toml

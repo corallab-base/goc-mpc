@@ -296,7 +296,16 @@ struct GraphOfConstraints {
 	int add_variable_constraint(int k, // The node (action) we are constraining
 				    int var, // The variables to constrain
 				    std::set<int> robot_ids); // The possible robot ids
-
+					
+	// Constrains var1 to be equal to var2	
+	int add_variables_equal_constraint(int k,
+					   int var1,
+					   int var2);
+	
+	// Constrains var1 to be not equal to var2
+	int add_variables_not_equal_constraint(int k
+					       int var1,
+					       int var2);
 
 	template <typename T>
 	void set_configuration(

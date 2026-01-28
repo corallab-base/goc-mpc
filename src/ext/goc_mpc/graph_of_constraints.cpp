@@ -1927,6 +1927,7 @@ int GraphOfConstraints::add_variable_constraint(
 	int var, 
 	std::set<int> robot_ids) {
 
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
 	for (int robot_id : robot_ids) {
 		DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
@@ -1961,5 +1962,50 @@ int GraphOfConstraints::add_variable_constraint(
 				}
 			}
 		});
+}
+
+int GraphOfConstraints::add_variables_equal_constraint(int k,
+					   int var1,
+					   int var2) {
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(var1 >= 0 && var1 < num_variables);
+	DRAKE_DEMAND(var2 >= 0 && var2 < num_variables);
+
+	return _add_op(DeferredOpKind::kLinearEq, k,
+		[=, this](const Eigen::VectorXd& x, const int robot_id) {
+			// This needs to evaluate our constraint
+			// Make sure that robot_id is in robot_ids
+			//
+			// TODO: I need to check that the robot assigned to var1 = robot
+			// Skip for now
+			return 0
+			//return robot_ids.find(robot_id) != robot_ids.end();
+		}, [=, this](auto& prog,
+			     const SubgraphOfConstraints& subgraph,
+			     const int phi_id,
+			     const auto& X,
+			     const auto & Assignments) {
+			
+			// Get the variables we want to constrain
+			const int variable1 = subgraph.subgraph_variable_id(var1);
+			const int variable2 = subgraph.subgraph_variable_id(var2);
+
+			for (int i = 0; i < num_agents; i++) {
+				a = Assignments(variable1, i);
+				b = Assignments(variable2, i);
+				prog.AddLinearEqualityConstraint(a, b);
+			}
+		});
+
+
+}
+
+int GraphOfConstraints::add_variables_not_equal_constraint(int k
+					       int var1,
+					       int var2) {
+	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
+	DRAKE_DEMAND(var1 >= 0 && var1 < num_variables);
+	DRAKE_DEMAND(var2 >= 0 && var2 < num_variables);
+
 }
 
