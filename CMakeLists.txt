@@ -8,7 +8,8 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
 # Find the pybind11 library
 set(PYBIND11_USE_CROSSCOMPILING On) # https://github.com/pybind/pybind11/pull/5083
-find_package(pybind11 REQUIRED)
+# Specifying version 2.13.6 to match the patched version of pybind11 used by drake
+find_package(pybind11 2.13.6 REQUIRED)
 
 #
 # drake dependency
