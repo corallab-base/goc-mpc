@@ -163,7 +163,7 @@ static void AddHoldRigidityStaticToX0(
 			prog->AddConstraint(rel_0 - rel_v,
 					    Eigen::Vector3d::Constant(3, -0.01),
 					    Eigen::Vector3d::Constant(3, 0.01))
-				.evaluator()->set_description(fmt::v8::format("-1->{} exact rigidity {}", v, obj_id));
+				.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
 		}
 	} else {
 		for (size_t i = 0; i < spec.held_point_ids.size(); ++i) {
@@ -184,7 +184,7 @@ static void AddHoldRigidityStaticToX0(
 				const Eigen::Matrix<Expression,3,1> d_v = p_i_v - p_j_v;
 				Expression e = d_v.squaredNorm() - d_0.squaredNorm();
 				prog->AddQuadraticConstraint(e, 0.0, 0.0)
-					.evaluator()->set_description(fmt::v8::format("-1->{} p2p distance rigidity", v));
+					.evaluator()->set_description(fmt::format("-1->{} p2p distance rigidity", v));
 			}
 		}
 
@@ -275,7 +275,7 @@ static void AddHoldRigidityStatic(
 			prog->AddConstraint(rel_u - rel_v,
 					    Eigen::Vector3d::Constant(3, -0.02),
 					    Eigen::Vector3d::Constant(3, 0.02))
-				.evaluator()->set_description(fmt::v8::format("{}->{} exact rigidity {}", u, v, obj_id));
+				.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
 		}
 	} else {
 		for (size_t i = 0; i < spec.held_point_ids.size(); ++i) {
@@ -707,7 +707,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			if (!possibly_manipulated_cubes_for_initial_layer.contains(obj)) {
 				// Enforce X_seg == x0_seg (all objects not effected by an edge constraint)
 				problem.prog->AddLinearEqualityConstraint(X_seg, x0_seg)
-					.evaluator()->set_description(fmt::v8::format("0->{} stationary point {}", v, obj));
+					.evaluator()->set_description(fmt::format("0->{} stationary point {}", v, obj));
 			}
 		}
 
@@ -863,13 +863,13 @@ GraphWaypointProblem build_graph_waypoint_problem(
 				if (!possibly_manipulated_cubes_during_each_edge.at(e_pair).contains(obj)) {
 					problem.prog->AddLinearEqualityConstraint(
 						X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim))
-						.evaluator()->set_description(fmt::v8::format("{}->{} stationary point {}", u, v, obj));
+						.evaluator()->set_description(fmt::format("{}->{} stationary point {}", u, v, obj));
 				}
 			} else {
 				// std::cout << "no information about possibly manipulated cubes for " << e_pair.first << "->" << e_pair.second << "? shouldn't happen" << std::endl;
 			// 	problem.prog->AddLinearEqualityConstraint(
 			// 		X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim))
-			// 		.evaluator()->set_description(fmt::v8::format("{}->{} stationary point {}", u, v, obj));;
+			// 		.evaluator()->set_description(fmt::format("{}->{} stationary point {}", u, v, obj));;
 			}
 
 			const int layer = layers.node_to_level.at(u);

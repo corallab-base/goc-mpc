@@ -526,7 +526,7 @@ int GraphOfConstraints::add_point_linear_eq(
 
 			// Enforces A * point_config_k == b
 			prog.AddLinearEqualityConstraint(A, b, point_config_k)
-				.evaluator()->set_description(fmt::v8::format("point {} linear constraint", point_id));
+				.evaluator()->set_description(fmt::format("point {} linear constraint", point_id));
 		});
 
 	return phi_id;
