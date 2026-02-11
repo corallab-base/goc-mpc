@@ -563,7 +563,7 @@ def main():
 
     # env, graph, goc_mpc = test_two_gripper_block_stacking(meshcat=meshcat)
     # env, graph, goc_mpc = n_gripper_n_block_stacking(n_grippers=3, n_blocks=5)
-    # env, graph, goc_mpc = two_gripper_block_stacking()
+    env, graph, goc_mpc = two_gripper_block_stacking()
     # env, graph, goc_mpc = two_gripper_pick_and_pour()
     # env, graph, goc_mpc = two_gripper_fold_sheet()
     # env, graph, goc_mpc = two_gripper_pick_and_pour()
@@ -626,7 +626,7 @@ def main():
                 short_path_sts.append(goc_mpc.short_path_mpc.get_last_solve_time())
             except RuntimeError as e:
                 print(e)
-                breakpoint()
+                # breakpoint()
                 xi_h, _, _ = goc_mpc.last_cycle_short_path
                 if xi_h.shape[0] > 1:
                     xi_h = xi_h[1:]
@@ -648,9 +648,9 @@ def main():
                 #     env.release_grasp("cube_0")
                 #     disturbed = True
 
-            if len(goc_mpc.last_cycle_backtracked_phases) > 0:
-                breakpoint()
-                    
+            # if len(goc_mpc.last_cycle_backtracked_phases) > 0:
+            #     breakpoint()
+
             # if k % 200 == 0:
             #     visualize_last_cycle(goc_mpc)
                 # fig = visualize_last_cycle(goc_mpc)
