@@ -123,7 +123,7 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
         /* short path times */
 	_times = Eigen::VectorXd(_num_steps);
 	for (int i = 0; i < _num_steps; ++i) {
-		_times(i) = (i+1) * _time_per_step;
+		_times(i) = (i) * _time_per_step;
 	}
 
 	/* short path points */
