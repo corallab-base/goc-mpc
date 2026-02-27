@@ -435,34 +435,42 @@ GraphTimingProblem build_graph_timing_problem(
 
 			// if (max_acc > 0) {
 			// 	for (int j = 0; j < agent_spline_length; ++j) {
-			// 		VectorX<Expression> xJm1(dim), xJ(dim), vJm1(dim), vJ(dim);
+			// 		VectorX<Expression> xJ(ambient_dim), xJm1(ambient_dim), vJ(tangent_dim), vJm1(tangent_dim);
 			// 		const Expression tau(time_deltas_i(j));
 			// 		if (j == 0 && j < agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * dim + k));
-			// 				vJm1(k) = Expression(v0(i * dim + k));
+			// 			for (int k = 0; k < ambient_dim; ++k) {
+			// 				xJm1(k) = Expression(x0(i * ambient_dim + k));
 			// 				xJ(k)   = Expression(wps_i(0, k));
+			// 			}
+			// 			for (int k = 0; k < tangent_dim; ++k) {
+			// 				vJm1(k) = Expression(v0(i * tangent_dim + k));
 			// 				vJ(k)   = Expression(vs_i(0, k));
 			// 			}
 			// 		} else if (j > 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
+			// 			for (int k = 0; k < ambient_dim; ++k) {
 			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
 			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k).Zero();
+			// 			}
+			// 			for (int k = 0; k < tangent_dim; ++k) {
+			// 				vJm1(k) = Expression(vs_i(j-1, k));
+			// 				vJ(k) = Expression(0.0);
 			// 			}
 			// 		} else if (j == 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * dim + k));
-			// 				vJm1(k) = Expression(v0(i * dim + k));
+			// 			for (int k = 0; k < ambient_dim; ++k) {
+			// 				xJm1(k) = Expression(x0(i * ambient_dim + k));
 			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k).Zero();
+			// 			}
+			// 			for (int k = 0; k < tangent_dim; ++k) {
+			// 				vJm1(k) = Expression(v0(i * tangent_dim + k));
+			// 				vJ(k) = Expression(0.0);
 			// 			}
 			// 		} else {
-			// 			for (int k = 0; k < dim; ++k) {
+			// 			for (int k = 0; k < ambient_dim; ++k) {
 			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
 			// 				xJ(k)   = Expression(wps_i(j, k));
+			// 			}
+			// 			for (int k = 0; k < tangent_dim; ++k) {
+			// 				vJm1(k) = Expression(vs_i(j-1, k));
 			// 				vJ(k)   = Expression(vs_i(j, k));
 			// 			}
 			// 		}
@@ -568,6 +576,7 @@ GraphTimingProblem build_graph_timing_problem(
 GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 			       std::vector<CubicConfigurationSpline> splines,
 			       double time_cost,
+			       double time_cost2,
 			       double ctrl_cost,
 			       double max_vel,
 			       double max_acc,
@@ -575,6 +584,7 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 	: _graph(&graph),
 	  _splines(std::make_shared<std::vector<CubicConfigurationSpline>>(std::move(splines))),
 	  _time_cost(time_cost),
+	  _time_cost2(time_cost2),
 	  _ctrl_cost(ctrl_cost),
 	  _max_vel(max_vel),
 	  _max_acc(max_acc),
@@ -672,7 +682,7 @@ bool GraphTimingMPC::solve(
 		problem = std::make_unique<GraphTimingProblem>(
 			build_graph_timing_problem(
 				*_graph, *_splines, remaining_vertices, waypoints, assignments, x0, v0,
-				_time_cost, 0.0, _ctrl_cost, _max_vel, _max_acc, _max_jerk));
+				_time_cost, _time_cost2, _ctrl_cost, _max_vel, _max_acc, _max_jerk));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in timing problem construction" << std::endl;
 		return false;

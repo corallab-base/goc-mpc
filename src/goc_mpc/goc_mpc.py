@@ -19,6 +19,9 @@ class GraphOfConstraintsMPC():
             self,
             graph: GraphOfConstraints,
             spline_spec: list[Block],
+	    time_cost: float = 1.0,
+	    time_cost2: float = 0.0,
+	    ctrl_cost: float = 1.0,
             time_delta_cutoff: float = 0.4,
             phi_tolerance: float = 0.03,
             short_path_length: int = 10,
@@ -48,13 +51,14 @@ class GraphOfConstraintsMPC():
         self.time_delta_cutoff = time_delta_cutoff
         self.phi_tolerance = phi_tolerance
         self.solve_for_waypoints_once = solve_for_waypoints_once
-        self.time_cost = 1.0
-        self.ctrl_cost = 1.0
+        self.time_cost = time_cost
+        self.time_cost2 = time_cost2
+        self.ctrl_cost = ctrl_cost
         self.short_path_time_per_step = short_path_time_per_step
 
         # solvers
         self.waypoint_mpc = GraphWaypointMPC(graph, self.last_cycle_splines)
-        self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines, 1.0, 1.0, max_vel, max_acc, max_jerk)
+        self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines, time_cost, time_cost2, ctrl_cost, max_vel, max_acc, max_jerk)
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length, num_agents, dim, short_path_time_per_step)
 
     def _solve_for_waypoints(self, x: np.ndarray):
@@ -206,7 +210,7 @@ class GraphOfConstraintsMPC():
         if not success:
             raise RuntimeError("ShortPathMPC Failed!")
 
-        
+
         return self.last_cycle_short_path
 
     #

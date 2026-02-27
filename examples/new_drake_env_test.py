@@ -610,7 +610,7 @@ def main():
         disturbed = False
 
         env._meshcat.StartRecording()
-        
+
         step = 3
         for k in range(0, 2000, step):
             x, x_dot = obs
@@ -626,7 +626,6 @@ def main():
                 short_path_sts.append(goc_mpc.short_path_mpc.get_last_solve_time())
             except RuntimeError as e:
                 print(e)
-                # breakpoint()
                 xi_h, _, _ = goc_mpc.last_cycle_short_path
                 if xi_h.shape[0] > 1:
                     xi_h = xi_h[1:]
@@ -666,10 +665,8 @@ def main():
         print("Median Solve Time", np.median(sts))
         print("Max Solve Time", np.max(sts))
 
-        breakpoint()
-
         env._meshcat.StopRecording()
-        
+
         resp = input("Repeat?")
         if resp == 'q':
             break
