@@ -373,7 +373,8 @@ GraphTimingProblem build_graph_timing_problem(
 							vJ(k)   = Expression(vs_i(j, k));
 						}
 					}
-					const Expression c = spline.compute_ctrl_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
+					// const Expression c = spline.compute_ctrl_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
+					const Expression c = spline.compute_energy_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
 					problem.prog->AddCost(c);
 				}
 			}

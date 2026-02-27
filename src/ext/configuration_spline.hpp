@@ -582,6 +582,7 @@ public:
 		const VecX<T>& vJ,
 		const VecX<T>& vJm1,
 		const T& tau) const {
+		/* Minimum acceleration cost */
 
 		const T inv_tau  = T(1.0) / tau;
 		const T inv_tau2 = inv_tau * inv_tau;
@@ -659,6 +660,116 @@ public:
 
 		return total;
 	}
+
+	template <typename T>
+	T compute_energy_cost(
+		const VecX<T>& xJ,
+		const VecX<T>& xJm1,
+		const VecX<T>& vJ,
+		const VecX<T>& vJm1,
+		const T& tau) const {
+
+		const T inv_tau = T(1.0) / tau;
+		T total = T(0.0);
+
+		for (const BlockOffset& off : block_offsets_) {
+			const int a0 = off.ambient_offset, aN = off.ambient_size;
+			const int t0 = off.tangent_offset, tN = off.tangent_size;
+
+			switch (off.type) {
+
+			case Block::Type::R: {
+				const auto xj   = xJ.segment(a0, aN);
+				const auto xjm1 = xJm1.segment(a0, aN);
+				const auto vj   = vJ.segment(t0, tN);
+				const auto vjm1 = vJm1.segment(t0, tN);
+
+				// Displacement (Delta x)
+				const VecX<T> disp = (xj - xjm1); // Use wrap_to_pi for Torus, so3_log for SO3
+
+				// Deviation from constant velocity (your existing D)
+				const VecX<T> D = disp - T(0.5) * tau * (vjm1 + vj);
+
+				// Velocity change (your existing V)
+				const VecX<T> V = (vj - vjm1);
+
+				// Analytical integral of velocity squared:
+				// Term 1: The 'Straight Line' energy (Distance^2 / Time)
+				// Term 2: The 'Wiggle' energy (Deviation from straight)
+				// Term 3: The 'Acceleration' energy (Velocity change)
+				total += inv_tau * disp.squaredNorm()
+					+ T(2.4) * inv_tau * D.squaredNorm()
+					+ T(1.0 / 60.0) * tau * V.squaredNorm();
+				break;
+			}
+			case Block::Type::Torus: {
+				// Torus block: ambient == tangent == aN == tN
+				// Use wrapped angle difference for the position residual (componentwise).
+				const auto xj   = xJ.segment(a0, aN);
+				const auto xjm1 = xJm1.segment(a0, aN);
+				const auto vj   = vJ.segment(t0, tN);
+				const auto vjm1 = vJm1.segment(t0, tN);
+
+				// Displacement (Delta x)
+				VecX<T> disp(aN);
+				for (int k = 0; k < aN; ++k) {
+					disp[k] = wrap_to_pi(xj[k] - xjm1[k]);
+				}
+
+				// Deviation from constant velocity (your existing D)
+				const VecX<T> D = disp - T(0.5) * tau * (vjm1 + vj);
+
+				// Velocity change (your existing V)
+				const VecX<T> V = (vj - vjm1);
+
+				// Analytical integral of velocity squared:
+				// Term 1: The 'Straight Line' energy (Distance^2 / Time)
+				// Term 2: The 'Wiggle' energy (Deviation from straight)
+				// Term 3: The 'Acceleration' energy (Velocity change)
+				total += inv_tau * disp.squaredNorm()
+					+ T(2.4) * inv_tau * D.squaredNorm()
+					+ T(1.0 / 60.0) * tau * V.squaredNorm();
+				break;
+			}
+			case Block::Type::SO3Quat: {
+				// SO(3) quaternion block:
+				// ambient = 4 (wxyz) in x*, tangent = 3 (angular velocity in chosen frame) in v*
+				DRAKE_DEMAND(aN == 4 && tN == 3);
+
+				const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
+				const Eigen::Matrix<T,4,1> qj   = xJ.segment(a0, 4);
+				const Vec<T,3> wjm1 = vJm1.segment(t0, 3);
+				const Vec<T,3> wj   = vJ.segment(t0, 3);
+
+				const auto Rjm1 = RotFromQuatWxyz(qjm1);
+				const auto Rj   = RotFromQuatWxyz(qj);
+				const auto Rrel = Rjm1.transpose() * Rj;
+
+				const Vec<T,3> disp = so3_log(Rrel);
+
+				// Deviation from constant velocity (your existing D)
+				const VecX<T> D = disp - T(0.5) * tau * (wjm1 + wj);
+
+				// Velocity change (your existing V)
+				const Vec<T,3> V = (wj - wjm1);
+
+				// Analytical integral of velocity squared:
+				// Term 1: The 'Straight Line' energy (Distance^2 / Time)
+				// Term 2: The 'Wiggle' energy (Deviation from straight)
+				// Term 3: The 'Acceleration' energy (Velocity change)
+				total += inv_tau * disp.squaredNorm()
+					+ T(2.4) * inv_tau * D.squaredNorm()
+					+ T(1.0 / 60.0) * tau * V.squaredNorm();
+				break;
+			}
+
+			default:
+				DRAKE_UNREACHABLE();
+			}
+		}
+		return total;
+	}
+
 
 private:
 	// -------- Internal per-block piece types ----------
