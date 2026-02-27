@@ -373,7 +373,7 @@ GraphTimingProblem build_graph_timing_problem(
 							vJ(k)   = Expression(vs_i(j, k));
 						}
 					}
-					const Expression c = spline.compute_ctrl_cost(xJ, xJm1, vJ, vJm1, tau);
+					const Expression c = spline.compute_ctrl_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
 					problem.prog->AddCost(c);
 				}
 			}
@@ -769,7 +769,7 @@ std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutof
 	 * These changes should also update the intialization of the solver. */
 
 	std::set<int> passed_nodes;
-	
+
 	for (int i = 0; i < _graph->num_agents; ++i) {
 		// Eigen::MatrixXd vs = result.GetSolution(problem->vs_list[i]);
 		// Eigen::VectorXd taus = result.GetSolution(problem->time_deltas_list[i]);

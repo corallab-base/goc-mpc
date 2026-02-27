@@ -23,20 +23,21 @@ template <typename T, int N> using Vec = Eigen::Matrix<T, N, 1>;
 
 static inline Expression sqr(const Expression& e) { return e * e; }
 
-// Wrap a scalar angle difference into (-pi, pi] using atan2(sin,cos),
-// works with drake::symbolic::Expression.
-static inline Expression wrap_to_pi(const Expression& delta) {
-	using drake::symbolic::sin;
-	using drake::symbolic::cos;
-	using drake::symbolic::atan2;
-	return atan2(sin(delta), cos(delta));
+// Wrap a scalar angle difference into (-pi, pi].
+template <typename T>
+T wrap_to_pi(const T& delta) {
+    using std::floor;
+    const T two_pi = T(2.0 * M_PI);
+    return delta - two_pi * floor((delta + T(M_PI)) / two_pi);
 }
 
 // Quaternion (w,x,y,z) -> RotationMatrix<Expression>
-static inline drake::math::RotationMatrix<Expression>
-RotFromQuatWxyz(const Eigen::Matrix<Expression,4,1>& qwxyz) {
-	Eigen::Quaternion<Expression> q(qwxyz(0), qwxyz(1), qwxyz(2), qwxyz(3));
-	return drake::math::RotationMatrix<Expression>(q);
+template <typename T>
+inline drake::math::RotationMatrix<T>
+RotFromQuatWxyz(const Eigen::Matrix<T,4,1>& qwxyz) {
+    Eigen::Quaternion<T> q(
+        qwxyz(0), qwxyz(1), qwxyz(2), qwxyz(3));
+    return drake::math::RotationMatrix<T>(q);
 }
 
 // hat(·) operator: φ -> φ^ (skew)
@@ -49,12 +50,13 @@ static inline Eigen::Matrix<Expression,3,3> hat(const Vec<Expression,3>& a) {
 }
 
 // Log map on SO(3): returns φ = θ * a  (axis-angle vector)
-static inline Vec<Expression,3>
-so3_log(const drake::math::RotationMatrix<Expression>& Rrel) {
-	Eigen::AngleAxis<Expression> aa = Rrel.ToAngleAxis();
-	const Expression theta = aa.angle();
-	const Vec<Expression,3> axis = aa.axis();
-	return theta * axis;  // 3x1
+template <typename T>
+inline Eigen::Matrix<T,3,1>
+so3_log(const drake::math::RotationMatrix<T>& Rrel) {
+    Eigen::AngleAxis<T> aa = Rrel.ToAngleAxis();
+    const T theta = aa.angle();
+    const Eigen::Matrix<T,3,1> axis = aa.axis();
+    return theta * axis;
 }
 
 // --------- Small SO(3) utilities (header-only, scalar-agnostic) ----------
@@ -573,12 +575,90 @@ public:
 		return total;
 	}
 
-	Expression compute_ctrl_cost(
-		const VecX<Expression>& xJ,
-		const VecX<Expression>& xJm1,
-		const VecX<Expression>& vJ,
-		const VecX<Expression>& vJm1,
-		const Expression& tau) const;
+	template <typename T>
+	T compute_ctrl_cost(
+		const VecX<T>& xJ,
+		const VecX<T>& xJm1,
+		const VecX<T>& vJ,
+		const VecX<T>& vJm1,
+		const T& tau) const {
+
+		const T inv_tau  = T(1.0) / tau;
+		const T inv_tau2 = inv_tau * inv_tau;
+		const T inv_tau3 = inv_tau2 * inv_tau;
+
+		T total = T(0.0);
+
+		for (const BlockOffset& off : block_offsets_) {
+			const int a0 = off.ambient_offset, aN = off.ambient_size;
+			const int t0 = off.tangent_offset, tN = off.tangent_size;
+
+			switch (off.type) {
+
+			case Block::Type::R: {
+				const auto xj   = xJ.segment(a0, aN);
+				const auto xjm1 = xJm1.segment(a0, aN);
+				const auto vj   = vJ.segment(t0, tN);
+				const auto vjm1 = vJm1.segment(t0, tN);
+
+				const VecX<T> D = (xj - xjm1) - T(0.5) * tau * (vjm1 + vj);
+				const VecX<T> V = (vj - vjm1);
+
+				total += T(12.0) * inv_tau3 * D.squaredNorm()
+				       + inv_tau * V.squaredNorm();
+				break;
+			}
+			case Block::Type::Torus: {
+				// Torus block: ambient == tangent == aN == tN
+				// Use wrapped angle difference for the position residual (componentwise).
+				const auto xj   = xJ.segment(a0, aN);
+				const auto xjm1 = xJm1.segment(a0, aN);
+				const auto vj   = vJ.segment(t0, tN);
+				const auto vjm1 = vJm1.segment(t0, tN);
+
+				VecX<T> Dw(aN);
+				for (int k = 0; k < aN; ++k) {
+					Dw[k] = wrap_to_pi(xj[k] - xjm1[k]);
+				}
+				const VecX<T> D = Dw - T(0.5) * tau * (vjm1 + vj);
+				const VecX<T> V = (vj - vjm1);
+
+				total += T(12.0) * inv_tau3 * D.squaredNorm()
+					+ inv_tau * V.squaredNorm();
+				break;
+			}
+			case Block::Type::SO3Quat: {
+				// SO(3) quaternion block:
+				// ambient = 4 (wxyz) in x*, tangent = 3 (angular velocity in chosen frame) in v*
+				DRAKE_DEMAND(aN == 4 && tN == 3);
+
+				const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
+				const Eigen::Matrix<T,4,1> qj   = xJ.segment(a0, 4);
+				const Vec<T,3> wjm1 = vJm1.segment(t0, 3);
+				const Vec<T,3> wj   = vJ.segment(t0, 3);
+
+				const auto Rjm1 = RotFromQuatWxyz(qjm1);
+				const auto Rj   = RotFromQuatWxyz(qj);
+				const auto Rrel = Rjm1.transpose() * Rj;
+
+				const Vec<T,3> dphi = so3_log(Rrel);
+				const Vec<T,3> D = dphi - T(0.5) * tau * (wjm1 + wj);
+				const Vec<T,3> V = (wj - wjm1);
+
+				total += T(12.0) * inv_tau3 * D.squaredNorm()
+					+ inv_tau * V.squaredNorm();
+				break;
+			}
+
+			// Torus and SO3Quat similar (templated helpers required)
+
+			default:
+				DRAKE_UNREACHABLE();
+			}
+		}
+
+		return total;
+	}
 
 private:
 	// -------- Internal per-block piece types ----------
