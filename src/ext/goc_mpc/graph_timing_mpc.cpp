@@ -409,8 +409,8 @@ GraphTimingProblem build_graph_timing_problem(
 					// |vel(0)| <= vmax and |vel(tau)| <= vmax (elementwise)
 					Eigen::VectorXd lb = Eigen::VectorXd::Constant(lin_dim, -max_vel);
 					Eigen::VectorXd ub = Eigen::VectorXd::Constant(lin_dim,  max_vel);
-					problem.prog->AddConstraint(vJm1, lb, ub);
-					problem.prog->AddConstraint(vJ, lb, ub);
+					problem.prog->AddConstraint(vJm1_lin, lb, ub);
+					problem.prog->AddConstraint(vJ_lin, lb, ub);
 				}
 
 				// Max Acceleration Constraints
