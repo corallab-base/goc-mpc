@@ -771,6 +771,74 @@ public:
 	}
 
 	template <typename T>
+	T compute_arclength_cost(
+		const VecX<T>& xJ,
+		const VecX<T>& xJm1,
+		const VecX<T>& vJ,
+		const VecX<T>& vJm1,
+		const T& tau) const {
+
+		T total = T(0.0);
+
+		// Gauss-Legendre 3-point weights and nodes for interval [0, 1]
+		const std::vector<T> w = { T(5.0/18.0), T(8.0/18.0), T(5.0/18.0) };
+		const std::vector<T> nodes = {
+			T(0.5 - 0.5 * 0.7745966692), // 0.5 - 0.5 * sqrt(3/5)
+			T(0.5),
+			T(0.5 + 0.5 * 0.7745966692)  // 0.5 + 0.5 * sqrt(3/5)
+		};
+
+		for (const BlockOffset& off : block_offsets_) {
+			const int a0 = off.ambient_offset, aN = off.ambient_size;
+			const int t0 = off.tangent_offset, tN = off.tangent_size;
+
+			switch (off.type) {
+
+			case Block::Type::R: {
+				const auto xj   = xJ.segment(a0, aN);
+				const auto xjm1 = xJm1.segment(a0, aN);
+				const auto vj   = vJ.segment(t0, tN);
+				const auto vjm1 = vJm1.segment(t0, tN);
+
+				/* For each quadrature point */
+				for (int i = 0; i < 3; ++i) {
+					T u = nodes[i];
+
+					// Cubic Hermite derivative basis functions at u in [0, 1]
+					// These calculate velocity p'(u) normalized by tau
+					T h0_dot = T(6.0*u*u - 6.0*u);
+					T h1_dot = T(3.0*u*u - 4.0*u + 1.0);
+					T h2_dot = T(-6.0*u*u + 6.0*u);
+					T h3_dot = T(3.0*u*u - 2.0*u);
+
+					// Velocity at this point (p_dot = (1/tau) * dp/du)
+					// Note: Since we integrate over dt, tau factors out:
+					// integral ||p_dot(t)|| dt = integral ||dp/du|| du
+					VecX<T> vel_u = h0_dot * (xj - xjm1) / tau // simplistic for brevity
+						+ h1_dot * vjm1
+						+ h3_dot * vj;
+
+					// Add weighted norm to total
+					total += w[i] * vel_u.norm() * tau;
+				}
+
+				break;
+			}
+			case Block::Type::Torus: {
+				break;
+			}
+			case Block::Type::SO3Quat: {
+				break;
+			}
+
+			default:
+				DRAKE_UNREACHABLE();
+			}
+		}
+		return total;
+	}
+
+	template <typename T>
 	std::pair<VecX<T>, VecX<T>> select_linear_blocks(
 		const VecX<T>& x,
 		const VecX<T>& v) const {

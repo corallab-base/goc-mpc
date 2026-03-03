@@ -144,7 +144,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("get_last_solve_time", &GraphWaypointMPC::get_last_solve_time);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
-                .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double, double>(),
+                .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double, double, double, double>(),
 		     py::keep_alive<1, 3>())
 		.def("solve", &GraphTimingMPC::solve)
 		.def("get_agent_spline_length", &GraphTimingMPC::get_agent_spline_length)

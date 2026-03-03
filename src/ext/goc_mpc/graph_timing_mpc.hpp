@@ -87,7 +87,9 @@ struct GraphTimingMPC {
 	// Optimization parameters
 	double _time_cost;
 	double _time_cost2;
-	double _ctrl_cost;
+	double _acceleration_cost;
+	double _energy_cost;
+	double _arclength_cost;
 	double _max_vel;
 	double _max_acc;
 	double _max_jerk;
@@ -107,7 +109,9 @@ struct GraphTimingMPC {
 		       std::vector<CubicConfigurationSpline> splines,
 		       double time_cost = 1e0,
 		       double time_cost2 = 0e0,
-		       double ctrl_cost = 1e0,
+		       double acceleration_cost = 0.0,
+		       double energy_cost = 0.0,
+		       double arclength_cost = 1.0,
 		       double max_vel = -1.0,
 		       double max_acc = -1.0,
 		       double max_jerk = -1.0);

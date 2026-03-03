@@ -249,7 +249,9 @@ GraphTimingProblem build_graph_timing_problem(
 	const Eigen::VectorXd& v0,
 	double time_cost,
 	double time_cost2,
-	double ctrl_cost,
+	double acceleration_cost,
+	double energy_cost,
+	double arclength_cost,
 	double max_vel,
 	double max_acc,
 	double max_jerk) {
@@ -373,24 +375,43 @@ GraphTimingProblem build_graph_timing_problem(
 					}
 				}
 
-				if (ctrl_cost > 0) {
-					// const Expression c = spline.compute_ctrl_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
-					const Expression c = spline.compute_energy_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
-					problem.prog->AddCost(c);
+				if (acceleration_cost > 0) {
+					const Expression acceleration = spline.compute_ctrl_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
+					problem.prog->AddCost(acceleration_cost * acceleration);
 				}
 
-				// // Max Velocity Constraints
-				// if (max_vel > 0) {
-				// 	// c = v0
-				// 	const VectorX<Expression> c = vJm1;
-				// 	// b = 3*(x1 - x0) - tau*(v1 + 2*v0)
-				// 	const VectorX<Expression> b = 3.0*(xJ - xJm1) - tau*(vJ + 2.0*vJm1);
-				// 	// a = -2*(x1 - x0) + tau*(v1 + v0)
-				// 	const VectorX<Expression> a = -2.0*(xJ - xJm1) + tau*(vJ + vJm1);
+				if (energy_cost > 0) {
+					const Expression energy = spline.compute_energy_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
+					problem.prog->AddCost(energy_cost * energy);
+				}
 
-				// 	// Midpoint velocity surrogate: v_mid = c + (1/tau)*(b + 3/4 a)
-				// 	const VectorX<Expression> v_mid = c + inv_tau * (b + 0.75 * a);
-				// }
+				if (arclength_cost > 0) {
+					const Expression arclength = spline.compute_arclength_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
+					problem.prog->AddCost(arclength_cost * arclength);
+				}
+
+				// Max Velocity Constraints
+				if (max_vel > 0) {
+					auto [xJ_lin, vJ_lin] = spline.select_linear_blocks(xJ, vJ);
+					auto [xJm1_lin, vJm1_lin] = spline.select_linear_blocks(xJm1, vJm1);
+					int lin_dim = vJ_lin.size();
+
+					// // c = v0
+					// const VectorX<Expression> c = vJm1;
+					// // b = 3*(x1 - x0) - tau*(v1 + 2*v0)
+					// const VectorX<Expression> b = 3.0*(xJ - xJm1) - tau*(vJ + 2.0*vJm1);
+					// // a = -2*(x1 - x0) + tau*(v1 + v0)
+					// const VectorX<Expression> a = -2.0*(xJ - xJm1) + tau*(vJ + vJm1);
+
+					// // Midpoint velocity surrogate: v_mid = c + (1/tau)*(b + 3/4 a)
+					// const VectorX<Expression> v_mid = c + inv_tau * (b + 0.75 * a);
+
+					// |vel(0)| <= vmax and |vel(tau)| <= vmax (elementwise)
+					Eigen::VectorXd lb = Eigen::VectorXd::Constant(lin_dim, -max_vel);
+					Eigen::VectorXd ub = Eigen::VectorXd::Constant(lin_dim,  max_vel);
+					problem.prog->AddConstraint(vJm1, lb, ub);
+					problem.prog->AddConstraint(vJ, lb, ub);
+				}
 
 				// Max Acceleration Constraints
 				if (max_acc > 0) {
@@ -468,7 +489,9 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 			       std::vector<CubicConfigurationSpline> splines,
 			       double time_cost,
 			       double time_cost2,
-			       double ctrl_cost,
+			       double acceleration_cost,
+			       double energy_cost,
+			       double arclength_cost,
 			       double max_vel,
 			       double max_acc,
 			       double max_jerk)
@@ -476,7 +499,9 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 	  _splines(std::make_shared<std::vector<CubicConfigurationSpline>>(std::move(splines))),
 	  _time_cost(time_cost),
 	  _time_cost2(time_cost2),
-	  _ctrl_cost(ctrl_cost),
+	  _acceleration_cost(acceleration_cost),
+	  _energy_cost(energy_cost),
+	  _arclength_cost(arclength_cost),
 	  _max_vel(max_vel),
 	  _max_acc(max_acc),
 	  _max_jerk(max_jerk),
@@ -573,13 +598,12 @@ bool GraphTimingMPC::solve(
 		problem = std::make_unique<GraphTimingProblem>(
 			build_graph_timing_problem(
 				*_graph, *_splines, remaining_vertices, waypoints, assignments, x0, v0,
-				_time_cost, _time_cost2, _ctrl_cost, _max_vel, _max_acc, _max_jerk));
+				_time_cost, _time_cost2, _acceleration_cost, _energy_cost, _arclength_cost,
+				_max_vel, _max_acc, _max_jerk));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in timing problem construction: " << e.what() << std::endl;
 		return false;
 	}
-
-
 
 	// Store ordered waypoints used in problem
 	_wps_list = problem->wps_list;
