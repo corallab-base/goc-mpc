@@ -330,217 +330,107 @@ GraphTimingProblem build_graph_timing_problem(
 			}
 
 			// 3. Control costs
-			if (ctrl_cost > 0) {
-				const double s12 = std::sqrt(12.0);
+			const double s12 = std::sqrt(12.0);
 
-				for (int j = 0; j < agent_spline_length; ++j) {
-					VectorX<Expression> xJ(ambient_dim), xJm1(ambient_dim), vJ(tangent_dim), vJm1(tangent_dim);
-					const Expression tau(time_deltas_i(j));
-					if (j == 0 && j < agent_spline_length - 1) {
-						for (int k = 0; k < ambient_dim; ++k) {
-							xJm1(k) = Expression(x0(i * ambient_dim + k));
-							xJ(k)   = Expression(wps_i(0, k));
-						}
-						for (int k = 0; k < tangent_dim; ++k) {
-							vJm1(k) = Expression(v0(i * tangent_dim + k));
-							vJ(k)   = Expression(vs_i(0, k));
-						}
-					} else if (j > 0 && j == agent_spline_length - 1) {
-						for (int k = 0; k < ambient_dim; ++k) {
-							xJm1(k) = Expression(wps_i(j-1, k));
-							xJ(k)   = Expression(wps_i(j, k));
-						}
-						for (int k = 0; k < tangent_dim; ++k) {
-							vJm1(k) = Expression(vs_i(j-1, k));
-							vJ(k) = Expression(0.0);
-						}
-					} else if (j == 0 && j == agent_spline_length - 1) {
-						for (int k = 0; k < ambient_dim; ++k) {
-							xJm1(k) = Expression(x0(i * ambient_dim + k));
-							xJ(k)   = Expression(wps_i(j, k));
-						}
-						for (int k = 0; k < tangent_dim; ++k) {
-							vJm1(k) = Expression(v0(i * tangent_dim + k));
-							vJ(k) = Expression(0.0);
-						}
-					} else {
-						for (int k = 0; k < ambient_dim; ++k) {
-							xJm1(k) = Expression(wps_i(j-1, k));
-							xJ(k)   = Expression(wps_i(j, k));
-						}
-						for (int k = 0; k < tangent_dim; ++k) {
-							vJm1(k) = Expression(vs_i(j-1, k));
-							vJ(k)   = Expression(vs_i(j, k));
-						}
+			for (int j = 0; j < agent_spline_length; ++j) {
+				VectorX<Expression> xJ(ambient_dim), xJm1(ambient_dim), vJ(tangent_dim), vJm1(tangent_dim);
+				const Expression tau(time_deltas_i(j));
+				if (j == 0 && j < agent_spline_length - 1) {
+					for (int k = 0; k < ambient_dim; ++k) {
+						xJm1(k) = Expression(x0(i * ambient_dim + k));
+						xJ(k)   = Expression(wps_i(0, k));
 					}
+					for (int k = 0; k < tangent_dim; ++k) {
+						vJm1(k) = Expression(v0(i * tangent_dim + k));
+						vJ(k)   = Expression(vs_i(0, k));
+					}
+				} else if (j > 0 && j == agent_spline_length - 1) {
+					for (int k = 0; k < ambient_dim; ++k) {
+						xJm1(k) = Expression(wps_i(j-1, k));
+						xJ(k)   = Expression(wps_i(j, k));
+					}
+					for (int k = 0; k < tangent_dim; ++k) {
+						vJm1(k) = Expression(vs_i(j-1, k));
+						vJ(k) = Expression(0.0);
+					}
+				} else if (j == 0 && j == agent_spline_length - 1) {
+					for (int k = 0; k < ambient_dim; ++k) {
+						xJm1(k) = Expression(x0(i * ambient_dim + k));
+						xJ(k)   = Expression(wps_i(j, k));
+					}
+					for (int k = 0; k < tangent_dim; ++k) {
+						vJm1(k) = Expression(v0(i * tangent_dim + k));
+						vJ(k) = Expression(0.0);
+					}
+				} else {
+					for (int k = 0; k < ambient_dim; ++k) {
+						xJm1(k) = Expression(wps_i(j-1, k));
+						xJ(k)   = Expression(wps_i(j, k));
+					}
+					for (int k = 0; k < tangent_dim; ++k) {
+						vJm1(k) = Expression(vs_i(j-1, k));
+						vJ(k)   = Expression(vs_i(j, k));
+					}
+				}
+
+				if (ctrl_cost > 0) {
 					// const Expression c = spline.compute_ctrl_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
 					const Expression c = spline.compute_energy_cost<Expression>(xJ, xJm1, vJ, vJm1, tau);
 					problem.prog->AddCost(c);
 				}
+
+				// // Max Velocity Constraints
+				// if (max_vel > 0) {
+				// 	// c = v0
+				// 	const VectorX<Expression> c = vJm1;
+				// 	// b = 3*(x1 - x0) - tau*(v1 + 2*v0)
+				// 	const VectorX<Expression> b = 3.0*(xJ - xJm1) - tau*(vJ + 2.0*vJm1);
+				// 	// a = -2*(x1 - x0) + tau*(v1 + v0)
+				// 	const VectorX<Expression> a = -2.0*(xJ - xJm1) + tau*(vJ + vJm1);
+
+				// 	// Midpoint velocity surrogate: v_mid = c + (1/tau)*(b + 3/4 a)
+				// 	const VectorX<Expression> v_mid = c + inv_tau * (b + 0.75 * a);
+				// }
+
+				// Max Acceleration Constraints
+				if (max_acc > 0) {
+					auto [xJ_lin, vJ_lin] = spline.select_linear_blocks(xJ, vJ);
+					auto [xJm1_lin, vJm1_lin] = spline.select_linear_blocks(xJm1, vJm1);
+					int lin_dim = xJ_lin.size();
+
+					// 2b = 2/tau^2 * ( 3*(x1 - x0) - tau*(v1 + 2*v0) )
+					const Expression inv_tau2 = pow(tau, -2.0);
+					const VectorX<Expression> b2 =
+						2.0 * inv_tau2 * ( 3.0*(xJ_lin - xJm1_lin)
+								   - tau*(vJ_lin + 2.0*vJm1_lin) );
+
+					// a6_tau = 6/tau^2 * ( -2*(x1 - x0) + tau*(v1 + v0) )
+					const VectorX<Expression> a6_tau =
+						6.0 * inv_tau2 * ( -2.0*(xJ_lin - xJm1_lin)
+								   + tau*(vJ_lin + vJm1_lin) );
+
+					// Endpoint accelerations
+					const VectorX<Expression> acc0  = b2;                 // t = 0
+					const VectorX<Expression> accT  = b2 + a6_tau;        // t = tau
+
+					// acc(0) <= amax and acc(tau) <= amax (elementwise)
+					Eigen::VectorXd lb = Eigen::VectorXd::Constant(lin_dim, -max_acc);
+					Eigen::VectorXd ub = Eigen::VectorXd::Constant(lin_dim,  max_acc);
+					problem.prog->AddConstraint(acc0, lb, ub);
+					problem.prog->AddConstraint(accT, lb, ub);
+				}
+
+				// if (max_jerk > 0) {
+				// 	// a6 = 6/tau^3 * (-2*(x1 - x0) + tau*(v1 + v0))
+				// 	const Expression coeff = 6.0 * pow(tau, -3.0);
+				// 	const VectorX<Expression> a6 = coeff * ( -2.0 * (xJ - xJm1) + tau * (vJ + vJm1) );
+
+				// 	// Bound a6 with symmetric bounds:
+				// 	Eigen::VectorXd lb2 = Eigen::VectorXd::Constant(dim, -max_jerk);
+				// 	Eigen::VectorXd ub2 = Eigen::VectorXd::Constant(dim,  max_jerk);
+				// 	problem.prog->AddConstraint(a6, lb2, ub2);
+				// }
 			}
-
-			// Velocity/Acceleration/Jerk Constraints
-			// if (max_vel > 0) {
-			// 	for (int j = 0; j < agent_spline_length; ++j) {
-			// 		VectorX<Expression> xJm1(dim), xJ(dim), vJm1(dim), vJ(dim);
-			// 		const Expression tau(time_deltas_i(j));
-			// 		const Expression inv_tau = pow(tau, -1.0);
-			// 		if (j == 0 && j < agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * dim + k));
-			// 				vJm1(k) = Expression(v0(i * dim + k));
-			// 				xJ(k)   = Expression(wps_i(0, k));
-			// 				vJ(k)   = Expression(vs_i(0, k));
-			// 			}
-			// 		} else if (j > 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k).Zero();
-			// 			}
-			// 		} else if (j == 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * dim + k));
-			// 				vJm1(k) = Expression(v0(i * dim + k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k).Zero();
-			// 			}
-			// 		} else {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k)   = Expression(vs_i(j, k));
-			// 			}
-			// 		}
-
-			// 		// Your cubic parameterization (unscaled a,b,c as in your code)
-			// 		// c = v0
-			// 		const VectorX<Expression> c = vJm1;
-			// 		// b = 3*(x1 - x0) - tau*(v1 + 2*v0)
-			// 		const VectorX<Expression> b = 3.0*(xJ - xJm1) - tau*(vJ + 2.0*vJm1);
-			// 		// a = -2*(x1 - x0) + tau*(v1 + v0)
-			// 		const VectorX<Expression> a = -2.0*(xJ - xJm1) + tau*(vJ + vJm1);
-
-			// 		// Midpoint velocity surrogate: v_mid = c + (1/tau)*(b + 3/4 a)
-			// 		const VectorX<Expression> v_mid = c + inv_tau * (b + 0.75 * a);
-
-			// 		// Enforce |v(0)| <= vmax and |v_mid| <= vmax  (elementwise)
-			// 		Eigen::VectorXd lb = Eigen::VectorXd::Constant(dim, -max_vel);
-			// 		Eigen::VectorXd ub = Eigen::VectorXd::Constant(dim,  max_vel);
-			// 		problem.prog->AddConstraint(c,     lb, ub);   // v(0) = c
-			// 		problem.prog->AddConstraint(v_mid, lb, ub);   // v(tau/2)
-			// 	}
-			// }
-
-			// if (max_acc > 0) {
-			// 	for (int j = 0; j < agent_spline_length; ++j) {
-			// 		VectorX<Expression> xJ(ambient_dim), xJm1(ambient_dim), vJ(tangent_dim), vJm1(tangent_dim);
-			// 		const Expression tau(time_deltas_i(j));
-			// 		if (j == 0 && j < agent_spline_length - 1) {
-			// 			for (int k = 0; k < ambient_dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * ambient_dim + k));
-			// 				xJ(k)   = Expression(wps_i(0, k));
-			// 			}
-			// 			for (int k = 0; k < tangent_dim; ++k) {
-			// 				vJm1(k) = Expression(v0(i * tangent_dim + k));
-			// 				vJ(k)   = Expression(vs_i(0, k));
-			// 			}
-			// 		} else if (j > 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < ambient_dim; ++k) {
-			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 			}
-			// 			for (int k = 0; k < tangent_dim; ++k) {
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
-			// 				vJ(k) = Expression(0.0);
-			// 			}
-			// 		} else if (j == 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < ambient_dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * ambient_dim + k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 			}
-			// 			for (int k = 0; k < tangent_dim; ++k) {
-			// 				vJm1(k) = Expression(v0(i * tangent_dim + k));
-			// 				vJ(k) = Expression(0.0);
-			// 			}
-			// 		} else {
-			// 			for (int k = 0; k < ambient_dim; ++k) {
-			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 			}
-			// 			for (int k = 0; k < tangent_dim; ++k) {
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
-			// 				vJ(k)   = Expression(vs_i(j, k));
-			// 			}
-			// 		}
-
-			// 		// b2 = 2/tau^2 * ( 3*(x1 - x0) - tau*(v1 + 2*v0) )
-			// 		const Expression inv_tau2 = pow(tau, -2.0);
-			// 		const VectorX<Expression> b2 =
-			// 			2.0 * inv_tau2 * ( 3.0*(xJ - xJm1) - tau*(vJ + 2.0*vJm1) );
-
-			// 		// a6_tau = 6/tau^2 * ( -2*(x1 - x0) + tau*(v1 + v0) )
-			// 		const VectorX<Expression> a6_tau =
-			// 			6.0 * inv_tau2 * ( -2.0*(xJ - xJm1) + tau*(vJ + vJm1) );
-
-			// 		// Endpoint accelerations
-			// 		const VectorX<Expression> acc0  = b2;                 // t = 0
-			// 		const VectorX<Expression> accT  = b2 + a6_tau;        // t = tau
-
-			// 		// ||acc(0)||_inf <= amax and ||acc(tau)||_inf <= amax (elementwise)
-			// 		Eigen::VectorXd lb = Eigen::VectorXd::Constant(dim, -max_acc);
-			// 		Eigen::VectorXd ub = Eigen::VectorXd::Constant(dim,  max_acc);
-			// 		problem.prog->AddConstraint(acc0, lb, ub);
-			// 		problem.prog->AddConstraint(accT, lb, ub);
-			// 	}
-			// }
-
-			// if (max_jerk > 0) {
-			// 	for (int j = 0; j < agent_spline_length; ++j) {
-			// 		VectorX<Expression> xJ(dim), xJm1(dim), vJ(dim), vJm1(dim);
-			// 		const Expression tau(time_deltas_i(j));
-			// 		if (j == 0 && j < agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * dim + k));
-			// 				vJm1(k) = Expression(v0(i * dim + k));
-			// 				xJ(k)   = Expression(wps_i(0, k));
-			// 				vJ(k)   = Expression(vs_i(0, k));
-			// 			}
-			// 		} else if (j > 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k).Zero();
-			// 			}
-			// 		} else if (j == 0 && j == agent_spline_length - 1) {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(x0(i * dim + k));
-			// 				vJm1(k) = Expression(v0(i * dim + k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k).Zero();
-			// 			}
-			// 		} else {
-			// 			for (int k = 0; k < dim; ++k) {
-			// 				xJm1(k) = Expression(wps_i(j-1, k));
-			// 				vJm1(k) = Expression(vs_i(j-1, k));
-			// 				xJ(k)   = Expression(wps_i(j, k));
-			// 				vJ(k)   = Expression(vs_i(j, k));
-			// 			}
-			// 		}
-
-			// 		// a6 = 6/tau^3 * (-2*(x1 - x0) + tau*(v1 + v0))
-			// 		const Expression coeff = 6.0 * pow(tau, -3.0);
-			// 		const VectorX<Expression> a6 = coeff * ( -2.0 * (xJ - xJm1) + tau * (vJ + vJm1) );
-
-			// 		// Bound a6 with symmetric bounds:
-			// 		Eigen::VectorXd lb2 = Eigen::VectorXd::Constant(dim, -max_jerk);
-			// 		Eigen::VectorXd ub2 = Eigen::VectorXd::Constant(dim,  max_jerk);
-			// 		problem.prog->AddConstraint(a6, lb2, ub2);
-			// 	}
-			// }
 		}
 
 		// const bool totally_ordered = true;
@@ -685,7 +575,7 @@ bool GraphTimingMPC::solve(
 				*_graph, *_splines, remaining_vertices, waypoints, assignments, x0, v0,
 				_time_cost, _time_cost2, _ctrl_cost, _max_vel, _max_acc, _max_jerk));
 	} catch (const std::exception& e) {
-		std::cout << "Caught exception in timing problem construction" << std::endl;
+		std::cout << "Caught exception in timing problem construction: " << e.what() << std::endl;
 		return false;
 	}
 
@@ -727,7 +617,7 @@ bool GraphTimingMPC::solve(
 		// result = drake::solvers::Solve(*(problem->prog));
 		result = solver.Solve(*(problem->prog));
 	} catch (const std::exception& e) {
-		std::cout << "Caught exception in solver" << std::endl;
+		std::cout << "Caught exception in solver: " << e.what() << std::endl;
 		return false;
 	}
 

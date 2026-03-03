@@ -770,6 +770,45 @@ public:
 		return total;
 	}
 
+	template <typename T>
+	std::pair<VecX<T>, VecX<T>> select_linear_blocks(
+		const VecX<T>& x,
+		const VecX<T>& v) const {
+
+		int lin_size = 0;
+		for (const BlockOffset& off : block_offsets_) {
+			switch (off.type) {
+			case Block::Type::R: {
+				// ambient size and tangent size are equal here.
+				lin_size += off.ambient_size;
+				break;
+			}
+			default:
+				;
+			}
+		}
+
+		int i = 0;
+		VecX<T> x_lin(lin_size);
+		VecX<T> v_lin(lin_size);
+		for (const BlockOffset& off : block_offsets_) {
+			const int a0 = off.ambient_offset, aN = off.ambient_size;
+			const int t0 = off.tangent_offset, tN = off.tangent_size;
+
+			switch (off.type) {
+			case Block::Type::R: {
+				x_lin.segment(i, aN) = x.segment(a0, aN);
+				v_lin.segment(i, tN) = v.segment(t0, tN);
+				i += aN;
+				break;
+			}
+			default:
+				;
+			}
+		}
+		return std::make_pair(x_lin, v_lin);
+	}
+
 
 private:
 	// -------- Internal per-block piece types ----------
