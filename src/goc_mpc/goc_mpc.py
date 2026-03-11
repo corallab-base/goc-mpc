@@ -19,11 +19,11 @@ class GraphOfConstraintsMPC():
             self,
             graph: GraphOfConstraints,
             spline_spec: list[Block],
-	    time_cost: float = 1.0,
-	    time_cost2: float = 0.0,
-	    acceleration_cost: float = 0.0,
-	    energy_cost: float = 0.0,
-	    arclength_cost: float = 1.0,
+            time_cost: float = 1.0,
+            time_cost2: float = 0.0,
+            acceleration_cost: float = 0.0,
+            energy_cost: float = 0.0,
+            arclength_cost: float = 1.0,
             time_delta_cutoff: float = 0.4,
             phi_tolerance: float = 0.03,
             short_path_length: int = 10,
@@ -55,9 +55,9 @@ class GraphOfConstraintsMPC():
         self.solve_for_waypoints_once = solve_for_waypoints_once
         self.time_cost = time_cost
         self.time_cost2 = time_cost2
-	self.acceleration_cost = acceleration_cost
-	self.energy_cost = energy_cost
-	self.arclength_cost = arclength_cost
+        self.acceleration_cost = acceleration_cost
+        self.energy_cost = energy_cost
+        self.arclength_cost = arclength_cost
         self.short_path_time_per_step = short_path_time_per_step
 
         # solvers
