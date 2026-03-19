@@ -757,11 +757,9 @@ public:
 				const Vec<T,3> wjm1 = vJm1.segment(t0, 3);
 				const Vec<T,3> wj   = vJ.segment(t0, 3);
 
-				const auto Rjm1 = RotFromQuatWxyz(qjm1);
-				const auto Rj   = RotFromQuatWxyz(qj);
-				const auto Rrel = Rjm1.transpose() * Rj;
-
-				const Vec<T,3> dphi = so3::mat::Log(Rrel);
+				const auto qrel_vec = drake::math::quatProduct(drake::math::quatConjugate(qjm1), qj);
+				Eigen::Quaternion<T> qrel(qrel_vec(0), qrel_vec(1), qrel_vec(2), qrel_vec(3));
+				const Vec<T,3> dphi = so3::quat::Log(qrel);
 				const Vec<T,3> D = dphi - T(0.5) * tau * (wjm1 + wj);
 				const Vec<T,3> V = (wj - wjm1);
 
@@ -858,11 +856,9 @@ public:
 				const Vec<T,3> wjm1 = vJm1.segment(t0, 3);
 				const Vec<T,3> wj   = vJ.segment(t0, 3);
 
-				const auto Rjm1 = RotFromQuatWxyz(qjm1);
-				const auto Rj   = RotFromQuatWxyz(qj);
-				const auto Rrel = Rjm1.transpose() * Rj;
-
-				const Vec<T,3> disp = so3::mat::Log(Rrel);
+				const auto qrel_vec = drake::math::quatProduct(drake::math::quatConjugate(qjm1), qj);
+				Eigen::Quaternion<T> qrel(qrel_vec(0), qrel_vec(1), qrel_vec(2), qrel_vec(3));
+				const Vec<T,3> disp = so3::quat::Log(qrel);
 
 				// Deviation from constant velocity (your existing D)
 				const VecX<T> D = disp - T(0.5) * tau * (wjm1 + wj);
