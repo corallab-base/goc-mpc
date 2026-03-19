@@ -2,6 +2,8 @@
 
 #include <drake/solvers/mathematical_program.h>
 #include <drake/math/rotation_matrix.h>
+#include <drake/math/quaternion.h>
+#include <drake/common/symbolic/expression.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -49,17 +51,6 @@ static inline Eigen::Matrix<Expression,3,3> hat(const Vec<Expression,3>& a) {
 	return A;
 }
 
-// Log map on SO(3): returns φ = θ * a  (axis-angle vector)
-template <typename T>
-inline Eigen::Matrix<T,3,1>
-so3_log(const drake::math::RotationMatrix<T>& Rrel) {
-    Eigen::AngleAxis<T> aa = Rrel.ToAngleAxis();
-    const T theta = aa.angle();
-    const Eigen::Matrix<T,3,1> axis = aa.axis();
-    return theta * axis;
-}
-
-// --------- Small SO(3) utilities (header-only, scalar-agnostic) ----------
 namespace so3 {
 
 	template <typename T>
@@ -76,46 +67,84 @@ namespace so3 {
 		return W;
 	}
 
-// Robust sin/cos series helpers near zero
-	template <typename T>
-	inline void sincos_series(const T& x, T* s, T* c) {
-		*s = std::sin(x);
-		*c = std::cos(x);
-	}
-
-	template <typename T>
-	inline Eigen::Quaternion<T> Exp(const Eigen::Matrix<T,3,1>& phi) {
-		const T theta = phi.norm();
-		if (theta < T(1e-12)) {
-			// q ≈ [1, 0.5*phi]
-			const Eigen::Matrix<T,3,1> half = T(0.5) * phi;
-			return Eigen::Quaternion<T>(T(1), half(0), half(1), half(2)).normalized();
+	namespace quat {
+		template <typename T>
+		inline Eigen::Quaternion<T> Exp(const Eigen::Matrix<T,3,1>& phi) {
+			const T theta = phi.norm();
+			if (theta < T(1e-12)) {
+				// q ≈ [1, 0.5*phi]
+				const Eigen::Matrix<T,3,1> half = T(0.5) * phi;
+				return Eigen::Quaternion<T>(T(1), half(0), half(1), half(2)).normalized();
+			}
+			const Eigen::Matrix<T,3,1> a = phi / theta;
+			const T half = T(0.5) * theta;
+			const T s = std::sin(half);
+			const T c = std::cos(half);
+			return Eigen::Quaternion<T>(c, a(0)*s, a(1)*s, a(2)*s);
 		}
-		const Eigen::Matrix<T,3,1> a = phi / theta;
-		const T half = T(0.5) * theta;
-		const T s = std::sin(half);
-		const T c = std::cos(half);
-		return Eigen::Quaternion<T>(c, a(0)*s, a(1)*s, a(2)*s);
-	}
 
-	template <typename T>
-	inline Eigen::Matrix<T,3,1> Log(const Eigen::Quaternion<T>& q_in) {
-		// Canonicalize sign so w >= 0 to pick shortest rotation
-		Eigen::Quaternion<T> q = (q_in.w() < T(0)) ? Eigen::Quaternion<T>(-q_in.w(), -q_in.x(), -q_in.y(), -q_in.z()) : q_in;
-		T w = q.w();
-		Eigen::Matrix<T,3,1> v(q.x(), q.y(), q.z());
-		const T n = v.norm();
-		const T eps = T(1e-12);
-		if (n < eps) {
-			// Log ~ 2*v (since angle ~ 2*|v| and axis ~ v/|v|)
-			return T(2) * v;
+		template <typename T>
+		inline Eigen::Matrix<T,3,1> Log(const Eigen::Quaternion<T>& q_in) {
+			// Canonicalize sign so w >= 0 to pick shortest rotation
+			Eigen::Quaternion<T> q = (q_in.w() < T(0)) ? Eigen::Quaternion<T>(-q_in.w(), -q_in.x(), -q_in.y(), -q_in.z()) : q_in;
+			T w = q.w();
+			Eigen::Matrix<T,3,1> v(q.x(), q.y(), q.z());
+			const T n = v.norm();
+			const T eps = T(1e-12);
+			if (n < eps) {
+				// Log ~ 2*v (since angle ~ 2*|v| and axis ~ v/|v|)
+				return T(2) * v;
+			}
+
+			if constexpr (std::is_same_v<T, Expression>) {
+				// angle θ = 2 atan2(|v|, w), axis = v/|v|
+				const T theta = T(2) * drake::symbolic::atan2(n, w);
+				return (theta / n) * v;
+			} else {
+				const T theta = T(2) * std::atan2(n, w);
+				return (theta / n) * v;
+			}
 		}
-		// angle θ = 2 atan2(|v|, w), axis = v/|v|
-		const T theta = T(2) * std::atan2(n, w);
-		return (theta / n) * v;
 	}
 
-// Left Jacobian J(φ) = I + A S + B S^2, with S = hat(φ)
+	namespace mat {
+
+		template <typename T>
+		inline drake::math::RotationMatrix<T> Exp(const Eigen::Matrix<T,3,1>& phi) {
+			const T theta_sq = phi.squaredNorm();
+			const T theta = sqrt(theta_sq);
+
+			Eigen::Matrix<T, 3, 3> phi_hat = hat(phi);
+
+			const Eigen::Matrix<T, 3, 3> phi_hat_sq = phi_hat * phi_hat;
+			Eigen::Matrix<T, 3, 3> R_mat;
+
+			if (theta < T(1e-6)) {
+				// Taylor expansion:
+				// sin(theta)/theta approx 1 - theta^2 / 6
+				// (1-cos(theta))/theta^2 approx 0.5 - theta^2 / 24
+				R_mat = Eigen::Matrix<T, 3, 3>::Identity() +
+					(T(1.0) - theta_sq / T(6.0)) * phi_hat +
+					(T(0.5) - theta_sq / T(24.0)) * phi_hat_sq;
+			} else {
+				R_mat = Eigen::Matrix<T, 3, 3>::Identity() +
+					(std::sin(theta) / theta) * phi_hat +
+					((T(1.0) - std::cos(theta)) / theta_sq) * phi_hat_sq;
+			}
+
+			return drake::math::RotationMatrix<T>(R_mat);
+		}
+
+		template <typename T>
+		inline Eigen::Matrix<T,3,1> Log(const drake::math::RotationMatrix<T>& Rrel) {
+			Eigen::AngleAxis<T> aa = Rrel.ToAngleAxis();
+			const T theta = aa.angle();
+			const Eigen::Matrix<T,3,1> axis = aa.axis();
+			return theta * axis;
+		}
+
+	}
+
 	template <typename T>
 	inline Eigen::Matrix<T,3,3> left_jacobian(const Eigen::Matrix<T,3,1>& phi) {
 		const T theta = phi.norm();
@@ -132,7 +161,6 @@ namespace so3 {
 		return I + A*S + B*S*S;
 	}
 
-// Inverse of left Jacobian (closed form)
 	template <typename T>
 	inline Eigen::Matrix<T,3,3> left_jacobian_inv(const Eigen::Matrix<T,3,1>& phi) {
 		const T theta = phi.norm();
@@ -150,7 +178,6 @@ namespace so3 {
 		return I - T(0.5)*S + C * (S*S);
 	}
 
-// Compute d/dt(J) * phidot (needed for ωdot = J φ¨ + (dJ/dt) φ̇)
 	template <typename T>
 	inline Eigen::Matrix<T,3,1> d_left_jacobian_times_phidot(
 		const Eigen::Matrix<T,3,1>& phi,
@@ -190,7 +217,7 @@ namespace so3 {
 		return dA_dt * Sphidot + dB_dt * S2phidot + B * Sd_S_phidot;
 	}
 
-} // namespace so3
+}
 
 // --------- Torus helpers ------------
 namespace torus {
@@ -216,13 +243,14 @@ namespace torus {
 class CubicConfigurationSpline {
 public:
 	struct Block {
-		enum class Type { R, Torus, SO3Quat /*, SE3 (TODO)*/ };
+		enum class Type { R, Torus, SO3Quat, SO3Mat /*, SE3 (TODO)*/ };
 		Type type;
 		int  size;   // ambient size; for SO3Quat size == 4; for R/Torus size == k
 
 		static Block R(int k)      { return Block{Type::R, k}; }
 		static Block Torus(int k)  { return Block{Type::Torus, k}; }
-		static Block SO3()         { return Block{Type::SO3Quat, 4}; } // ambient 4 (quat)
+		static Block SO3Quat()     { return Block{Type::SO3Quat, 4}; } // ambient 4 (quat)
+		static Block SO3Mat()      { return Block{Type::SO3Mat, 9}; }
 	};
 
 	struct BlockOffset {
@@ -247,7 +275,7 @@ public:
 		int dim() const { return static_cast<int>(c.size()); }
 	};
 
-	struct SO3Piece {
+	struct SO3QuatPiece {
 		double tau{};
 		Eigen::Quaterniond q0;
 		Eigen::Vector3d omega0, omega1;
@@ -255,9 +283,17 @@ public:
 		Eigen::Vector3d a, b, c, d; // φ(t) cubic
 	};
 
+	struct SO3MatPiece {
+		double tau{};
+		drake::math::RotationMatrix<double> R0;
+		Eigen::Vector3d omega0, omega1;
+		Eigen::Vector3d phi1; // log(R0^{-1} R1)
+		Eigen::Vector3d a, b, c, d; // φ(t) cubic
+	};
+
 	struct SegmentPiece {
 		double t0{}, t1{};
-		std::vector<std::variant<EuclPiece, TorusPiece, SO3Piece>> blocks;
+		std::vector<std::variant<EuclPiece, TorusPiece, SO3QuatPiece, SO3MatPiece>> blocks;
 	};
 
 	using Spec = std::vector<Block>;
@@ -288,14 +324,22 @@ public:
 		for (const auto& b : spec_) {
 			int a_off = ambient_dim_;
 			int t_off = tan_dim_;
-			int a_sz  = (b.type == Block::Type::SO3Quat) ? 4 : b.size;
-			int t_sz  = (b.type == Block::Type::SO3Quat) ? 3 : b.size;
+			int a_sz, t_sz;
+			if (b.type == Block::Type::SO3Quat) {
+				a_sz  = 4;
+				t_sz  = 3;
+			} else if (b.type == Block::Type::SO3Mat) {
+				a_sz  = 9;
+				t_sz  = 3;
+			} else {
+				a_sz  = b.size;
+				t_sz  = b.size;
+			}
+
 			ambient_dim_ += a_sz;
 			tan_dim_ += t_sz;
 			blocks_.push_back(b);
 			block_offsets_.emplace_back(a_off, t_off, a_sz, t_sz, b.type);
-			// std::cout << "a_off: " << a_off << std::endl;
-			// std::cout << "a_sz: " << a_sz << std::endl;
 		}
 		clear();
 	}
@@ -382,7 +426,7 @@ public:
 					break;
 				}
 				case Block::Type::SO3Quat: {
-					SO3Piece p;
+					SO3QuatPiece p;
 					p.tau = tau;
 					// Read and canonicalize quats (w,x,y,z)
 					Eigen::Quaterniond q0(pts(i, a_off+0), pts(i, a_off+1), pts(i, a_off+2), pts(i, a_off+3));
@@ -395,7 +439,7 @@ public:
 
 					// Relative motion φ = Log(q0^{-1} * q1), in so(3)
 					Eigen::Quaterniond qrel = q0.conjugate() * q1;
-					p.phi1 = so3::Log(qrel);
+					p.phi1 = so3::quat::Log(qrel);
 
 					// Cubic in φ(t): φ(0)=0, φ'(0)=v0φ, φ(τ)=φ1, φ'(τ)=v1φ
 					// v0φ = ω0 (since J(0)=I), v1φ = J(φ1)^{-1} ω1
@@ -410,6 +454,48 @@ public:
 					p.q0 = q0;
 					seg.blocks.emplace_back(std::move(p));
 					a_off += 4; t_off += 3;
+					break;
+				}
+				case Block::Type::SO3Mat: {
+					SO3MatPiece p;
+					p.tau = tau;
+
+					// Read rotation matricies
+					// The validity of these should be
+					// enforced by the constraints of the
+					// waypoint problem or their initialization.
+					Eigen::Matrix3d R0_mat;
+					R0_mat << pts(i, a_off+0), pts(i, a_off+1), pts(i, a_off+2),
+						pts(i, a_off+3), pts(i, a_off+4), pts(i, a_off+5),
+						pts(i, a_off+6), pts(i, a_off+7), pts(i, a_off+8);
+					drake::math::RotationMatrix<double> R0(R0_mat);
+					Eigen::Matrix3d R1_mat;
+					R1_mat << pts(i+1, a_off+0), pts(i+1, a_off+1), pts(i+1, a_off+2),
+						pts(i+1, a_off+3), pts(i+1, a_off+4), pts(i+1, a_off+5),
+						pts(i+1, a_off+6), pts(i+1, a_off+7), pts(i+1, a_off+8);
+					drake::math::RotationMatrix<double> R1(R1_mat);
+
+					// Body angular velocities
+					p.omega0 = vels.row(i).segment(t_off, 3).transpose();
+					p.omega1 = vels.row(i+1).segment(t_off, 3).transpose();
+
+					// Relative motion φ = Log(R0^{-1} * R1), in so(3)
+					drake::math::RotationMatrix<double> Rrel = R0.inverse() * R1;
+					p.phi1 = so3::mat::Log(Rrel);
+
+					// Cubic in φ(t): φ(0)=0, φ'(0)=v0φ, φ(τ)=φ1, φ'(τ)=v1φ
+					// v0φ = ω0 (since J(0)=I), v1φ = J(φ1)^{-1} ω1
+					const Eigen::Matrix3d J1_inv = so3::left_jacobian_inv(p.phi1);
+					const Eigen::Vector3d v0phi = p.omega0;
+					const Eigen::Vector3d v1phi = J1_inv * p.omega1;
+					p.d = Eigen::Vector3d::Zero();
+					p.c = v0phi;
+					p.b = (3.0*p.phi1 - tau*(2.0*v0phi + v1phi)) / (tau*tau);
+					p.a = (-2.0*p.phi1 + tau*(v0phi + v1phi)) / (tau*tau*tau);
+
+					p.R0 = R0;
+					seg.blocks.emplace_back(std::move(p));
+					a_off += 9; t_off += 3;
 					break;
 				}
 				}
@@ -483,15 +569,15 @@ public:
 				a.segment(t_off, kdim) = phidd;
 
 				a_off += kdim; t_off += kdim;
-			} else { // SO3
-				const auto& p = std::get<SO3Piece>(blk);
+			} else if (std::holds_alternative<SO3QuatPiece>(blk)) {
+				const auto& p = std::get<SO3QuatPiece>(blk);
 				const double tt = local_t;
 				Eigen::Matrix<double,3,1> phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
 				Eigen::Matrix<double,3,1> phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
 				Eigen::Matrix<double,3,1> phidd= 2.0*p.b + tt*6.0*p.a;
 
 				// q(t) = q0 * Exp(phi(t))
-				Eigen::Quaterniond qe = so3::Exp(phi);
+				Eigen::Quaterniond qe = so3::quat::Exp(phi);
 				Eigen::Quaterniond qt = (p.q0 * qe).normalized();
 				if (qt.w() < 0) qt.coeffs() *= -1.0; // canonicalize
 
@@ -506,6 +592,32 @@ public:
 				a.segment(t_off, 3) = omgd;
 
 				a_off += 4; t_off += 3;
+			} else if (std::holds_alternative<SO3MatPiece>(blk)) {
+				const auto& p = std::get<SO3MatPiece>(blk);
+				const double tt = local_t;
+				Eigen::Matrix<double,3,1> phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
+				Eigen::Matrix<double,3,1> phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
+				Eigen::Matrix<double,3,1> phidd= 2.0*p.b + tt*6.0*p.a;
+
+				// q(t) = q0 * Exp(phi(t))
+				drake::math::RotationMatrix<double> Re = so3::mat::Exp(phi);
+				drake::math::RotationMatrix<double> Rt = p.R0 * Re;
+
+				// ω = J(phi) φdot,  ωdot = J φ¨ + (dJ/dt) φdot
+				Eigen::Matrix3d J   = so3::left_jacobian(phi);
+				Eigen::Vector3d omg = J * phid;
+				Eigen::Vector3d dJphid = so3::d_left_jacobian_times_phidot(phi, phid);
+				Eigen::Vector3d omgd = J * phidd + dJphid;
+
+				q.segment(a_off+0, 3) = Rt.row(0);
+				q.segment(a_off+3, 3) = Rt.row(1);
+				q.segment(a_off+6, 3) = Rt.row(2);
+				v.segment(t_off, 3) = omg;
+				a.segment(t_off, 3) = omgd;
+
+				a_off += 9; t_off += 3;
+			} else {
+				DRAKE_UNREACHABLE();
 			}
 		}
 		return Eval{std::move(q), std::move(v), std::move(a)};
@@ -539,7 +651,6 @@ public:
 				total += d.squaredNorm();
 				break;
 			}
-
 			case Block::Type::Torus: {
 				VecX<Expression> dw(aN);
 				for (int k = 0; k < aN; ++k) {
@@ -548,22 +659,32 @@ public:
 				total += dw.squaredNorm();
 				break;
 			}
-
 			case Block::Type::SO3Quat: {
 				// ambient 4: (w,x,y,z)
 				DRAKE_DEMAND(aN == 4);
 				const auto q1wxyz = q1.segment(a0, 4);
 				const auto q2wxyz = q2.segment(a0, 4);
 
-				// NOTE: assumes unit quaternions; enforce ||q||=1 elsewhere.
-				// const auto R1 = RotFromQuatWxyz(q1wxyz).matrix();
-				// const auto R2 = RotFromQuatWxyz(q2wxyz).matrix();
-
-				// total += (R2 - R1).squaredNorm();                // squared frobenius norm (chordal distance)
 				// total += (q2wxyz - q1wxyz).squaredNorm();
 				// total += (1 - drake::symbolic::abs(q1wxyz.dot(q2wxyz)));
 				// total += drake::symbolic::min((q1wxyz - q2wxyz).squaredNorm(), (q1wxyz + q2wxyz).squaredNorm());
 				total += (1 - (q1wxyz.dot(q2wxyz))*(q1wxyz.dot(q2wxyz)));
+				break;
+			}
+			case Block::Type::SO3Mat: {
+				DRAKE_DEMAND(aN == 9);
+
+				Eigen::Matrix<Expression, 3, 3> R1;
+				R1 << q1(a0+0), q1(a0+1), q1(a0+2),
+					q1(a0+3), q1(a0+4), q1(a0+5),
+					q1(a0+6), q1(a0+7), q1(a0+8);
+				Eigen::Matrix<Expression, 3, 3> R2;
+				R2 << q2(a0+0), q2(a0+1), q2(a0+2),
+					q2(a0+3), q2(a0+4), q2(a0+5),
+					q2(a0+6), q2(a0+7), q2(a0+8);
+
+				// squared frobenius norm (chordal distance)
+				total += (R2 - R1).squaredNorm();
 				break;
 			}
 
@@ -629,8 +750,6 @@ public:
 				break;
 			}
 			case Block::Type::SO3Quat: {
-				// SO(3) quaternion block:
-				// ambient = 4 (wxyz) in x*, tangent = 3 (angular velocity in chosen frame) in v*
 				DRAKE_DEMAND(aN == 4 && tN == 3);
 
 				const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
@@ -642,7 +761,7 @@ public:
 				const auto Rj   = RotFromQuatWxyz(qj);
 				const auto Rrel = Rjm1.transpose() * Rj;
 
-				const Vec<T,3> dphi = so3_log(Rrel);
+				const Vec<T,3> dphi = so3::mat::Log(Rrel);
 				const Vec<T,3> D = dphi - T(0.5) * tau * (wjm1 + wj);
 				const Vec<T,3> V = (wj - wjm1);
 
@@ -650,9 +769,10 @@ public:
 					+ inv_tau * V.squaredNorm();
 				break;
 			}
-
-			// Torus and SO3Quat similar (templated helpers required)
-
+			case Block::Type::SO3Mat: {
+				DRAKE_DEMAND(aN == 9 && tN == 3);
+				break;
+			}
 			default:
 				DRAKE_UNREACHABLE();
 			}
@@ -703,7 +823,6 @@ public:
 				break;
 			}
 			case Block::Type::Torus: {
-				// Torus block: ambient == tangent == aN == tN
 				// Use wrapped angle difference for the position residual (componentwise).
 				const auto xj   = xJ.segment(a0, aN);
 				const auto xjm1 = xJm1.segment(a0, aN);
@@ -732,8 +851,6 @@ public:
 				break;
 			}
 			case Block::Type::SO3Quat: {
-				// SO(3) quaternion block:
-				// ambient = 4 (wxyz) in x*, tangent = 3 (angular velocity in chosen frame) in v*
 				DRAKE_DEMAND(aN == 4 && tN == 3);
 
 				const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
@@ -745,7 +862,7 @@ public:
 				const auto Rj   = RotFromQuatWxyz(qj);
 				const auto Rrel = Rjm1.transpose() * Rj;
 
-				const Vec<T,3> disp = so3_log(Rrel);
+				const Vec<T,3> disp = so3::mat::Log(Rrel);
 
 				// Deviation from constant velocity (your existing D)
 				const VecX<T> D = disp - T(0.5) * tau * (wjm1 + wj);
@@ -762,7 +879,10 @@ public:
 					+ T(1.0 / 60.0) * tau * V.squaredNorm();
 				break;
 			}
-
+			case Block::Type::SO3Mat: {
+				DRAKE_DEMAND(aN == 9 && tN == 3);
+				break;
+			}
 			default:
 				DRAKE_UNREACHABLE();
 			}
@@ -848,7 +968,10 @@ public:
 
 				break;
 			}
-
+			case Block::Type::SO3Mat: {
+				DRAKE_DEMAND(aN == 9 && tN == 3);
+				break;
+			}
 			default:
 				DRAKE_UNREACHABLE();
 			}

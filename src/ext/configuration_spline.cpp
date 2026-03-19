@@ -17,9 +17,10 @@ void init_submodule_configuration_spline(py::module_& m) {
 
 	// Expose Block + Spec (std::vector<Block>) so you can pass a spec from Python
 	py::class_<CubicConfigurationSpline::Block>(q_spline, "Block")
-		.def_static("R",      &CubicConfigurationSpline::Block::R,      py::arg("k"))
-		.def_static("Torus",  &CubicConfigurationSpline::Block::Torus,  py::arg("k"))
-		.def_static("SO3",    &CubicConfigurationSpline::Block::SO3);
+		.def_static("R",        &CubicConfigurationSpline::Block::R,      py::arg("k"))
+		.def_static("Torus",    &CubicConfigurationSpline::Block::Torus,  py::arg("k"))
+		.def_static("SO3Quat",  &CubicConfigurationSpline::Block::SO3Quat)
+		.def_static("SO3Mat",   &CubicConfigurationSpline::Block::SO3Mat);
 
 	py::class_<CubicConfigurationSpline::BlockOffset>(q_spline, "BlockOffset")
 		.def_readonly("ambient_offset", &CubicConfigurationSpline::BlockOffset::ambient_offset)

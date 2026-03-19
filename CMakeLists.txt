@@ -3,6 +3,10 @@ project(goc_mpc VERSION 0.0.1)
 set(PY_VERSION_SUFFIX "")  # e.g. b3.dev1, see PEP 440
 set(PY_FULL_VERSION ${PROJECT_VERSION}${PY_VERSION_SUFFIX})
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 # Find the Python development files
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
