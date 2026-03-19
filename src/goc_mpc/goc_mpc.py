@@ -55,6 +55,7 @@ class GraphOfConstraintsMPC():
         self.solve_for_waypoints_once = solve_for_waypoints_once
         self.time_cost = time_cost
         self.time_cost2 = time_cost2
+        self.short_path_length = short_path_length
         self.acceleration_cost = acceleration_cost
         self.energy_cost = energy_cost
         self.arclength_cost = arclength_cost
@@ -197,15 +198,31 @@ class GraphOfConstraintsMPC():
         if teleport:
             wps = self.waypoint_mpc.view_waypoints()
             next_agent_states = []
-            for i, agent_nodes in enumerate(self.timing_mpc.view_agent_nodes_list()):
+            next_agent_deltas = []
+
+            nodes_and_timings = list(zip(
+                self.timing_mpc.view_agent_nodes_list(),
+                self.timing_mpc.view_time_deltas_list()
+            ))
+
+            for i, (agent_nodes, timings) in enumerate(nodes_and_timings):
                 next_agent_node = next(iter(agent_nodes), -1)
+                next_agent_delta = next(iter(timings), 0.0)
                 if next_agent_node == -1:
                     next_agent_state = x[i*self.graph.dim:(i+1)*self.graph.dim].copy()
                 else:
                     next_agent_state = wps[next_agent_node, i*self.graph.dim:(i+1)*self.graph.dim].copy()
                 next_agent_state[3:7] /= np.linalg.norm(next_agent_state[3:7])
                 next_agent_states.append(next_agent_state)
-            return np.expand_dims(np.concatenate(next_agent_states), 0), None, None
+                next_agent_deltas.append(next_agent_delta)
+
+            next_agent_states = np.expand_dims(np.concatenate(next_agent_states), 0)
+            next_agent_states = np.tile(next_agent_states, (self.short_path_length, 1))
+
+            next_agent_times = np.array(max(next_agent_deltas))
+            next_agent_times = np.tile(next_agent_times, (self.short_path_length,))
+
+            return next_agent_states, None, next_agent_times
 
         if not success:
             raise RuntimeError("TimingMPC Failed!")
@@ -215,7 +232,10 @@ class GraphOfConstraintsMPC():
         if not success:
             raise RuntimeError("ShortPathMPC Failed!")
 
-
+        # tuple:
+        # points: n by d_pos
+        # vels: n by d_vel
+        # times: n
         return self.last_cycle_short_path
 
     #
