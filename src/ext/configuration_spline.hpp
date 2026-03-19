@@ -825,9 +825,27 @@ public:
 				break;
 			}
 			case Block::Type::Torus: {
+				const auto vj   = vJ.segment(t0, tN);
+				const auto vjm1 = vJm1.segment(t0, tN);
+
+				T v0_norm = sqrt(vjm1.squaredNorm() + T(1e-8));
+				T v1_norm = sqrt(vj.squaredNorm() + T(1e-8));
+				total += tau * (v0_norm + v1_norm) / T(2.0);
+
 				break;
 			}
 			case Block::Type::SO3Quat: {
+				DRAKE_DEMAND(aN == 4 && tN == 3);
+
+				const Vec<T,3> wjm1 = vJm1.segment(t0, 3);
+				const Vec<T,3> wj   = vJ.segment(t0, 3);
+
+				// Simple trapezoidal approximation for angular arc length
+				// Arc length ≈ τ * (‖ω₀‖ + ‖ω₁‖) / 2
+				T w0_norm = sqrt(wjm1.squaredNorm() + T(1e-8));
+				T w1_norm = sqrt(wj.squaredNorm() + T(1e-8));
+				total += tau * (w0_norm + w1_norm) / T(2.0);
+
 				break;
 			}
 
