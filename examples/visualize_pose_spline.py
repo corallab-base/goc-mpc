@@ -27,6 +27,12 @@ def _split_pos_quat(q, quat_order="wxyz"):
     quat = quat / np.linalg.norm(quat)
     return pos, quat
 
+def _split_pos_rotmat(q):
+    q = np.asarray(q, dtype=float).ravel()
+    pos = q[:3]
+    R = q[3:12].reshape(3,3)
+    return pos, R
+
 def _get_q_from_eval(eval_out):
     # Accept q or (q, v, a) or (q, v)
     if isinstance(eval_out, (list, tuple)):
@@ -64,8 +70,8 @@ def render_spline_to_html(
         q = [x, y, z, quat(4)] with quat_order specified by `quat_order`.
     html_out : str
         Output HTML path (self-contained; no internet needed).
-    quat_order : {"wxyz", "xyzw"}
-        Quaternion storage order in q.
+    quat_order : {"wxyz", "xyzw", "rotmat"}
+        Quaternion storage order in q (or indicator that its rotmat instead of quaternion).
     n_frames : int
         Number of animation frames between t_min and t_max.
     axis_length : float
@@ -97,7 +103,10 @@ def render_spline_to_html(
     path_pos = []
     for t in t_dense:
         q_full = _get_q_from_eval(spline.eval(t))
-        pos, _ = _split_pos_quat(q_full, quat_order)
+        if quat_order == "rotmat":
+            pos, _ = _split_pos_rotmat(q_full)
+        else:
+            pos, _ = _split_pos_quat(q_full, quat_order)
         path_pos.append(pos)
     path_pos = np.array(path_pos)
 
@@ -116,8 +125,12 @@ def render_spline_to_html(
     frames = []
     for t in t_frames:
         q_full = _get_q_from_eval(spline.eval(t))
-        pos, quat = _split_pos_quat(q_full, quat_order)
-        R = _quat_to_rotmat(quat, quat_order)
+        if quat_order == "rotmat":
+            pos, R = _split_pos_rotmat(q_full)
+        else:
+            pos, quat = _split_pos_quat(q_full, quat_order)
+            R = _quat_to_rotmat(quat, quat_order)
+
         ex, ey, ez = R[:, 0], R[:, 1], R[:, 2]
         px, py, pz = pos
 
@@ -152,8 +165,13 @@ def render_spline_to_html(
 
     # Initial pose (first frame)
     init_q = _get_q_from_eval(spline.eval(t_frames[0]))
-    init_pos, init_quat = _split_pos_quat(init_q, quat_order)
-    R0 = _quat_to_rotmat(init_quat, quat_order)
+
+    if quat_order == "rotmat":
+        init_pos, R0 = _split_pos_rotmat(init_q)
+    else:
+        init_pos, init_quat = _split_pos_quat(init_q, quat_order)
+        R0 = _quat_to_rotmat(init_quat, quat_order)
+
     ex0, ey0, ez0 = R0[:, 0], R0[:, 1], R0[:, 2]
     px0, py0, pz0 = init_pos
     x_x, x_y, x_z = _seg(init_pos, ex0, axis_length)
@@ -240,6 +258,10 @@ if __name__ == "__main__":
         x, y, z = axis * s
         return np.array([w, x, y, z]) if order == "wxyz" else np.array([x, y, z, w])
 
+    def axis_angle_to_rot_mat(axis, angle_rad):
+        quat = axis_angle_to_quat(axis, angle_rad)
+        return _quat_to_rotmat(quat)
+
     p0 = np.array([0.00, 0.00, 0.00])
     p1 = np.array([0.60, 0.30, 0.20])
     p2 = np.array([0.20, 0.80, 0.50])
@@ -250,11 +272,23 @@ if __name__ == "__main__":
     q2 = axis_angle_to_quat([0, 1, 1], np.deg2rad(240))
     q3 = axis_angle_to_quat([1, 0, 1], np.deg2rad(360))
 
-    pts1 = np.vstack([
+    R0 = axis_angle_to_rot_mat([0, 0, 1], np.deg2rad(0)).flatten()
+    R1 = axis_angle_to_rot_mat([1, 1, 0], np.deg2rad(120)).flatten()
+    R2 = axis_angle_to_rot_mat([0, 1, 1], np.deg2rad(240)).flatten()
+    R3 = axis_angle_to_rot_mat([1, 0, 1], np.deg2rad(360)).flatten()
+
+    pts1_quat = np.vstack([
         np.hstack([p0, q0]),
         np.hstack([p1, q1]),
         np.hstack([p2, q2]),
         np.hstack([p3, q3]),
+    ])
+
+    pts1_rotmat = np.vstack([
+        np.hstack([p0, R0]),
+        np.hstack([p1, R1]),
+        np.hstack([p2, R2]),
+        np.hstack([p3, R3]),
     ])
 
     lin_v = np.array([
@@ -271,19 +305,35 @@ if __name__ == "__main__":
     ])
     vels1 = np.hstack([lin_v, ang_v])
 
-    spline_spec = [Block.R(3), Block.SO3()]
-    spline1 = CubicConfigurationSpline(spline_spec)
-    spline1.set(pts1, vels1, times)
+    spline_spec1 = [Block.R(3), Block.SO3Quat()]
+    spline1 = CubicConfigurationSpline(spline_spec1)
+    spline1.set(pts1_quat, vels1, times)
 
-    html_path = render_spline_to_html(
+    spline_spec2 = [Block.R(3), Block.SO3Mat()]
+    spline2 = CubicConfigurationSpline(spline_spec2)
+    spline2.set(pts1_rotmat, vels1, times)
+
+    html_path1 = render_spline_to_html(
         spline1,
-        html_out="spline_viewer.html",
+        html_out="spline1_viewer.html",
         quat_order="wxyz",
         n_frames=240,
         axis_length=0.15,
         path_samples=500,
-        title="R³ × SO(3) Spline (Demo)",
-        include_knots=pts1[:, :3],
+        title="R³ × SO(3) Quat Spline (Demo)",
+        include_knots=pts1_quat[:, :3],
     )
-    print(f"Wrote {html_path}")
+
+    html_path2 = render_spline_to_html(
+        spline2,
+        html_out="spline2_viewer.html",
+        quat_order="rotmat",
+        n_frames=240,
+        axis_length=0.15,
+        path_samples=500,
+        title="R³ × SO(3) Rotmat Spline (Demo)",
+        include_knots=pts1_rotmat[:, :3],
+    )
+
+    print(f"Wrote {html_path1} and {html_path2}")
     print("Serve it (e.g.) with:  python -m http.server 8000")
