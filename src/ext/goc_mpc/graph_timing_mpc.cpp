@@ -393,7 +393,6 @@ GraphTimingProblem build_graph_timing_problem(
 				// Max Velocity Constraints
 				if (max_vel > 0) {
 					auto [xJ_lin, vJ_lin] = spline.select_linear_blocks(xJ, vJ);
-					auto [xJm1_lin, vJm1_lin] = spline.select_linear_blocks(xJm1, vJm1);
 					int lin_dim = vJ_lin.size();
 
 					// // c = v0
@@ -409,8 +408,8 @@ GraphTimingProblem build_graph_timing_problem(
 					// |vel(0)| <= vmax and |vel(tau)| <= vmax (elementwise)
 					Eigen::VectorXd lb = Eigen::VectorXd::Constant(lin_dim, -max_vel);
 					Eigen::VectorXd ub = Eigen::VectorXd::Constant(lin_dim,  max_vel);
-					problem.prog->AddConstraint(vJm1_lin, lb, ub);
-					problem.prog->AddConstraint(vJ_lin, lb, ub);
+					problem.prog->AddConstraint(vJ_lin, lb, ub)
+						.evaluator()->set_description("max vel constraint");
 				}
 
 				// Max Acceleration Constraints
