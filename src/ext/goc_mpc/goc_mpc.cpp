@@ -129,7 +129,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("point_b"),
 		     py::arg("disp"))
 		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint)
-		.def("add_variable_constraint", &GraphOfConstraints::add_variable_constraint);
+		.def("add_variable_constraint", &GraphOfConstraints::add_variable_constraint)
+		.def("add_variable_ineq_constraint", &GraphOfConstraints::add_variable_ineq_constraint);
 
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
                 .def(py::init<GraphOfConstraints&, std::vector<CubicConfigurationSpline>>(),

@@ -73,6 +73,16 @@ struct DeferredEdgeOp {
 			   const drake::solvers::MatrixXDecisionVariable&)> short_path_builder;
 };
 
+struct DeferredVarOp {
+	DeferredOpKind kind;
+	int id;
+	std::function<void(drake::solvers::MathematicalProgram&,
+			   const struct SubgraphOfConstraints&,
+			   const int,
+			   const drake::solvers::MatrixXDecisionVariable&,
+			   const drake::solvers::MatrixXDecisionVariable&)> builder;
+};
+
 struct AgentInteraction {
 	enum Type { LESS_THAN, EQUAL };
 
@@ -115,11 +125,15 @@ struct GraphOfConstraints {
 	std::map<int, struct DeferredEdgeOp> edge_ops;
 	std::map<int, int> _edge_phi_to_static_assignment_map;
 
+	// Var phi map
+	std::map<int, struct DeferredVarOp> var_ops;
+
 	// backtracking map
 	std::map<int, int> backtrack_map;
 
 	// Rest
-	int num_phis, num_edge_phis, num_variables, _num_total_assignables;
+	int num_phis, num_edge_phis, num_var_phis;
+	int num_variables, _num_total_assignables;
 	int num_agents, num_objects, dim, non_robot_dim, total_dim;
 	
 	// Required for big-M computation
@@ -153,6 +167,10 @@ struct GraphOfConstraints {
 			   const Eigen::VectorXi& assignments) const;
 
 	std::map<int, struct DeferredEdgeOp> get_next_edge_ops(const std::vector<int> completed_vertices) const;
+
+	const std::map<int, DeferredVarOp>& get_var_ops() const {
+		return var_ops;
+	}
 
 	std::vector<int> get_phi_ids(int node) const;
 
@@ -295,9 +313,12 @@ struct GraphOfConstraints {
 	// Variable Constraints
 
 	// 'var' can only be assigned to {robot_ids}
-	int add_variable_constraint(int k, // The node (action) we are constraining
-				    int var, // The variables to constrain
-				    std::set<int> robot_ids); // The possible robot ids
+	int add_variable_constraint(int var,
+				    std::set<int> robot_ids);
+
+	// var1 != var2
+	int add_variable_ineq_constraint(int var1,
+					 int var2);
 
 
 private:
@@ -335,6 +356,13 @@ private:
 		edge_phi_to_variable_map[id] = var;
 		edge_ops[id] = DeferredEdgeOp{kind, id, u, v, cubes,
 			std::forward<EF>(eval_f), std::forward<WF>(wp_f), std::forward<SF>(sp_f)};
+		return id;
+	}
+
+	template <typename F>
+	int _add_var_op(DeferredOpKind kind, F&& f) {
+		const int id = num_var_phis++;
+		var_ops[id] = DeferredVarOp{kind, id, std::forward<F>(f)};
 		return id;
 	}
 };

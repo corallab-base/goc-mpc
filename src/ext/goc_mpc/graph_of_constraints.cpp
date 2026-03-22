@@ -18,6 +18,7 @@ GraphOfConstraints::GraphOfConstraints(const std::vector<std::string> robots,
 	  _object_names(objects),
 	  num_phis(0),
 	  num_edge_phis(0),
+	  num_var_phis(0),
 	  num_variables(0),
 	  _num_total_assignables(0),
 	  num_agents(robots.size()),
@@ -812,13 +813,16 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 						  VectorXDecisionVariable vars(dim + 1);
 						  for (int j = 0; j < dim; ++j) vars[j] = X(node_k, i*dim + j);
 						  vars[dim] = Assignments(variable_k, i);   // <-- use A as selector
-				
+
+						  auto _agent_x_lb = _global_x_lb.segment(i*dim, dim);
+						  auto _agent_x_ub = _global_x_ub.segment(i*dim, dim);
+
 						  for (int r = 0; r < A.rows(); ++r) {
 							  const Eigen::RowVectorXd c = A.row(r);
 							  const auto [max_cx, min_cx] = max_min_ct_x_over_box(
 								  c,
-								  _global_x_lb,
-								  _global_x_ub);
+								  _agent_x_lb,
+								  _agent_x_ub);
 
 							  const double rhs = b[r];
 							  // Pick M so that when s = 0 the constraint is loose:
@@ -1768,7 +1772,6 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 }
 
 int GraphOfConstraints::add_variable_constraint(
-	int k,
 	int var,
 	std::set<int> robot_ids) {
 
@@ -1777,16 +1780,13 @@ int GraphOfConstraints::add_variable_constraint(
 		DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
 	}
 
- 	return _add_op(DeferredOpKind::kLinearEq, k,
-		[=, this](const Eigen::VectorXd& x, const int robot_id) {
-			// This needs to evaluate our constraint
-			// Make sure that robot_id is in robot_ids
-			return robot_ids.find(robot_id) != robot_ids.end();
-		}, [=, this](auto& prog,
-			     const SubgraphOfConstraints& subgraph,
-			     const int phi_id,
-			     const auto& X,
-			     const auto & Assignments) {
+ 	return _add_var_op(
+		DeferredOpKind::kLinearEq,
+		[=, this](auto& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int phi_id,
+			  const auto& X,
+			  const auto & Assignments) {
 
 			// Get the variable we want to constrain
 			const int variable_k = subgraph.subgraph_variable_id(var);
@@ -1794,11 +1794,8 @@ int GraphOfConstraints::add_variable_constraint(
 			// For every robot (i) we want to constrain the Assignments to
 			// something like [0, 0, 0, 1, 1, 0, 1] where the 1 entries are the
 			// robots that are allowed
-			//
-			// Each row in Assignments describes which robot is assigned
-
 			for (int i = 0; i < num_agents; i++) {
-				// If i is not in robot_ids
+				// If i is not in robot_ids (not allowed)
 				if (robot_ids.find(i) == robot_ids.end()) {
 					// Make sure it is constrained to NOT be assigned
 					const auto s = Assignments(variable_k, i);
@@ -1808,3 +1805,30 @@ int GraphOfConstraints::add_variable_constraint(
 		});
 }
 
+int GraphOfConstraints::add_variable_ineq_constraint(
+	int var1,
+	int var2) {
+
+	DRAKE_DEMAND(var1 >= 0 && var1 < num_variables);
+	DRAKE_DEMAND(var2 >= 0 && var2 < num_variables);
+
+ 	return _add_var_op(
+		DeferredOpKind::kLinearIneq,
+		[=, this](auto& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int phi_id,
+			  const auto& X,
+			  const auto& Assignments) {
+
+			// Get the variable we want to constrain
+			const int variable1_k = subgraph.subgraph_variable_id(var1);
+			const int variable2_k = subgraph.subgraph_variable_id(var2);
+
+			for (int i = 0; i < num_agents; i++) {
+				const auto s = Assignments(variable1_k, i) + Assignments(variable2_k, i);
+				// 1 <= binary v1 + binary v2 <= 1 implies both
+				// cannot be zero and both cannot be one.
+				prog.AddLinearConstraint(s, 1, 1);
+			}
+		});
+}

@@ -911,6 +911,11 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 					 previous_X.row(edge_op.u_node));
 	}
 
+	// Add variable assignment constraints from registry
+	for (const auto& [var_phi_id, var_op] : graph->get_var_ops()) {
+		var_op.builder(prog, subgraph, var_phi_id, X, Assignments);
+	}
+
 	problem.prog = std::move(prog_ptr);
 
 	return std::move(problem);
