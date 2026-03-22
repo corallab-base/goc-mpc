@@ -308,7 +308,8 @@ GraphTimingProblem build_graph_timing_problem(
 			// Create variables
 			VectorXDecisionVariable time_deltas_i = problem.prog->NewContinuousVariables(agent_spline_length, time_deltas_name);
 			for (int j = 0; j < agent_spline_length; ++j) {
-				problem.prog->AddBoundingBoxConstraint(0.01, 10.0, time_deltas_i(j));
+				problem.prog->AddBoundingBoxConstraint(0.01, 100.0, time_deltas_i(j))
+					.evaluator()->set_description("time delta bound constraint");
 			}
 			problem.time_deltas_list[i] = time_deltas_i;
 
@@ -436,8 +437,10 @@ GraphTimingProblem build_graph_timing_problem(
 					// acc(0) <= amax and acc(tau) <= amax (elementwise)
 					Eigen::VectorXd lb = Eigen::VectorXd::Constant(lin_dim, -max_acc);
 					Eigen::VectorXd ub = Eigen::VectorXd::Constant(lin_dim,  max_acc);
-					problem.prog->AddConstraint(acc0, lb, ub);
-					problem.prog->AddConstraint(accT, lb, ub);
+					problem.prog->AddConstraint(acc0, lb, ub)
+						.evaluator()->set_description("max acc constraint");
+					problem.prog->AddConstraint(accT, lb, ub)
+						.evaluator()->set_description("max acc constraint");
 				}
 
 				// if (max_jerk > 0) {
@@ -467,11 +470,13 @@ GraphTimingProblem build_graph_timing_problem(
 			// taus
 			Eigen::VectorX<Expression> taus_i = problem.time_deltas_list[p.agent_i].head(p.agent_i_depth+1);
 			Eigen::VectorX<Expression> taus_j = problem.time_deltas_list[p.agent_j].head(p.agent_j_depth+1);
-			problem.prog->AddLinearConstraint(taus_i.sum() <= taus_j.sum());
+			problem.prog->AddLinearConstraint(taus_i.sum() <= taus_j.sum())
+				.evaluator()->set_description("timing less than constraint");
 		} else if (p.type == AgentInteraction::Type::EQUAL) {
 			Eigen::VectorX<Expression> taus_i = problem.time_deltas_list[p.agent_i].head(p.agent_i_depth+1);
 			Eigen::VectorX<Expression> taus_j = problem.time_deltas_list[p.agent_j].head(p.agent_j_depth+1);
-			problem.prog->AddLinearConstraint(taus_i.sum() == taus_j.sum());
+			problem.prog->AddLinearConstraint(taus_i.sum() == taus_j.sum())
+				.evaluator()->set_description("timing equality constraint");
 		} else {
 			throw std::runtime_error("Not implemented");
 		}
@@ -640,7 +645,7 @@ bool GraphTimingMPC::solve(
 		// result = drake::solvers::Solve(*(problem->prog));
 		result = solver.Solve(*(problem->prog));
 	} catch (const std::exception& e) {
-		std::cout << "Caught exception in solver: " << e.what() << std::endl;
+		std::cout << "Caught exception in timing solver: " << e.what() << std::endl;
 		return false;
 	}
 
