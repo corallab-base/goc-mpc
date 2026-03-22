@@ -185,7 +185,7 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 	try {
 		result = drake::solvers::Solve(*problem->prog);
 	} catch (const std::exception& e) {
-		std::cout << "Caught exception in solver" << std::endl;
+		std::cout << "Caught exception in short path solver" << std::endl;
 		return false;
 	}
 
