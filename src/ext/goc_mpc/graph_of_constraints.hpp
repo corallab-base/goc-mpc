@@ -292,6 +292,14 @@ struct GraphOfConstraints {
 							  int point_id,
 							  double holding_distance_max = 0.1);
 
+	// Variable Constraints
+
+	// 'var' can only be assigned to {robot_ids}
+	int add_variable_constraint(int k, // The node (action) we are constraining
+				    int var, // The variables to constrain
+				    std::set<int> robot_ids); // The possible robot ids
+
+
 private:
 
 	template <typename EF, typename F>

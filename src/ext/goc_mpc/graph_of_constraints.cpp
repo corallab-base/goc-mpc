@@ -1766,3 +1766,45 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 			return;
 		});
 }
+
+int GraphOfConstraints::add_variable_constraint(
+	int k,
+	int var,
+	std::set<int> robot_ids) {
+
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	for (int robot_id : robot_ids) {
+		DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	}
+
+ 	return _add_op(DeferredOpKind::kLinearEq, k,
+		[=, this](const Eigen::VectorXd& x, const int robot_id) {
+			// This needs to evaluate our constraint
+			// Make sure that robot_id is in robot_ids
+			return robot_ids.find(robot_id) != robot_ids.end();
+		}, [=, this](auto& prog,
+			     const SubgraphOfConstraints& subgraph,
+			     const int phi_id,
+			     const auto& X,
+			     const auto & Assignments) {
+
+			// Get the variable we want to constrain
+			const int variable_k = subgraph.subgraph_variable_id(var);
+
+			// For every robot (i) we want to constrain the Assignments to
+			// something like [0, 0, 0, 1, 1, 0, 1] where the 1 entries are the
+			// robots that are allowed
+			//
+			// Each row in Assignments describes which robot is assigned
+
+			for (int i = 0; i < num_agents; i++) {
+				// If i is not in robot_ids
+				if (robot_ids.find(i) == robot_ids.end()) {
+					// Make sure it is constrained to NOT be assigned
+					const auto s = Assignments(variable_k, i);
+					prog.AddLinearEqualityConstraint(s, 0);
+				}
+			}
+		});
+}
+
