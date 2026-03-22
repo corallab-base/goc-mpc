@@ -247,6 +247,12 @@ def two_gripper_pick_and_pour():
     graph = GraphOfConstraints(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1", "cube_2"],
                                state_lower_bound, state_upper_bound)
 
+    # 0: Start
+    # 1: Pick cube_0
+    # 2: Place cube_0 on cube_1
+    graph.structure.add_nodes(3)
+    graph.structure.add_edge(0, 1, True)
+    graph.structure.add_edge(1, 2, True)
 
     # RESET
     start_node = graph.structure.add_node()
@@ -255,48 +261,48 @@ def two_gripper_pick_and_pour():
                                 1.50, -0.2, 0.5, 0.0, 0.707071, -0.707071, 0.0])
     graph.add_robots_linear_eq(start_node, np.eye(joint_agent_dim), home_position_1)
 
-    # PITCHER
-    pitcher_approach, pitcher_pick_up = graph.structure.add_nodes(2)
-    graph.structure.add_edge(start_node, pitcher_approach, True)
-    graph.structure.add_edge(pitcher_approach, pitcher_pick_up, True)
+    # Which robot does the job
+    r1 = graph.add_variable()
 
-    graph.add_robot_to_point_alignment_cost(pitcher_approach,
-                                            0, 0, np.array([0.0, 1.0, 1.0]),
-                                            u_body_opt=np.array([1.0, 0.0, 0.0]),
-                                            roll_ref_flat=True,
-                                            w_flat=1.0)
-    graph.add_robot_to_point_displacement_constraint(pitcher_approach, 0, 0, np.array([-0.20, 0.00, -0.05]));
+    #phi0 = graph.add_robot_to_point_displacement_constraint(0, 0, 0, np.array([0.0, 0.0, -0.1]))
+    phi_pick = graph.add_assignable_robot_to_point_displacement_constraint(
+            1,  # Node Index
+            r1, # Robot variable
+            0,  # Cube Index
+            np.array([0.0, 0.0, -0.1])
+    )
 
     # graph.add_robot_relative_rotation_constraint(pitcher_approach, pitcher_pick_up, 0, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
     phi1 = graph.add_robot_to_point_displacement_constraint(pitcher_pick_up, 0, 0, np.array([-0.15, 0.00, -0.04]));
     graph.add_grasp_change(phi1, "grab", 0, 0);
 
-    # CUP
-    cup_approach, cup_pick_up = graph.structure.add_nodes(2)
-    graph.structure.add_edge(start_node, cup_approach, True)
-    graph.structure.add_edge(cup_approach, cup_pick_up, True)
+    # Hold the block as it is moved
+    phi_hold = graph.add_assignable_robot_holding_point_constraint(
+            1,  # Start Node
+            2,  # End Node
+            r1,
+            0,  # Cube Index
+            0.1
+    )
 
-    graph.add_robot_to_point_alignment_cost(cup_approach,
-                                            1, 1, np.array([0.0, 0.0, 1.0]),
-                                            u_body_opt=np.array([1.0, 0.0, 0.0]),
-                                            roll_ref_flat=True,
-                                            w_flat=1.0)
-    graph.add_robot_to_point_displacement_cost(cup_approach, 1, 1, np.array([0.25, 0.0, -0.05]))
+    # The same robot that is holding cube_0 should place it on cube_1
+    phi_place = graph.add_assignable_robot_to_point_displacement_constraint(
+            2,  # Node Index
+            r1,
+            1,  # Cube Index
+            np.array([0.0, 0.0, -0.1])
+    )
 
     # graph.add_robot_relative_rotation_constraint(cup_approach, cup_pick_up, 1, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
     phi2 = graph.add_robot_to_point_displacement_constraint(cup_pick_up, 1, 1, np.array([0.15, 0.00, -0.08]));
     graph.add_grasp_change(phi2, "grab", 1, 1);
 
-    # BRING PITCHER AND CUP CLOSE TO EACH OTHER
-    bring_close = graph.structure.add_node()
-    graph.structure.add_edge(pitcher_pick_up, bring_close, True)
-    graph.structure.add_edge(cup_pick_up, bring_close, True)
+    # phi1 = graph.add_assignable_robot_to_point_displacement_constraint(0, r2, 2, np.array([0.0, 0.0, -0.1]))
 
-    graph.add_robot_holding_cube_constraint(pitcher_pick_up, bring_close, 0, 0, 0.25);
-    graph.add_robot_holding_cube_constraint(cup_pick_up, bring_close, 1, 1, 0.25);
+    #phi1 = graph.add_robot_quat_linear_eq(0, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
 
-    graph.add_robot_relative_rotation_constraint(pitcher_pick_up, bring_close, 0, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
-    graph.add_robot_relative_rotation_constraint(cup_pick_up, bring_close, 1, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
+    # Grab cube_0 (which ever robot is assigned)
+        #graspPhi0 = graph.add_assignable_robot_holding_point_constraint(0, 1, r1, 0, 0.1)
 
     graph.add_point_to_point_displacement_cost(bring_close, 0, 1, np.array([-0.1, 0.0, -0.12]));
     graph.add_point_linear_eq(bring_close, 0, np.array([[0.0, 0.0, 0.0],
@@ -341,25 +347,10 @@ def two_gripper_pick_and_pour():
     # graph.add_grasp_change(phi4, "grab", 1, 2);
 
     # graspPhi1 = graph.add_robot_holding_cube_constraint(2, 3, 1, 2, 0.1);
-    # graph.add_robot_relative_rotation_constraint(2, 3, 1, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
 
-    # # BRING PITCHER AND CUP CLOSE TO EACH OTHER
-    # graph.add_robot_to_point_displacement_cost(1, 0, 0, np.array([0.05, 0.0, -0.05]));
-    # graph.add_robot_to_point_displacement_cost(2, 1, 2, np.array([-0.05, 0.0, -0.05]));
-    # graph.add_point_to_point_displacement_cost(3, 0, 2, np.array([0.1, 0.0, -0.1]));
-    # graph.add_point_linear_eq(3, 0, np.array([[0.0, 0.0, 0.0],
-    #                                           [0.0, 0.0, 0.0],
-    #                                           [0.0, 0.0, 1.0]]), np.array([0.0, 0.0, 0.3]))
+    # phi3 = graph.add_assignable_robot_to_point_displacement_constraint(3, r2, 0, np.array([0.0, 0.0, -0.2]));
 
-
-    # # POUR PITCHER
-    # graph.add_robot_holding_cube_constraint(3, 4, 0, 0, 0.1);
-    # graph.add_robot_holding_cube_constraint(3, 4, 1, 2, 0.1);
-    # graph.add_robot_relative_displacement_constraint(3, 4, 1, np.array([0.0, 0.0, 0.0]));
-    # graph.add_point_to_point_displacement_cost(4, 0, 2, np.array([0.1, 0.0, -0.1]));
-    # graph.add_robot_relative_rotation_constraint(3, 4, 0,
-    #                                              RollPitchYaw(np.pi/3, 0.0, 0.0).ToQuaternion());
-    # graph.make_node_unpassable(4)
+    # phi4 = graph.add_assignable_robot_to_point_displacement_constraint(4, r1, 1, np.array([0.0, 0.0, -0.5]));
 
     # GoC-MPC
     spline_spec = [Block.R(3), Block.SO3Quat()]
@@ -574,13 +565,14 @@ def main():
     # env, graph, goc_mpc = n_gripper_n_block_stacking(n_grippers=3, n_blocks=5)
     env, graph, goc_mpc = two_gripper_block_stacking()
     # env, graph, goc_mpc = two_gripper_pick_and_pour()
+    # env, graph, goc_mpc = two_gripper_assignable_block_stacking()
+    # env, graph, goc_mpc = two_gripper_rotate_in_place()
     # env, graph, goc_mpc = two_gripper_fold_sheet()
     # env, graph, goc_mpc = two_gripper_pick_and_pour()
     # env, graph, goc_mpc = two_gripper_assignable_move()
 
     dim = graph.dim
     num_agents = graph.num_agents
-
     observed_qs = []
 
     dt = goc_mpc.short_path_time_per_step
@@ -606,7 +598,7 @@ def main():
 
         # let settle
         for _ in range(20):
-            qpos = obs[0][:num_agents * dim]
+            qpos = obs[0][:graph.num_agents * graph.dim]
             obs, _, _, _, _ = env.step(qpos)
 
         # # for debugging, get assignments and pass a few nodes.
