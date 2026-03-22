@@ -91,10 +91,12 @@ struct GraphWaypointMPC {
 	const double get_last_solve_time() { return _last_solve_time; }
 
 private:
-	bool _solve_with_mosek(const std::vector<int>& remaining_vertices,
-			       const Eigen::VectorXd& x0);
-	bool _solve_with_gurobi(const std::vector<int>& remaining_vertices,
-				const Eigen::VectorXd& x0);
-	bool _solve_with_enumeration_and_ipopt(const std::vector<int>& remaining_vertices,
-					       const Eigen::VectorXd& x0);
+	bool SolveWithMosek(const std::vector<int>& remaining_vertices,
+			    const Eigen::VectorXd& x0,
+			    bool enforce_rigidity_and_relax_binary_vars);
+	bool SolveWithGurobi(const std::vector<int>& remaining_vertices,
+			     const Eigen::VectorXd& x0,
+			     bool enforce_rigidity_and_relax_binary_vars);
+	bool SolveWithEnumerationAndIPOPT(const std::vector<int>& remaining_vertices,
+					  const Eigen::VectorXd& x0);
 };

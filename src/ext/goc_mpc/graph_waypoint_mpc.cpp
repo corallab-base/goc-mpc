@@ -506,7 +506,8 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	const std::vector<int>& remaining_vertices,
 	Eigen::VectorXd x0,
 	Eigen::MatrixXd previous_X,
-	bool enforce_rigidity) {
+	bool enforce_rigidity,
+	bool relax_binary_vars) {
 
 	const int num_agents = graph->num_agents;
 	const int num_objects = graph->num_objects;
@@ -526,9 +527,9 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	problem.subgraph = std::make_unique<SubgraphOfConstraints>(subgraph);
 
 	MatrixXDecisionVariable Assignments;
-	if (enforce_rigidity) {
-		// If enforcing rigidity, define the assignment variables as
-		// continuous so that they can be pinned manually.
+	if (relax_binary_vars) {
+		// Define the assignment variables as continuous so that they
+		// can be pinned manually.
 		Assignments = prog.NewContinuousVariables(subgraph.num_variables(),
 							  num_agents, "Assignments");
 		problem.Assignments = Assignments;
@@ -544,8 +545,6 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				.evaluator()->set_description("exclusive assignment");
 		}
 	} else {
-		std::cout << "Num Variables: " << subgraph.num_variables() << std::endl;
-
 		if (subgraph.num_variables() > 0) {
 			Assignments = prog.NewBinaryVariables(subgraph.num_variables(),
 							      num_agents, "Assignments");
@@ -559,8 +558,6 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				.evaluator()->set_description("exclusive assignment");;
 		}
 	}
-
-
 
 	const int robot_dim = graph->dim;
 	const int objs_start = graph->num_agents * graph->dim;
@@ -1145,7 +1142,7 @@ EnumSolveResult EnumerateAllAssignmentsAndSolve(
 			problem->prog->SetInitialGuess(problem->X, res.GetSolution(problem->X));
 		} else {
 			std::cout << "NO SUCCESS FOR ASSIGNMENTS:\n" << A0 << std::endl;
-			PrintSolverReport(problem, res, 1e-6);
+			// PrintSolverReport(problem, res, 1e-6);
 		}
 
 		first = false;
@@ -1171,22 +1168,28 @@ bool GraphWaypointMPC::solve(
 		_first_cycle = false;
 	}
 
-	const bool enforce_rigidity = true;
+	const bool enforce_rigidity = false;
 
 	if (enforce_rigidity) {
-		return _solve_with_enumeration_and_ipopt(remaining_vertices, x0);
-		// return _solve_with_gurobi(remaining_vertices, x0);
-		// return _solve_with_mosek(remaining_vertices, x0);
+		// return SolveWithBranchAndBoundPlusROPTLIB(remaining_vertices, x0);
+		return SolveWithEnumerationAndIPOPT(remaining_vertices, x0);
+		// return SolveWithGurobi(remaining_vertices, x0, true);
+		// return SolveWithMosek(remaining_vertices, x0, true);
 	} else {
-		return _solve_with_mosek(remaining_vertices, x0);
+		return SolveWithGurobi(remaining_vertices, x0, false);
+		// return SolveWithMosek(remaining_vertices, x0, false);
 	}
 }
 
-bool GraphWaypointMPC::_solve_with_mosek(
+bool GraphWaypointMPC::SolveWithMosek(
 	const std::vector<int>& remaining_vertices,
-	const Eigen::VectorXd& x0) {
+	const Eigen::VectorXd& x0,
+	bool enforce_rigidity_and_relax_binary_vars) {
 
-	GraphWaypointProblem problem = BuildGraphWaypointProblem(_graph, _splines, remaining_vertices, x0, _waypoints, false);
+	GraphWaypointProblem problem = BuildGraphWaypointProblem(
+		_graph, _splines, remaining_vertices, x0, _waypoints,
+		enforce_rigidity_and_relax_binary_vars,
+		enforce_rigidity_and_relax_binary_vars);
 
 	// Solve
 	drake::solvers::MosekSolver solver;
@@ -1235,11 +1238,15 @@ bool GraphWaypointMPC::_solve_with_mosek(
 	return false;
 }
 
-bool GraphWaypointMPC::_solve_with_gurobi(
+bool GraphWaypointMPC::SolveWithGurobi(
 	const std::vector<int>& remaining_vertices,
-	const Eigen::VectorXd& x0) {
+	const Eigen::VectorXd& x0,
+	bool enforce_rigidity_and_relax_binary_vars) {
 
-	GraphWaypointProblem problem = BuildGraphWaypointProblem(_graph, _splines, remaining_vertices, x0, _waypoints, true);
+	GraphWaypointProblem problem = BuildGraphWaypointProblem(
+		_graph, _splines, remaining_vertices, x0, _waypoints,
+		enforce_rigidity_and_relax_binary_vars,
+		enforce_rigidity_and_relax_binary_vars);
 
 	// Solve
 	drake::solvers::GurobiSolver solver;
@@ -1304,20 +1311,21 @@ bool GraphWaypointMPC::_solve_with_gurobi(
 	return false;
 }
 
-bool GraphWaypointMPC::_solve_with_enumeration_and_ipopt(
+bool GraphWaypointMPC::SolveWithEnumerationAndIPOPT(
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
 	std::unique_ptr<GraphWaypointProblem> problem;
 	try {
 		problem = std::make_unique<GraphWaypointProblem>(
-			BuildGraphWaypointProblem(_graph, _splines, remaining_vertices, x0, _waypoints, true));
+			BuildGraphWaypointProblem(
+				_graph, _splines, remaining_vertices, x0, _waypoints,
+				/*enforce_rigidity=*/true,
+				/*relax_binary_vars=*/true));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in waypoint problem construction: " << e.what() << std::endl;
 		return false;
 	}
-
-	std::cout << problem->prog->to_string() << std::endl;
 
 	// Enumerate per-row choices (all agents, or pruned)
 	std::vector<std::vector<int>> choices_per_row(problem->Assignments.rows());
