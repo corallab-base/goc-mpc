@@ -198,38 +198,35 @@ def two_gripper_block_stacking():
     default_rot_mat = np.array([0.0, 0.0, 0.0,
                                 -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0])
 
+    r1 = graph.add_variable()
+    r2 = graph.add_variable()
 
-    phi0 = graph.add_robot_to_point_displacement_constraint(0, 0, 0, np.array([0.0, 0.0, -0.1]));
-    # graph.add_robot_quat_linear_eq(0, 0, np.eye(4), np.array([0.0, 0.0, -1.0, 0.0]))
-    graph.add_robot_linear_eq(0, 0, A_rot_mat, default_rot_mat)
 
-    graph.add_grasp_change(phi0, "grab", 0, 0);
 
-    graspPhi0 = graph.add_robot_holding_cube_constraint(0, 1, 0, 0, 0.1);
+    phi0 = graph.add_assignable_robot_to_point_displacement_constraint(0, r1, 0, np.array([0.0, 0.0, -0.1]));
+    graph.add_assignable_linear_eq(0, r1, A_rot_mat, default_rot_mat)
 
-    # phi1 = graph.add_robot_to_point_displacement_constraint(1, 0, 1, np.array([0.0, 0.0, -0.2]));
+    graph.add_assignable_grasp_change(phi0, "grab", 0);
+
+    graspPhi0 = graph.add_assignable_robot_holding_point_constraint(0, 1, r1, 0, 0.1);
+
     phi1 = graph.add_point_to_point_displacement_constraint(1, 0, 1, np.array([0.0, 0.0, -0.2]), tol=0.01)
-    graph.add_robot_linear_eq(1, 0, A_rot_mat, default_rot_mat)
+    graph.add_assignable_linear_eq(1, 0, A_rot_mat, default_rot_mat)
 
-    # graph.add_robot_quat_linear_eq(1, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
-    graph.add_grasp_change(phi1, "release", 0, 0);
+    graph.add_assignable_grasp_change(phi1, "release", 0);
 
-    phi2 = graph.add_robot_to_point_displacement_constraint(2, 1, 2, np.array([0.0, 0.0, -0.1]));
-    # graph.add_robot_quat_linear_eq(2, 1, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
-    graph.add_grasp_change(phi2, "grab", 1, 2);
-    graph.add_robot_linear_eq(2, 1, A_rot_mat, default_rot_mat)
+    phi2 = graph.add_assignable_robot_to_point_displacement_constraint(2, r2, 2, np.array([0.0, 0.0, -0.1]));
+    graph.add_assignable_grasp_change(phi2, "grab", 2);
+    graph.add_assignable_linear_eq(2, r2, A_rot_mat, default_rot_mat)
 
-    graspPhi1 = graph.add_robot_holding_cube_constraint(2, 3, 1, 2, 0.1);
+    graspPhi1 = graph.add_assignable_robot_holding_point_constraint(2, 3, r2, 2, 0.1);
 
-    # phi3 = graph.add_robot_to_point_displacement_constraint(3, 1, 0, np.array([0.0, 0.0, -0.2]));
     phi3 = graph.add_point_to_point_displacement_constraint(3, 2, 1, np.array([0.0, 0.0, -0.2]), tol=0.01)
-    # graph.add_robot_quat_linear_eq(3, 1, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
-    graph.add_grasp_change(phi3, "release", 1, 2);
-    graph.add_robot_linear_eq(3, 1, A_rot_mat, default_rot_mat)
+    graph.add_assignable_grasp_change(phi3, "release", 2);
+    graph.add_assignable_linear_eq(3, r2, A_rot_mat, default_rot_mat)
 
-    phi4 = graph.add_robot_to_point_displacement_constraint(4, 0, 1, np.array([0.0, 0.0, -0.5]));
-    # graph.add_robot_quat_linear_eq(4, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
-    graph.add_robot_linear_eq(4, 0, A_rot_mat, default_rot_mat)
+    phi4 = graph.add_assignable_robot_to_point_displacement_constraint(4, r1, 1, np.array([0.0, 0.0, -0.5]));
+    graph.add_assignable_linear_eq(4, r1, A_rot_mat, default_rot_mat)
 
     # GoC-MPC
     spline_spec = [Block.R(3), Block.SO3Mat()]
