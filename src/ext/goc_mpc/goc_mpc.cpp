@@ -8,7 +8,6 @@
 #include "graph_short_path_mpc.hpp"
 
 using drake::symbolic::Expression;
-using drake::multibody::MultibodyPlant;
 namespace py = pybind11;
 
 /*
@@ -24,13 +23,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 
 
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
-		.def(py::init<MultibodyPlant<Expression>&,
-		     const std::vector<std::string>,
+		.def(py::init<const std::vector<std::string>,
 		     const std::vector<std::string>,
 		     double,
 		     double>(),
-		     py::keep_alive<1, 2>(),
-		     py::arg("plant"),
 		     py::arg("robot_names"),
 		     py::arg("cube_names"),
 		     py::arg("state_lower_bound"),

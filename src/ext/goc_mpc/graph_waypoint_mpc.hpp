@@ -48,7 +48,7 @@ struct GraphWaypointProblem {
 	GraphWaypointProblem& operator=(GraphWaypointProblem&&) = default;
 };
 
-GraphWaypointProblem build_graph_waypoint_problem(
+GraphWaypointProblem BuildGraphWaypointProblem(
 	const GraphOfConstraints& graph,
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
 	const std::vector<int>& remaining_vertices,

@@ -59,13 +59,12 @@ def visualize_last_cycle(goc_mpc):
 
 
 def test_two_gripper_block_stacking(n_points=3, quat=np.array([0.0, -0.70710678,  0.70710678, 0.0]), meshcat=None):
-    env = SimpleDrakeGym(["free_body_0", "free_body_1"], [f"cube_{i}" for i in range(n_points)], meshcat=meshcat)
+    env = SimpleDrakeGym(["pos_quat_0", "pos_quat_1"], [f"cube_{i}" for i in range(n_points)], meshcat=meshcat)
 
     state_lower_bound = -10.0
     state_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], [f"cube_{i}" for i in range(n_points)],
+    graph = GraphOfConstraints(["pos_quat_0", "pos_quat_1"], [f"cube_{i}" for i in range(n_points)],
                                state_lower_bound, state_upper_bound)
 
     joint_agent_dim = graph.num_agents * graph.dim;
@@ -121,7 +120,7 @@ def test_two_gripper_block_stacking(n_points=3, quat=np.array([0.0, -0.70710678,
     graph.add_robot_pos_linear_eq(right_safe_pos_node, 1, np.eye(3), right_safe_position);
 
     # # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Quat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = False,
                                     time_delta_cutoff = 0.0,
@@ -129,15 +128,14 @@ def test_two_gripper_block_stacking(n_points=3, quat=np.array([0.0, -0.70710678,
     return env, graph, goc_mpc
 
 def n_gripper_n_block_stacking(n_grippers=3, n_blocks=5, quat=np.array([0.0, 0.0, 1.0, 0.0])):
-    agents = [f"free_body_{j}" for j in range(n_grippers)]
+    agents = [f"pos_quat_{j}" for j in range(n_grippers)]
     objects = [f"cube_{i}" for i in range(n_blocks)]
     env = SimpleDrakeGym(agents, objects)
 
     state_lower_bound = -10.0
     state_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, agents, objects,
+    graph = GraphOfConstraints(agents, objects,
                                state_lower_bound, state_upper_bound)
 
     joint_agent_dim = graph.num_agents * graph.dim;
@@ -170,7 +168,7 @@ def n_gripper_n_block_stacking(n_grippers=3, n_blocks=5, quat=np.array([0.0, 0.0
     graph.structure.add_edge(place1, pick4, True)
 
 
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Quat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = False,
                                     time_delta_cutoff = 0.0,
@@ -179,13 +177,12 @@ def n_gripper_n_block_stacking(n_grippers=3, n_blocks=5, quat=np.array([0.0, 0.0
 
 
 def two_gripper_block_stacking():
-    env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"])
+    env = SimpleDrakeGym(["pos_rot_mat_0", "pos_rot_mat_1"], ["cube_0", "cube_1", "cube_2"])
 
     state_lower_bound = -10.0
     state_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"],
+    graph = GraphOfConstraints(["pos_rot_mat_0", "pos_rot_mat_1"], ["cube_0", "cube_1", "cube_2"],
                                state_lower_bound, state_upper_bound)
 
     joint_agent_dim = graph.num_agents * graph.dim;
@@ -196,46 +193,61 @@ def two_gripper_block_stacking():
     graph.structure.add_edge(1, 3, True)
     graph.structure.add_edge(1, 4, True)
 
+    A_rot_mat = np.eye(3+9)
+    A_rot_mat[:3, :3] = 0.0
+    default_rot_mat = np.array([0.0, 0.0, 0.0,
+                                -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0])
+
+
     phi0 = graph.add_robot_to_point_displacement_constraint(0, 0, 0, np.array([0.0, 0.0, -0.1]));
-    graph.add_robot_quat_linear_eq(0, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
+    # graph.add_robot_quat_linear_eq(0, 0, np.eye(4), np.array([0.0, 0.0, -1.0, 0.0]))
+    graph.add_robot_linear_eq(0, 0, A_rot_mat, default_rot_mat)
+
     graph.add_grasp_change(phi0, "grab", 0, 0);
 
     graspPhi0 = graph.add_robot_holding_cube_constraint(0, 1, 0, 0, 0.1);
 
-    phi1 = graph.add_robot_to_point_displacement_constraint(1, 0, 1, np.array([0.0, 0.0, -0.2]));
-    graph.add_robot_quat_linear_eq(1, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
+    # phi1 = graph.add_robot_to_point_displacement_constraint(1, 0, 1, np.array([0.0, 0.0, -0.2]));
+    phi1 = graph.add_point_to_point_displacement_constraint(1, 0, 1, np.array([0.0, 0.0, -0.2]), tol=0.01)
+    graph.add_robot_linear_eq(1, 0, A_rot_mat, default_rot_mat)
+
+    # graph.add_robot_quat_linear_eq(1, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
     graph.add_grasp_change(phi1, "release", 0, 0);
 
     phi2 = graph.add_robot_to_point_displacement_constraint(2, 1, 2, np.array([0.0, 0.0, -0.1]));
-    graph.add_robot_quat_linear_eq(2, 1, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
+    # graph.add_robot_quat_linear_eq(2, 1, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
     graph.add_grasp_change(phi2, "grab", 1, 2);
+    graph.add_robot_linear_eq(2, 1, A_rot_mat, default_rot_mat)
 
     graspPhi1 = graph.add_robot_holding_cube_constraint(2, 3, 1, 2, 0.1);
 
-    phi3 = graph.add_robot_to_point_displacement_constraint(3, 1, 0, np.array([0.0, 0.0, -0.2]));
-    graph.add_robot_quat_linear_eq(3, 1, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
+    # phi3 = graph.add_robot_to_point_displacement_constraint(3, 1, 0, np.array([0.0, 0.0, -0.2]));
+    phi3 = graph.add_point_to_point_displacement_constraint(3, 2, 1, np.array([0.0, 0.0, -0.2]), tol=0.01)
+    # graph.add_robot_quat_linear_eq(3, 1, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
     graph.add_grasp_change(phi3, "release", 1, 2);
+    graph.add_robot_linear_eq(3, 1, A_rot_mat, default_rot_mat)
 
     phi4 = graph.add_robot_to_point_displacement_constraint(4, 0, 1, np.array([0.0, 0.0, -0.5]));
-    graph.add_robot_quat_linear_eq(4, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
+    # graph.add_robot_quat_linear_eq(4, 0, np.eye(4), np.array([0.0, 0.0, 1.0, 0.0]))
+    graph.add_robot_linear_eq(4, 0, A_rot_mat, default_rot_mat)
 
     # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Mat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = False,
                                     time_delta_cutoff = 0.0,
-                                    phi_tolerance = 0.03)
+                                    phi_tolerance = 0.03,
+                                    max_acc = 1.0)
     return env, graph, goc_mpc
 
 
 def two_gripper_pick_and_pour():
-    env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"])
+    env = SimpleDrakeGym(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1", "cube_2"])
 
     state_lower_bound = -10.0
     state_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"],
+    graph = GraphOfConstraints(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1", "cube_2"],
                                state_lower_bound, state_upper_bound)
 
 
@@ -244,7 +256,7 @@ def two_gripper_pick_and_pour():
     joint_agent_dim = graph.num_agents * graph.dim;
     home_position_1 = np.array([0.30, -0.2, 0.5, 0.0, -0.707071, -0.707071, 0.0,
                                 1.50, -0.2, 0.5, 0.0, 0.707071, -0.707071, 0.0])
-    graph.add_robots_linear_eq(0, np.eye(joint_agent_dim), home_position_1)
+    graph.add_robots_linear_eq(start_node, np.eye(joint_agent_dim), home_position_1)
 
     # PITCHER
     pitcher_approach, pitcher_pick_up = graph.structure.add_nodes(2)
@@ -258,7 +270,7 @@ def two_gripper_pick_and_pour():
                                             w_flat=1.0)
     graph.add_robot_to_point_displacement_constraint(pitcher_approach, 0, 0, np.array([-0.20, 0.00, -0.05]));
 
-    graph.add_robot_relative_rotation_constraint(pitcher_approach, pitcher_pick_up, 0, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
+    # graph.add_robot_relative_rotation_constraint(pitcher_approach, pitcher_pick_up, 0, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
     phi1 = graph.add_robot_to_point_displacement_constraint(pitcher_pick_up, 0, 0, np.array([-0.15, 0.00, -0.04]));
     graph.add_grasp_change(phi1, "grab", 0, 0);
 
@@ -274,7 +286,7 @@ def two_gripper_pick_and_pour():
                                             w_flat=1.0)
     graph.add_robot_to_point_displacement_cost(cup_approach, 1, 1, np.array([0.25, 0.0, -0.05]))
 
-    graph.add_robot_relative_rotation_constraint(cup_approach, cup_pick_up, 1, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
+    # graph.add_robot_relative_rotation_constraint(cup_approach, cup_pick_up, 1, RollPitchYaw(0.0, 0.0, 0.0).ToQuaternion());
     phi2 = graph.add_robot_to_point_displacement_constraint(cup_pick_up, 1, 1, np.array([0.15, 0.00, -0.08]));
     graph.add_grasp_change(phi2, "grab", 1, 1);
 
@@ -294,8 +306,8 @@ def two_gripper_pick_and_pour():
                                                         [0.0, 0.0, 0.0],
                                                         [0.0, 0.0, 1.0]]), np.array([0.0, 0.0, 0.25]))
 
-    # # OR OVER ANOTHER POINT IF WANTED:
-    # # graph.add_point_to_point_displacement_cost(bring_close, 1, 2, np.array([0.0, -0.08, -0.20]));
+    # OR OVER ANOTHER POINT IF WANTED:
+    # graph.add_point_to_point_displacement_cost(bring_close, 1, 2, np.array([0.0, -0.08, -0.20]));
 
     # POUR
     pour = graph.structure.add_node()
@@ -353,22 +365,25 @@ def two_gripper_pick_and_pour():
     # graph.make_node_unpassable(4)
 
     # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Quat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = False,
                                     time_delta_cutoff = 0.0001,
-                                    phi_tolerance = 0.03)
+                                    phi_tolerance = 0.03,
+                                    acceleration_cost = 1.0,
+                                    energy_cost = 0.0,
+                                    arclength_cost = 0.0,
+                                    max_acc = 1.0)
     return env, graph, goc_mpc
 
 
 def two_gripper_fold_sheet():
-    env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1"])
+    env = SimpleDrakeGym(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1"])
 
     state_lower_bound = -10.0
     state_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0", "cube_1"],
+    graph = GraphOfConstraints(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1"],
                                state_lower_bound, state_upper_bound)
 
     # RESET
@@ -399,7 +414,7 @@ def two_gripper_fold_sheet():
     graph.add_grasp_change(trivial_phi2, "grab", 1, 1);
 
     # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Quat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = False,
                                     time_delta_cutoff = 0.0,
@@ -408,13 +423,12 @@ def two_gripper_fold_sheet():
 
 
 def two_gripper_assignable_move():
-    env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"])
+    env = SimpleDrakeGym(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1", "cube_2"])
 
     state_lower_bound = -10.0
     state_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"],
+    graph = GraphOfConstraints(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1", "cube_2"],
                                state_lower_bound, state_upper_bound)
 
     graph.structure.add_nodes(2)
@@ -433,7 +447,7 @@ def two_gripper_assignable_move():
     graph.add_point_linear_eq(1, cube, np.eye(3), np.array([0.0, 0.0, 0.1]))
 
     # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Quat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = True,
                                     time_delta_cutoff = 0.0,
@@ -442,13 +456,13 @@ def two_gripper_assignable_move():
 
 
 # def two_gripper_assignable_block_stacking():
-#     env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"])
+#     env = SimpleDrakeGym(["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1", "cube_2"])
 
 #     state_lower_bound = -10.0
 #     state_upper_bound =  10.0
 
 #     symbolic_plant = env.plant.ToSymbolic()
-#     graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0", "cube_1", "cube_2"],
+#     graph = GraphOfConstraints(symbolic_plant, ["pos_quat_0", "pos_quat_1"], ["cube_0", "cube_1", "cube_2"],
 #                                state_lower_bound, state_upper_bound)
 
 #     graph.structure.add_nodes(2)
@@ -480,20 +494,19 @@ def two_gripper_assignable_move():
 #     # phi4 = graph.add_assignable_robot_to_point_displacement_constraint(4, r1, 1, np.array([0.0, 0.0, -0.5]));
 
 #     # GoC-MPC
-#     spline_spec = [Block.R(3), Block.SO3()]
+#     spline_spec = [Block.R(3), Block.SO3Quat()]
 #     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
 #                                     time_delta_cutoff = 0.001,)
 #     return env, graph, goc_mpc
 
 
 def two_gripper_rotate_in_place():
-    env = SimpleDrakeGym(["free_body_0", "free_body_1"], ["cube_0"])
+    env = SimpleDrakeGym(["pos_quat_0", "pos_quat_1"], ["cube_0"])
 
     state_lower_bound = -10.0
     tate_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], ["cube_0"],
+    graph = GraphOfConstraints(["pos_quat_0", "pos_quat_1"], ["cube_0"],
                                state_lower_bound, state_upper_bound)
     graph.structure.add_nodes(3)
     graph.structure.add_edge(0, 1, True)
@@ -518,7 +531,7 @@ def two_gripper_rotate_in_place():
                                                         RollPitchYaw(-np.pi/4, 0.0, 0.0).ToQuaternion());
 
     # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Quat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = False,
                                     time_delta_cutoff = 0.05,
@@ -530,13 +543,12 @@ def two_gripper_rotation_test():
     meshcat = Meshcat(port=7002)
 
     # env and visualization
-    env = SimpleDrakeGym(["free_body_0", "free_body_1"], [], meshcat=meshcat)
+    env = SimpleDrakeGym(["pos_quat_0", "pos_quat_1"], [], meshcat=meshcat)
 
     state_lower_bound = -10.0
     tate_upper_bound =  10.0
 
-    symbolic_plant = env.plant.ToSymbolic()
-    graph = GraphOfConstraints(symbolic_plant, ["free_body_0", "free_body_1"], [],
+    graph = GraphOfConstraints(["pos_quat_0", "pos_quat_1"], [],
                                state_lower_bound, state_upper_bound)
 
     graph.structure.add_nodes(2)
@@ -552,7 +564,7 @@ def two_gripper_rotation_test():
     phi0 = graph.add_robots_linear_eq(1, np.eye(joint_agent_dim), goal_position_2);
 
     # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3()]
+    spline_spec = [Block.R(3), Block.SO3Quat()]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1)
     return env, graph, goc_mpc
 
@@ -611,16 +623,16 @@ def main():
 
         env._meshcat.StartRecording()
 
+        t = 0.0
+        teleport = False
+
         step = 3
         for k in range(0, 2000, step):
             x, x_dot = obs
 
-            # if k % 300 == 0:
-            #     breakpoint()
-            # time.sleep(0.5)
-
             try:
-                xi_h, _, _ = goc_mpc.step(k * dt, x, x_dot, teleport=False)
+                xi_h, xi_dot_h, times_h = goc_mpc.step(t, x, x_dot, teleport=teleport)
+
                 wp_sts.append(goc_mpc.waypoint_mpc.get_last_solve_time())
                 timing_sts.append(goc_mpc.timing_mpc.get_last_solve_time())
                 short_path_sts.append(goc_mpc.short_path_mpc.get_last_solve_time())
@@ -630,35 +642,23 @@ def main():
                 if xi_h.shape[0] > 1:
                     xi_h = xi_h[1:]
 
-            # if len(goc_mpc.remaining_phases) < 2:
-            #     breakpoint()
+            breakpoint()
 
-            # print("real cube 0 q:", x[6:9])
-            # ag0_next_node = goc_mpc.timing_mpc.get_agent_spline_nodes(0)[0]
-            # print("agent 0 next spline node:", ag0_next_node)
-            # print("agent 0 next goal:", goc_mpc.waypoint_mpc.view_waypoints()[ag0_next_node, 6:9])
-
-            # if k > 162:
-                # breakpoint()
-                # # detach grasp to see if backtracking is possible.
-                # assert "cube_0" in env._grasps
-
-                # if "cube_0" in env._grasps and not disturbed:
-                #     env.release_grasp("cube_0")
-                #     disturbed = True
-
-            # if len(goc_mpc.last_cycle_backtracked_phases) > 0:
-            #     breakpoint()
-
-            # if k % 200 == 0:
-            #     visualize_last_cycle(goc_mpc)
-                # fig = visualize_last_cycle(goc_mpc)
-                # breakpoint()
-                # input("Continue?")
-                # plt.close(fig)
-
+            # get target point on xi_h and associated time
             qpos = xi_h[step]
+            time_delta = times_h[step]
+
+            # jump to target point
             obs, rew, done, trunc, info = env.step(qpos, grasp_cmds=goc_mpc.last_grasp_commands)
+
+            # advance time by the associated time delta
+            t += time_delta
+
+            if len(goc_mpc.remaining_phases) == 0:
+                break
+
+            if teleport:
+                time.sleep(1.0)
 
         sts = np.array(wp_sts) + np.array(timing_sts) + np.array(short_path_sts)
         print("Mean Solve Time", np.mean(sts))

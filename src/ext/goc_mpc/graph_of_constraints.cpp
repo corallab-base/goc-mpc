@@ -1,20 +1,20 @@
 #include "graph_of_constraints.hpp"
+#include "../utils.hpp"
+
 
 using drake::solvers::Binding;
 using drake::solvers::Constraint;
 using drake::solvers::VectorXDecisionVariable;
 using drake::symbolic::Expression;
 using drake::math::RigidTransform;
-using drake::multibody::RigidBody;
+using drake::math::RotationMatrix;
 
 // Constructor
-GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
-				       const std::vector<std::string> robots,
+GraphOfConstraints::GraphOfConstraints(const std::vector<std::string> robots,
 				       const std::vector<std::string> objects,
 				       double global_x_lb,
 				       double global_x_ub)
-	: _plant(&plant),
-	  _robot_names(robots),
+	: _robot_names(robots),
 	  _object_names(objects),
 	  num_phis(0),
 	  num_edge_phis(0),
@@ -26,14 +26,13 @@ GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
 	  non_robot_dim(0) {
 
 	for (const std::string& s : robots) {
-		ModelInstanceIndex robot = _plant->GetModelInstanceByName(s);
-
 		int robot_qdim;
-		if (s.find("free_body") != std::string::npos) {
-			// special case because I want quaternion state space.
-			robot_qdim = 7;
+		if (s.find("pos_quat") != std::string::npos) {
+			robot_qdim = 3 + 4;
+		} else if (s.find("pos_rot_mat") != std::string::npos) {
+			robot_qdim = 3 + 9;
 		} else {
-			robot_qdim = _plant->num_actuated_dofs(robot);
+			throw std::runtime_error("Only supporting 'pos_quat' and 'pos_rot_mat' robots.");
 		}
 
 		if (dim == 0) {
@@ -43,17 +42,8 @@ GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
 		}
 	}
 
-	for (const std::string& s : objects) {
-		ModelInstanceIndex obj = _plant->GetModelInstanceByName(s);
-		/* silly check because these should be 3dof points, but whatever */
-		int obj_qdim = _plant->num_positions(obj);
-		int obj_qddim = _plant->num_velocities(obj);
-		if (non_robot_dim == 0 && obj_qdim == obj_qddim) {
-			non_robot_dim = obj_qdim;
-		} else if (non_robot_dim != obj_qdim) {
-			throw std::runtime_error("Only supporting objects with the same dimension.");
-		}
-	}
+	// Only supporting other 3D points in state space.
+	non_robot_dim = 3;
 
 	total_dim = num_agents * dim + num_objects * non_robot_dim;
 
@@ -62,8 +52,13 @@ GraphOfConstraints::GraphOfConstraints(MultibodyPlant<Expression>& plant,
 
 	int i = 0;
 	for (int ag = 0; ag < num_agents; ++ag) {
-		if (robot_is_free_body(ag)) {
-			for (int j = i+3; j < i+7; ++j) {
+		if (robot_is_pos_quat(ag)) {
+			for (int j = i+3; j < i+3+4; ++j) {
+				_global_x_lb(j) = -1;
+				_global_x_ub(j) = 1;
+			}
+		} else if (robot_is_pos_rot_mat(ag)) {
+			for (int j = i+3; j < i+3+9; ++j) {
 				_global_x_lb(j) = -1;
 				_global_x_ub(j) = 1;
 			}
@@ -93,7 +88,15 @@ int GraphOfConstraints::add_variable()
 }
 
 bool GraphOfConstraints::robot_is_free_body(int ag) const {
-	return _robot_names.at(ag).find("free_body") != std::string::npos;
+	return robot_is_pos_quat(ag) || robot_is_pos_rot_mat(ag);
+}
+
+bool GraphOfConstraints::robot_is_pos_quat(int ag) const {
+	return _robot_names.at(ag).find("pos_quat") != std::string::npos;
+}
+
+bool GraphOfConstraints::robot_is_pos_rot_mat(int ag) const {
+	return _robot_names.at(ag).find("pos_rot_mat") != std::string::npos;
 }
 
 std::tuple<std::vector<std::optional<int>>,
@@ -664,7 +667,8 @@ int GraphOfConstraints::add_robot_quat_linear_eq(int k, int robot_id, const Eige
 				       const auto&) {
 				     const int node_k = subgraph.subgraph_id(k);
 				     VectorXDecisionVariable agent_quat_k = X.row(node_k).segment(robot_id*dim + 3, 4);
-				     auto beq = prog.AddLinearEqualityConstraint(A, b, agent_quat_k);
+				     prog.AddLinearEqualityConstraint(A, b, agent_quat_k)
+					     .evaluator()->set_description(fmt::format("robot {} quaternion constraint", robot_id));
 			     });
 
 	// record that this constraint is statically assigned to this robot.
@@ -841,96 +845,6 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 				  });
 }
 
-template <typename T>
-void GraphOfConstraints::set_configuration(
-	std::unique_ptr<drake::systems::Context<T>>& context,
-	const Eigen::VectorX<T>& q_all) const {
-
-	using drake::multibody::JointIndex;
-	using drake::multibody::ModelInstanceIndex;
-	using drake::math::RollPitchYaw;
-
-	// VectorX<T> q = plant->GetPositions(*context);
-
-	// for (ModelInstanceIndex i : plant ->
-	int i = 0;
-	for (std::string r_name : _robot_names) {
-		const auto& mi = _plant->GetModelInstanceByName(r_name);
-
-		if (r_name.find("free_body") != std::string::npos) {
-
-
-			// Eigen::Vector3<T> p_W;
-			// p_W << q_all.segment(i, 3);
-			// i += 3;
-
-			// const T w = q_all(i + 0);
-			// const T x = q_all(i + 1);
-			// const T y = q_all(i + 2);
-			// const T z = q_all(i + 3);
-			// i += 4;
-
-			// // Normalize without branches (smooth except at norm2 = 0).
-			// const T norm2 = w*w + x*x + y*y + z*z;
-			// // Strongly recommend: add equality constraint norm2 == 1 in the program.
-			// const T s  = T(1) / norm2;   // 1 / |q|^2
-			// const T s2 = T(2) * s;       // 2 / |q|^2
-
-			// Eigen::Matrix<T,3,3> Rm;
-			// Rm(0,0) = T(1) - s2*(y*y + z*z);
-			// Rm(0,1) =       s2*(x*y - w*z);
-			// Rm(0,2) =       s2*(x*z + w*y);
-
-			// Rm(1,0) =       s2*(x*y + w*z);
-			// Rm(1,1) = T(1) - s2*(x*x + z*z);
-			// Rm(1,2) =       s2*(y*z - w*x);
-
-			// Rm(2,0) =       s2*(x*z - w*y);
-			// Rm(2,1) =       s2*(y*z + w*x);
-			// Rm(2,2) = T(1) - s2*(x*x + y*y);
-
-			// drake::math::RotationMatrix<T> R_WB(Rm);
-			// const drake::math::RigidTransform<T> X_WB(R_WB, p_W);
-
-			// const auto& body = _plant->GetBodyByName("ee_link", mi);
-			// _plant->SetFreeBodyPose(context.get(), body, X_WB);
-
-			Eigen::Vector3<T> p_W;
-			p_W << q_all.segment(i, 3);
-			i+=3;
-
-			// w, x, y, z
-			Eigen::Quaternion<T> q_W(q_all(i), q_all(i+1), q_all(i+2), q_all(i+3));
-			i+=4;
-
-			// Pick the actual free base body in this model instance.
-			const auto& body = _plant->GetBodyByName("ee_link", mi);
-
-			const RigidTransform<T> X_WB(q_W, p_W);
-			_plant->SetFreeBodyPose(context.get(), body, X_WB);
-		} else {
-			const std::vector<JointIndex> joint_indices = _plant->GetActuatedJointIndices(mi);
-			for (JointIndex j : joint_indices) {
-				const auto& joint = _plant->get_joint(j);
-				DRAKE_DEMAND(joint.num_positions() == 1);  // Only supporting 1-dof joints
-				// Set position for this joint in context.
-				joint.SetPositions(context.get(), q_all.segment(i, 1));
-				i++;
-			}
-		}
-	}
-
-	DRAKE_DEMAND(i == num_agents * dim);
-
-	for (std::string o_name : _object_names) {
-		const auto& mi = _plant->GetModelInstanceByName(o_name);
-		_plant->SetPositions(context.get(), mi, q_all.segment(i, non_robot_dim));
-		i += non_robot_dim;
-	}
-
-	DRAKE_DEMAND(i == total_dim);
-}
-
 int GraphOfConstraints::add_robot_above_cube_constraint(
 	int k,
 	int robot_id, // std::string robot_model_name,
@@ -944,43 +858,21 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 	// DRAKE_DEMAND(cube_i >= 0 && cube_i < num_objects);
 	// If you track num_objects, you can also check cube_i bounds here.
 
-	const std::string& robot_model_name = _robot_names.at(robot_id);
-	const std::string& cube_model_name = _object_names.at(cube_id);
-
-	const ModelInstanceIndex robot_mi = _plant->GetModelInstanceByName(robot_model_name);
-	const ModelInstanceIndex cube_mi  = _plant->GetModelInstanceByName(cube_model_name);
-
 	int phi_id = _add_op(DeferredOpKind::kNonlinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
 				       const int... /*unused*/) {
 
-				     using drake::math::RigidTransform;
-				     using drake::symbolic::Evaluate;
+				     auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
+				     auto p_WC = CubePosFromRow(this, cube_id, x);
 
-				     const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
-				     const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
+				     Eigen::Vector3d g;
+				     g << (p_WR(0) - p_WC(0) - x_offset),
+					     (p_WR(1) - p_WC(1) - y_offset),
+					     (p_WR(2) - p_WC(2) - delta_z);
 
-				     Eigen::VectorX<Expression> q_all = x.cast<Expression>();
-
-				     auto context = _plant->CreateDefaultContext();
-				     set_configuration(context, q_all);
-
-				     const RigidTransform<Expression> X_WR =
-					     _plant->EvalBodyPoseInWorld(*context, robot_body);
-				     const RigidTransform<Expression> X_WC =
-					     _plant->EvalBodyPoseInWorld(*context, cube_body);
-
-				     // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
-				     Eigen::Vector3<Expression> g;
-				     g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
-					     (X_WR.translation().y() - X_WC.translation().y() - y_offset),
-					     (X_WR.translation().z() - X_WC.translation().z() - delta_z);
-
-				     // dp_expr has no free symbols (only constants), so Evaluate(...) -> double works.
 				     double violation = 0.0;
 				     for (int i = 0; i < 3; ++i) {
-					     const double gi = g[i].Evaluate();
-					     violation = std::max(violation, std::abs(gi));
+					     violation = std::max(violation, std::abs(g(i)));
 				     }
 				     return violation;
 			     },
@@ -990,9 +882,6 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 				       const auto& X,
 				       const auto&... /*unused*/) {
 
-				     using drake::multibody::JointIndex;
-				     using drake::systems::Context;
-
 				     const int node_k = subgraph.subgraph_id(k);
 
 				     // Convert X[row] decision variables to Expressions.
@@ -1001,23 +890,13 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 					     q_all(j) = Expression(X(node_k, j));
 				     }
 
-				     // Context<Expression> with these positions.
-				     auto context = _plant->CreateDefaultContext();
-				     set_configuration(context, q_all);
+				     auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", q_all);
+				     auto p_WC = CubePosFromRow(this, cube_id, q_all);
 
-				     // World poses of each model's body.
-				     const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
-				     const auto& cube_body  = _plant->GetBodyByName("cb_body", cube_mi);
-				     const RigidTransform<Expression> X_WR =
-					     _plant->EvalBodyPoseInWorld(*context, robot_body);
-				     const RigidTransform<Expression> X_WC =
-					     _plant->EvalBodyPoseInWorld(*context, cube_body);
-
-				     // g(q) = [x_r - x_c, y_r - y_c, z_r - z_c - Δz] = 0
 				     Eigen::Vector3<Expression> g;
-				     g << (X_WR.translation().x() - X_WC.translation().x() - x_offset),
-					     (X_WR.translation().y() - X_WC.translation().y() - y_offset),
-					     (X_WR.translation().z() - X_WC.translation().z() - delta_z);
+				     g << (p_WR(0) - p_WC(0) - x_offset),
+					     (p_WR(1) - p_WC(1) - y_offset),
+					     (p_WR(2) - p_WC(2) - delta_z);
 
 				     prog.AddConstraint(g, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 			     }
@@ -1213,19 +1092,12 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 				     auto sqhinge = [&](double a){ const double h = hinge(a); return h*h; };
 
 				     // --- Extract pose & point from the numeric state ---
-				     Vector3d p_WE;
-				     Matrix3d R_WE;
-				     {
-					     // robot pose at node k
-					     const int robot_offset = robot_start;  // already captured from outer scope
-					     PoseFromRow_FreeBody<double>(x, robot_offset, &p_WE, &R_WE);
-				     }
-
-				     const Vector3d p_WP = x.segment(objs_start + point_id * non_robot_dim, 3);
+				     auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", x);
+				     auto p_WC = CubePosFromRow(this, point_id, x);
 
 				     // --- Build r, d ---
 				     const Vector3d r = R_WE * ee_ray_body;    // body ray in world
-				     const Vector3d d = p_WP - p_WE;           // displacement to target
+				     const Vector3d d = p_WC - p_WE;           // displacement to target
 
 				     double residual = 0.0;
 
@@ -1287,18 +1159,14 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 			     [=, this](auto& prog, const SubgraphOfConstraints& subgraph, const int /*phi_id*/,
 				       const auto& X, const auto&...) {
 				     const unsigned int node_k = subgraph.subgraph_id(k);
-				     Eigen::RowVectorX<Expression> row = AsExprRow(X.row(node_k));
+				     Eigen::Matrix<Expression, Eigen::Dynamic, 1> row = X.row(node_k);
 
-				     Eigen::Matrix<Expression,3,1> p_WE;
-				     Eigen::Matrix<Expression,3,3> R_WE;
-				     PoseFromRow_FreeBody<Expression>(row, robot_start, &p_WE, &R_WE);
-
-				     const Eigen::Matrix<Expression,3,1> p_WP =
-					     PointWorldFromRow(row, objs_start, non_robot_dim, point_id);
+				     auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", row);
+				     auto p_WC = CubePosFromRow(this, point_id, row);
 
 				     // r = R * v_b, d = P - E
 				     Eigen::Matrix<Expression,3,1> r = R_WE * ee_ray_body;
-				     Eigen::Matrix<Expression,3,1> d = p_WP - p_WE;
+				     Eigen::Matrix<Expression,3,1> d = p_WC - p_WE;
 
 				     // (1) Point-at: r × d = 0
 				     auto rc = r.cross(d);
@@ -1377,13 +1245,11 @@ int GraphOfConstraints::add_robot_to_point_alignment_cost(
 		using Eigen::Vector3d; using Eigen::Matrix3d;
 
 		// Pose at node k
-		Vector3d p_WE; Matrix3d R_WE;
-		PoseFromRow_FreeBody<double>(x, robot_start, &p_WE, &R_WE);
-
-		const Vector3d p_WP = x.segment(objs_start + point_id * non_robot_dim, 3);
+		auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", x);
+		auto p_WC = CubePosFromRow(this, point_id, x);
 
 		const Vector3d r = R_WE * ee_ray_body;       // body ray in world
-		const Vector3d d = p_WP - p_WE;
+		const Vector3d d = p_WC - p_WE;
 		const double d2 = d.squaredNorm();
 		const double r_dot_d = r.dot(d);
 
@@ -1416,7 +1282,6 @@ int GraphOfConstraints::add_robot_to_point_alignment_cost(
 		else if (roll_ref_flat && u_body_opt) {
 			const Vector3d& u_b = *u_body_opt;
 			const Vector3d u = R_WE * u_b;
-			std::cout << "u.z(): " << u.z() << std::endl;
 			J += w_flat * (u.z() * u.z());
 		}
 
@@ -1434,18 +1299,13 @@ int GraphOfConstraints::add_robot_to_point_alignment_cost(
 				 const auto& X, const auto&...) {
 		using drake::symbolic::Expression;
 		const unsigned int node_k = subgraph.subgraph_id(k);
-		Eigen::RowVectorX<Expression> row = AsExprRow(X.row(node_k));
+		Eigen::Matrix<Expression, Eigen::Dynamic, 1> row = X.row(node_k);
 
-		// Pose
-		Eigen::Matrix<Expression,3,1> p_WE;
-		Eigen::Matrix<Expression,3,3> R_WE;
-		PoseFromRow_FreeBody<Expression>(row, robot_start, &p_WE, &R_WE);
-
-		const Eigen::Matrix<Expression,3,1> p_WP =
-			PointWorldFromRow(row, objs_start, non_robot_dim, point_id);
+		auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", row);
+		auto p_WC = CubePosFromRow(this, point_id, row);
 
 		const Eigen::Matrix<Expression,3,1> r = R_WE * ee_ray_body;
-		const Eigen::Matrix<Expression,3,1> d = p_WP - p_WE;
+		const Eigen::Matrix<Expression,3,1> d = p_WC - p_WE;
 
 		Expression d2 = d.dot(d);
 		Expression r_dot_d = r.dot(d);
@@ -1664,22 +1524,14 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
 	// If you track num_objects, you can also check cube_i bounds here.
 
-	const std::string& robot_model_name = _robot_names.at(robot_id);
-	const std::string& cube_model_name = _object_names.at(point_id);
-
-	const ModelInstanceIndex robot_mi = _plant->GetModelInstanceByName(robot_model_name);
-	const ModelInstanceIndex cube_mi  = _plant->GetModelInstanceByName(cube_model_name);
-
-	const int robot_start = robot_id * dim;
-	const int objs_start = num_agents * dim;
-	const int point_start = objs_start + point_id * non_robot_dim;
-
 	int edge_phi_id = _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({point_id}),
 			    [=, this](const Eigen::VectorXd& x,
 				      const Eigen::VectorXi&/*unused*/) {
-				    Eigen::Vector3d p_WE = x.segment(robot_start, 3);
-				    Eigen::Vector3d p_WP = x.segment(point_start, 3);
-				    Eigen::Vector3d r = (p_WP - p_WE);
+
+				    auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
+				    auto p_WC = CubePosFromRow(this, point_id, x);
+
+				    Eigen::Vector3d r = (p_WC - p_WR);
 
 				    double violation = 0.0;
 				    if (use_l2) {
@@ -1696,26 +1548,15 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				      const drake::solvers::MatrixXDecisionVariable& X,
 				      const drake::solvers::MatrixXDecisionVariable& /*unused*/,
 				      const Eigen::VectorXd& x_u) {
-				    using drake::math::RigidTransform;
-
-				    const auto& robot_body = _plant->GetBodyByName("ee_link", robot_mi);
-				    const auto& cube_body  = _plant->GetBodyByName("cb_body",  cube_mi);
-
-				    Eigen::VectorX<Expression> q_all(total_dim);
 
 				    const double d = holding_distance_max;
 				    auto add_box_proximity = [&](int graph_row) {
-					    for (int j = 0; j < total_dim; ++j) q_all(j) = Expression(X(graph_row, j));
+					    Eigen::VectorX<Expression> q = X.row(graph_row);
 
-					    auto context = _plant->CreateDefaultContext();
-					    set_configuration(context, q_all);
+					    auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", q);
+					    auto p_WC = CubePosFromRow(this, point_id, q);
 
-					    const RigidTransform<Expression> X_WR =
-						    _plant->EvalBodyPoseInWorld(*context, robot_body);
-					    const RigidTransform<Expression> X_WC =
-						    _plant->EvalBodyPoseInWorld(*context, cube_body);
-
-					    const Eigen::Vector3<Expression> dp = X_WR.translation() - X_WC.translation();
+					    const Eigen::Vector3<Expression> dp = p_WR - p_WC;
 
 					    // Box: |dx| <= d, |dy| <= d, |dz| <= d  (no squares, no quadratic)
 					    for (int i = 0; i < 3; ++i) {

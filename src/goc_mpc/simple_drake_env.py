@@ -123,7 +123,7 @@ class SimpleDrakeGym:
         for name in self._controlled_names:
             if "point_mass" in name:
                 mis = parser.AddModels(str(robot_path))
-            elif "free_body" in name:
+            elif "free_body" in name or "pos_quat" in name or "pos_rot_mat" in name:
                 mis = parser.AddModels(str(free_body_robot_path))
             elif "ur5e" in name:
                 mis = parser.AddModels(str(ur5e_robot_path))
@@ -153,7 +153,7 @@ class SimpleDrakeGym:
         self._context = self._diagram.CreateDefaultContext()
         self.plant_context = self.plant.GetMyMutableContextFromRoot(self._context)
         self._sim = Simulator(self._diagram, context=self._context)
-        self._sim.set_publish_every_time_step(False)
+        # self._sim.set_publish_every_time_step(False)
 
         # --- Sizes for obs/action bookkeeping (same as before) ---
         self._passive_nq = [self.plant.num_positions(mi) for mi in self._passive]
@@ -216,10 +216,17 @@ class SimpleDrakeGym:
 
     def _get_model_q(self, name):
         mi = self.plant.GetModelInstanceByName(name)
-        if "free_body" in name:
+        if "free_body" in name or "pos_quat" in name:
             body = self.plant.GetBodyByName("ee_link", mi)
             pose = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
             return np.concatenate((pose.translation(), pose.rotation().ToQuaternion().wxyz()))
+        elif "pos_rot_mat" in name:
+            body = self.plant.GetBodyByName("ee_link", mi)
+            pose = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
+            return np.concatenate((pose.translation(),
+                                   pose.rotation().row(0),
+                                   pose.rotation().row(1),
+                                   pose.rotation().row(2)))
         elif "cube" in name:
             return self.plant.GetPositions(self.plant_context, mi)
         else:
@@ -232,7 +239,11 @@ class SimpleDrakeGym:
 
     def _get_model_qdot(self, name):
         mi = self.plant.GetModelInstanceByName(name)
-        if "free_body" in name:
+        if "free_body" in name or "pos_quat" in name:
+            body = self.plant.GetBodyByName("ee_link", mi)
+            spatial_velocity = self.plant.EvalBodySpatialVelocityInWorld(self.plant_context, body)
+            return np.concatenate((spatial_velocity.translational(), spatial_velocity.rotational()))
+        elif "pos_rot_mat" in name:
             body = self.plant.GetBodyByName("ee_link", mi)
             spatial_velocity = self.plant.EvalBodySpatialVelocityInWorld(self.plant_context, body)
             return np.concatenate((spatial_velocity.translational(), spatial_velocity.rotational()))
@@ -265,12 +276,20 @@ class SimpleDrakeGym:
     def _get_q_dim(self, name):
         if "free_body" in name:
             return 7
+        elif "pos_quat" in name:
+            return 3+4
+        elif "pos_rot_mat" in name:
+            return 3+9
         else:
             mi = self.plant.GetModelInstanceByName(name)
             return self.plant.get_actuated_dofs(mi)
 
     def _get_qdot_dim(self, name):
         if "free_body" in name:
+            return 6
+        elif "pos_quat" in name:
+            return 6
+        elif "pos_rot_mat" in name:
             return 6
         else:
             mi = self.plant.GetModelInstanceByName(name)
@@ -294,15 +313,25 @@ class SimpleDrakeGym:
 
     def _set_model_q(self, name, q):
         mi = self.plant.GetModelInstanceByName(name)
-        if "free_body" in name:
+        if "free_body" in name or "pos_quat" in name:
             # Interpret q as [x y z w x y z]
             x_W = q[:3]
-            q_W = Quaternion(q[3:])
+            q_W = Quaternion(q[3:] / np.linalg.norm(q[3:]))
 
             # Pick the actual free base body in this model instance.
             body = self.plant.GetBodyByName("ee_link", mi)
 
             X_WB = RigidTransform(q_W, x_W)
+            self.plant.SetFreeBodyPose(self.plant_context, body, X_WB)
+        elif "pos_rot_mat" in name:
+            # Interpret q as [x y z r00 r01 r02 r10 r11 r12 r20 r21 r22]
+            x_W = q[:3]
+            R_W = RotationMatrix(q[3:].reshape(3, 3))
+
+            # Pick the actual free base body in this model instance.
+            body = self.plant.GetBodyByName("ee_link", mi)
+
+            X_WB = RigidTransform(R_W, x_W)
             self.plant.SetFreeBodyPose(self.plant_context, body, X_WB)
         elif "cube" in name:
             return self.plant.SetPositions(self.plant_context, mi, q)
@@ -571,11 +600,22 @@ class SimpleDrakeGym:
         qdot = []
         for name in self._controlled_names:
             mi = self.plant.GetModelInstanceByName(name)
-            if "free_body" in name:
+            if "free_body" in name or "pos_quat" in name:
                 body = self.plant.GetBodyByName("ee_link", mi)
                 X_WE = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
                 q.append(X_WE.translation())
                 q.append(X_WE.rotation().ToQuaternion().wxyz())
+
+                Xdot_WE = self.plant.EvalBodySpatialVelocityInWorld(self.plant_context, body)
+                qdot.append(Xdot_WE.translational())
+                qdot.append(Xdot_WE.rotational())
+            elif "pos_rot_mat" in name:
+                body = self.plant.GetBodyByName("ee_link", mi)
+                X_WE = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
+                q.append(X_WE.translation())
+                q.extend([X_WE.rotation().row(0),
+                          X_WE.rotation().row(1),
+                          X_WE.rotation().row(2)])
 
                 Xdot_WE = self.plant.EvalBodySpatialVelocityInWorld(self.plant_context, body)
                 qdot.append(Xdot_WE.translational())

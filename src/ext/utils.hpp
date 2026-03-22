@@ -5,6 +5,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
+#include "goc_mpc/graph_of_constraints.hpp"
+
 using drake::symbolic::Expression;
 using drake::symbolic::Variable;
 using namespace pybind11::literals;
@@ -47,20 +49,29 @@ RotFromQuatBranchless(const T& w,
 	return R;
 }
 
-// Extract pose (position + quaternion rotation) from a row vector.
-// `row` must contain at least 7 elements starting at `robot_offset`:
-// [px, py, pz, qw, qx, qy, qz].
 template <typename T>
-void PoseFromRow_FreeBody(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
-                          int robot_offset,
-                          Eigen::Matrix<T,3,1>* p_WE,
-                          Eigen::Matrix<T,3,3>* R_WE) {
-	*p_WE = row.template segment<3>(robot_offset + 0);
+std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+PoseFromRow_PosQuat(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
+		   int robot_offset) {
+	Eigen::Matrix<T,3,1> p_WE = row.template segment<3>(robot_offset + 0);
 	const T& w = row(robot_offset + 3);
 	const T& x = row(robot_offset + 4);
 	const T& y = row(robot_offset + 5);
 	const T& z = row(robot_offset + 6);
-	*R_WE = RotFromQuatBranchless<T>(w,x,y,z);
+	Eigen::Matrix<T,3,3> R_WE = RotFromQuatBranchless<T>(w,x,y,z);
+	return std::make_pair(p_WE, R_WE);
+}
+
+template <typename T>
+std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+PoseFromRow_PosRotMatrix(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
+			int robot_offset) {
+	Eigen::Matrix<T,3,1> p_WE = row.template segment<3>(robot_offset + 0);
+	Eigen::Matrix<T,3,3> R_WE;
+	R_WE << row(robot_offset + 3), row(robot_offset + 4), row(robot_offset + 5),
+		row(robot_offset + 6), row(robot_offset + 7), row(robot_offset + 8),
+		row(robot_offset + 9), row(robot_offset + 10), row(robot_offset + 11);
+	return std::make_pair(p_WE, R_WE);
 }
 
 // Templated row→Expression helper (safe for Eigen blocks).
@@ -79,7 +90,49 @@ Eigen::Vector3<Expression> PointWorldFromRow(
 	return row.segment(objs_start + obj_id * non_robot_dim, 3).transpose();
 }
 
-// World position of a "point" from x0 (as Expression).
-Eigen::Vector3<Expression> PointWorldFromX0(
-	const Eigen::VectorXd& x0,
-	int objs_start, int non_robot_dim, int obj_id);
+template <typename T>
+Eigen::Vector3<T>
+CubePosFromRow(const struct GraphOfConstraints* graph,
+	       const int cube_index,
+	       const Eigen::Matrix<T,Eigen::Dynamic,1>& q) {
+	const int cube_pos_offset = graph->num_agents * graph->dim + cube_index * graph->non_robot_dim;
+	return q.segment(cube_pos_offset, 3);
+}
+
+template <typename T>
+std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+PoseFromRow(const struct GraphOfConstraints* graph,
+	    const int agent_index,
+	    const std::string ee_frame_name,
+	    const Eigen::Matrix<T,Eigen::Dynamic,1>& q) {
+
+	const int agent_config_offset = agent_index * graph->dim;
+
+	if (graph->robot_is_pos_quat(agent_index)) {
+		return PoseFromRow_PosQuat(q, agent_config_offset);
+	} else if (graph->robot_is_pos_rot_mat(agent_index)) {
+		return PoseFromRow_PosRotMatrix(q, agent_config_offset);
+	} else {
+		// const MultibodyPlant<T> *plant;
+
+		// if constexpr (std::is_same_v<T, Expression>) {
+		// 	plant = graph->_plant.get();
+		// } else {
+		// 	plant = graph->_double_plant.get();
+		// }
+
+		// auto ctx = plant->CreateDefaultContext();
+		// graph->set_configuration(ctx, q);
+
+		// const auto& W = plant->world_frame();
+		// const auto& E = plant->GetFrameByName(
+		// 	ee_frame_name,
+		// 	plant->GetModelInstanceByName(
+		// 		graph->_robot_names.at(agent_index)));
+
+		// const auto X_WE = plant->CalcRelativeTransform(*ctx, W, E);
+
+		// return std::make_pair(X_WE.translation(), X_WE.rotation().matrix());
+		throw std::runtime_error("Only supporting 'pos_quat' and 'pos_rot_mat' robots.");
+	}
+}

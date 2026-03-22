@@ -11,8 +11,6 @@
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
 #include <drake/solvers/solve.h>
-#include <drake/multibody/plant/multibody_plant.h>
-#include <drake/multibody/tree/multibody_tree_indexes.h>
 #include <drake/math/quaternion.h>
 
 #include <pybind11/pybind11.h>
@@ -20,13 +18,10 @@
 #include <pybind11/eigen.h>
 
 #include "../graphs.hpp"
-#include "../utils.hpp"
 
 using drake::solvers::Binding;
 using drake::solvers::Constraint;
 using drake::symbolic::Expression;
-using drake::multibody::MultibodyPlant;
-using drake::multibody::ModelInstanceIndex;
 using namespace pybind11::literals;
 namespace py = pybind11;
 
@@ -101,7 +96,6 @@ struct AgentInteraction {
 
 struct GraphOfConstraints {
 
-	std::shared_ptr<MultibodyPlant<Expression>> _plant;
 	const std::vector<std::string> _robot_names;
 	const std::vector<std::string> _object_names;
 	Graph<py::object> structure;
@@ -137,8 +131,7 @@ struct GraphOfConstraints {
 	// 		   const Eigen::VectorXd& global_x_lb,
 	// 		   const Eigen::VectorXd& global_x_ub);
 
-	GraphOfConstraints(MultibodyPlant<Expression>& plant,
-			   const std::vector<std::string> robots,
+	GraphOfConstraints(const std::vector<std::string> robots,
 			   const std::vector<std::string> objects,
 			   double global_x_lb,
 			   double global_x_ub);
@@ -146,6 +139,10 @@ struct GraphOfConstraints {
 	int add_variable();
 
 	bool robot_is_free_body(int ag) const;
+
+	bool robot_is_pos_quat(int ag) const;
+
+	bool robot_is_pos_rot_mat(int ag) const;
 
 	Graph<py::object> get_structure() const { return structure; }
 
@@ -294,11 +291,6 @@ struct GraphOfConstraints {
 							  int var,
 							  int point_id,
 							  double holding_distance_max = 0.1);
-
-	template <typename T>
-	void set_configuration(
-		std::unique_ptr<drake::systems::Context<T>>& context,
-		const Eigen::VectorX<T>& q_all) const;
 
 private:
 

@@ -94,18 +94,11 @@ inline Eigen::Vector3d M_exact_edge_componentwise(
 	return Eigen::Vector3d::Constant(Mscalar);
 }
 
-// === NEW: single-vertex rigidity anchored to x0 ===
-//
-// Enforce for node v:
-//   R_WE(v)^T (p_WP(v) - p_WE(v))  ==  R_WE(x0)^T (p_WP(x0) - p_WE(x0))
-//
-// This adds 3 equality constraints per held point.
 static void AddHoldRigidityStaticToX0(
-	MathematicalProgram* prog,
+	MathematicalProgram& prog,
 	const SubgraphOfConstraints& subgraph,
 	const GraphOfConstraints* graph,
-	const drake::multibody::MultibodyPlant<Expression>& plant,
-	const drake::solvers::MatrixXDecisionVariable& X,
+	const MatrixXDecisionVariable& X,
 	int v,                               // vertex id in the ORIGINAL graph
 	const HoldSpec& spec,
 	int robot_dim,
@@ -116,37 +109,11 @@ static void AddHoldRigidityStaticToX0(
 
 	const int sg_v = subgraph.subgraph_id(v);
 
-	Eigen::VectorX<drake::symbolic::Expression> x0_expr =
-		x0.template cast<drake::symbolic::Expression>();
-	Eigen::VectorX<drake::symbolic::Expression> X_v_expr =
-		X.row(sg_v).template cast<drake::symbolic::Expression>();
+	Eigen::Matrix<Expression, Eigen::Dynamic, 1> x0_expr = x0.template cast<Expression>();
+	Eigen::Matrix<Expression, Eigen::Dynamic, 1> X_v_expr = X.row(sg_v).template cast<Expression>();
 
-	Eigen::Matrix<Expression,3,1> p_WE_0, p_WE_v;
-	Eigen::Matrix<Expression,3,3> R_WE_0, R_WE_v;
-
-	if (graph->robot_is_free_body(spec.robot_ag)) {
-		const int rob_off = spec.robot_ag * robot_dim;
-		PoseFromRow_FreeBody(x0_expr, rob_off, &p_WE_0, &R_WE_0);
-		PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);
-	} else {
-		// Build contexts: one from v (variables) and one from x0 (constants).
-		auto ctx_0  = plant.CreateDefaultContext();
-		auto ctx_v  = plant.CreateDefaultContext();
-		graph->set_configuration(ctx_0, x0_expr);
-		graph->set_configuration(ctx_v, X_v_expr);
-
-		const auto& W = plant.world_frame();
-		const auto& E = plant.GetFrameByName(spec.ee_frame_name,
-						     plant.GetModelInstanceByName(graph->_robot_names.at(spec.robot_ag)));
-
-		const auto X_WE_0 = plant.CalcRelativeTransform(*ctx_0, W, E);
-		const auto X_WE_v = plant.CalcRelativeTransform(*ctx_v, W, E);
-
-		p_WE_0 = X_WE_0.translation();
-		p_WE_v = X_WE_v.translation();
-		R_WE_0 = X_WE_0.rotation().matrix();
-		R_WE_v = X_WE_v.rotation().matrix();
-	}
+	auto [p_WE_0, R_WE_0] = PoseFromRow<Expression>(graph, spec.robot_ag, spec.ee_frame_name, x0_expr);
+	auto [p_WE_v, R_WE_v] = PoseFromRow<Expression>(graph, spec.robot_ag, spec.ee_frame_name, X_v_expr);
 
 	if (exact_rigidity) {
 		for (int obj_id : spec.held_point_ids) {
@@ -160,10 +127,23 @@ static void AddHoldRigidityStaticToX0(
 			const Eigen::Matrix<Expression,3,1> rel_v =
 				R_WE_v.transpose() * (p_WP_v - p_WE_v);
 
-			prog->AddConstraint(rel_0 - rel_v,
-					    Eigen::Vector3d::Constant(3, -0.01),
-					    Eigen::Vector3d::Constant(3, 0.01))
-				.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
+
+			if (graph->robot_is_pos_rot_mat(spec.robot_ag)) {
+				// If the rotation matrix is directly
+				// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
+				for (int i = 0; i < 3; ++i) {
+					prog.AddQuadraticConstraint(rel_0(i) - rel_v(i), -0.001, 0.001)
+						.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
+				}
+			} else {
+				prog.AddConstraint(rel_0 - rel_v,
+						   Eigen::Vector3d::Constant(3, -0.001),
+						   Eigen::Vector3d::Constant(3, 0.001))
+					.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
+			}
+
+
+
 		}
 	} else {
 		for (size_t i = 0; i < spec.held_point_ids.size(); ++i) {
@@ -183,7 +163,7 @@ static void AddHoldRigidityStaticToX0(
 				const Eigen::Matrix<Expression,3,1> d_0 = p_i_0 - p_j_0;
 				const Eigen::Matrix<Expression,3,1> d_v = p_i_v - p_j_v;
 				Expression e = d_v.squaredNorm() - d_0.squaredNorm();
-				prog->AddQuadraticConstraint(e, 0.0, 0.0)
+				prog.AddQuadraticConstraint(e, 0.0, 0.0)
 					.evaluator()->set_description(fmt::format("-1->{} p2p distance rigidity", v));
 			}
 		}
@@ -199,18 +179,20 @@ static void AddHoldRigidityStaticToX0(
 			const Eigen::Matrix<Expression,3,1> d_v = p_WP_v - p_WE_v;
 
 			Expression e = d_v.squaredNorm() - d_0.squaredNorm();
-			prog->AddQuadraticConstraint(e, 0.0, 0.0)
+			prog.AddQuadraticConstraint(e, 0.0, 0.0)
 				.evaluator()->set_description("-1->v r2p distance rigidity");
 		}
 	}
 }
 
-// Add 3 equality constraints for each held point: R^T(p_P - p_E) (u) == same (v).
+// Add 3 equality constraints for each held point: R^T(p_P - p_E) (u) == R^T(p_P - p_E) (v).
+// (I.e., Undoing the end effector rotation on the vector between the point and
+// the end effector at node u yields the same as undoing the end effector
+// rotation on the vector between the point and the end effector at node v.)
 static void AddHoldRigidityStatic(
-	MathematicalProgram* prog,
+	MathematicalProgram& prog,
 	const SubgraphOfConstraints& subgraph,
 	const GraphOfConstraints* graph,
-	const drake::multibody::MultibodyPlant<Expression>& plant,
 	const MatrixXDecisionVariable& X,
 	int u, int v,                         // graph vertex ids in the *original* graph
 	const HoldSpec& spec,
@@ -223,42 +205,14 @@ static void AddHoldRigidityStatic(
 	const int sg_u = subgraph.subgraph_id(u);
 	const int sg_v = subgraph.subgraph_id(v);
 
-	// Build contexts for u and v with q filled from X
-	auto ctx_u = plant.CreateDefaultContext();
-	auto ctx_v = plant.CreateDefaultContext();
-
         // Cast Variables -> Expressions and materialize as owning row vectors.
 	Eigen::VectorX<drake::symbolic::Expression> X_u_expr =
 		X.row(sg_u).template cast<drake::symbolic::Expression>();
 	Eigen::VectorX<drake::symbolic::Expression> X_v_expr =
 		X.row(sg_v).template cast<drake::symbolic::Expression>();
 
-	Eigen::Matrix<Expression,3,1> p_WE_u, p_WE_v;
-	Eigen::Matrix<Expression,3,3> R_WE_u, R_WE_v;
-
-	if (graph->robot_is_free_body(spec.robot_ag)) {
-		const int rob_off = spec.robot_ag * robot_dim;
-		PoseFromRow_FreeBody(X_u_expr, rob_off, &p_WE_u, &R_WE_u);
-		PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);
-	} else {
-		// original plant path (no quats → no branches)
-		auto ctx_u = plant.CreateDefaultContext();
-		auto ctx_v = plant.CreateDefaultContext();
-		graph->set_configuration(ctx_u, X_u_expr);
-		graph->set_configuration(ctx_v, X_v_expr);
-
-		const auto& W = plant.world_frame();
-		const auto& E = plant.GetFrameByName(spec.ee_frame_name,
-						     plant.GetModelInstanceByName(graph->_robot_names.at(spec.robot_ag)));
-
-		const auto X_WE_u = plant.CalcRelativeTransform(*ctx_u, W, E);
-		const auto X_WE_v = plant.CalcRelativeTransform(*ctx_v, W, E);
-
-		p_WE_u = X_WE_u.translation();
-		p_WE_v = X_WE_v.translation();
-		R_WE_u = X_WE_u.rotation().matrix();
-		R_WE_v = X_WE_v.rotation().matrix();
-	}
+	auto [p_WE_u, R_WE_u] = PoseFromRow<Expression>(graph, spec.robot_ag, spec.ee_frame_name, X_u_expr);
+	auto [p_WE_v, R_WE_v] = PoseFromRow<Expression>(graph, spec.robot_ag, spec.ee_frame_name, X_v_expr);
 
 	if (exact_rigidity) {
 		for (int obj_id : spec.held_point_ids) {
@@ -272,10 +226,20 @@ static void AddHoldRigidityStatic(
 			const Eigen::Matrix<Expression,3,1> rel_v =
 				R_WE_v.transpose() * (p_WP_v - p_WE_v);
 
-			prog->AddConstraint(rel_u - rel_v,
-					    Eigen::Vector3d::Constant(3, -0.02),
-					    Eigen::Vector3d::Constant(3, 0.02))
-				.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
+
+			if (graph->robot_is_pos_rot_mat(spec.robot_ag)) {
+				// If the rotation matrix is directly
+				// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
+				for (int i = 0; i < 3; ++i) {
+					prog.AddQuadraticConstraint(rel_u(i) - rel_v(i), -0.001, 0.001)
+						.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
+				}
+			} else {
+				prog.AddConstraint(rel_u - rel_v,
+						   Eigen::Vector3d::Constant(3, -0.001),
+						   Eigen::Vector3d::Constant(3, 0.001))
+					.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
+			}
 		}
 	} else {
 		for (size_t i = 0; i < spec.held_point_ids.size(); ++i) {
@@ -295,7 +259,7 @@ static void AddHoldRigidityStatic(
 				const Eigen::Matrix<Expression,3,1> d_u = p_i_u - p_j_u;
 				const Eigen::Matrix<Expression,3,1> d_v = p_i_v - p_j_v;
 				Expression e = d_v.squaredNorm() - d_u.squaredNorm();
-				prog->AddQuadraticConstraint(e, 0.0, 0.0)
+				prog.AddQuadraticConstraint(e, 0.0, 0.0)
 					.evaluator()->set_description("u->v p2p distance rigidity");
 			}
 		}
@@ -310,17 +274,16 @@ static void AddHoldRigidityStatic(
 			const Eigen::Matrix<Expression,3,1> d_v = p_WP_v - p_WE_v;
 
 			Expression e = d_v.squaredNorm() - d_u.squaredNorm();
-			prog->AddQuadraticConstraint(e, 0.0, 0.0)
+			prog.AddQuadraticConstraint(e, 0.0, 0.0)
 				.evaluator()->set_description("u->v r2p distance rigidity");
 		}
 	}
 }
 
 void AddHoldRigidityAssignableToX0(
-	MathematicalProgram* prog,
+	MathematicalProgram& prog,
 	const SubgraphOfConstraints& subgraph,
 	const GraphOfConstraints* graph,
-	const drake::multibody::MultibodyPlant<Expression>& plant,
 	const MatrixXDecisionVariable& X,
 	int v,
 	const AssignableHoldSpec& spec,
@@ -360,33 +323,8 @@ void AddHoldRigidityAssignableToX0(
 	// For each possible agent k, construct the same residual as static-HoldSpec(robot_ag=k),
 	// then gate with +/- M * (1 - A_row(k)).
 	for (int k = 0; k < num_agents; ++k) {
-		Matrix<Expression,3,1> p_WE_0, p_WE_v;
-		Matrix<Expression,3,3> R_WE_0, R_WE_v;
-
-		if (graph->robot_is_free_body(k)) {
-			const int rob_off = k * robot_dim;
-			PoseFromRow_FreeBody(x0_expr, rob_off, &p_WE_0, &R_WE_0);
-			PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);
-		} else {
-			// Build contexts for articulated robot k.
-			auto ctx_0 = plant.CreateDefaultContext();
-			auto ctx_v = plant.CreateDefaultContext();
-			graph->set_configuration(ctx_0, x0_expr);
-			graph->set_configuration(ctx_v, X_v_expr);
-
-			const auto& W = plant.world_frame();
-			const auto& E = plant.GetFrameByName(
-				spec.ee_frame_name,
-				plant.GetModelInstanceByName(graph->_robot_names.at(k)));
-
-			const auto X_WE_0 = plant.CalcRelativeTransform(*ctx_0, W, E);
-			const auto X_WE_v = plant.CalcRelativeTransform(*ctx_v, W, E);
-
-			p_WE_0 = X_WE_0.translation();
-			p_WE_v = X_WE_v.translation();
-			R_WE_0 = X_WE_0.rotation().matrix();
-			R_WE_v = X_WE_v.rotation().matrix();
-		}
+		auto [p_WE_0, R_WE_0] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, x0_expr);
+		auto [p_WE_v, R_WE_v] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, X_v_expr);
 
 		// For free-body agent k:
 		const int ee_start3 = k * robot_dim;  // assuming first 3 are world position
@@ -422,23 +360,37 @@ void AddHoldRigidityAssignableToX0(
 			for (int j = 0; j < 3; ++j) {
 				const Expression slack = Mvec(j) * (1.0 - A_row(k));
 
-				// Upper bound residual: residual - slack <= 0
-				prog->AddConstraint(residual(j) - slack, neg_inf, 0.0)
-					.evaluator()->set_description("0->v exact rigidity (assignable, +)");
 
-				// Lower bound residual: -residual - slack <= 0
-				prog->AddConstraint(-residual(j) - slack, neg_inf, 0.0)
-					.evaluator()->set_description("0->v exact rigidity (assignable, -)");
+				if (graph->robot_is_pos_rot_mat(k)) {
+					// If the rotation matrix is directly
+					// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
+
+					// Upper bound residual: residual - slack <= 0
+					prog.AddQuadraticConstraint(residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("0->v exact rigidity (assignable, +)");
+
+					// Lower bound residual: -residual - slack <= 0
+					prog.AddQuadraticConstraint(-residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("0->v exact rigidity (assignable, -)");
+
+				} else {
+					// Upper bound residual: residual - slack <= 0
+					prog.AddConstraint(residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("0->v exact rigidity (assignable, +)");
+
+					// Lower bound residual: -residual - slack <= 0
+					prog.AddConstraint(-residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("0->v exact rigidity (assignable, -)");
+				}
 			}
 		}
 	}
 }
 
 void AddHoldRigidityAssignable(
-	MathematicalProgram* prog,
+	MathematicalProgram& prog,
 	const SubgraphOfConstraints& subgraph,
 	const GraphOfConstraints* graph,
-	const drake::multibody::MultibodyPlant<Expression>& plant,
 	const MatrixXDecisionVariable& X,
 	int u, int v,
 	const AssignableHoldSpec& spec,
@@ -482,32 +434,8 @@ void AddHoldRigidityAssignable(
 	// For each possible agent k, construct the same residual as static-HoldSpec(robot_ag=k),
 	// then gate with +/- M * (1 - A_row(k)).
 	for (int k = 0; k < num_agents; ++k) {
-		Matrix<Expression,3,1> p_WE_u, p_WE_v;
-		Matrix<Expression,3,3> R_WE_u, R_WE_v;
-
-		if (graph->robot_is_free_body(k)) {
-			const int rob_off = k * robot_dim;
-			PoseFromRow_FreeBody(X_u_expr, rob_off, &p_WE_u, &R_WE_u);
-			PoseFromRow_FreeBody(X_v_expr, rob_off, &p_WE_v, &R_WE_v);
-		} else {
-			auto ctx_u = plant.CreateDefaultContext();
-			auto ctx_v = plant.CreateDefaultContext();
-			graph->set_configuration(ctx_u, X_u_expr);
-			graph->set_configuration(ctx_v, X_v_expr);
-
-			const auto& W = plant.world_frame();
-			const auto& E = plant.GetFrameByName(
-				spec.ee_frame_name,
-				plant.GetModelInstanceByName(graph->_robot_names.at(k)));
-
-			const auto X_WE_u = plant.CalcRelativeTransform(*ctx_u, W, E);
-			const auto X_WE_v = plant.CalcRelativeTransform(*ctx_v, W, E);
-
-			p_WE_u = X_WE_u.translation();
-			p_WE_v = X_WE_v.translation();
-			R_WE_u = X_WE_u.rotation().matrix();
-			R_WE_v = X_WE_v.rotation().matrix();
-		}
+		auto [p_WE_u, R_WE_u] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, X_u_expr);
+		auto [p_WE_v, R_WE_v] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, X_v_expr);
 
 		// For free-body agent k:
 		const int ee_start3 = k * robot_dim;  // assuming first 3 are world position
@@ -543,18 +471,36 @@ void AddHoldRigidityAssignable(
 			for (int j = 0; j < 3; ++j) {
 				const Expression slack = Mvec_uv(j) * (1.0 - A_row(k));
 
-				prog->AddConstraint(residual(j) - slack, neg_inf, 0.0)
-					.evaluator()->set_description("u->v exact rigidity (assignable, +)");
 
-				prog->AddConstraint(-residual(j) - slack, neg_inf, 0.0)
-					.evaluator()->set_description("u->v exact rigidity (assignable, -)");
+				if (graph->robot_is_pos_rot_mat(k)) {
+					// If the rotation matrix is directly
+					// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
+
+					// Upper bound residual: residual - slack <= 0
+					prog.AddQuadraticConstraint(residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("u->v exact rigidity (assignable, +)");
+
+					// Lower bound residual: -residual - slack <= 0
+					prog.AddQuadraticConstraint(-residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("u->v exact rigidity (assignable, -)");
+
+
+				} else {
+					// Upper bound residual: residual - slack <= 0
+					prog.AddConstraint(residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("u->v exact rigidity (assignable, +)");
+
+					// Lower bound residual: -residual - slack <= 0
+					prog.AddConstraint(-residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("u->v exact rigidity (assignable, -)");
+				}
 			}
 		}
 	}
 }
 
 
-GraphWaypointProblem build_graph_waypoint_problem(
+GraphWaypointProblem BuildGraphWaypointProblem(
 	GraphOfConstraints* graph,
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
 	const std::vector<int>& remaining_vertices,
@@ -569,39 +515,45 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 	using namespace drake::solvers;
 
-	// Create program
+	// Create problem struct
 	GraphWaypointProblem problem;
-	problem.prog = std::make_unique<MathematicalProgram>();
+
+	// Create initial program
+	std::unique_ptr<MathematicalProgram> prog_ptr = std::make_unique<MathematicalProgram>();
+	MathematicalProgram& prog = *prog_ptr;
 
 	// record the subgraph
 	problem.subgraph = std::make_unique<SubgraphOfConstraints>(subgraph);
 
 	MatrixXDecisionVariable Assignments;
 	if (enforce_rigidity) {
-		// Continuous (relaxed) assignment variables (z x m).
-		Assignments = problem.prog->NewContinuousVariables(subgraph.num_variables(),
-								   num_agents, "Assignments");
+		// If enforcing rigidity, define the assignment variables as
+		// continuous so that they can be pinned manually.
+		Assignments = prog.NewContinuousVariables(subgraph.num_variables(),
+							  num_agents, "Assignments");
 		problem.Assignments = Assignments;
 
 		Eigen::MatrixXd lb = Eigen::MatrixXd::Zero(Assignments.rows(), Assignments.cols());
 		Eigen::MatrixXd ub = Eigen::MatrixXd::Ones(Assignments.rows(), Assignments.cols());
-		problem.A_bounds = std::make_unique<drake::solvers::Binding<drake::solvers::BoundingBoxConstraint>>(problem.prog->AddBoundingBoxConstraint(lb, ub, problem.Assignments));
+		problem.A_bounds = std::make_unique<drake::solvers::Binding<drake::solvers::BoundingBoxConstraint>>(prog.AddBoundingBoxConstraint(lb, ub, problem.Assignments));
+		problem.A_bounds->evaluator()->set_description("continuous agent assignment bounds");
 
-		// Keep your one-hot equality: sum_k A(i,k) = 1  (unchanged)
 		for (int i = 0; i < subgraph.num_variables(); ++i) {
-			problem.prog->AddLinearEqualityConstraint(
+			prog.AddLinearEqualityConstraint(
 				Eigen::RowVectorXd::Ones(num_agents), 1.0, Assignments.row(i))
 				.evaluator()->set_description("exclusive assignment");
 		}
 	} else {
-		// Binary assignment variables (z x m).
-		Assignments = problem.prog->NewBinaryVariables(subgraph.num_variables(),
-							       num_agents, "Assignments");
-		problem.Assignments = Assignments;
+		std::cout << "Num Variables: " << subgraph.num_variables() << std::endl;
 
-		// One-hot per row (each task gets exactly one agent): sum_k a(row,k) = 1.
+		if (subgraph.num_variables() > 0) {
+			Assignments = prog.NewBinaryVariables(subgraph.num_variables(),
+							      num_agents, "Assignments");
+			problem.Assignments = Assignments;
+		}
+
 		for (int i = 0; i < subgraph.num_variables(); ++i) {
-			problem.prog->AddLinearEqualityConstraint(
+			prog.AddLinearEqualityConstraint(
 				Eigen::RowVectorXd::Ones(num_agents),
 				1.0, Assignments.row(i))
 				.evaluator()->set_description("exclusive assignment");;
@@ -615,32 +567,70 @@ GraphWaypointProblem build_graph_waypoint_problem(
 	const int non_robot_dim = graph->non_robot_dim;
 
 	// x: continuous configuration variables (n x m*d+o).
-	MatrixXDecisionVariable X = problem.prog->NewContinuousVariables(subgraph.num_nodes(), num_agents * robot_dim + num_objects * non_robot_dim, "X");
+	MatrixXDecisionVariable X = prog.NewContinuousVariables(subgraph.num_nodes(), num_agents * robot_dim + num_objects * non_robot_dim, "X");
 	problem.X = X;
 
 	for (int i = 0; i < X.rows(); ++i) {
-		problem.prog->AddBoundingBoxConstraint(graph->_global_x_lb, graph->_global_x_ub, X.row(i).transpose());
+		prog.AddBoundingBoxConstraint(graph->_global_x_lb, graph->_global_x_ub, X.row(i).transpose())
+			.evaluator()->set_description("configuration space bounds");
 	}
 
 	//
-	// QUATERNION CONSTRAINTS
+	// QUATERNION / ROTATION MATRIX CONSTRAINTS
 	//
 
 	for (int ag = 0; ag < num_agents; ++ag) {
-		if (graph->robot_is_free_body(ag)) {
+		if (graph->robot_is_pos_quat(ag)) {
 			for (int node = 0; node < subgraph.num_nodes(); ++node) {
 				VectorX<Expression> ag_quat = AsExprRow(X.row(node).segment(ag * robot_dim + 3, 4));
 				Expression ag_quat_norm = ag_quat.squaredNorm();
 				const double tol = 0.001;
-				problem.prog->AddQuadraticConstraint(ag_quat_norm, 1.0-tol, 1.0+tol)
+				prog.AddQuadraticConstraint(ag_quat_norm, 1.0-tol, 1.0+tol)
 					.evaluator()->set_description("unit quaternion constraint");
+			}
+		} else if (graph->robot_is_pos_rot_mat(ag)) {
+			for (int node = 0; node < subgraph.num_nodes(); ++node) {
+
+				VectorXDecisionVariable R_flat = X.row(node).segment(ag * robot_dim + 3, 9);
+				Eigen::Matrix<Variable, 3, 3> R;
+				for (int i = 0; i < 3; ++i) {
+					for (int j = 0; j < 3; ++j) {
+						R(i, j) = R_flat(i * 3 + j);
+					}
+				}
+
+			        // orthogonality constraint: R^T R = I
+				Eigen::Matrix<Expression, 3, 3> orthogonality_residual = R.transpose() * R - Eigen::Matrix3d::Identity();
+
+				const double tol = 0.001;
+				for (int i = 0; i < 3; ++i) {
+					for (int j = i; j < 3; ++j) {
+						prog.AddQuadraticConstraint(orthogonality_residual(i, j), 0.0-tol, 0.0+tol)
+							.evaluator()->set_description("rotation matrix orthogonality constraint");
+					}
+				}
+
+				// right-handedness: col1 x col2 = col3
+				Eigen::Matrix<Expression, 3, 1> right_handedness_residual = R.col(0).cross(R.col(1)) - R.col(2);
+				for (int i = 0; i < 3; ++i) {
+					prog.AddQuadraticConstraint(right_handedness_residual(i), 0.0-tol, 0.0+tol)
+						.evaluator()->set_description("rotation matrix right-handedness constraint");
+				}
 			}
 		}
 	}
 
+	///////////////////////////////////////////////////////////////////////
+        //           OBJECTIVE FUNCTION AND RIGIDITY CONSTRAINT              //
+        ///////////////////////////////////////////////////////////////////////
+
 	//
-	// OBJECTIVE FUNCTION
+        // ACT 1: INITIAL EDGES FROM CURRENT STATE TO NEXT NODES
+        //
+
 	//
+        // PART 1: IDENTIFY EDGES SPANNING OBJECT MANIPULATION
+        //
 
 	const auto& next_edge_ops = graph->get_next_edge_ops(remaining_vertices);
 	std::set<int> possibly_manipulated_cubes_for_initial_layer;
@@ -677,6 +667,11 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			op.cubes.begin(), op.cubes.end());
 	}
 
+	//
+        // PART 2: ADD LAYER 0 COST FOR EDGES TO NEXT NODES IN SUBGRAPH AND RIGIDITY CONSTRAINTS
+        // IF CURRENTLY MANIPULATING ANYTHING
+        //
+
 	for (auto v : subgraph.structure.sources()) {
 		int sg_v = subgraph.subgraph_id(v);
 
@@ -688,7 +683,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 				x0_exps(k) = Expression(x0(ag * robot_dim + k));
 			}
 			Expression dist = splines->at(ag).squared_distance(x0_exps, X.row(sg_v).segment(ag * robot_dim, robot_dim));
-			problem.prog->AddCost(dist);
+			prog.AddCost(dist);
 		}
 
 		// Second, for the source nodes, add CONSTRAINTS saything that a block
@@ -706,7 +701,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 			if (!possibly_manipulated_cubes_for_initial_layer.contains(obj)) {
 				// Enforce X_seg == x0_seg (all objects not effected by an edge constraint)
-				problem.prog->AddLinearEqualityConstraint(X_seg, x0_seg)
+				prog.AddLinearEqualityConstraint(X_seg, x0_seg)
 					.evaluator()->set_description(fmt::format("0->{} stationary point {}", v, obj));
 			}
 		}
@@ -715,7 +710,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_for_initial_layer) {
 				auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
 				AddHoldRigidityAssignableToX0(
-					problem.prog.get(), subgraph, graph, *graph->_plant, X,
+					prog, subgraph, graph, X,
 					v, hold_spec,
 					/*robot_dim=*/robot_dim,
 					/*objs_start=*/objs_start,
@@ -725,7 +720,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 			for (const HoldSpec& hold_spec : hold_specs_for_initial_layer) {
 				AddHoldRigidityStaticToX0(
-					problem.prog.get(), subgraph, graph, *graph->_plant, X,
+					prog, subgraph, graph, X,
 					v, hold_spec,
 					/*robot_dim=*/robot_dim,
 					/*objs_start=*/objs_start,
@@ -736,7 +731,15 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		}
 	}
 
-	// Assume `subgraph` is your InducedSubgraphView<LabelT> instance
+	//
+        // ACT 2: EDGES BEYOND NEXT NODES
+        //
+
+	//
+        // PART 3: IDENTIFY CONCURRENT EDGES FOR EACH EDGE IN GRAPH, AND
+        // POSSIBLY MANIPULATED CUBES ACROSS EACH EDGE USING CONCURRENT EDGES
+        //
+
 	auto result = subgraph.structure.compute_concurrent_edges_overlap();
 
 	std::map<std::pair<int, int>, std::set<int>> possibly_manipulated_cubes_during_each_edge;
@@ -747,8 +750,6 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		int a = e.u;
 		int b = e.v;
 		const std::pair<int, int> e_pair = std::make_pair(a, b);
-
-		// std::cout << "checking: " << a << "->" << b << std::endl;
 
 		// Also consider the edge itself
 		if (graph->edge_to_phis_map.contains(e_pair)) {
@@ -767,10 +768,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			int v = ce.v;
 			const std::pair<int, int> ce_pair = std::make_pair(u, v);
 
-			// std::cout << "there is a concurrent edge: " << u << "->" << v << std::endl;
-
 			if (graph->edge_to_phis_map.contains(ce_pair)) {
-
 				for (int edge_phi_id : graph->edge_to_phis_map.at(ce_pair)) {
 					DeferredEdgeOp& op = graph->edge_ops.at(edge_phi_id);
 
@@ -841,7 +839,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 		for (int ag = 0; ag < num_agents; ++ag) {
 			Expression dist = splines->at(ag).squared_distance(X.row(sg_u).segment(ag * robot_dim, robot_dim),
 									   X.row(sg_v).segment(ag * robot_dim, robot_dim));
-			problem.prog->AddCost(dist);
+			prog.AddCost(dist);
 		}
 
 		for (int obj = 0; obj < num_objects; ++obj) {
@@ -861,13 +859,13 @@ GraphWaypointProblem build_graph_waypoint_problem(
 			if (possibly_manipulated_cubes_during_each_edge.contains(e_pair)) {
 
 				if (!possibly_manipulated_cubes_during_each_edge.at(e_pair).contains(obj)) {
-					problem.prog->AddLinearEqualityConstraint(
+					prog.AddLinearEqualityConstraint(
 						X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim))
 						.evaluator()->set_description(fmt::format("{}->{} stationary point {}", u, v, obj));
 				}
 			} else {
 				// std::cout << "no information about possibly manipulated cubes for " << e_pair.first << "->" << e_pair.second << "? shouldn't happen" << std::endl;
-			// 	problem.prog->AddLinearEqualityConstraint(
+			// 	prog.AddLinearEqualityConstraint(
 			// 		X_seg_u - X_seg_v, Eigen::VectorXd::Zero(non_robot_dim))
 			// 		.evaluator()->set_description(fmt::format("{}->{} stationary point {}", u, v, obj));;
 			}
@@ -878,7 +876,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 					for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_during_each_layer.at(layer)) {
 						auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
 						AddHoldRigidityAssignable(
-							problem.prog.get(), subgraph, graph, *graph->_plant, X,
+							prog, subgraph, graph, X,
 							u, v, hold_spec,
 							/*robot_dim=*/robot_dim,
 							/*objs_start=*/objs_start,
@@ -890,7 +888,7 @@ GraphWaypointProblem build_graph_waypoint_problem(
 				if (hold_specs_during_each_layer.contains(layer)) {
 					for (const HoldSpec& hold_spec : hold_specs_during_each_layer.at(layer)) {
 						AddHoldRigidityStatic(
-							problem.prog.get(), subgraph, graph, *graph->_plant, X,
+							prog, subgraph, graph, X,
 							u, v, hold_spec,
 							/*robot_dim=*/robot_dim,
 							/*objs_start=*/objs_start,
@@ -904,14 +902,16 @@ GraphWaypointProblem build_graph_waypoint_problem(
 
 	// Add constraints/costs from registry
 	for (const auto& [phi_id, op] : subgraph.get_subgraph_ops()) {
-		op.builder(*(problem.prog), subgraph, phi_id, X, Assignments);
+		op.builder(prog, subgraph, phi_id, X, Assignments);
 	}
 
 	// Add constraints/costs from edge registry
 	for (const auto& [edge_phi_id, edge_op] : subgraph.get_subgraph_edge_ops()) {
-		edge_op.waypoint_builder(*(problem.prog), subgraph, edge_phi_id, X, Assignments,
+		edge_op.waypoint_builder(prog, subgraph, edge_phi_id, X, Assignments,
 					 previous_X.row(edge_op.u_node));
 	}
+
+	problem.prog = std::move(prog_ptr);
 
 	return std::move(problem);
 }
@@ -1043,7 +1043,7 @@ void PrintSolverReport(GraphWaypointProblem* problem,
 
 inline void PinAssignmentScenario(
 	const drake::solvers::Binding<drake::solvers::BoundingBoxConstraint>& box,
-	const drake::solvers::MatrixXDecisionVariable& A,
+	const MatrixXDecisionVariable& A,
 	const std::vector<int>& agent_of_row) {
 	const int Z = A.rows(), M = A.cols();
 	Eigen::VectorXd lb(Z*M), ub(Z*M);
@@ -1091,6 +1091,7 @@ EnumSolveResult EnumerateAllAssignmentsAndSolve(
 	const Eigen::MatrixXd* warmstart_X = nullptr) {
 
 	using drake::solvers::IpoptSolver;
+	using drake::solvers::SnoptSolver;
 	using drake::solvers::NloptSolver;
 	IpoptSolver solver;
 	if (!solver.available()) throw std::runtime_error("IPOPT not available.");
@@ -1170,6 +1171,7 @@ bool GraphWaypointMPC::solve(
 	if (enforce_rigidity) {
 		return _solve_with_enumeration_and_ipopt(remaining_vertices, x0);
 		// return _solve_with_gurobi(remaining_vertices, x0);
+		// return _solve_with_mosek(remaining_vertices, x0);
 	} else {
 		return _solve_with_mosek(remaining_vertices, x0);
 	}
@@ -1179,7 +1181,7 @@ bool GraphWaypointMPC::_solve_with_mosek(
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
-	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, _waypoints, false);
+	GraphWaypointProblem problem = BuildGraphWaypointProblem(_graph, _splines, remaining_vertices, x0, _waypoints, false);
 
 	// Solve
 	drake::solvers::MosekSolver solver;
@@ -1232,7 +1234,7 @@ bool GraphWaypointMPC::_solve_with_gurobi(
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
-	GraphWaypointProblem problem = build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, _waypoints, true);
+	GraphWaypointProblem problem = BuildGraphWaypointProblem(_graph, _splines, remaining_vertices, x0, _waypoints, true);
 
 	// Solve
 	drake::solvers::GurobiSolver solver;
@@ -1304,11 +1306,13 @@ bool GraphWaypointMPC::_solve_with_enumeration_and_ipopt(
 	std::unique_ptr<GraphWaypointProblem> problem;
 	try {
 		problem = std::make_unique<GraphWaypointProblem>(
-			build_graph_waypoint_problem(_graph, _splines, remaining_vertices, x0, _waypoints, true));
+			BuildGraphWaypointProblem(_graph, _splines, remaining_vertices, x0, _waypoints, true));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in waypoint problem construction: " << e.what() << std::endl;
 		return false;
 	}
+
+	std::cout << problem->prog->to_string() << std::endl;
 
 	// Enumerate per-row choices (all agents, or pruned)
 	std::vector<std::vector<int>> choices_per_row(problem->Assignments.rows());
