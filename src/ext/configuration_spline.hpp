@@ -930,12 +930,17 @@ public:
 					// Velocity at this point (p_dot = (1/tau) * dp/du)
 					// Note: Since we integrate over dt, tau factors out:
 					// integral ||p_dot(t)|| dt = integral ||dp/du|| du
-					VecX<T> vel_u = h0_dot * (xj - xjm1) / tau // simplistic for brevity
-						+ h1_dot * vjm1
-						+ h3_dot * vj;
+					VecX<T> vel_u_times_tau = h0_dot * (xj - xjm1) // simplistic for brevity
+						+ tau * h1_dot * vjm1
+						+ tau * h3_dot * vj;
+
+					// Computing the norm like this with an
+					// added epislon prevents a division by
+					// zero when calculating the derivative
+					T vel_u_times_tau_norm = sqrt(vel_u_times_tau.squaredNorm() + T(1e-8));
 
 					// Add weighted norm to total
-					total += w[i] * vel_u.norm() * tau;
+					total += w[i] * vel_u_times_tau_norm;
 				}
 
 				break;
