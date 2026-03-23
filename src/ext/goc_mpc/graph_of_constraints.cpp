@@ -1748,7 +1748,8 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 	int v,
 	int var,
 	int point_id,
-	double holding_distance_max) {
+	double holding_distance_max,
+	bool use_l2) {
 
 	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
 	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
@@ -1758,8 +1759,23 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 	return _add_assignable_edge_op(
 		DeferredOpKind::kAgentLinearEq, u, v, var, std::set<int>({point_id}),
 		[=, this](const Eigen::VectorXd& x,
-			  const Eigen::VectorXi&/*unused*/) {
-			return 0;
+			  const Eigen::VectorXi& assignments) {
+
+			const int robot_id = assignments(var);
+
+			auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
+			auto p_WC = CubePosFromRow(this, point_id, x);
+
+			Eigen::Vector3d r = (p_WC - p_WR);
+
+			double violation = 0.0;
+			if (use_l2) {
+				violation = r.lpNorm<2>() - holding_distance_max;
+			} else {
+				violation = r.lpNorm<Eigen::Infinity>() - holding_distance_max;
+			}
+			std::cout << "holding constraint violation: " << violation << std::endl;
+			return violation;
 		},
 		[=, this](drake::solvers::MathematicalProgram& prog,
 			  const SubgraphOfConstraints& subgraph,

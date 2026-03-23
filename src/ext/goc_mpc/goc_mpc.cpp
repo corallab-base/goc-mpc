@@ -105,7 +105,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("v"),
 		     py::arg("robot_id"),
 		     py::arg("point_ids"),
-		     py::arg("holding_distance_max") = 0.1)
+		     py::arg("holding_distance_max") = 0.1,
+		     py::arg("use_l2") = false)
 		.def("add_robot_relative_rotation_constraint", &GraphOfConstraints::add_robot_relative_rotation_constraint)
 		.def("add_robot_relative_displacement_constraint", &GraphOfConstraints::add_robot_relative_displacement_constraint)
 		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,

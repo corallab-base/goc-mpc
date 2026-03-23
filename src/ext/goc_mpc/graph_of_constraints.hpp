@@ -310,7 +310,8 @@ struct GraphOfConstraints {
 							  int v,
 							  int var,
 							  int point_id,
-							  double holding_distance_max = 0.1);
+							  double holding_distance_max = 0.1,
+							  bool use_l2 = false);
 
 	// Variable Constraints
 
