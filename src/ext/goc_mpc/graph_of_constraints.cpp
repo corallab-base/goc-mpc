@@ -1594,6 +1594,49 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	return edge_phi_id;
 }
 
+int GraphOfConstraints::add_edge_point_to_point_displacement_constraint(
+	int u,
+	int v,
+	int point_a,
+	int point_b,
+	Eigen::Vector3d& disp,
+	Eigen::Vector3d& tol) {
+
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(point_a >= 0 && point_a < num_objects);
+	DRAKE_DEMAND(point_b >= 0 && point_b < num_objects);
+
+	int edge_phi_id = _add_edge_op(DeferredOpKind::kLinearEq, u, v, std::set<int>({}),
+			    [=, this](const Eigen::VectorXd& x,
+				      const Eigen::VectorXi&/*unused*/) {
+				    auto p_WC_a = CubePosFromRow(this, point_a, x);
+				    auto p_WC_b = CubePosFromRow(this, point_b, x);
+				    Eigen::Vector3d r  = (p_WC_b - p_WC_a) - disp;   // want r == 0
+				    Eigen::Vector3d err = r.cwiseAbs() - tol;
+				    return err.maxCoeff();
+			    },
+			    [=, this](drake::solvers::MathematicalProgram& prog,
+				      const SubgraphOfConstraints& subgraph,
+				      const int phi_id,
+				      const drake::solvers::MatrixXDecisionVariable& X,
+				      const drake::solvers::MatrixXDecisionVariable& /*unused*/,
+				      const Eigen::VectorXd& x_u) {
+				    return;
+			    },
+			    [](drake::solvers::MathematicalProgram& prog,
+			       const int phi_id,
+			       const Eigen::VectorXi& var_assignments,
+			       const drake::solvers::MatrixXDecisionVariable& Xi) {
+				    return;
+			    });
+
+	// record that this constraint is statically assigned to this robot.
+	// _edge_phi_to_static_assignment_map[edge_phi_id] = robot_id;
+
+	return edge_phi_id;
+}
+
 int GraphOfConstraints::add_robot_relative_rotation_constraint(
 	int u,
 	int v,

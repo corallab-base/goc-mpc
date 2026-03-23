@@ -290,6 +290,13 @@ struct GraphOfConstraints {
 					      double holding_distance_max = 0.1,
 					      bool use_l2 = false);
 
+	int add_edge_point_to_point_displacement_constraint(int u,
+							    int v,
+							    int point_a,
+							    int point_b,
+							    Eigen::Vector3d& disp,
+							    Eigen::Vector3d& tol);
+
 	int add_robot_relative_rotation_constraint(int u,
 						   int v,
 						   int robot_id,
