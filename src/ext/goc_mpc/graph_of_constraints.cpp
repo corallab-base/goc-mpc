@@ -32,8 +32,10 @@ GraphOfConstraints::GraphOfConstraints(const std::vector<std::string> robots,
 			robot_qdim = 3 + 4;
 		} else if (s.find("pos_rot_mat") != std::string::npos) {
 			robot_qdim = 3 + 9;
+		} else if (s.find("point_mass") != std::string::npos) {
+			robot_qdim = 3;
 		} else {
-			throw std::runtime_error("Only supporting 'pos_quat' and 'pos_rot_mat' robots.");
+			throw std::runtime_error("Only supporting 'point_mass', 'pos_quat', and 'pos_rot_mat' robots.");
 		}
 
 		if (dim == 0) {
@@ -89,7 +91,7 @@ int GraphOfConstraints::add_variable()
 }
 
 bool GraphOfConstraints::robot_is_free_body(int ag) const {
-	return robot_is_pos_quat(ag) || robot_is_pos_rot_mat(ag);
+	return robot_is_pos_quat(ag) || robot_is_pos_rot_mat(ag) || robot_is_point_mass(ag);
 }
 
 bool GraphOfConstraints::robot_is_pos_quat(int ag) const {
@@ -98,6 +100,10 @@ bool GraphOfConstraints::robot_is_pos_quat(int ag) const {
 
 bool GraphOfConstraints::robot_is_pos_rot_mat(int ag) const {
 	return _robot_names.at(ag).find("pos_rot_mat") != std::string::npos;
+}
+
+bool GraphOfConstraints::robot_is_point_mass(int ag) const {
+	return _robot_names.at(ag).find("point_mass") != std::string::npos;
 }
 
 std::tuple<std::vector<std::optional<int>>,

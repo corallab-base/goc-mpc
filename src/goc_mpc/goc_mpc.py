@@ -155,7 +155,7 @@ class GraphOfConstraintsMPC():
 
                 for edge_phi_id, op in self.graph.get_next_edge_ops(self.remaining_phases).items():
                     if not self.graph.evaluate_edge_phi(edge_phi_id, x, self.last_cycle_var_assignments, 0.00):
-                        print(f"violated path constraint on {op.u_node}->{op.v_node} ({edge_phi_id})! backtracking.")
+                        print(f"violated path constraint on {op.u_node}->{op.v_node} (edge phi id: {edge_phi_id})! backtracking.")
                         self.completed_phases -= {op.u_node}
                         self.remaining_phases.append(op.u_node)
 

@@ -254,7 +254,7 @@ class SimpleDrakeGym:
             joint_indices = self.plant.GetActuatedJointIndices(mi)
             for ji in joint_indices:
                 joint = self.plant.get_joint(ji)
-                q.append(joint.GetOneVelocity(self.plant_context))
+                qdot.append(joint.GetOneVelocity(self.plant_context))
             return np.array(qdot)
 
     def _get_q(self):
@@ -282,7 +282,7 @@ class SimpleDrakeGym:
             return 3+9
         else:
             mi = self.plant.GetModelInstanceByName(name)
-            return self.plant.get_actuated_dofs(mi)
+            return self.plant.num_actuated_dofs(mi)
 
     def _get_qdot_dim(self, name):
         if "free_body" in name:
@@ -293,7 +293,7 @@ class SimpleDrakeGym:
             return 6
         else:
             mi = self.plant.GetModelInstanceByName(name)
-            return self.plant.get_actuated_dofs(mi)
+            return self.plant.num_actuated_dofs(mi)
 
     def _set_q(self, q: np.ndarray):
         for i, name in enumerate(self._controlled_names):
@@ -333,7 +333,7 @@ class SimpleDrakeGym:
 
             X_WB = RigidTransform(R_W, x_W)
             self.plant.SetFreeBodyPose(self.plant_context, body, X_WB)
-        elif "cube" in name:
+        elif "cube" in name or "point_mass" in name:
             return self.plant.SetPositions(self.plant_context, mi, q)
         else:
             joint_indices = self.plant.GetActuatedJointIndices(mi)
@@ -354,7 +354,7 @@ class SimpleDrakeGym:
 
             V_WB = SpatialVelocity(w_W, v_W) # expressed in World
             self.plant.SetFreeBodySpatialVelocity(body, V_WB, self.plant_context)
-        elif "cube" in name:
+        elif "cube" in name or "point_mass" in name:
             return self.plant.SetVelocities(self.plant_context, mi, qdot)
         else:
             joint_indices = self.plant.GetActuatedJointIndices(mi)

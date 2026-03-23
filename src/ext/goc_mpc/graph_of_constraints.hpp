@@ -158,6 +158,8 @@ struct GraphOfConstraints {
 
 	bool robot_is_pos_rot_mat(int ag) const;
 
+	bool robot_is_point_mass(int ag) const;
+
 	Graph<py::object> get_structure() const { return structure; }
 
 	std::tuple<std::vector<std::optional<int>>,

@@ -74,6 +74,18 @@ PoseFromRow_PosRotMatrix(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
 	return std::make_pair(p_WE, R_WE);
 }
 
+template <typename T>
+std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+PoseFromRow_PointMass(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
+		      int robot_offset) {
+	Eigen::Matrix<T,3,1> p_WE = row.template segment<3>(robot_offset + 0);
+	Eigen::Matrix<T,3,3> R_WE;
+	R_WE << T(1.0), T(0.0), T(0.0),
+		T(0.0), T(1.0), T(0.0),
+		T(0.0), T(0.0), T(1.0);
+	return std::make_pair(p_WE, R_WE);
+}
+
 // Templated row→Expression helper (safe for Eigen blocks).
 template <class Derived>
 Eigen::RowVectorX<Expression> AsExprRow(const Eigen::MatrixBase<Derived>& row) {
@@ -112,6 +124,8 @@ PoseFromRow(const struct GraphOfConstraints* graph,
 		return PoseFromRow_PosQuat(q, agent_config_offset);
 	} else if (graph->robot_is_pos_rot_mat(agent_index)) {
 		return PoseFromRow_PosRotMatrix(q, agent_config_offset);
+	} else if (graph->robot_is_point_mass(agent_index)) {
+		return PoseFromRow_PointMass(q, agent_config_offset);
 	} else {
 		// const MultibodyPlant<T> *plant;
 
@@ -133,6 +147,6 @@ PoseFromRow(const struct GraphOfConstraints* graph,
 		// const auto X_WE = plant->CalcRelativeTransform(*ctx, W, E);
 
 		// return std::make_pair(X_WE.translation(), X_WE.rotation().matrix());
-		throw std::runtime_error("Only supporting 'pos_quat' and 'pos_rot_mat' robots.");
+		throw std::runtime_error("Only supporting 'point_mass', 'pos_quat', and 'pos_rot_mat' robots.");
 	}
 }
