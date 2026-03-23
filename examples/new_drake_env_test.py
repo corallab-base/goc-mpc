@@ -177,59 +177,72 @@ def n_gripper_n_block_stacking(n_grippers=3, n_blocks=5, quat=np.array([0.0, 0.0
 
 
 def two_gripper_block_stacking():
-    env = SimpleDrakeGym(["pos_rot_mat_0", "pos_rot_mat_1"], ["cube_0", "cube_1", "cube_2"])
+    env = SimpleDrakeGym(["point_mass_0", "point_mass_1"], ["cube_0", "cube_1", "cube_2"])
 
     state_lower_bound = -10.0
     state_upper_bound =  10.0
 
-    graph = GraphOfConstraints(["pos_rot_mat_0", "pos_rot_mat_1"], ["cube_0", "cube_1", "cube_2"],
+    graph = GraphOfConstraints(["point_mass_0", "point_mass_1"], ["cube_0", "cube_1", "cube_2"],
                                state_lower_bound, state_upper_bound)
 
     joint_agent_dim = graph.num_agents * graph.dim;
 
-    graph.structure.add_nodes(5)
+    graph.structure.add_nodes(6)
     graph.structure.add_edge(0, 1, True)
     graph.structure.add_edge(2, 3, True)
     graph.structure.add_edge(1, 3, True)
     graph.structure.add_edge(1, 4, True)
-
-    A_rot_mat = np.eye(3+9)
-    A_rot_mat[:3, :3] = 0.0
-    default_rot_mat = np.array([0.0, 0.0, 0.0,
-                                -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0])
+    graph.structure.add_edge(3, 5, True)
 
     r1 = graph.add_variable()
     r2 = graph.add_variable()
-
-
+    graph.add_variable_ineq_constraint(r1, r2)
 
     phi0 = graph.add_assignable_robot_to_point_displacement_constraint(0, r1, 0, np.array([0.0, 0.0, -0.1]));
-    graph.add_assignable_linear_eq(0, r1, A_rot_mat, default_rot_mat)
-
     graph.add_assignable_grasp_change(phi0, "grab", 0);
 
-    graspPhi0 = graph.add_assignable_robot_holding_point_constraint(0, 1, r1, 0, 0.1);
+    graspPhi0 = graph.add_assignable_robot_holding_point_constraint(0, 1, r1, 0, 0.2);
 
-    phi1 = graph.add_point_to_point_displacement_constraint(1, 0, 1, np.array([0.0, 0.0, -0.2]), tol=0.01)
-    graph.add_assignable_linear_eq(1, 0, A_rot_mat, default_rot_mat)
-
+    phi1 = graph.add_assignable_robot_to_point_displacement_constraint(1, r1, 1, np.array([0.0, 0.0, -0.2]))
     graph.add_assignable_grasp_change(phi1, "release", 0);
 
     phi2 = graph.add_assignable_robot_to_point_displacement_constraint(2, r2, 2, np.array([0.0, 0.0, -0.1]));
     graph.add_assignable_grasp_change(phi2, "grab", 2);
-    graph.add_assignable_linear_eq(2, r2, A_rot_mat, default_rot_mat)
 
-    graspPhi1 = graph.add_assignable_robot_holding_point_constraint(2, 3, r2, 2, 0.1);
+    # r2 hold on to block 2 while moving to block 1
+    graspPhi1 = graph.add_assignable_robot_holding_point_constraint(2, 3, r2, 2, 0.2);
 
-    phi3 = graph.add_point_to_point_displacement_constraint(3, 2, 1, np.array([0.0, 0.0, -0.2]), tol=0.01)
+    # r2 move 30 centimeters above block 1
+    phi3 = graph.add_assignable_robot_to_point_displacement_constraint(3, r2, 1, np.array([0.0, 0.0, -0.3]))
+
+    # after r2 is above block 1, release block 2
     graph.add_assignable_grasp_change(phi3, "release", 2);
-    graph.add_assignable_linear_eq(3, r2, A_rot_mat, default_rot_mat)
 
-    phi4 = graph.add_assignable_robot_to_point_displacement_constraint(4, r1, 1, np.array([0.0, 0.0, -0.5]));
-    graph.add_assignable_linear_eq(4, r1, A_rot_mat, default_rot_mat)
+    # move a safe distance away from blocks after placing them
+    phi4 = graph.add_assignable_robot_to_point_displacement_constraint(4, r1, 0, np.array([0.5, 0.5, -0.5]));
+    phi5 = graph.add_assignable_robot_to_point_displacement_constraint(5, r2, 2, np.array([-0.5, -0.5, -0.5]));
+
+    # when the 0 stacked on 1 edge constraint is violated here, back track all the way to node 0
+    stackedPhi0 = graph.add_edge_point_to_point_displacement_constraint(
+        u=1, v=4, point_a=0, point_b=1,
+        disp=np.array([0.0, 0.0, -0.1]),
+        tol=np.array([0.1, 0.1, 0.5]))
+    graph.add_backtrack_link(stackedPhi0, 0)
+
+    # when the 2 stacked on 0 edge constraint is violated here, back track all the way to node 2
+    stackedPhi1 = graph.add_edge_point_to_point_displacement_constraint(
+        u=3, v=5, point_a=2, point_b=0,
+        disp=np.array([0.0, 0.0, -0.1]),
+        tol=np.array([0.1, 0.1, 0.5]))
+    graph.add_backtrack_link(stackedPhi1, 2)
+
+    # forever attempt to move toward 4/5 so that backtracking can occur as
+    # neccessary when disturbances are made at the end
+    graph.make_node_unpassable(4)
+    graph.make_node_unpassable(5)
 
     # GoC-MPC
-    spline_spec = [Block.R(3), Block.SO3Mat()]
+    spline_spec = [Block.R(3)]
     goc_mpc = GraphOfConstraintsMPC(graph, spline_spec, short_path_time_per_step = 0.1,
                                     solve_for_waypoints_once = False,
                                     time_delta_cutoff = 0.0,
@@ -617,13 +630,14 @@ def main():
         # goc_mpc.pass_node(2, assignments)
 
         disturbed = False
+        disturbed2 = False
 
         env._meshcat.StartRecording()
 
         t = 0.0
         teleport = False
 
-        step = 3
+        step = 1
         for k in range(0, 2000, step):
             x, x_dot = obs
 
@@ -639,14 +653,28 @@ def main():
                 if xi_h.shape[0] > 1:
                     xi_h = xi_h[1:]
 
-            breakpoint()
-
             # get target point on xi_h and associated time
             qpos = xi_h[step]
             time_delta = times_h[step]
 
             # jump to target point
             obs, rew, done, trunc, info = env.step(qpos, grasp_cmds=goc_mpc.last_grasp_commands)
+
+            if not disturbed and k > 500:
+                i = 2
+                name = env._passive_names[i]
+                q_slice = env._passive_q_slices[i]
+                new_q = obs[0][q_slice] + np.array([0.5, 0.0, 0.0])
+                env._set_model_q(name, new_q)
+                disturbed = True
+
+            if not disturbed2 and k > 1000:
+                i = 1
+                name = env._passive_names[i]
+                q_slice = env._passive_q_slices[i]
+                new_q = obs[0][q_slice] + np.array([-0.5, 0.0, 0.0])
+                env._set_model_q(name, new_q)
+                disturbed2 = True
 
             # advance time by the associated time delta
             t += time_delta
