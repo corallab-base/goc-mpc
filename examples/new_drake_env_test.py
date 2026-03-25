@@ -227,14 +227,14 @@ def two_gripper_block_stacking():
         u=1, v=4, point_a=0, point_b=1,
         disp=np.array([0.0, 0.0, -0.1]),
         tol=np.array([0.1, 0.1, 0.5]))
-    graph.add_backtrack_link(stackedPhi0, 0)
+    graph.add_backtrack_links(stackedPhi0, [0, 2])
 
     # when the 2 stacked on 0 edge constraint is violated here, back track all the way to node 2
     stackedPhi1 = graph.add_edge_point_to_point_displacement_constraint(
         u=3, v=5, point_a=2, point_b=0,
         disp=np.array([0.0, 0.0, -0.1]),
         tol=np.array([0.1, 0.1, 0.5]))
-    graph.add_backtrack_link(stackedPhi1, 2)
+    graph.add_backtrack_links(stackedPhi1, [2])
 
     # forever attempt to move toward 4/5 so that backtracking can occur as
     # neccessary when disturbances are made at the end

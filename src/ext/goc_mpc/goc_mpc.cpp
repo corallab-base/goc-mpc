@@ -49,7 +49,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("evaluate_edge_phi", &GraphOfConstraints::evaluate_edge_phi)
 		.def("get_edge_phi_agent", &GraphOfConstraints::get_edge_phi_agent)
-		.def("add_backtrack_link", &GraphOfConstraints::add_backtrack_link)
+		.def("add_backtrack_links", &GraphOfConstraints::add_backtrack_links)
 		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
 		.def("add_robots_linear_eq", &GraphOfConstraints::add_robots_linear_eq)
 		.def("add_robot_linear_eq", &GraphOfConstraints::add_robot_linear_eq)

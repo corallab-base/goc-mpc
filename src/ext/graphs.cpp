@@ -786,7 +786,7 @@ void init_submodule_graphs(py::module_& m) {
 		.def("neighbors", (const std::vector<GraphPy::Edge>& (GraphPy::*)(int) const)&GraphPy::neighbors,
 		     py::arg("u"), py::return_value_policy::reference_internal)
 		// .def("bfs", [](const GraphPy &g, int s){ auto r = g.bfs(s); return py::dict("parent"_a=r.parent, "dist"_a=r.dist); })
-		// .def("dfs", &GraphPy::dfs)
+		.def("dfs", &GraphPy::dfs)
 		// .def("dijkstra", [](const GraphPy &g, int s, py::function weight_fn){
 		// 	auto result = g.dijkstra(s, [weight_fn](const Label &lbl){ return weight_fn(lbl).cast<double>(); });
 		// 	return py::dict("dist"_a=result.dist, "parent"_a=result.parent);

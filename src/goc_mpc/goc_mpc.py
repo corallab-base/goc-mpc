@@ -156,15 +156,25 @@ class GraphOfConstraintsMPC():
                 for edge_phi_id, op in self.graph.get_next_edge_ops(self.remaining_phases).items():
                     if not self.graph.evaluate_edge_phi(edge_phi_id, x, self.last_cycle_var_assignments, 0.00):
                         print(f"violated path constraint on {op.u_node}->{op.v_node} (edge phi id: {edge_phi_id})! backtracking.")
-                        self.completed_phases -= {op.u_node}
-                        self.remaining_phases.append(op.u_node)
 
-                        backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
-                        self.last_cycle_backtracked_phases[backtracked_agent] = op.u_node
+                        if edge_phi_id in self.graph.backtrack_map:
+                            for node in self.graph.backtrack_map[edge_phi_id]:
+                                child_nodes = self.graph.structure.dfs(node)
+                                self.completed_phases -= set(child_nodes)
+                                self.remaining_phases = list(set(self.remaining_phases) | set(child_nodes))
+                                # TODO: This is meant to open the gripper for
+                                # the right agent when backtracking. Replace it
+                                # with edge constraint for gripper preceeding actions
+                                backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
+                                self.last_cycle_backtracked_phases[backtracked_agent] = op.u_node
+                        else:
+                            self.completed_phases -= {op.u_node}
+                            self.remaining_phases.append(op.u_node)
+
+                            backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
+                            self.last_cycle_backtracked_phases[backtracked_agent] = op.u_node
 
                         remaining_phases_changed = True
-
-                # TODO: more serious backtracking
 
             # while not self.timing_mpc.at_the_start() and phi.maxError(C, 0.5+timingMPC.phase+subSeqStart) > opt.precision:
             #     # back track appropriately

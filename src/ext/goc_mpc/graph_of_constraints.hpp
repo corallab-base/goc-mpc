@@ -129,7 +129,7 @@ struct GraphOfConstraints {
 	std::map<int, struct DeferredVarOp> var_ops;
 
 	// backtracking map
-	std::map<int, int> backtrack_map;
+	std::map<int, std::vector<int>> backtrack_map;
 
 	// Rest
 	int num_phis, num_edge_phis, num_var_phis;
@@ -188,7 +188,7 @@ struct GraphOfConstraints {
 
 	int get_edge_phi_agent(int phi_id, const Eigen::VectorXi& var_assignments) const;
 
-	void add_backtrack_link(int to, int from);
+	void add_backtrack_links(int edge_id, std::vector<int> backtrack_nodes);
 
 	// Grasp change util
 	void add_grasp_change(int phi_id, std::string command, int robot_id, int cube_id);

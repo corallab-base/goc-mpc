@@ -276,8 +276,8 @@ int GraphOfConstraints::get_edge_phi_agent(int phi_id, const Eigen::VectorXi& va
 	return -1;
 }
 
-void GraphOfConstraints::add_backtrack_link(int to, int from) {
-	backtrack_map[to] = from;
+void GraphOfConstraints::add_backtrack_links(int edge_id, std::vector<int> backtrack_nodes) {
+	backtrack_map[edge_id] = backtrack_nodes;
 }
 
 // Grasp util
