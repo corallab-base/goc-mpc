@@ -640,17 +640,21 @@ bool GraphTimingMPC::solve(
 	// 	problem->prog->SetInitialGuess(problem->X.row(i), _waypoints.row(v));
 	// }
 
-
 	// Solve
-	drake::solvers::IpoptSolver solver;
-	// auto result = solver.Solve(*problem.prog);
+	using drake::solvers::IpoptSolver;
+	using drake::solvers::NloptSolver;
+	NloptSolver solver;
+
+	// Choose Nlopt algorithm
+	// problem->prog->SetSolverOption(NloptSolver::id(), "algorithm", "LD_SLSQP");
 
 	MathematicalProgramResult result;
 	try {
-		// result = drake::solvers::Solve(*(problem->prog));
 		result = solver.Solve(*(problem->prog));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in timing solver: " << e.what() << std::endl;
+		std::cout << "problem: " << std::endl;
+		std::cout << problem->prog->to_string() << std::endl;
 		return false;
 	}
 
@@ -676,6 +680,8 @@ bool GraphTimingMPC::solve(
 		return true;
 	} else {
 		PrintSolverReport(problem.get(), result, 1e-6);
+		std::cout << "problem: " << std::endl;
+		std::cout << problem->prog->to_string() << std::endl;
 		return false;
 	}
 }
@@ -788,7 +794,6 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 }
 
 
-// Safe indexing and accessors
 const std::vector<double> GraphTimingMPC::get_next_taus() const {
 	std::vector<double> result;
 	for (int i = 0; i < _graph->num_agents; ++i) {
@@ -802,7 +807,7 @@ const std::vector<double> GraphTimingMPC::get_next_taus() const {
 	return result;
 }
 
-// Safe indexing and accessors
+
 const std::vector<int> GraphTimingMPC::get_next_nodes() const {
 	std::vector<int> result;
 	for (int i = 0; i < _graph->num_agents; ++i) {
@@ -815,184 +820,3 @@ const std::vector<int> GraphTimingMPC::get_next_nodes() const {
 	}
 	return result;
 }
-
-
-// py::array_t<double> GraphTimingMPC::get_waypoints() const {
-// 	if (done()) {
-// 		return remainder_slice_2d(_waypoints, 0);
-// 	} else {
-// 		return remainder_slice_2d(_waypoints, 0);
-// 	}
-// }
-
-// py::array_t<double> TimingMPC::get_time_deltas() const {
-// 	if (done()) {
-// 		// Return single time step
-// 		py::array_t<double> ret(1);
-// 		auto ret_mut = ret.mutable_unchecked<1>();
-// 		ret_mut(0) = 0.1;
-// 		return ret;
-// 	}
-// 	auto remaining_time_deltas = remainder_slice_1d(this->time_deltas, this->phase);
-// 	return remaining_time_deltas;
-// }
-
-// py::array_t<unsigned int> GraphTimingMPC::get_ordering() const {
-// 	// if (done()) {
-// 	// 	// Return single time step
-// 	// 	py::array_t<double> ret(1);
-// 	// 	auto ret_mut = ret.mutable_unchecked<1>();
-// 	// 	ret_mut(0) = 0.1;
-// 	// 	return ret;
-// 	// }
-// 	// auto remaining_time_deltas = remainder_slice_1d(this->time_deltas, this->phase);
-// 	// return integral(remaining_time_deltas);
-// 	return _ordering;
-// }
-
-// py::array_t<double> GraphTimingMPC::get_times() const {
-// 	if (done()) {
-// 		// Return single time step
-// 		py::array_t<double> ret(1);
-// 		auto ret_mut = ret.mutable_unchecked<1>();
-// 		ret_mut(0) = 0.1;
-// 		return ret;
-// 	}
-// 	auto remaining_time_deltas = remainder_slice_1d(_time_deltas, 0);
-// 	return integral(remaining_time_deltas);
-// }
-
-
-// py::array_t<double> GraphTimingMPC::get_vels() const {
-// 	const int phase = 0; // static_cast<int>(this->phase);
-
-// 	// Done: return final velocity (usually zero)
-// 	if (done()) {
-// 		return remainder_slice_2d(_vels, _num_nodes - 1);
-// 	}
-
-// 	int num_rows = _num_nodes - phase;  // including final appended zero row
-// 	int num_cols = _dim;
-
-// 	// Allocate final velocity array (including appended zero row)
-// 	py::array_t<double> result({num_rows, num_cols});
-// 	auto result_mut = result.mutable_unchecked<2>();
-
-// 	// Directly copy from this->vels
-// 	auto src = remainder_slice_2d(_vels, phase).unchecked<2>();
-// 	for (int i = 0; i < num_rows - 1; ++i) {
-// 		for (int j = 0; j < _dim; ++j) {
-// 			result_mut(i, j) = src(i, j);
-// 		}
-// 	}
-
-// 	// Append zero vector at the end
-// 	for (int j = 0; j < _dim; ++j) {
-// 		result_mut(num_rows - 1, j) = 0.0;
-// 	}
-
-// 	return result;
-// }
-
-
-/* after having optimized for a waypoint ordering and a spline going
- * through the waypoints in that order, update the spline according to
- * an amount of passed time. Also check for phase progression when it's
- * expected. */
-// bool GraphTimingMPC::set_progressed_time(double time_delta, double time_delta_cutoff) {
-// 	bool any_progression = false;
-// 	std::set<unsigned int> next_nodes = _next_nodes();
-
-// 	auto time_deltas_mut = _time_deltas.mutable_unchecked<1>();
-// 	for (unsigned int n : next_nodes) {
-// 		if (time_delta < time_deltas_mut(n)) {
-// 			time_deltas_mut(n) -= time_delta;
-// 		} else {
-
-// 		}
-// 	}
-
-// 	if (time_delta < tau(phase)) { // time still within phase
-// 		tau(phase) -= gap; //change initialization of timeOpt
-// 		return false;
-// 	}
-
-// 	//time beyond current phase
-// 	if (phase + 1 < nPhases()) { //if there exists another phase
-// 		tau(phase+1) -= gap-tau(phase); //change initialization of timeOpt
-// 		tau(phase) = 0.; //change initialization of timeOpt
-// 	} else {
-// 		if(phase+1==nPhases() && neverDone) { //stay in last phase and reinit tau=.1
-// 			tau(phase)=.1+tauCutoff;
-// 			return false;
-// 		}
-// 		tau = 0.;
-// 	}
-
-// 	phase++; //increase phase
-// 	return true;
-// }
-
-// void TimingMPC::set_updated_waypoints(const py::array_t<double>& _waypoints, bool set_next_waypoint_tangent) {
-// 	if (_waypoints.size() != this->waypoints.size()) { //full reset
-// 		waypoints = _waypoints;
-// 		tau = 10.0 * ones(waypoints.d0);
-// 		vels.clear();
-// 		tangents.clear();
-// 	} else if (&waypoints != &_waypoints) {
-// 		waypoints = _waypoints;
-// 	}
-
-// 	if (set_next_waypoint_tangent) {
-// 		LOG(-1) <<"questionable";
-// 		tangents.resize(waypoints.d0-1, waypoints.d1);
-// 		for(uint k=1; k<waypoints.d0; k++) {
-// 			tangents[k-1] = waypoints[k] - waypoints[k-1];
-// 			op_normalize(tangents[k-1].noconst());
-// 		}
-// 	}
-// }
-
-// void TimingMPC::update_backtrack() {
-// 	if (this->phase == 0) {
-// 		throw std::runtime_error("Cannot backtrack from phase 0.");
-// 	}
-
-// 	/* by default, go back one */
-// 	unsigned int phaseTo = this->phase - 1;
-
-// 	/* Check if back_tracking_table is initialized and non-empty */
-// 	/* if so, use that to determine where to go */
-// 	if (this->back_tracking_table.size() > 0) {
-// 		if (this->phase >= this->back_tracking_table.size()) {
-// 			throw std::runtime_error("Phase index out of bounds in back_tracking_table.");
-// 		}
-// 		auto bt = this->back_tracking_table.unchecked<1>();
-// 		phaseTo = bt(this->phase);
-// 	}
-
-// 	this->update_set_phase(phaseTo);
-// }
-
-// void TimingMPC::update_set_phase(unsigned int phaseTo) {
-// 	std::cout << "[TimingMPC] Backtracking from phase " << this->phase
-// 		  << " to " << phaseTo << " times: " << std::endl;
-
-// 	if (phaseTo > this->phase) {
-// 		throw std::runtime_error("Cannot advance phase using update_set_phase — only backward steps allowed.");
-// 	}
-
-// 	auto time_deltas_ = this->time_deltas.mutable_unchecked<1>();
-// 	int N = time_deltas_.shape(0);
-
-// 	while (this->phase > phaseTo) {
-// 		if (this->phase < static_cast<unsigned int>(N)) {
-// 			time_deltas_(this->phase) = std::max(1.0, time_deltas_(this->phase));
-// 		}
-// 		this->phase--;
-// 	}
-
-// 	time_deltas_(this->phase) = 1.0;
-// }
-
-
