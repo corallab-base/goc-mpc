@@ -1909,11 +1909,13 @@ int GraphOfConstraints::add_variable_ineq_constraint(
 			const int variable1_k = subgraph.subgraph_variable_id(var1);
 			const int variable2_k = subgraph.subgraph_variable_id(var2);
 
-			for (int i = 0; i < num_agents; i++) {
-				const auto s = Assignments(variable1_k, i) + Assignments(variable2_k, i);
-				// 1 <= binary v1 + binary v2 <= 1 implies both
-				// cannot be zero and both cannot be one.
-				prog.AddLinearConstraint(s, 1, 1);
+			if (variable1_k != -1 && variable2_k != -1) {
+				for (int i = 0; i < num_agents; i++) {
+					const auto s = Assignments(variable1_k, i) + Assignments(variable2_k, i);
+					// 1 <= binary v1 + binary v2 <= 1 implies both
+					// cannot be zero and both cannot be one.
+					prog.AddLinearConstraint(s, 1, 1);
+				}
 			}
 		});
 }
