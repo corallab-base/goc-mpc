@@ -467,10 +467,15 @@ GraphTimingProblem build_graph_timing_problem(
 
 	for (const struct AgentInteraction& p : agent_interactions) {
 		if (p.type == AgentInteraction::Type::LESS_THAN) {
+			double min_tau = 0.0;
+			if (graph.edge_to_min_tau_map.contains(std::make_pair(p.node_u, p.node_v))) {
+				min_tau = graph.edge_to_min_tau_map.at(std::make_pair(p.node_u, p.node_v));
+			}
+
 			// taus
 			Eigen::VectorX<Expression> taus_i = problem.time_deltas_list[p.agent_i].head(p.agent_i_depth+1);
 			Eigen::VectorX<Expression> taus_j = problem.time_deltas_list[p.agent_j].head(p.agent_j_depth+1);
-			problem.prog->AddLinearConstraint(taus_i.sum() <= taus_j.sum())
+			problem.prog->AddLinearConstraint(taus_i.sum() + min_tau <= taus_j.sum())
 				.evaluator()->set_description("timing less than constraint");
 		} else if (p.type == AgentInteraction::Type::EQUAL) {
 			Eigen::VectorX<Expression> taus_i = problem.time_deltas_list[p.agent_i].head(p.agent_i_depth+1);

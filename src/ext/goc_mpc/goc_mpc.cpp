@@ -137,6 +137,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("point_b"),
 		     py::arg("disp"))
 		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint)
+		// EDGE TIMING CONSTRAINTS  ///////////////////////////////////
+		.def("add_edge_min_tau_constraint", &GraphOfConstraints::add_edge_min_tau_constraint,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("minimum_time_delta"))
+		// VARIABLE CONSTRAINTS ///////////////////////////////////////
 		.def("add_variable_constraint", &GraphOfConstraints::add_variable_constraint)
 		.def("add_variable_ineq_constraint", &GraphOfConstraints::add_variable_ineq_constraint);
 

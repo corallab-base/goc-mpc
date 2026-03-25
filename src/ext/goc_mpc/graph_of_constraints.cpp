@@ -1838,6 +1838,21 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+//                         TIMING (EDGE) CONSTRAINTS                         //
+///////////////////////////////////////////////////////////////////////////////
+
+void GraphOfConstraints::add_edge_min_tau_constraint(int u,
+						     int v,
+						     double minimum_time_delta) {
+
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(minimum_time_delta >= 0);
+
+	edge_to_min_tau_map[std::make_pair(u, v)] = minimum_time_delta;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 //                            VARIABLE CONSTRAINTS                           //
 ///////////////////////////////////////////////////////////////////////////////
 

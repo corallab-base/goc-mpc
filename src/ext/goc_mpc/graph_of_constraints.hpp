@@ -111,6 +111,7 @@ struct GraphOfConstraints {
 	Graph<py::object> structure;
 	std::map<int, std::vector<int>> node_to_phis_map;
 	std::map<std::pair<int, int>, std::vector<int>> edge_to_phis_map;
+	std::map<std::pair<int, int>, double> edge_to_min_tau_map;
 	std::set<int> unpassable_nodes;
 
 	// Node Phi maps
@@ -319,6 +320,12 @@ struct GraphOfConstraints {
 							  int point_id,
 							  double holding_distance_max = 0.1,
 							  bool use_l2 = false);
+
+	// Timing (Edge) Constraints
+
+	void add_edge_min_tau_constraint(int u,
+					 int v,
+					 double minimum_time_delta);
 
 	// Variable Constraints
 

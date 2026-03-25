@@ -218,6 +218,9 @@ def two_gripper_block_stacking():
     # after r2 is above block 1, release block 2
     graph.add_assignable_grasp_change(phi3, "release", 2);
 
+    # ensure timing delay between placing block 0 and placing block 2
+    graph.add_edge_min_tau_constraint(1, 3, 1.0)
+
     # move a safe distance away from blocks after placing them
     phi4 = graph.add_assignable_robot_to_point_displacement_constraint(4, r1, 0, np.array([0.5, 0.5, -0.5]));
     phi5 = graph.add_assignable_robot_to_point_displacement_constraint(5, r2, 2, np.array([-0.5, -0.5, -0.5]));
