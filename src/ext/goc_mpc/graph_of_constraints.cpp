@@ -319,7 +319,7 @@ std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraint
 			// it should be assigned at this point.
 			int robot_id = assignments(phi_id);
 			if (robot_id == -1) {
-				throw std::runtime_error("Somehow constraint was not assigned.");
+				throw std::runtime_error(fmt::format("Somehow constraint {} at node {} was not assigned.", phi_id, k));
 			} else {
 				const std::string& robot_model_name = _robot_names.at(robot_id);
 				for (const auto& assignable_change : _assignable_grasp_change_map.at(phi_id)) {
@@ -1520,7 +1520,9 @@ int GraphOfConstraints::add_point_to_point_alignment_constraint(
 		       });
 }
 
-// EDGE-CONSTRAINTS
+///////////////////////////////////////////////////////////////////////////////
+//                              EDGE CONSTRAINTS                             //
+///////////////////////////////////////////////////////////////////////////////
 
 int GraphOfConstraints::add_robot_holding_cube_constraint(
 	int u,
@@ -1537,7 +1539,6 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	int edge_phi_id = _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({point_id}),
 			    [=, this](const Eigen::VectorXd& x,
 				      const Eigen::VectorXi&/*unused*/) {
-
 				    auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
 				    auto p_WC = CubePosFromRow(this, point_id, x);
 
@@ -1835,6 +1836,10 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 			return;
 		});
 }
+
+///////////////////////////////////////////////////////////////////////////////
+//                            VARIABLE CONSTRAINTS                           //
+///////////////////////////////////////////////////////////////////////////////
 
 int GraphOfConstraints::add_variable_constraint(
 	int var,
