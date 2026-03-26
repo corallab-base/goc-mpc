@@ -506,6 +506,7 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	const std::vector<int>& remaining_vertices,
 	Eigen::VectorXd x0,
 	Eigen::MatrixXd previous_X,
+	Eigen::VectorXi previous_var_assignments,
 	bool enforce_rigidity,
 	bool relax_binary_vars) {
 
@@ -703,6 +704,9 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 			}
 		}
 
+		// Third, optionally enforce rigidity between points and
+		// end-effectors to enable solving for robot poses based on
+		// keypoint requirements
 		if (enforce_rigidity) {
 			for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_for_initial_layer) {
 				auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
@@ -724,6 +728,17 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 					/*non_robot_dim=*/non_robot_dim,
 					x0,
 					/*exact_rigidity=*/true);
+			}
+		}
+
+		// Fourth, ensure reassignments aren't done while holding a block??
+		// This is a heuristic that maybe will be replaced.
+		for (const AssignableHoldSpec& hold_spec : assignable_hold_specs_for_initial_layer) {
+			int prev_assignment = previous_var_assignments(hold_spec.var);
+			auto A_row = GetARowForVar(subgraph, Assignments, hold_spec.var);
+			if (prev_assignment != -1) {
+				prog.AddLinearEqualityConstraint(A_row(prev_assignment) == 1)
+					.evaluator()->set_description(fmt::format("{} non-changing constraint", hold_spec.var));
 			}
 		}
 	}
@@ -1187,7 +1202,7 @@ bool GraphWaypointMPC::SolveWithMosek(
 	bool enforce_rigidity_and_relax_binary_vars) {
 
 	GraphWaypointProblem problem = BuildGraphWaypointProblem(
-		_graph, _splines, remaining_vertices, x0, _waypoints,
+		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
 		enforce_rigidity_and_relax_binary_vars,
 		enforce_rigidity_and_relax_binary_vars);
 
@@ -1244,7 +1259,7 @@ bool GraphWaypointMPC::SolveWithGurobi(
 	bool enforce_rigidity_and_relax_binary_vars) {
 
 	GraphWaypointProblem problem = BuildGraphWaypointProblem(
-		_graph, _splines, remaining_vertices, x0, _waypoints,
+		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
 		enforce_rigidity_and_relax_binary_vars,
 		enforce_rigidity_and_relax_binary_vars);
 
@@ -1319,7 +1334,7 @@ bool GraphWaypointMPC::SolveWithEnumerationAndIPOPT(
 	try {
 		problem = std::make_unique<GraphWaypointProblem>(
 			BuildGraphWaypointProblem(
-				_graph, _splines, remaining_vertices, x0, _waypoints,
+				_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
 				/*enforce_rigidity=*/true,
 				/*relax_binary_vars=*/true));
 	} catch (const std::exception& e) {
