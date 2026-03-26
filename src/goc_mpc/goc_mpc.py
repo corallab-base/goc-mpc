@@ -159,9 +159,9 @@ class GraphOfConstraintsMPC():
 
                         if edge_phi_id in self.graph.backtrack_map:
                             for node in self.graph.backtrack_map[edge_phi_id]:
-                                child_nodes = self.graph.structure.dfs(node)
-                                self.completed_phases -= set(child_nodes)
-                                self.remaining_phases = list(set(self.remaining_phases) | set(child_nodes))
+                                self.completed_phases -= {node}
+                                if node not in self.remaining_phases:
+                                    self.remaining_phases.append(node)
                                 # TODO: This is meant to open the gripper for
                                 # the right agent when backtracking. Replace it
                                 # with edge constraint for gripper preceeding actions

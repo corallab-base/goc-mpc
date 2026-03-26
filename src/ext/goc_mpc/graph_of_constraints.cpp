@@ -277,7 +277,26 @@ int GraphOfConstraints::get_edge_phi_agent(int phi_id, const Eigen::VectorXi& va
 }
 
 void GraphOfConstraints::add_backtrack_links(int edge_id, std::vector<int> backtrack_nodes) {
-	backtrack_map[edge_id] = backtrack_nodes;
+	// If edge_id isn't in the map yet, [] automatically creates an empty vector for it.
+	auto& existing_nodes = backtrack_map[edge_id];
+	std::vector<int> new_nodes{};
+
+	for (int node : backtrack_nodes) {
+		auto descendants = structure.dfs(node);
+		new_nodes.insert(new_nodes.end(), descendants.begin(), descendants.end());
+	}
+
+	existing_nodes.insert(existing_nodes.end(), new_nodes.begin(), new_nodes.end());
+	std::sort(existing_nodes.begin(), existing_nodes.end());
+	existing_nodes.erase(std::unique(existing_nodes.begin(), existing_nodes.end()), existing_nodes.end());
+}
+
+void GraphOfConstraints::add_manual_backtrack_links(int edge_id, std::vector<int> backtrack_nodes) {
+	// If edge_id isn't in the map yet, [] automatically creates an empty vector for it.
+	auto& existing_nodes = backtrack_map[edge_id];
+	existing_nodes.insert(existing_nodes.end(), backtrack_nodes.begin(), backtrack_nodes.end());
+	std::sort(existing_nodes.begin(), existing_nodes.end());
+	existing_nodes.erase(std::unique(existing_nodes.begin(), existing_nodes.end()), existing_nodes.end());
 }
 
 // Grasp util

@@ -190,6 +190,7 @@ struct GraphOfConstraints {
 	int get_edge_phi_agent(int phi_id, const Eigen::VectorXi& var_assignments) const;
 
 	void add_backtrack_links(int edge_id, std::vector<int> backtrack_nodes);
+	void add_manual_backtrack_links(int edge_id, std::vector<int> backtrack_nodes);
 
 	// Grasp change util
 	void add_grasp_change(int phi_id, std::string command, int robot_id, int cube_id);
