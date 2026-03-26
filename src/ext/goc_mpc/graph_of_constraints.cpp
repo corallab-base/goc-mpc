@@ -646,8 +646,9 @@ int GraphOfConstraints::add_robot_pos_linear_eq(int k, int robot_id, const Eigen
 				       const auto& X,
 				       const auto&) {
 				     const int node_k = subgraph.subgraph_id(k);
-				     VectorXDecisionVariable agent_pos_k = X.row(node_k).segment(robot_id*dim, 3);
-				     auto beq = prog.AddLinearEqualityConstraint(A, b, agent_pos_k);
+				     Eigen::Matrix<Expression, Eigen::Dynamic, 1> row = X.row(node_k);
+				     auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", row);
+				     prog.AddLinearEqualityConstraint(A*b == p_WR);
 			     });
 
 	// record that this constraint is statically assigned to this robot.
