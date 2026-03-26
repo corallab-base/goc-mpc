@@ -1787,6 +1787,46 @@ int GraphOfConstraints::add_robot_relative_displacement_constraint(
 	return edge_phi_id;
 }
 
+int GraphOfConstraints::add_edge_assignable_robot_to_point_displacement_constraint(
+	int u,
+	int v,
+	int var,
+	int point_id,
+	Eigen::Vector3d& disp,
+	Eigen::Vector3d& tol) {
+
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+
+	return _add_assignable_edge_op(
+		DeferredOpKind::kAgentLinearEq, u, v, var, std::set<int>(),
+		[=, this](const Eigen::VectorXd& x,
+			  const Eigen::VectorXi& assignments) {
+			const int robot_id = assignments(var);
+			auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
+			auto p_WC = CubePosFromRow(this, point_id, x);
+			Eigen::Vector3d r  = (p_WC - p_WR) - disp;   // want r == 0
+			Eigen::Vector3d err = r.cwiseAbs() - tol;
+			return err.maxCoeff();
+		},
+		[=, this](drake::solvers::MathematicalProgram& prog,
+			  const SubgraphOfConstraints& subgraph,
+			  const int phi_id,
+			  const drake::solvers::MatrixXDecisionVariable& X,
+			  const drake::solvers::MatrixXDecisionVariable& /*unused*/,
+			  const Eigen::VectorXd& x_u) {
+			return;
+		},
+		[](drake::solvers::MathematicalProgram& prog,
+		   const int phi_id,
+		   const Eigen::VectorXi& var_assignments,
+		   const drake::solvers::MatrixXDecisionVariable& Xi) {
+			return;
+		});
+}
+
 int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 	int u,
 	int v,

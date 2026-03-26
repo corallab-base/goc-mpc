@@ -314,6 +314,15 @@ struct GraphOfConstraints {
 						int point_ids,
 						double holding_distance_max = 0.1);
 
+	// Assignable Edge Constraints
+
+	int add_edge_assignable_robot_to_point_displacement_constraint(int u,
+								       int v,
+								       int var,
+								       int point_id,
+								       Eigen::Vector3d& disp,
+								       Eigen::Vector3d& tol);
+
 	int add_assignable_robot_holding_point_constraint(int u,
 							  int v,
 							  int var,
