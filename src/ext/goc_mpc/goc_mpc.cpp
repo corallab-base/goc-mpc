@@ -54,7 +54,11 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_robots_linear_eq", &GraphOfConstraints::add_robots_linear_eq)
 		.def("add_robot_linear_eq", &GraphOfConstraints::add_robot_linear_eq)
 		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
-		.def("add_robot_pos_linear_eq", &GraphOfConstraints::add_robot_pos_linear_eq)
+		.def("add_robot_pos_linear_eq", &GraphOfConstraints::add_robot_pos_linear_eq,
+		     py::arg("k"),
+		     py::arg("robot_id"),
+		     py::arg("A"),
+		     py::arg("b"))
 		.def("add_robot_quat_linear_eq", &GraphOfConstraints::add_robot_quat_linear_eq)
 		.def("add_assignable_robot_quat_linear_eq", &GraphOfConstraints::add_assignable_robot_quat_linear_eq)
 		.def("add_robot_to_point_displacement_constraint", &GraphOfConstraints::add_robot_to_point_displacement_constraint,
@@ -93,29 +97,6 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("w_u_stab") = 0.01,
 		     py::arg("eps") = 1e-10,
 		     py::arg("eps_d") = 1e-3)
-		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint,
-		     py::arg("u"),
-		     py::arg("v"),
-		     py::arg("robot_id"),
-		     py::arg("point_ids"),
-		     py::arg("holding_distance_max") = 0.1,
-		     py::arg("use_l2") = false)
-		.def("add_assignable_robot_holding_point_constraint", &GraphOfConstraints::add_assignable_robot_holding_point_constraint,
-		     py::arg("u"),
-		     py::arg("v"),
-		     py::arg("robot_id"),
-		     py::arg("point_ids"),
-		     py::arg("holding_distance_max") = 0.1,
-		     py::arg("use_l2") = false)
-		.def("add_edge_point_to_point_displacement_constraint", &GraphOfConstraints::add_edge_point_to_point_displacement_constraint,
-		     py::arg("u"),
-		     py::arg("v"),
-		     py::arg("point_a"),
-		     py::arg("point_b"),
-		     py::arg("disp"),
-		     py::arg("tol"))
-		.def("add_robot_relative_rotation_constraint", &GraphOfConstraints::add_robot_relative_rotation_constraint)
-		.def("add_robot_relative_displacement_constraint", &GraphOfConstraints::add_robot_relative_displacement_constraint)
 		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,
 		     py::arg("k"),
 		     py::arg("robot_id"),
@@ -137,6 +118,38 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("point_b"),
 		     py::arg("disp"))
 		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint)
+		// EDGE CONSTRAINTS  ///////////////////////////////////
+		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("robot_id"),
+		     py::arg("point_ids"),
+		     py::arg("holding_distance_max") = 0.1,
+		     py::arg("use_l2") = false)
+		.def("add_edge_point_to_point_displacement_constraint", &GraphOfConstraints::add_edge_point_to_point_displacement_constraint,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("point_a"),
+		     py::arg("point_b"),
+		     py::arg("disp"),
+		     py::arg("tol"))
+		.def("add_robot_relative_rotation_constraint", &GraphOfConstraints::add_robot_relative_rotation_constraint)
+		.def("add_robot_relative_displacement_constraint", &GraphOfConstraints::add_robot_relative_displacement_constraint)
+		// ASSIGNABLE EDGE CONSTRAINTS ////////////////////////////////
+		.def("add_assignable_robot_holding_point_constraint", &GraphOfConstraints::add_assignable_robot_holding_point_constraint,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("robot_id"),
+		     py::arg("point_ids"),
+		     py::arg("holding_distance_max") = 0.1,
+		     py::arg("use_l2") = false)
+		.def("add_edge_assignable_robot_to_point_displacement_constraint", &GraphOfConstraints::add_edge_assignable_robot_to_point_displacement_constraint,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("var"),
+		     py::arg("point_id"),
+		     py::arg("disp"),
+		     py::arg("tol"))
 		// EDGE TIMING CONSTRAINTS  ///////////////////////////////////
 		.def("add_edge_min_tau_constraint", &GraphOfConstraints::add_edge_min_tau_constraint,
 		     py::arg("u"),
