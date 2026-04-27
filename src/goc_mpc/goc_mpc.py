@@ -3,7 +3,6 @@ import numpy as np
 
 from goc_mpc.graphs import Graph
 
-from ._ext.splines import CubicSpline
 from ._ext.configuration_spline import CubicConfigurationSpline, Block
 from ._ext.goc_mpc import (
     GraphOfConstraints,
