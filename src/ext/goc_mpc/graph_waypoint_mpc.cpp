@@ -135,6 +135,11 @@ static void AddHoldRigidityStaticToX0(
 					prog.AddQuadraticConstraint(rel_0(i) - rel_v(i), -0.001, 0.001)
 						.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
 				}
+			} else if (graph->robot_is_point_mass(spec.robot_ag)) {
+				prog.AddLinearConstraint(rel_0 - rel_v,
+						   Eigen::Vector3d::Constant(3, -0.001),
+						   Eigen::Vector3d::Constant(3, 0.001))
+					.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
 			} else {
 				prog.AddConstraint(rel_0 - rel_v,
 						   Eigen::Vector3d::Constant(3, -0.001),
@@ -234,6 +239,11 @@ static void AddHoldRigidityStatic(
 					prog.AddQuadraticConstraint(rel_u(i) - rel_v(i), -0.001, 0.001)
 						.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
 				}
+			} else if (graph->robot_is_point_mass(spec.robot_ag)) {
+				prog.AddLinearConstraint(rel_u - rel_v,
+						   Eigen::Vector3d::Constant(3, -0.001),
+						   Eigen::Vector3d::Constant(3, 0.001))
+					.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
 			} else {
 				prog.AddConstraint(rel_u - rel_v,
 						   Eigen::Vector3d::Constant(3, -0.001),
@@ -373,6 +383,14 @@ void AddHoldRigidityAssignableToX0(
 					prog.AddQuadraticConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("0->v exact rigidity (assignable, -)");
 
+				} else if (graph->robot_is_point_mass(k)) {
+					// Upper bound residual: residual - slack <= 0
+					prog.AddLinearConstraint(residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("0->v exact rigidity (assignable, +)");
+
+					// Lower bound residual: -residual - slack <= 0
+					prog.AddLinearConstraint(-residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("0->v exact rigidity (assignable, -)");
 				} else {
 					// Upper bound residual: residual - slack <= 0
 					prog.AddConstraint(residual(j) - slack, neg_inf, 0.0)
@@ -473,9 +491,6 @@ void AddHoldRigidityAssignable(
 
 
 				if (graph->robot_is_pos_rot_mat(k)) {
-					// If the rotation matrix is directly
-					// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
-
 					// Upper bound residual: residual - slack <= 0
 					prog.AddQuadraticConstraint(residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, +)");
@@ -483,8 +498,14 @@ void AddHoldRigidityAssignable(
 					// Lower bound residual: -residual - slack <= 0
 					prog.AddQuadraticConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, -)");
+				} else if (graph->robot_is_point_mass(k)) {
+					// Upper bound residual: residual - slack <= 0
+					prog.AddLinearConstraint(residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("u->v exact rigidity (assignable, +)");
 
-
+					// Lower bound residual: -residual - slack <= 0
+					prog.AddLinearConstraint(-residual(j) - slack, neg_inf, 0.0)
+						.evaluator()->set_description("u->v exact rigidity (assignable, -)");
 				} else {
 					// Upper bound residual: residual - slack <= 0
 					prog.AddConstraint(residual(j) - slack, neg_inf, 0.0)
@@ -1187,8 +1208,8 @@ bool GraphWaypointMPC::solve(
 
 	if (enforce_rigidity) {
 		// return SolveWithBranchAndBoundPlusROPTLIB(remaining_vertices, x0);
-		return SolveWithEnumerationAndIPOPT(remaining_vertices, x0);
-		// return SolveWithGurobi(remaining_vertices, x0, true);
+		// return SolveWithEnumerationAndIPOPT(remaining_vertices, x0);
+		return SolveWithGurobi(remaining_vertices, x0, true);
 		// return SolveWithMosek(remaining_vertices, x0, true);
 	} else {
 		return SolveWithGurobi(remaining_vertices, x0, false);

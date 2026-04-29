@@ -1570,7 +1570,15 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				    } else {
 					    violation = r.lpNorm<Eigen::Infinity>() - holding_distance_max;
 				    }
-				    std::cout << "holding constraint violation: " << violation << std::endl;
+
+				    if (violation > 0) {
+					    std::cout << "holding constraint violation: " << violation << std::endl;
+					    std::cout << "robot id: " << robot_id << std::endl;
+					    std::cout << "point id: " << point_id << std::endl;
+					    std::cout << "p_WC: " << p_WC << std::endl;
+					    std::cout << "p_WR: " << p_WR << std::endl;
+					    std::cout << "r: " << r << std::endl;
+				    }
 				    return violation;
 			    },
 			    [=, this](drake::solvers::MathematicalProgram& prog,
@@ -1825,6 +1833,10 @@ int GraphOfConstraints::add_edge_assignable_robot_to_point_displacement_constrai
 		[=, this](const Eigen::VectorXd& x,
 			  const Eigen::VectorXi& assignments) {
 			const int robot_id = assignments(var);
+			// If robot isn't assigned for this constraint now,
+			// assume its violated.
+			if (robot_id == -1) { return 99.0; }
+
 			auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
 			auto p_WC = CubePosFromRow(this, point_id, x);
 			Eigen::Vector3d r  = (p_WC - p_WR) - disp;   // want r == 0
@@ -1864,8 +1876,10 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 		DeferredOpKind::kAgentLinearEq, u, v, var, std::set<int>({point_id}),
 		[=, this](const Eigen::VectorXd& x,
 			  const Eigen::VectorXi& assignments) {
-
 			const int robot_id = assignments(var);
+			// If robot isn't assigned for this constraint now,
+			// assume its violated.
+			if (robot_id == -1) { return 99.0; }
 
 			auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
 			auto p_WC = CubePosFromRow(this, point_id, x);
@@ -1878,7 +1892,16 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 			} else {
 				violation = r.lpNorm<Eigen::Infinity>() - holding_distance_max;
 			}
-			std::cout << "holding constraint violation: " << violation << std::endl;
+
+			if (violation > 0) {
+				std::cout << "holding constraint violation: " << violation << std::endl;
+				std::cout << "robot id: " << robot_id << std::endl;
+				std::cout << "point id: " << point_id << std::endl;
+				std::cout << "p_WC: " << p_WC << std::endl;
+				std::cout << "p_WR: " << p_WR << std::endl;
+				std::cout << "r: " << r << std::endl;
+			}
+
 			return violation;
 		},
 		[=, this](drake::solvers::MathematicalProgram& prog,
