@@ -23,14 +23,20 @@ void init_submodule_goc_mpc(py::module_& m) {
 
 
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
-		.def(py::init<const std::vector<std::string>,
-		     const std::vector<std::string>,
-		     double,
-		     double>(),
-		     py::arg("robot_names"),
-		     py::arg("cube_names"),
+		.def(py::init<const std::vector<CubicConfigurationSpline::Spec>&,
+		              const std::vector<CubicConfigurationSpline::Spec>&,
+		              double,
+		              double,
+		              const std::vector<std::string>&,
+		              const std::vector<std::string>&>(),
+		     py::arg("robot_specs"),
+		     py::arg("object_specs"),
 		     py::arg("state_lower_bound"),
-		     py::arg("state_upper_bound"))
+		     py::arg("state_upper_bound"),
+		     py::arg("robot_names") = std::vector<std::string>{},
+		     py::arg("object_names") = std::vector<std::string>{})
+		.def_readonly("_robot_specs", &GraphOfConstraints::_robot_specs)
+		.def_readonly("_object_specs", &GraphOfConstraints::_object_specs)
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("num_objects", &GraphOfConstraints::num_objects)

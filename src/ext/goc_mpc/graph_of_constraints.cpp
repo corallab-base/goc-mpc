@@ -1,6 +1,8 @@
 #include "graph_of_constraints.hpp"
 #include "../utils.hpp"
 
+#include <algorithm>
+
 
 using drake::solvers::Binding;
 using drake::solvers::Constraint;
@@ -10,34 +12,35 @@ using drake::math::RigidTransform;
 using drake::math::RotationMatrix;
 
 // Constructor
-GraphOfConstraints::GraphOfConstraints(const std::vector<std::string> robots,
-				       const std::vector<std::string> objects,
-				       double global_x_lb,
-				       double global_x_ub)
-	: _robot_names(robots),
-	  _object_names(objects),
+GraphOfConstraints::GraphOfConstraints(
+		const std::vector<CubicConfigurationSpline::Spec>& robot_specs,
+		const std::vector<CubicConfigurationSpline::Spec>& object_specs,
+		double global_x_lb,
+		double global_x_ub,
+		const std::vector<std::string>& robot_names,
+		const std::vector<std::string>& object_names)
+	: _robot_specs(robot_specs),
+	  _robot_names(robot_names),
+	  _object_specs(object_specs),
+	  _object_names(object_names),
 	  num_phis(0),
 	  num_edge_phis(0),
 	  num_var_phis(0),
 	  num_variables(0),
 	  _num_total_assignables(0),
-	  num_agents(robots.size()),
-	  num_objects(objects.size()),
+	  num_agents(robot_specs.size()),
+	  num_objects(object_specs.size()),
 	  dim(0),
 	  non_robot_dim(0) {
 
-	for (const std::string& s : robots) {
-		int robot_qdim;
-		if (s.find("pos_quat") != std::string::npos) {
-			robot_qdim = 3 + 4;
-		} else if (s.find("pos_rot_mat") != std::string::npos) {
-			robot_qdim = 3 + 9;
-		} else if (s.find("point_mass") != std::string::npos) {
-			robot_qdim = 3;
-		} else {
-			throw std::runtime_error("Only supporting 'point_mass', 'pos_quat', and 'pos_rot_mat' robots.");
-		}
+	if (!robot_names.empty() && robot_names.size() != robot_specs.size())
+		throw std::runtime_error("robot_names size must match robot_specs size.");
+	if (!object_names.empty() && object_names.size() != object_specs.size())
+		throw std::runtime_error("object_names size must match object_specs size.");
 
+	for (const auto& spec : robot_specs) {
+		int robot_qdim = 0;
+		for (const auto& b : spec) robot_qdim += b.size;
 		if (dim == 0) {
 			dim = robot_qdim;
 		} else if (dim != robot_qdim) {
@@ -45,28 +48,33 @@ GraphOfConstraints::GraphOfConstraints(const std::vector<std::string> robots,
 		}
 	}
 
-	// Only supporting other 3D points in state space.
-	non_robot_dim = 3;
+	for (const auto& spec : object_specs) {
+		int obj_dim = 0;
+		for (const auto& b : spec) obj_dim += b.size;
+		if (non_robot_dim == 0) {
+			non_robot_dim = obj_dim;
+		} else if (non_robot_dim != obj_dim) {
+			throw std::runtime_error("Only supporting objects with the same dimension.");
+		}
+	}
 
 	total_dim = num_agents * dim + num_objects * non_robot_dim;
 
 	_global_x_lb = Eigen::VectorXd::Constant(total_dim, global_x_lb);
 	_global_x_ub = Eigen::VectorXd::Constant(total_dim, global_x_ub);
 
-	int i = 0;
+	int offset = 0;
 	for (int ag = 0; ag < num_agents; ++ag) {
-		if (robot_is_pos_quat(ag)) {
-			for (int j = i+3; j < i+3+4; ++j) {
-				_global_x_lb(j) = -1;
-				_global_x_ub(j) = 1;
+		for (const auto& b : _robot_specs[ag]) {
+			if (b.type == CubicConfigurationSpline::Block::Type::SO3Quat ||
+			    b.type == CubicConfigurationSpline::Block::Type::SO3Mat) {
+				for (int j = offset; j < offset + b.size; ++j) {
+					_global_x_lb(j) = -1;
+					_global_x_ub(j) = 1;
+				}
 			}
-		} else if (robot_is_pos_rot_mat(ag)) {
-			for (int j = i+3; j < i+3+9; ++j) {
-				_global_x_lb(j) = -1;
-				_global_x_ub(j) = 1;
-			}
+			offset += b.size;
 		}
-		i += dim;
 	}
 }
 
@@ -95,15 +103,48 @@ bool GraphOfConstraints::robot_is_free_body(int ag) const {
 }
 
 bool GraphOfConstraints::robot_is_pos_quat(int ag) const {
-	return _robot_names.at(ag).find("pos_quat") != std::string::npos;
+	const auto& spec = _robot_specs.at(ag);
+	return std::any_of(spec.begin(), spec.end(),
+		[](const CubicConfigurationSpline::Block& b) {
+			return b.type == CubicConfigurationSpline::Block::Type::SO3Quat;
+		});
 }
 
 bool GraphOfConstraints::robot_is_pos_rot_mat(int ag) const {
-	return _robot_names.at(ag).find("pos_rot_mat") != std::string::npos;
+	const auto& spec = _robot_specs.at(ag);
+	return std::any_of(spec.begin(), spec.end(),
+		[](const CubicConfigurationSpline::Block& b) {
+			return b.type == CubicConfigurationSpline::Block::Type::SO3Mat;
+		});
 }
 
 bool GraphOfConstraints::robot_is_point_mass(int ag) const {
-	return _robot_names.at(ag).find("point_mass") != std::string::npos;
+	const auto& spec = _robot_specs.at(ag);
+	return std::all_of(spec.begin(), spec.end(),
+		[](const CubicConfigurationSpline::Block& b) {
+			return b.type == CubicConfigurationSpline::Block::Type::R;
+		});
+}
+
+int GraphOfConstraints::robot_ambient_dim(int ag) const {
+	int d = 0;
+	for (const auto& b : _robot_specs.at(ag)) d += b.size;
+	return d;
+}
+
+int GraphOfConstraints::robot_tangent_dim(int ag) const {
+	int d = 0;
+	for (const auto& b : _robot_specs.at(ag)) {
+		d += (b.type == CubicConfigurationSpline::Block::Type::SO3Quat ||
+		      b.type == CubicConfigurationSpline::Block::Type::SO3Mat) ? 3 : b.size;
+	}
+	return d;
+}
+
+int GraphOfConstraints::object_ambient_dim(int ob) const {
+	int d = 0;
+	for (const auto& b : _object_specs.at(ob)) d += b.size;
+	return d;
 }
 
 std::tuple<std::vector<std::optional<int>>,

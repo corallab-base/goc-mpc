@@ -17,6 +17,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
 
+#include "../configuration_spline.hpp"
 #include "../graphs.hpp"
 
 using drake::solvers::Binding;
@@ -106,7 +107,9 @@ struct AgentInteraction {
 
 struct GraphOfConstraints {
 
+	const std::vector<CubicConfigurationSpline::Spec> _robot_specs;
 	const std::vector<std::string> _robot_names;
+	const std::vector<CubicConfigurationSpline::Spec> _object_specs;
 	const std::vector<std::string> _object_names;
 	Graph<py::object> structure;
 	std::map<int, std::vector<int>> node_to_phis_map;
@@ -142,14 +145,12 @@ struct GraphOfConstraints {
 	Eigen::VectorXd _global_x_ub;
 
 	// Constructor
-	// GraphOfConstraints(unsigned int num_agents, unsigned int dim,
-	// 		   const Eigen::VectorXd& global_x_lb,
-	// 		   const Eigen::VectorXd& global_x_ub);
-
-	GraphOfConstraints(const std::vector<std::string> robots,
-			   const std::vector<std::string> objects,
+	GraphOfConstraints(const std::vector<CubicConfigurationSpline::Spec>& robot_specs,
+			   const std::vector<CubicConfigurationSpline::Spec>& object_specs,
 			   double global_x_lb,
-			   double global_x_ub);
+			   double global_x_ub,
+			   const std::vector<std::string>& robot_names = {},
+			   const std::vector<std::string>& object_names = {});
 
 	int add_variable();
 
@@ -160,6 +161,12 @@ struct GraphOfConstraints {
 	bool robot_is_pos_rot_mat(int ag) const;
 
 	bool robot_is_point_mass(int ag) const;
+
+	int robot_ambient_dim(int ag) const;
+
+	int robot_tangent_dim(int ag) const;
+
+	int object_ambient_dim(int ob) const;
 
 	Graph<py::object> get_structure() const { return structure; }
 
