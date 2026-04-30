@@ -22,33 +22,11 @@ template <typename T> using VecX = Eigen::Matrix<T, Eigen::Dynamic, 1>;
 template <typename T> using Vec3 = Eigen::Matrix<T, 3, 1>;
 template <typename T, int N> using Vec = Eigen::Matrix<T, N, 1>;
 
-
-static inline Expression sqr(const Expression& e) { return e * e; }
-
-// Wrap a scalar angle difference into (-pi, pi].
 template <typename T>
 T wrap_to_pi(const T& delta) {
     using std::floor;
     const T two_pi = T(2.0 * M_PI);
     return delta - two_pi * floor((delta + T(M_PI)) / two_pi);
-}
-
-// Quaternion (w,x,y,z) -> RotationMatrix<Expression>
-template <typename T>
-inline drake::math::RotationMatrix<T>
-RotFromQuatWxyz(const Eigen::Matrix<T,4,1>& qwxyz) {
-    Eigen::Quaternion<T> q(
-        qwxyz(0), qwxyz(1), qwxyz(2), qwxyz(3));
-    return drake::math::RotationMatrix<T>(q);
-}
-
-// hat(·) operator: φ -> φ^ (skew)
-static inline Eigen::Matrix<Expression,3,3> hat(const Vec<Expression,3>& a) {
-	Eigen::Matrix<Expression,3,3> A;
-	A << Expression(0), -a(2),        a(1),
-		a(2),         Expression(0), -a(0),
-		-a(1),         a(0),          Expression(0);
-	return A;
 }
 
 namespace so3 {
@@ -754,14 +732,14 @@ public:
 
 				const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
 				const Eigen::Matrix<T,4,1> qj   = xJ.segment(a0, 4);
-				const Vec<T,3> wjm1 = vJm1.segment(t0, 3);
-				const Vec<T,3> wj   = vJ.segment(t0, 3);
+				const Vec3<T> wjm1 = vJm1.segment(t0, 3);
+				const Vec3<T> wj   = vJ.segment(t0, 3);
 
 				const auto qrel_vec = drake::math::quatProduct(drake::math::quatConjugate(qjm1), qj);
 				Eigen::Quaternion<T> qrel(qrel_vec(0), qrel_vec(1), qrel_vec(2), qrel_vec(3));
-				const Vec<T,3> dphi = so3::quat::Log(qrel);
-				const Vec<T,3> D = dphi - T(0.5) * tau * (wjm1 + wj);
-				const Vec<T,3> V = (wj - wjm1);
+				const Vec3<T> dphi = so3::quat::Log(qrel);
+				const Vec3<T> D = dphi - T(0.5) * tau * (wjm1 + wj);
+				const Vec3<T> V = (wj - wjm1);
 
 				total += T(12.0) * inv_tau3 * D.squaredNorm()
 					+ inv_tau * V.squaredNorm();

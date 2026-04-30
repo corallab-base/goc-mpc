@@ -2,8 +2,6 @@
 
 namespace py = pybind11;
 using drake::symbolic::Expression;
-template <typename T> using VecX = Eigen::Matrix<T, Eigen::Dynamic, 1>;
-template <typename T, int N> using Vec = Eigen::Matrix<T, N, 1>;
 
 
 /*
