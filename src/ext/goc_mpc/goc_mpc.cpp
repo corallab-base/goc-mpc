@@ -166,9 +166,29 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_variable_constraint", &GraphOfConstraints::add_variable_constraint)
 		.def("add_variable_ineq_constraint", &GraphOfConstraints::add_variable_ineq_constraint);
 
+	py::enum_<WaypointSolver>(goc_mpc, "WaypointSolver")
+		.value("kGurobi", WaypointSolver::kGurobi)
+		.value("kMosek",  WaypointSolver::kMosek)
+		.value("kIPOPT",  WaypointSolver::kIPOPT)
+		.export_values();
+
+	py::enum_<WaypointObjective>(goc_mpc, "WaypointObjective")
+		.value("kSquaredDistance", WaypointObjective::kSquaredDistance)
+		.value("kL1",              WaypointObjective::kL1)
+		.export_values();
+
         py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
-                .def(py::init<GraphOfConstraints&, std::vector<CubicConfigurationSpline>>(),
-		     py::keep_alive<1, 3>())
+                .def(py::init<GraphOfConstraints&,
+			      std::vector<CubicConfigurationSpline>,
+			      WaypointSolver,
+			      bool,
+			      WaypointObjective>(),
+		     py::keep_alive<1, 2>(),
+		     py::arg("graph"),
+		     py::arg("splines"),
+		     py::arg("solver")            = WaypointSolver::kGurobi,
+		     py::arg("enforce_rigidity")  = false,
+		     py::arg("objective")         = WaypointObjective::kSquaredDistance)
 		.def("solve", &GraphWaypointMPC::solve)
 		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
 		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal)

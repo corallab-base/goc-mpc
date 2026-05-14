@@ -509,6 +509,35 @@ void AddHoldRigidityAssignable(
 }
 
 
+// Add L1 cost between two symbolic configuration expressions over a spline's R blocks.
+// Introduces one slack variable t_i per component (t_i >= |x1_i - x2_i|) and adds
+// sum(t) as a linear cost. Non-Euclidean blocks (Torus, SO3) are skipped.
+static void AddL1Cost(
+	MathematicalProgram& prog,
+	const CubicConfigurationSpline& spline,
+	const VecX<Expression>& x1,
+	const VecX<Expression>& x2) {
+
+	const double kInf = std::numeric_limits<double>::infinity();
+
+	for (const auto& off : spline.block_offsets_) {
+		if (off.type != CubicConfigurationSpline::Block::Type::R) continue;
+		const int a0 = off.ambient_offset;
+		const int aN = off.ambient_size;
+
+		auto t = prog.NewContinuousVariables(aN, "l1_t");
+		prog.AddBoundingBoxConstraint(0.0, kInf, t);
+
+		for (int i = 0; i < aN; ++i) {
+			const Expression diff = x1(a0 + i) - x2(a0 + i);
+			prog.AddLinearConstraint( diff - Expression(t(i)), -kInf, 0.0);
+			prog.AddLinearConstraint(-diff - Expression(t(i)), -kInf, 0.0);
+		}
+
+		prog.AddLinearCost(Eigen::VectorXd::Ones(aN), 0.0, t);
+	}
+}
+
 GraphWaypointProblem BuildGraphWaypointProblem(
 	GraphOfConstraints* graph,
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
@@ -517,7 +546,8 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	Eigen::MatrixXd previous_X,
 	Eigen::VectorXi previous_var_assignments,
 	bool enforce_rigidity,
-	bool relax_binary_vars) {
+	bool relax_binary_vars,
+	WaypointObjective objective) {
 
 	const int num_agents = graph->num_agents;
 	const int num_objects = graph->num_objects;
@@ -689,8 +719,12 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 			for (int k = 0; k < robot_dim; ++k) {
 				x0_exps(k) = Expression(x0(ag * robot_dim + k));
 			}
-			Expression dist = splines->at(ag).squared_distance(x0_exps, X.row(sg_v).segment(ag * robot_dim, robot_dim));
-			prog.AddCost(dist);
+			VectorX<Expression> x_var = X.row(sg_v).segment(ag * robot_dim, robot_dim).template cast<Expression>();
+			if (objective == WaypointObjective::kSquaredDistance) {
+				prog.AddCost(splines->at(ag).squared_distance(x0_exps, x_var));
+			} else {
+				AddL1Cost(prog, splines->at(ag), x0_exps, x_var);
+			}
 		}
 
 		// Second, for the source nodes, add CONSTRAINTS saything that a block
@@ -858,9 +892,13 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		int sg_v = subgraph.subgraph_id(v);
 		std::pair<int, int> e_pair = std::make_pair(u, v);
 		for (int ag = 0; ag < num_agents; ++ag) {
-			Expression dist = splines->at(ag).squared_distance(X.row(sg_u).segment(ag * robot_dim, robot_dim),
-									   X.row(sg_v).segment(ag * robot_dim, robot_dim));
-			prog.AddCost(dist);
+			VectorX<Expression> x_u = X.row(sg_u).segment(ag * robot_dim, robot_dim).template cast<Expression>();
+			VectorX<Expression> x_v = X.row(sg_v).segment(ag * robot_dim, robot_dim).template cast<Expression>();
+			if (objective == WaypointObjective::kSquaredDistance) {
+				prog.AddCost(splines->at(ag).squared_distance(x_u, x_v));
+			} else {
+				AddL1Cost(prog, splines->at(ag), x_u, x_v);
+			}
 		}
 
 		for (int obj = 0; obj < num_objects; ++obj) {
@@ -947,9 +985,15 @@ GraphWaypointProblem BuildGraphWaypointProblem(
  */
 
 GraphWaypointMPC::GraphWaypointMPC(GraphOfConstraints& graph,
-				   std::vector<CubicConfigurationSpline> splines)
+				   std::vector<CubicConfigurationSpline> splines,
+				   WaypointSolver solver,
+				   bool enforce_rigidity,
+				   WaypointObjective objective)
 	: _graph(&graph),
-	  _splines(std::make_shared<std::vector<CubicConfigurationSpline>>(std::move(splines))) {
+	  _splines(std::make_shared<std::vector<CubicConfigurationSpline>>(std::move(splines))),
+	  _solver(solver),
+	  _enforce_rigidity(enforce_rigidity),
+	  _objective(objective) {
 	// Allocate persistent output buffers.
 	_waypoints = Eigen::MatrixXd::Zero(_graph->structure.num_nodes(), _graph->total_dim);
 	_assignments = Eigen::VectorXi::Constant(_graph->num_phis, -1);
@@ -1192,28 +1236,24 @@ bool GraphWaypointMPC::solve(
 		_first_cycle = false;
 	}
 
-	const bool enforce_rigidity = false;
-
-	if (enforce_rigidity) {
-		// return SolveWithBranchAndBoundPlusROPTLIB(remaining_vertices, x0);
-		// return SolveWithEnumerationAndIPOPT(remaining_vertices, x0);
-		return SolveWithGurobi(remaining_vertices, x0, true);
-		// return SolveWithMosek(remaining_vertices, x0, true);
-	} else {
-		return SolveWithGurobi(remaining_vertices, x0, false);
-		// return SolveWithMosek(remaining_vertices, x0, false);
+	switch (_solver) {
+	case WaypointSolver::kGurobi:
+		return SolveWithGurobi(remaining_vertices, x0);
+	case WaypointSolver::kMosek:
+		return SolveWithMosek(remaining_vertices, x0);
+	case WaypointSolver::kIPOPT:
+		return SolveWithEnumerationAndIPOPT(remaining_vertices, x0);
 	}
+	return false;
 }
 
 bool GraphWaypointMPC::SolveWithMosek(
 	const std::vector<int>& remaining_vertices,
-	const Eigen::VectorXd& x0,
-	bool enforce_rigidity_and_relax_binary_vars) {
+	const Eigen::VectorXd& x0) {
 
 	GraphWaypointProblem problem = BuildGraphWaypointProblem(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		enforce_rigidity_and_relax_binary_vars,
-		enforce_rigidity_and_relax_binary_vars);
+		_enforce_rigidity, _enforce_rigidity, _objective);
 
 	// Solve
 	drake::solvers::MosekSolver solver;
@@ -1264,13 +1304,11 @@ bool GraphWaypointMPC::SolveWithMosek(
 
 bool GraphWaypointMPC::SolveWithGurobi(
 	const std::vector<int>& remaining_vertices,
-	const Eigen::VectorXd& x0,
-	bool enforce_rigidity_and_relax_binary_vars) {
+	const Eigen::VectorXd& x0) {
 
 	GraphWaypointProblem problem = BuildGraphWaypointProblem(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		enforce_rigidity_and_relax_binary_vars,
-		enforce_rigidity_and_relax_binary_vars);
+		_enforce_rigidity, _enforce_rigidity, _objective);
 
 	std::cout << problem.prog->to_string() << std::endl;
 
@@ -1346,8 +1384,9 @@ bool GraphWaypointMPC::SolveWithEnumerationAndIPOPT(
 		problem = std::make_unique<GraphWaypointProblem>(
 			BuildGraphWaypointProblem(
 				_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-				/*enforce_rigidity=*/true,
-				/*relax_binary_vars=*/true));
+				_enforce_rigidity,
+				/*relax_binary_vars=*/true,
+				_objective));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in waypoint problem construction: " << e.what() << std::endl;
 		return false;

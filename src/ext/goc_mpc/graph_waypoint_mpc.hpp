@@ -28,6 +28,10 @@ using namespace pybind11::literals;
 namespace py = pybind11;
 
 
+enum class WaypointSolver { kGurobi, kMosek, kIPOPT };
+enum class WaypointObjective { kSquaredDistance, kL1 };
+
+
 struct GraphWaypointProblem {
 	// Necessary to use a unique_ptr for movability. Weird...
 	std::unique_ptr<drake::solvers::MathematicalProgram> prog;
@@ -49,10 +53,15 @@ struct GraphWaypointProblem {
 };
 
 GraphWaypointProblem BuildGraphWaypointProblem(
-	const GraphOfConstraints& graph,
+	GraphOfConstraints* graph,
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
 	const std::vector<int>& remaining_vertices,
-	Eigen::VectorXd x0);
+	Eigen::VectorXd x0,
+	Eigen::MatrixXd previous_X,
+	Eigen::VectorXi previous_var_assignments,
+	bool enforce_rigidity,
+	bool relax_binary_vars,
+	WaypointObjective objective = WaypointObjective::kSquaredDistance);
 
 struct GraphWaypointMPC {
 	// reference to graph of constraints object.
@@ -68,15 +77,21 @@ struct GraphWaypointMPC {
 	Eigen::VectorXi _var_assignments;
 	bool _first_cycle;
 
+	// Solver configuration
+	WaypointSolver _solver;
+	bool _enforce_rigidity;
+	WaypointObjective _objective;
+
 	// Recording Metrics
 	drake::SteadyTimer _timer;
 	double _last_solve_time;
 
 	// Constructor
 	GraphWaypointMPC(GraphOfConstraints& graph,
-			 std::vector<CubicConfigurationSpline> splines);
-
-	// std::optional<std::pair<Eigen::MatrixXd, Eigen::VectorXi>>
+			 std::vector<CubicConfigurationSpline> splines,
+			 WaypointSolver solver = WaypointSolver::kGurobi,
+			 bool enforce_rigidity = false,
+			 WaypointObjective objective = WaypointObjective::kSquaredDistance);
 
 	// Core solve routine, based on the remaining vertices, computes a
 	// subgraph of graph of constraints, solves for the optimal agent
@@ -92,11 +107,9 @@ struct GraphWaypointMPC {
 
 private:
 	bool SolveWithMosek(const std::vector<int>& remaining_vertices,
-			    const Eigen::VectorXd& x0,
-			    bool enforce_rigidity_and_relax_binary_vars);
+			    const Eigen::VectorXd& x0);
 	bool SolveWithGurobi(const std::vector<int>& remaining_vertices,
-			     const Eigen::VectorXd& x0,
-			     bool enforce_rigidity_and_relax_binary_vars);
+			     const Eigen::VectorXd& x0);
 	bool SolveWithEnumerationAndIPOPT(const std::vector<int>& remaining_vertices,
 					  const Eigen::VectorXd& x0);
 };
