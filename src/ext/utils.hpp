@@ -86,6 +86,23 @@ PoseFromRow_PointMass(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
 	return std::make_pair(p_WE, R_WE);
 }
 
+// State layout: [x, y, z, θ]  (R³ × T¹, yaw = rotation about world Z)
+template <typename T>
+std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+PoseFromRow_PosYaw(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
+		   int robot_offset) {
+	using std::cos; using std::sin;
+	Eigen::Matrix<T,3,1> p_WE = row.template segment<3>(robot_offset + 0);
+	const T theta = row(robot_offset + 3);
+	const T c = cos(theta);
+	const T s = sin(theta);
+	Eigen::Matrix<T,3,3> R_WE;
+	R_WE <<    c,  -s, T(0),
+		   s,   c, T(0),
+		T(0), T(0), T(1);
+	return std::make_pair(p_WE, R_WE);
+}
+
 // Templated row→Expression helper (safe for Eigen blocks).
 template <class Derived>
 Eigen::RowVectorX<Expression> AsExprRow(const Eigen::MatrixBase<Derived>& row) {
@@ -120,33 +137,16 @@ PoseFromRow(const struct GraphOfConstraints* graph,
 
 	const int agent_config_offset = agent_index * graph->dim;
 
-	if (graph->robot_is_pos_quat(agent_index)) {
+	switch (graph->robot_kind(agent_index)) {
+	case RobotKind::kPosQuat:
 		return PoseFromRow_PosQuat(q, agent_config_offset);
-	} else if (graph->robot_is_pos_rot_mat(agent_index)) {
+	case RobotKind::kPosRotMat:
 		return PoseFromRow_PosRotMatrix(q, agent_config_offset);
-	} else if (graph->robot_is_point_mass(agent_index)) {
+	case RobotKind::kPointMass:
 		return PoseFromRow_PointMass(q, agent_config_offset);
-	} else {
-		// const MultibodyPlant<T> *plant;
-
-		// if constexpr (std::is_same_v<T, Expression>) {
-		// 	plant = graph->_plant.get();
-		// } else {
-		// 	plant = graph->_double_plant.get();
-		// }
-
-		// auto ctx = plant->CreateDefaultContext();
-		// graph->set_configuration(ctx, q);
-
-		// const auto& W = plant->world_frame();
-		// const auto& E = plant->GetFrameByName(
-		// 	ee_frame_name,
-		// 	plant->GetModelInstanceByName(
-		// 		graph->_robot_names.at(agent_index)));
-
-		// const auto X_WE = plant->CalcRelativeTransform(*ctx, W, E);
-
-		// return std::make_pair(X_WE.translation(), X_WE.rotation().matrix());
-		throw std::runtime_error("Only supporting 'point_mass', 'pos_quat', and 'pos_rot_mat' robots.");
+	case RobotKind::kPosYaw:
+		return PoseFromRow_PosYaw(q, agent_config_offset);
+	case RobotKind::kArticulated:
+		throw std::runtime_error("PoseFromRow: articulated robots require FK, not yet supported.");
 	}
 }

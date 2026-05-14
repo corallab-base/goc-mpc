@@ -39,6 +39,23 @@ GraphOfConstraints::GraphOfConstraints(
 		throw std::runtime_error("object_names size must match object_specs size.");
 
 	for (const auto& spec : robot_specs) {
+		const bool has_quat    = std::any_of(spec.begin(), spec.end(), [](const auto& b) {
+			return b.type == CubicConfigurationSpline::Block::Type::SO3Quat; });
+		const bool has_rot_mat = std::any_of(spec.begin(), spec.end(), [](const auto& b) {
+			return b.type == CubicConfigurationSpline::Block::Type::SO3Mat; });
+		const bool has_torus   = std::any_of(spec.begin(), spec.end(), [](const auto& b) {
+			return b.type == CubicConfigurationSpline::Block::Type::Torus; });
+		const bool all_eucl    = std::all_of(spec.begin(), spec.end(), [](const auto& b) {
+			return b.type == CubicConfigurationSpline::Block::Type::R; });
+
+		if (has_quat)         _robot_kinds.push_back(RobotKind::kPosQuat);
+		else if (has_rot_mat) _robot_kinds.push_back(RobotKind::kPosRotMat);
+		else if (has_torus)   _robot_kinds.push_back(RobotKind::kPosYaw);
+		else if (all_eucl)    _robot_kinds.push_back(RobotKind::kPointMass);
+		else                  _robot_kinds.push_back(RobotKind::kArticulated);
+	}
+
+	for (const auto& spec : robot_specs) {
 		int robot_qdim = 0;
 		for (const auto& b : spec) robot_qdim += b.size;
 		if (dim == 0) {
@@ -98,33 +115,6 @@ int GraphOfConstraints::add_variable()
 	return num_variables++;
 }
 
-bool GraphOfConstraints::robot_is_free_body(int ag) const {
-	return robot_is_pos_quat(ag) || robot_is_pos_rot_mat(ag) || robot_is_point_mass(ag);
-}
-
-bool GraphOfConstraints::robot_is_pos_quat(int ag) const {
-	const auto& spec = _robot_specs.at(ag);
-	return std::any_of(spec.begin(), spec.end(),
-		[](const CubicConfigurationSpline::Block& b) {
-			return b.type == CubicConfigurationSpline::Block::Type::SO3Quat;
-		});
-}
-
-bool GraphOfConstraints::robot_is_pos_rot_mat(int ag) const {
-	const auto& spec = _robot_specs.at(ag);
-	return std::any_of(spec.begin(), spec.end(),
-		[](const CubicConfigurationSpline::Block& b) {
-			return b.type == CubicConfigurationSpline::Block::Type::SO3Mat;
-		});
-}
-
-bool GraphOfConstraints::robot_is_point_mass(int ag) const {
-	const auto& spec = _robot_specs.at(ag);
-	return std::all_of(spec.begin(), spec.end(),
-		[](const CubicConfigurationSpline::Block& b) {
-			return b.type == CubicConfigurationSpline::Block::Type::R;
-		});
-}
 
 int GraphOfConstraints::robot_ambient_dim(int ag) const {
 	int d = 0;

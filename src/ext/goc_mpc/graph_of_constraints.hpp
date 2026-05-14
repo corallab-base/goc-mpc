@@ -29,6 +29,9 @@ namespace py = pybind11;
 
 struct SubgraphOfConstraints;
 
+enum class RobotKind { kPointMass, kPosYaw, kPosQuat, kPosRotMat, kArticulated };
+enum class ConstraintDegree { kLinear, kQuadratic, kGeneral };
+
 enum class DeferredOpKind {
 	kLinearEq,
 	kLinearIneq,
@@ -109,6 +112,7 @@ struct GraphOfConstraints {
 
 	const std::vector<CubicConfigurationSpline::Spec> _robot_specs;
 	const std::vector<std::string> _robot_names;
+	std::vector<RobotKind> _robot_kinds;
 	const std::vector<CubicConfigurationSpline::Spec> _object_specs;
 	const std::vector<std::string> _object_names;
 	Graph<py::object> structure;
@@ -154,13 +158,28 @@ struct GraphOfConstraints {
 
 	int add_variable();
 
-	bool robot_is_free_body(int ag) const;
+	RobotKind robot_kind(int ag) const { return _robot_kinds.at(ag); }
 
-	bool robot_is_pos_quat(int ag) const;
+	ConstraintDegree robot_rigidity_constraint_degree(int ag) const {
+		switch (robot_kind(ag)) {
+		case RobotKind::kPointMass:   return ConstraintDegree::kLinear;
+		case RobotKind::kPosYaw:      return ConstraintDegree::kGeneral;
+		case RobotKind::kPosRotMat:   return ConstraintDegree::kQuadratic;
+		case RobotKind::kPosQuat:     return ConstraintDegree::kGeneral;
+		case RobotKind::kArticulated: return ConstraintDegree::kGeneral;
+		}
+	}
 
-	bool robot_is_pos_rot_mat(int ag) const;
+	bool robot_is_free_body(int ag) const {
+		const auto k = robot_kind(ag);
+		return k == RobotKind::kPointMass || k == RobotKind::kPosYaw ||
+		       k == RobotKind::kPosQuat   || k == RobotKind::kPosRotMat;
+	}
 
-	bool robot_is_point_mass(int ag) const;
+	bool robot_is_pos_yaw(int ag) const     { return robot_kind(ag) == RobotKind::kPosYaw; }
+	bool robot_is_pos_quat(int ag) const    { return robot_kind(ag) == RobotKind::kPosQuat; }
+	bool robot_is_pos_rot_mat(int ag) const { return robot_kind(ag) == RobotKind::kPosRotMat; }
+	bool robot_is_point_mass(int ag) const  { return robot_kind(ag) == RobotKind::kPointMass; }
 
 	int robot_ambient_dim(int ag) const;
 
@@ -243,7 +262,7 @@ struct GraphOfConstraints {
 	int add_robot_to_point_displacement_constraint(int k,
 						       int robot_id,
 						       int point_id,
-						       Eigen::Vector3d& disp,
+						       const Eigen::VectorXd& disp,
 						       double tol = 0.0);
 	int add_robot_to_point_displacement_cost(int k,
 						 int robot_id,

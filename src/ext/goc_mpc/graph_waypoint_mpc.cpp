@@ -128,23 +128,24 @@ static void AddHoldRigidityStaticToX0(
 				R_WE_v.transpose() * (p_WP_v - p_WE_v);
 
 
-			if (graph->robot_is_pos_rot_mat(spec.robot_ag)) {
-				// If the rotation matrix is directly
-				// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
-				for (int i = 0; i < 3; ++i) {
+			switch (graph->robot_rigidity_constraint_degree(spec.robot_ag)) {
+			case ConstraintDegree::kQuadratic:
+				for (int i = 0; i < 3; ++i)
 					prog.AddQuadraticConstraint(rel_0(i) - rel_v(i), -0.001, 0.001)
 						.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
-				}
-			} else if (graph->robot_is_point_mass(spec.robot_ag)) {
+				break;
+			case ConstraintDegree::kLinear:
 				prog.AddLinearConstraint(rel_0 - rel_v,
-						   Eigen::Vector3d::Constant(3, -0.001),
-						   Eigen::Vector3d::Constant(3, 0.001))
+						Eigen::Vector3d::Constant(3, -0.001),
+						Eigen::Vector3d::Constant(3, 0.001))
 					.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
-			} else {
+				break;
+			case ConstraintDegree::kGeneral:
 				prog.AddConstraint(rel_0 - rel_v,
-						   Eigen::Vector3d::Constant(3, -0.001),
-						   Eigen::Vector3d::Constant(3, 0.001))
+						Eigen::Vector3d::Constant(3, -0.001),
+						Eigen::Vector3d::Constant(3, 0.001))
 					.evaluator()->set_description(fmt::format("-1->{} exact rigidity {}", v, obj_id));
+				break;
 			}
 
 
@@ -232,23 +233,24 @@ static void AddHoldRigidityStatic(
 				R_WE_v.transpose() * (p_WP_v - p_WE_v);
 
 
-			if (graph->robot_is_pos_rot_mat(spec.robot_ag)) {
-				// If the rotation matrix is directly
-				// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
-				for (int i = 0; i < 3; ++i) {
+			switch (graph->robot_rigidity_constraint_degree(spec.robot_ag)) {
+			case ConstraintDegree::kQuadratic:
+				for (int i = 0; i < 3; ++i)
 					prog.AddQuadraticConstraint(rel_u(i) - rel_v(i), -0.001, 0.001)
 						.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
-				}
-			} else if (graph->robot_is_point_mass(spec.robot_ag)) {
+				break;
+			case ConstraintDegree::kLinear:
 				prog.AddLinearConstraint(rel_u - rel_v,
-						   Eigen::Vector3d::Constant(3, -0.001),
-						   Eigen::Vector3d::Constant(3, 0.001))
+						Eigen::Vector3d::Constant(3, -0.001),
+						Eigen::Vector3d::Constant(3, 0.001))
 					.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
-			} else {
+				break;
+			case ConstraintDegree::kGeneral:
 				prog.AddConstraint(rel_u - rel_v,
-						   Eigen::Vector3d::Constant(3, -0.001),
-						   Eigen::Vector3d::Constant(3, 0.001))
+						Eigen::Vector3d::Constant(3, -0.001),
+						Eigen::Vector3d::Constant(3, 0.001))
 					.evaluator()->set_description(fmt::format("{}->{} exact rigidity {}", u, v, obj_id));
+				break;
 			}
 		}
 	} else {
@@ -371,34 +373,25 @@ void AddHoldRigidityAssignableToX0(
 				const Expression slack = Mvec(j) * (1.0 - A_row(k));
 
 
-				if (graph->robot_is_pos_rot_mat(k)) {
-					// If the rotation matrix is directly
-					// represented in the decision variables, R_WE_0/v^T * p_WE/P_0/v is quadratic
-
-					// Upper bound residual: residual - slack <= 0
+				switch (graph->robot_rigidity_constraint_degree(k)) {
+				case ConstraintDegree::kQuadratic:
 					prog.AddQuadraticConstraint(residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("0->v exact rigidity (assignable, +)");
-
-					// Lower bound residual: -residual - slack <= 0
 					prog.AddQuadraticConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("0->v exact rigidity (assignable, -)");
-
-				} else if (graph->robot_is_point_mass(k)) {
-					// Upper bound residual: residual - slack <= 0
+					break;
+				case ConstraintDegree::kLinear:
 					prog.AddLinearConstraint(residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("0->v exact rigidity (assignable, +)");
-
-					// Lower bound residual: -residual - slack <= 0
 					prog.AddLinearConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("0->v exact rigidity (assignable, -)");
-				} else {
-					// Upper bound residual: residual - slack <= 0
+					break;
+				case ConstraintDegree::kGeneral:
 					prog.AddConstraint(residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("0->v exact rigidity (assignable, +)");
-
-					// Lower bound residual: -residual - slack <= 0
 					prog.AddConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("0->v exact rigidity (assignable, -)");
+					break;
 				}
 			}
 		}
@@ -490,30 +483,25 @@ void AddHoldRigidityAssignable(
 				const Expression slack = Mvec_uv(j) * (1.0 - A_row(k));
 
 
-				if (graph->robot_is_pos_rot_mat(k)) {
-					// Upper bound residual: residual - slack <= 0
+				switch (graph->robot_rigidity_constraint_degree(k)) {
+				case ConstraintDegree::kQuadratic:
 					prog.AddQuadraticConstraint(residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, +)");
-
-					// Lower bound residual: -residual - slack <= 0
 					prog.AddQuadraticConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, -)");
-				} else if (graph->robot_is_point_mass(k)) {
-					// Upper bound residual: residual - slack <= 0
+					break;
+				case ConstraintDegree::kLinear:
 					prog.AddLinearConstraint(residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, +)");
-
-					// Lower bound residual: -residual - slack <= 0
 					prog.AddLinearConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, -)");
-				} else {
-					// Upper bound residual: residual - slack <= 0
+					break;
+				case ConstraintDegree::kGeneral:
 					prog.AddConstraint(residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, +)");
-
-					// Lower bound residual: -residual - slack <= 0
 					prog.AddConstraint(-residual(j) - slack, neg_inf, 0.0)
 						.evaluator()->set_description("u->v exact rigidity (assignable, -)");
+					break;
 				}
 			}
 		}
@@ -599,7 +587,9 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	//
 
 	for (int ag = 0; ag < num_agents; ++ag) {
-		if (graph->robot_is_pos_quat(ag)) {
+		switch (graph->robot_kind(ag)) {
+		case RobotKind::kPosQuat:
+		{
 			for (int node = 0; node < subgraph.num_nodes(); ++node) {
 				VectorX<Expression> ag_quat = AsExprRow(X.row(node).segment(ag * robot_dim + 3, 4));
 				Expression ag_quat_norm = ag_quat.squaredNorm();
@@ -607,35 +597,33 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				prog.AddQuadraticConstraint(ag_quat_norm, 1.0-tol, 1.0+tol)
 					.evaluator()->set_description("unit quaternion constraint");
 			}
-		} else if (graph->robot_is_pos_rot_mat(ag)) {
+			break;
+		}
+		case RobotKind::kPosRotMat:
+		{
 			for (int node = 0; node < subgraph.num_nodes(); ++node) {
-
 				VectorXDecisionVariable R_flat = X.row(node).segment(ag * robot_dim + 3, 9);
 				Eigen::Matrix<Variable, 3, 3> R;
-				for (int i = 0; i < 3; ++i) {
-					for (int j = 0; j < 3; ++j) {
+				for (int i = 0; i < 3; ++i)
+					for (int j = 0; j < 3; ++j)
 						R(i, j) = R_flat(i * 3 + j);
-					}
-				}
 
-			        // orthogonality constraint: R^T R = I
 				Eigen::Matrix<Expression, 3, 3> orthogonality_residual = R.transpose() * R - Eigen::Matrix3d::Identity();
-
 				const double tol = 0.001;
-				for (int i = 0; i < 3; ++i) {
-					for (int j = i; j < 3; ++j) {
+				for (int i = 0; i < 3; ++i)
+					for (int j = i; j < 3; ++j)
 						prog.AddQuadraticConstraint(orthogonality_residual(i, j), 0.0-tol, 0.0+tol)
 							.evaluator()->set_description("rotation matrix orthogonality constraint");
-					}
-				}
 
-				// right-handedness: col1 x col2 = col3
 				Eigen::Matrix<Expression, 3, 1> right_handedness_residual = R.col(0).cross(R.col(1)) - R.col(2);
-				for (int i = 0; i < 3; ++i) {
+				for (int i = 0; i < 3; ++i)
 					prog.AddQuadraticConstraint(right_handedness_residual(i), 0.0-tol, 0.0+tol)
 						.evaluator()->set_description("rotation matrix right-handedness constraint");
-				}
 			}
+			break;
+		}
+		default:
+			break;
 		}
 	}
 
@@ -1283,6 +1271,8 @@ bool GraphWaypointMPC::SolveWithGurobi(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
 		enforce_rigidity_and_relax_binary_vars,
 		enforce_rigidity_and_relax_binary_vars);
+
+	std::cout << problem.prog->to_string() << std::endl;
 
 	// Solve
 	drake::solvers::GurobiSolver solver;
