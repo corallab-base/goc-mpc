@@ -6,6 +6,8 @@ from goc_mpc.graphs import Graph
 from ._ext.configuration_spline import CubicConfigurationSpline, Block
 from ._ext.goc_mpc import (
     GraphOfConstraints,
+    WaypointSolver,
+    WaypointObjective,
     GraphWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC
@@ -18,6 +20,11 @@ class GraphOfConstraintsMPC():
             self,
             graph: GraphOfConstraints,
             spline_spec: list[Block],
+            # waypoint mpc hyperparameters
+            waypoint_solver: WaypointSolver = WaypointSolver.kGurobi,
+            waypoint_objective: WaypointObjective = WaypointObjective.kSquaredDistance,
+            waypoint_enforce_rigidity: bool = False,
+            # timing mpc hyperparameters
             time_cost: float = 1.0,
             time_cost2: float = 0.0,
             acceleration_cost: float = 0.0,
@@ -25,12 +32,14 @@ class GraphOfConstraintsMPC():
             arclength_cost: float = 1.0,
             time_delta_cutoff: float = 0.4,
             phi_tolerance: float = 0.03,
-            short_path_length: int = 10,
-            short_path_time_per_step: float = 0.05,
-            solve_for_waypoints_once: bool = False,
             max_vel: float = -1.0,
             max_acc: float = -1.0,
             max_jerk: float = -1.0,
+            # short path mpc hyperparameters
+            short_path_length: int = 10,
+            short_path_time_per_step: float = 0.05,
+            # misc. options
+            solve_for_waypoints_once: bool = False,
     ):
         # problem definition data
         num_agents = graph.num_agents
@@ -61,10 +70,16 @@ class GraphOfConstraintsMPC():
         self.short_path_time_per_step = short_path_time_per_step
 
         # solvers
-        self.waypoint_mpc = GraphWaypointMPC(graph, self.last_cycle_splines)
-        self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines, time_cost, time_cost2,
-                                         acceleration_cost, energy_cost, arclength_cost, max_vel, max_acc, max_jerk)
-        self.short_path_mpc = GraphShortPathMPC(graph, short_path_length, num_agents, dim, short_path_time_per_step)
+        self.waypoint_mpc = GraphWaypointMPC(graph, self.last_cycle_splines,
+                                             solver = waypoint_solver,
+                                             objective = waypoint_objective,
+                                             enforce_rigidity = waypoint_enforce_rigidity)
+        self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines,
+                                         time_cost, time_cost2, acceleration_cost,
+                                         energy_cost, arclength_cost,
+                                         max_vel, max_acc, max_jerk)
+        self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
+                                                num_agents, dim, short_path_time_per_step)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):
