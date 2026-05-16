@@ -2,6 +2,8 @@
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
 
+#include <drake/bindings/pydrake/symbolic_types_pybind.h>
+
 #include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
@@ -164,7 +166,27 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("minimum_time_delta"))
 		// VARIABLE CONSTRAINTS ///////////////////////////////////////
 		.def("add_variable_constraint", &GraphOfConstraints::add_variable_constraint)
-		.def("add_variable_ineq_constraint", &GraphOfConstraints::add_variable_ineq_constraint);
+		.def("add_variable_ineq_constraint", &GraphOfConstraints::add_variable_ineq_constraint)
+		// SYMBOLIC UNIFIED CONSTRAINT API ////////////////////////////
+		.def("object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
+		.def("agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
+		// accept either a single Formula or a numpy array of Formulas (from
+		// element-wise == on object arrays) and reduce with conjunction.
+		.def("add_constraint", [](GraphOfConstraints& self, int node,
+		                          py::object formula_obj) -> int {
+			drake::symbolic::Formula f;
+			try {
+				f = py::cast<drake::symbolic::Formula>(formula_obj);
+			} catch (const py::cast_error&) {
+				bool first = true;
+				for (auto h : formula_obj) {
+					auto fh = py::cast<drake::symbolic::Formula>(h);
+					if (first) { f = fh; first = false; }
+					else        f = f && fh;
+				}
+			}
+			return self.add_constraint(node, f);
+		}, py::arg("node"), py::arg("formula"));
 
 	py::enum_<WaypointSolver>(goc_mpc, "WaypointSolver")
 		.value("kGurobi", WaypointSolver::kGurobi)

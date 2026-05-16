@@ -5,6 +5,8 @@
 #include <fmt/format.h>
 
 #include <drake/common/symbolic/expression.h>
+#include <drake/common/symbolic/expression/environment.h>
+#include <drake/common/symbolic/expression/formula.h>
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/ipopt_solver.h>
 #include <drake/solvers/branch_and_bound.h>
@@ -42,6 +44,8 @@ enum class DeferredOpKind {
 	kOther,
 	// MultiAgent
 	kAgentLinearEq,
+	// Symbolic (unified path via drake::symbolic)
+	kSymbolic,
 };
 
 struct DeferredOp {
@@ -147,6 +151,10 @@ struct GraphOfConstraints {
 	// Required for big-M computation
 	Eigen::VectorXd _global_x_lb;
 	Eigen::VectorXd _global_x_ub;
+
+	// Symbolic placeholder variables for the unified add_constraint API
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _agent_q_vars;
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _object_q_vars;
 
 	// Constructor
 	GraphOfConstraints(const std::vector<CubicConfigurationSpline::Spec>& robot_specs,
@@ -373,6 +381,10 @@ struct GraphOfConstraints {
 	int add_variable_ineq_constraint(int var1,
 					 int var2);
 
+	// Symbolic unified constraint API
+	drake::VectorX<drake::symbolic::Expression> agent_q(int agent_id) const;
+	drake::VectorX<drake::symbolic::Expression> object_q(int object_id) const;
+	int add_constraint(int node, const drake::symbolic::Formula& f);
 
 private:
 

@@ -80,6 +80,13 @@ GraphOfConstraints::GraphOfConstraints(
 	_global_x_lb = Eigen::VectorXd::Constant(total_dim, global_x_lb);
 	_global_x_ub = Eigen::VectorXd::Constant(total_dim, global_x_ub);
 
+	for (int i = 0; i < num_agents; ++i)
+		_agent_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			dim, fmt::format("agent_{}_q", i)));
+	for (int o = 0; o < num_objects; ++o)
+		_object_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			non_robot_dim, fmt::format("object_{}_q", o)));
+
 	int offset = 0;
 	for (int ag = 0; ag < num_agents; ++ag) {
 		for (const auto& b : _robot_specs[ag]) {
@@ -2032,4 +2039,91 @@ int GraphOfConstraints::add_variable_ineq_constraint(
 				}
 			}
 		});
+}
+
+// Symbolic unified constraint API
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::agent_q(int agent_id) const {
+	return _agent_q_vars.at(agent_id).cast<drake::symbolic::Expression>();
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::object_q(int object_id) const {
+	return _object_q_vars.at(object_id).cast<drake::symbolic::Expression>();
+}
+
+namespace {
+
+double ComputeViolation(const drake::symbolic::Formula& f,
+                        const drake::symbolic::Environment& env) {
+	using drake::symbolic::FormulaKind;
+	switch (f.get_kind()) {
+	case FormulaKind::Eq:
+		return std::abs(get_lhs_expression(f).Evaluate(env) -
+		                get_rhs_expression(f).Evaluate(env));
+	case FormulaKind::Leq:
+		return std::max(0.0, get_lhs_expression(f).Evaluate(env) -
+		                     get_rhs_expression(f).Evaluate(env));
+	case FormulaKind::Geq:
+		return std::max(0.0, get_rhs_expression(f).Evaluate(env) -
+		                     get_lhs_expression(f).Evaluate(env));
+	case FormulaKind::Lt:
+		return std::max(0.0, get_lhs_expression(f).Evaluate(env) -
+		                     get_rhs_expression(f).Evaluate(env));
+	case FormulaKind::Gt:
+		return std::max(0.0, get_rhs_expression(f).Evaluate(env) -
+		                     get_lhs_expression(f).Evaluate(env));
+	case FormulaKind::And: {
+		double v = 0.0;
+		for (const auto& sub : get_operands(f))
+			v = std::max(v, ComputeViolation(sub, env));
+		return v;
+	}
+	default:
+		return f.Evaluate(env) ? 0.0 : 1.0;
+	}
+}
+
+} // namespace
+
+int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula& f) {
+	// Capture everything needed for both lambdas by value.
+	auto agent_vars  = _agent_q_vars;
+	auto object_vars = _object_q_vars;
+	const int n_agents = num_agents;
+	const int d = dim;
+	const int n_objects = num_objects;
+	const int obj_dim = non_robot_dim;
+
+	auto eval_fn = [f, agent_vars, object_vars, n_agents, d, n_objects, obj_dim]
+	               (const Eigen::VectorXd& x, const int) -> double {
+		drake::symbolic::Environment env;
+		for (int i = 0; i < n_agents; ++i)
+			for (int j = 0; j < d; ++j)
+				env.insert(agent_vars[i][j], x[i * d + j]);
+		for (int o = 0; o < n_objects; ++o)
+			for (int j = 0; j < obj_dim; ++j)
+				env.insert(object_vars[o][j], x[n_agents * d + o * obj_dim + j]);
+		return ComputeViolation(f, env);
+	};
+
+	auto build_fn = [f, agent_vars, object_vars, n_agents, d, n_objects, obj_dim, node]
+	                (drake::solvers::MathematicalProgram& prog,
+	                 const struct SubgraphOfConstraints& sg,
+	                 const int,
+	                 const drake::solvers::MatrixXDecisionVariable& X,
+	                 const drake::solvers::MatrixXDecisionVariable&) {
+		const int sg_node = sg.subgraph_id(node);
+		drake::symbolic::Substitution sub;
+		for (int i = 0; i < n_agents; ++i)
+			for (int j = 0; j < d; ++j)
+				sub[agent_vars[i][j]] = Expression(X(sg_node, i * d + j));
+		for (int o = 0; o < n_objects; ++o)
+			for (int j = 0; j < obj_dim; ++j)
+				sub[object_vars[o][j]] = Expression(X(sg_node, n_agents * d + o * obj_dim + j));
+		prog.AddConstraint(f.Substitute(sub));
+	};
+
+	return _add_op(DeferredOpKind::kSymbolic, node, std::move(eval_fn), std::move(build_fn));
 }
