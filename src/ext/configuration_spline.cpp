@@ -53,6 +53,8 @@ void init_submodule_configuration_spline(py::module_& m) {
 						   std::move(ev.a_tangent));
 		     },
 		     py::arg("t"))
+		.def("set_linear",    &CubicConfigurationSpline::set_linear,  py::arg("linear"))
+		.def("is_linear",     &CubicConfigurationSpline::is_linear)
 		.def("eval_multiple", &CubicConfigurationSpline::eval_multiple)
 		.def("compute_ctrl_cost",
 		     [](const CubicConfigurationSpline& self,

@@ -40,6 +40,7 @@ class GraphOfConstraintsMPC():
             short_path_time_per_step: float = 0.05,
             # misc. options
             solve_for_waypoints_once: bool = False,
+            linear_interpolation: bool = False,
     ):
         # problem definition data
         num_agents = graph.num_agents
@@ -49,6 +50,8 @@ class GraphOfConstraintsMPC():
         self.graph = graph
         self.last_cycle_time = 0.0
         self.last_cycle_splines = [CubicConfigurationSpline(spline_spec) for _ in range(num_agents)]
+        for s in self.last_cycle_splines:
+            s.set_linear(linear_interpolation)
         self.last_cycle_waypoints = None
         self.last_cycle_var_assignments = None
         self.last_cycle_short_path = None

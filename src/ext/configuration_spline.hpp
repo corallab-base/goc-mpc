@@ -285,6 +285,8 @@ public:
 	Eigen::VectorXd times_;
 	std::vector<SegmentPiece> pieces_;
 
+	bool linear_ = false;
+
 	CubicConfigurationSpline()
 		: block_offsets_(0),
 		  blocks_(0) {}
@@ -329,6 +331,9 @@ public:
 		times_.resize(0);
 		pieces_.clear();
 	}
+
+	void set_linear(bool linear) { linear_ = linear; }
+	bool is_linear() const { return linear_; }
 
 	// ----- API: set from waypoints/vels/times -----
 	// pts: (N x ambient_dim), vels: (N x tangent_dim), times: (N)
@@ -516,83 +521,109 @@ public:
 		Eigen::VectorXd v(tan_dim_);
 		Eigen::VectorXd a(tan_dim_);
 
+		const double alpha = (tau > 0.0) ? (local_t / tau) : 0.0;
+
 		int a_off = 0, t_off = 0;
 		for (size_t bi = 0; bi < seg.blocks.size(); ++bi) {
 			const auto& bo = block_offsets_[bi];
 			const auto& blk = seg.blocks[bi];
 			if (std::holds_alternative<EuclPiece>(blk)) {
 				const auto& p = std::get<EuclPiece>(blk);
-				const double tt = local_t;
-				Eigen::VectorXd x  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
-				Eigen::VectorXd xd = p.c + tt * (2.0*p.b + tt*3.0*p.a);
-				Eigen::VectorXd xdd= 2.0*p.b + tt*6.0*p.a;
-
-				q.segment(a_off, p.dim()) = x;
-				v.segment(t_off, p.dim()) = xd;
-				a.segment(t_off, p.dim()) = xdd;
-
+				if (linear_) {
+					const Eigen::VectorXd disp = p.x1 - p.x0;
+					q.segment(a_off, p.dim()) = p.x0 + alpha * disp;
+					v.segment(t_off, p.dim()) = disp / tau;
+					a.segment(t_off, p.dim()).setZero();
+				} else {
+					const double tt = local_t;
+					Eigen::VectorXd x  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
+					Eigen::VectorXd xd = p.c + tt * (2.0*p.b + tt*3.0*p.a);
+					Eigen::VectorXd xdd= 2.0*p.b + tt*6.0*p.a;
+					q.segment(a_off, p.dim()) = x;
+					v.segment(t_off, p.dim()) = xd;
+					a.segment(t_off, p.dim()) = xdd;
+				}
 				a_off += p.dim(); t_off += p.dim();
 			} else if (std::holds_alternative<TorusPiece>(blk)) {
 				const auto& p = std::get<TorusPiece>(blk);
-				const double tt = local_t;
-				Eigen::VectorXd phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
-				Eigen::VectorXd phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
-				Eigen::VectorXd phidd= 2.0*p.b + tt*6.0*p.a;
-
 				const int kdim = p.dim();
-				for (int j = 0; j < kdim; ++j) {
-					q(a_off + j) = torus::wrap_pi(p.a0(j) + phi(j));
+				if (linear_) {
+					for (int j = 0; j < kdim; ++j) {
+						q(a_off + j) = torus::wrap_pi(p.a0(j) + alpha * p.delta(j));
+					}
+					v.segment(t_off, kdim) = p.delta / tau;
+					a.segment(t_off, kdim).setZero();
+				} else {
+					const double tt = local_t;
+					Eigen::VectorXd phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
+					Eigen::VectorXd phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
+					Eigen::VectorXd phidd= 2.0*p.b + tt*6.0*p.a;
+					for (int j = 0; j < kdim; ++j) {
+						q(a_off + j) = torus::wrap_pi(p.a0(j) + phi(j));
+					}
+					v.segment(t_off, kdim) = phid;
+					a.segment(t_off, kdim) = phidd;
 				}
-				v.segment(t_off, kdim) = phid;
-				a.segment(t_off, kdim) = phidd;
-
 				a_off += kdim; t_off += kdim;
 			} else if (std::holds_alternative<SO3QuatPiece>(blk)) {
 				const auto& p = std::get<SO3QuatPiece>(blk);
-				const double tt = local_t;
-				Eigen::Matrix<double,3,1> phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
-				Eigen::Matrix<double,3,1> phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
-				Eigen::Matrix<double,3,1> phidd= 2.0*p.b + tt*6.0*p.a;
-
-				// q(t) = q0 * Exp(phi(t))
-				Eigen::Quaterniond qe = so3::quat::Exp(phi);
-				Eigen::Quaterniond qt = (p.q0 * qe).normalized();
-				if (qt.w() < 0) qt.coeffs() *= -1.0; // canonicalize
-
-				// ω = J(phi) φdot,  ωdot = J φ¨ + (dJ/dt) φdot
-				Eigen::Matrix3d J   = so3::left_jacobian(phi);
-				Eigen::Vector3d omg = J * phid;
-				Eigen::Vector3d dJphid = so3::d_left_jacobian_times_phidot(phi, phid);
-				Eigen::Vector3d omgd = J * phidd + dJphid;
-
-				q(a_off+0) = qt.w(); q(a_off+1) = qt.x(); q(a_off+2) = qt.y(); q(a_off+3) = qt.z();
-				v.segment(t_off, 3) = omg;
-				a.segment(t_off, 3) = omgd;
-
+				if (linear_) {
+					// Geodesic (SLERP): q(t) = q0 * Exp(alpha * phi1)
+					const Eigen::Vector3d phi = alpha * p.phi1;
+					Eigen::Quaterniond qe = so3::quat::Exp(phi);
+					Eigen::Quaterniond qt = (p.q0 * qe).normalized();
+					if (qt.w() < 0) qt.coeffs() *= -1.0;
+					const Eigen::Vector3d omega = p.phi1 / tau;
+					q(a_off+0) = qt.w(); q(a_off+1) = qt.x(); q(a_off+2) = qt.y(); q(a_off+3) = qt.z();
+					v.segment(t_off, 3) = omega;
+					a.segment(t_off, 3).setZero();
+				} else {
+					const double tt = local_t;
+					Eigen::Matrix<double,3,1> phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
+					Eigen::Matrix<double,3,1> phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
+					Eigen::Matrix<double,3,1> phidd= 2.0*p.b + tt*6.0*p.a;
+					Eigen::Quaterniond qe = so3::quat::Exp(phi);
+					Eigen::Quaterniond qt = (p.q0 * qe).normalized();
+					if (qt.w() < 0) qt.coeffs() *= -1.0;
+					Eigen::Matrix3d J   = so3::left_jacobian(phi);
+					Eigen::Vector3d omg = J * phid;
+					Eigen::Vector3d dJphid = so3::d_left_jacobian_times_phidot(phi, phid);
+					Eigen::Vector3d omgd = J * phidd + dJphid;
+					q(a_off+0) = qt.w(); q(a_off+1) = qt.x(); q(a_off+2) = qt.y(); q(a_off+3) = qt.z();
+					v.segment(t_off, 3) = omg;
+					a.segment(t_off, 3) = omgd;
+				}
 				a_off += 4; t_off += 3;
 			} else if (std::holds_alternative<SO3MatPiece>(blk)) {
 				const auto& p = std::get<SO3MatPiece>(blk);
-				const double tt = local_t;
-				Eigen::Matrix<double,3,1> phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
-				Eigen::Matrix<double,3,1> phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
-				Eigen::Matrix<double,3,1> phidd= 2.0*p.b + tt*6.0*p.a;
-
-				// q(t) = q0 * Exp(phi(t))
-				drake::math::RotationMatrix<double> Re = so3::mat::Exp(phi);
-				drake::math::RotationMatrix<double> Rt = p.R0 * Re;
-
-				// ω = J(phi) φdot,  ωdot = J φ¨ + (dJ/dt) φdot
-				Eigen::Matrix3d J   = so3::left_jacobian(phi);
-				Eigen::Vector3d omg = J * phid;
-				Eigen::Vector3d dJphid = so3::d_left_jacobian_times_phidot(phi, phid);
-				Eigen::Vector3d omgd = J * phidd + dJphid;
-
-				q.segment(a_off+0, 3) = Rt.row(0);
-				q.segment(a_off+3, 3) = Rt.row(1);
-				q.segment(a_off+6, 3) = Rt.row(2);
-				v.segment(t_off, 3) = omg;
-				a.segment(t_off, 3) = omgd;
-
+				if (linear_) {
+					// Geodesic: R(t) = R0 * Exp(alpha * phi1)
+					const Eigen::Vector3d phi = alpha * p.phi1;
+					drake::math::RotationMatrix<double> Re = so3::mat::Exp(phi);
+					drake::math::RotationMatrix<double> Rt = p.R0 * Re;
+					const Eigen::Vector3d omega = p.phi1 / tau;
+					q.segment(a_off+0, 3) = Rt.row(0);
+					q.segment(a_off+3, 3) = Rt.row(1);
+					q.segment(a_off+6, 3) = Rt.row(2);
+					v.segment(t_off, 3) = omega;
+					a.segment(t_off, 3).setZero();
+				} else {
+					const double tt = local_t;
+					Eigen::Matrix<double,3,1> phi  = p.d + tt * (p.c + tt*(p.b + tt*p.a));
+					Eigen::Matrix<double,3,1> phid = p.c + tt * (2.0*p.b + tt*3.0*p.a);
+					Eigen::Matrix<double,3,1> phidd= 2.0*p.b + tt*6.0*p.a;
+					drake::math::RotationMatrix<double> Re = so3::mat::Exp(phi);
+					drake::math::RotationMatrix<double> Rt = p.R0 * Re;
+					Eigen::Matrix3d J   = so3::left_jacobian(phi);
+					Eigen::Vector3d omg = J * phid;
+					Eigen::Vector3d dJphid = so3::d_left_jacobian_times_phidot(phi, phid);
+					Eigen::Vector3d omgd = J * phidd + dJphid;
+					q.segment(a_off+0, 3) = Rt.row(0);
+					q.segment(a_off+3, 3) = Rt.row(1);
+					q.segment(a_off+6, 3) = Rt.row(2);
+					v.segment(t_off, 3) = omg;
+					a.segment(t_off, 3) = omgd;
+				}
 				a_off += 9; t_off += 3;
 			} else {
 				DRAKE_UNREACHABLE();
