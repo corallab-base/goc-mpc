@@ -42,6 +42,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("num_objects", &GraphOfConstraints::num_objects)
+		.def_readonly("num_phis", &GraphOfConstraints::num_phis)
+		.def_readonly("num_variables", &GraphOfConstraints::num_variables)
 		.def_readonly("dim", &GraphOfConstraints::dim)
 		.def_readonly("non_robot_dim", &GraphOfConstraints::non_robot_dim)
 		.def_readonly("total_dim", &GraphOfConstraints::total_dim)
