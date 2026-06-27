@@ -1051,26 +1051,29 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 	int k,
 	int robot_id,
 	int point_id,
-	Eigen::Vector3d& disp,
+	const Eigen::VectorXd& disp,
 	double tol) {
 
 	DRAKE_DEMAND(k >= 0 && k < structure.num_nodes());
 	DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
 	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
 
+	const int k_slice = std::min(robot_ambient_dim(robot_id), object_ambient_dim(point_id));
+	DRAKE_DEMAND(disp.size() == k_slice);
+
 	const int robot_start = robot_id * dim;
 	const int objs_start = num_agents * dim;
 	const int point_start = objs_start + point_id * non_robot_dim;
 
-	Eigen::VectorXd lb = Eigen::VectorXd::Constant(3, -tol);
-	Eigen::VectorXd ub = Eigen::VectorXd::Constant(3,  tol);
+	Eigen::VectorXd lb = Eigen::VectorXd::Constant(k_slice, -tol);
+	Eigen::VectorXd ub = Eigen::VectorXd::Constant(k_slice,  tol);
 
 	int phi_id = _add_op(DeferredOpKind::kLinearEq, k,
 			     [=, this](const Eigen::VectorXd& x,
 				       const int... /*unused*/) {
-				     Eigen::Vector3d p_WE = x.segment(robot_start, 3);
-				     Eigen::Vector3d p_WP = x.segment(point_start, 3);
-				     Eigen::Vector3d r  = (p_WP - p_WE) - disp;   // want r == 0
+				     Eigen::VectorXd p_WE = x.segment(robot_start, k_slice);
+				     Eigen::VectorXd p_WP = x.segment(point_start, k_slice);
+				     Eigen::VectorXd r  = (p_WP - p_WE) - disp;
 				     return r.lpNorm<Eigen::Infinity>();
 			     },
 			     [=, this](auto& prog,
@@ -1081,17 +1084,13 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 				     const unsigned int node_k = subgraph.subgraph_id(k);
 				     VectorXDecisionVariable row = X.row(node_k);
 
-				     VectorXDecisionVariable p_WE = row.segment(robot_start, 3);
-				     VectorXDecisionVariable p_WP = row.segment(point_start, 3);
+				     VectorXDecisionVariable p_WE = row.segment(robot_start, k_slice);
+				     VectorXDecisionVariable p_WP = row.segment(point_start, k_slice);
 
-				     // Enforce pB - pA = disp  (3 scalar equalities)
 				     prog.AddLinearConstraint((p_WP - p_WE) - disp, lb, ub);
-
-				     // prog.AddLinearEqualityConstraint(p_WP - p_WE, disp);
 			     }
 		);
 
-	// record that this constraint is statically assigned to this robot.
 	_phi_to_static_assignment_map[phi_id] = robot_id;
 
 	return phi_id;
