@@ -80,12 +80,18 @@ GraphOfConstraints::GraphOfConstraints(
 	_global_x_lb = Eigen::VectorXd::Constant(total_dim, global_x_lb);
 	_global_x_ub = Eigen::VectorXd::Constant(total_dim, global_x_ub);
 
-	for (int i = 0; i < num_agents; ++i)
+	for (int i = 0; i < num_agents; ++i) {
 		_agent_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
 			dim, fmt::format("agent_{}_q", i)));
-	for (int o = 0; o < num_objects; ++o)
+		_agent_q_vars_2.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			dim, fmt::format("agent_{}_q_2", i)));
+	}
+	for (int o = 0; o < num_objects; ++o) {
 		_object_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
 			non_robot_dim, fmt::format("object_{}_q", o)));
+		_object_q_vars_2.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			non_robot_dim, fmt::format("object_{}_q_2", o)));
+	}
 
 	int offset = 0;
 	for (int ag = 0; ag < num_agents; ++ag) {
@@ -2053,6 +2059,19 @@ GraphOfConstraints::object_q(int object_id) const {
 	return _object_q_vars.at(object_id).cast<drake::symbolic::Expression>();
 }
 
+// For unified edge constraint API
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::agent_q_2(int agent_id) const {
+	return _agent_q_vars_2.at(agent_id).cast<drake::symbolic::Expression>();
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::object_q_2(int object_id) const {
+	return _object_q_vars_2.at(object_id).cast<drake::symbolic::Expression>();
+}
+
+
 namespace {
 
 double ComputeViolation(const drake::symbolic::Formula& f,
@@ -2126,4 +2145,53 @@ int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula&
 	};
 
 	return _add_op(DeferredOpKind::kSymbolic, node, std::move(eval_fn), std::move(build_fn));
+}
+
+int GraphOfConstraints::add_edge_constraint(int u, int v, const drake::symbolic::Formula& f) {
+	// Capture everything needed for both lambdas by value.
+	auto agent_vars  = _agent_q_vars;
+	auto object_vars = _object_q_vars;
+	auto agent_vars_2  = _agent_q_vars_2;
+	auto object_vars_2 = _object_q_vars_2;
+	const int n_agents = num_agents;
+	const int d = dim;
+	const int n_objects = num_objects;
+	const int obj_dim = non_robot_dim;
+
+	auto eval_fn = [](const Eigen::VectorXd& x, const Eigen::VectorXi& i) -> double {
+		// TODO
+		return 0.0;
+	};
+
+	auto wp_build_fn = [f, agent_vars, object_vars, agent_vars_2, object_vars_2,
+			    n_agents, d, n_objects, obj_dim, u, v]
+		(drake::solvers::MathematicalProgram& prog,
+		 const struct SubgraphOfConstraints& sg,
+		 const int,
+		 const drake::solvers::MatrixXDecisionVariable& X,
+		 const drake::solvers::MatrixXDecisionVariable&,
+		 const Eigen::VectorXd& x_u) {
+		const int sg_u_node = sg.subgraph_id(u);
+		const int sg_v_node = sg.subgraph_id(v);
+		drake::symbolic::Substitution sub;
+		for (int i = 0; i < n_agents; ++i) {
+			for (int j = 0; j < d; ++j) {
+				sub[agent_vars[i][j]] = Expression(X(sg_u_node, i * d + j));
+				sub[agent_vars_2[i][j]] = Expression(X(sg_v_node, i * d + j));
+			}
+		}
+		for (int o = 0; o < n_objects; ++o) {
+			for (int j = 0; j < obj_dim; ++j) {
+				sub[object_vars[o][j]] = Expression(X(sg_u_node, n_agents * d + o * obj_dim + j));
+				sub[object_vars_2[o][j]] = Expression(X(sg_v_node, n_agents * d + o * obj_dim + j));
+			}
+		}
+		prog.AddConstraint(f.Substitute(sub));
+	};
+
+	auto sp_build_fn = [](drake::solvers::MathematicalProgram&, const int, const Eigen::VectorXi&,
+			      const drake::solvers::MatrixXDecisionVariable&) { return; };
+
+	return _add_edge_op(DeferredOpKind::kSymbolic, u, v, std::set<int>({}),
+			    std::move(eval_fn), std::move(wp_build_fn), std::move(sp_build_fn));
 }

@@ -172,6 +172,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// SYMBOLIC UNIFIED CONSTRAINT API ////////////////////////////
 		.def("object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
 		.def("agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
+		.def("u_object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
+		.def("u_agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
+		.def("v_object_q", &GraphOfConstraints::object_q_2, py::arg("object_q"))
+		.def("v_agent_q", &GraphOfConstraints::agent_q_2, py::arg("agent_q"))
 		// accept either a single Formula or a numpy array of Formulas (from
 		// element-wise == on object arrays) and reduce with conjunction.
 		.def("add_constraint", [](GraphOfConstraints& self, int node,
@@ -188,7 +192,22 @@ void init_submodule_goc_mpc(py::module_& m) {
 				}
 			}
 			return self.add_constraint(node, f);
-		}, py::arg("node"), py::arg("formula"));
+		}, py::arg("node"), py::arg("formula"))
+		.def("add_edge_constraint", [](GraphOfConstraints& self, int u, int v,
+					       py::object formula_obj) -> int {
+			drake::symbolic::Formula f;
+			try {
+				f = py::cast<drake::symbolic::Formula>(formula_obj);
+			} catch (const py::cast_error&) {
+				bool first = true;
+				for (auto h : formula_obj) {
+					auto fh = py::cast<drake::symbolic::Formula>(h);
+					if (first) { f = fh; first = false; }
+					else        f = f && fh;
+				}
+			}
+			return self.add_edge_constraint(u, v, f);
+		}, py::arg("u"), py::arg("v"), py::arg("formula"));
 
 	py::enum_<WaypointSolver>(goc_mpc, "WaypointSolver")
 		.value("kGurobi", WaypointSolver::kGurobi)

@@ -156,6 +156,11 @@ struct GraphOfConstraints {
 	std::vector<drake::VectorX<drake::symbolic::Variable>> _agent_q_vars;
 	std::vector<drake::VectorX<drake::symbolic::Variable>> _object_q_vars;
 
+	// Symbolic placeholder variables for the second variables in the
+	// unified add_edge_constraint API
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _agent_q_vars_2;
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _object_q_vars_2;
+
 	// Constructor
 	GraphOfConstraints(const std::vector<CubicConfigurationSpline::Spec>& robot_specs,
 			   const std::vector<CubicConfigurationSpline::Spec>& object_specs,
@@ -385,6 +390,10 @@ struct GraphOfConstraints {
 	drake::VectorX<drake::symbolic::Expression> agent_q(int agent_id) const;
 	drake::VectorX<drake::symbolic::Expression> object_q(int object_id) const;
 	int add_constraint(int node, const drake::symbolic::Formula& f);
+
+	drake::VectorX<drake::symbolic::Expression> agent_q_2(int agent_id) const;
+	drake::VectorX<drake::symbolic::Expression> object_q_2(int object_id) const;
+	int add_edge_constraint(int u, int v, const drake::symbolic::Formula& f);
 
 private:
 
