@@ -1,6 +1,6 @@
 [project]
 name = "goc-mpc"
-version = "0.9.1"
+version = "0.9.2"
 description = ""
 authors = [
     {name = "Tassos Manganaris",email = "tassos.manganaris@gmail.com"}

@@ -2,7 +2,7 @@
 Graph-of-Constraints Python Module
 """
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 from .goc_mpc import (
     GraphOfConstraints,
