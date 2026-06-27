@@ -19,7 +19,6 @@ static void PrintSolverReport(GraphTimingProblem* problem,
 
 	cout << "=== Drake Solve() Report ===\n";
 	cout << "Solver:           " << result.get_solver_id().name() << "\n";
-	// to_string(SolutionResult) is supported; if your Drake is older, cast to int.
 	cout << "SolutionResult:   " << to_string(result.get_solution_result()) << "\n";
 	cout << "Success?          " << (result.is_success() ? "yes" : "no") << "\n";
 

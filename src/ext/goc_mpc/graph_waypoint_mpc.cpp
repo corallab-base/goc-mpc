@@ -1310,8 +1310,6 @@ bool GraphWaypointMPC::SolveWithGurobi(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
 		_enforce_rigidity, _enforce_rigidity, _objective);
 
-	std::cout << problem.prog->to_string() << std::endl;
-
 	// Solve
 	drake::solvers::GurobiSolver solver;
 
