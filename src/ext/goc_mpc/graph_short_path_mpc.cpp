@@ -199,3 +199,21 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 		return false;
 	}
 }
+
+void GraphShortPathMPC::add_sphere_obstacle(
+		int agent_id, Eigen::Vector3d pos,
+		double r_agent, double r_obs, double weight) {
+	_obstacles.push_back({Obstacle::SPHERE, agent_id, pos, r_agent, r_obs,
+	                      Eigen::Vector3d::Zero(), weight});
+}
+
+void GraphShortPathMPC::add_box_obstacle(
+		int agent_id, Eigen::Vector3d pos,
+		Eigen::Vector3d half_sizes, double r_agent, double weight) {
+	_obstacles.push_back({Obstacle::BOX, agent_id, pos, r_agent, 0.0,
+	                      half_sizes, weight});
+}
+
+void GraphShortPathMPC::clear_obstacles() {
+	_obstacles.clear();
+}

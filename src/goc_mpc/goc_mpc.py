@@ -344,6 +344,39 @@ class GraphOfConstraintsMPC():
     def unpause(self):
         self._pause_event.clear()
 
+    def register_obstacle(self, obs_type, pos, *,
+                          radius: float = 0.0,
+                          half_sizes=None,
+                          agent_id: int = -1,
+                          agent_radius: float = 0.05,
+                          weight: float = 10.0):
+        """Register a static obstacle for the short-path collision cost.
+
+        Args:
+            obs_type:     ObsType.SPHERE or ObsType.BOX
+            pos:          obstacle center in world frame, shape (3,)
+            radius:       sphere radius (SPHERE only)
+            half_sizes:   axis-aligned half-extents, shape (3,) (BOX only)
+            agent_id:     which agent to apply to (-1 = all agents)
+            agent_radius: bounding-sphere radius of the agent (default 0.05 m)
+            weight:       cost weight (larger → stronger avoidance)
+        """
+        from goc_mpc import ObsType  # local import to avoid circular dep
+        pos = np.asarray(pos, dtype=float)
+        if obs_type == ObsType.SPHERE:
+            self.short_path_mpc.add_sphere_obstacle(
+                agent_id, pos, agent_radius, float(radius), float(weight))
+        elif obs_type == ObsType.BOX:
+            hs = np.asarray(half_sizes, dtype=float)
+            self.short_path_mpc.add_box_obstacle(
+                agent_id, pos, hs, agent_radius, float(weight))
+        else:
+            raise ValueError(f"Unknown ObsType: {obs_type}")
+
+    def clear_obstacles(self):
+        """Remove all registered obstacles from the short-path planner."""
+        self.short_path_mpc.clear_obstacles()
+
     #
     # utils
     #

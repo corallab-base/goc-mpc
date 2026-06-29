@@ -267,5 +267,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_points", &GraphShortPathMPC::view_points, py::return_value_policy::reference_internal)
 		.def("view_vels", &GraphShortPathMPC::view_vels, py::return_value_policy::reference_internal)
 		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal)
-		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time);
+		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time)
+		.def("add_sphere_obstacle", &GraphShortPathMPC::add_sphere_obstacle,
+		     py::arg("agent_id"), py::arg("pos"), py::arg("r_agent"), py::arg("r_obs"),
+		     py::arg("weight") = 1.0)
+		.def("add_box_obstacle", &GraphShortPathMPC::add_box_obstacle,
+		     py::arg("agent_id"), py::arg("pos"), py::arg("half_sizes"), py::arg("r_agent"),
+		     py::arg("weight") = 1.0)
+		.def("clear_obstacles", &GraphShortPathMPC::clear_obstacles);
 }

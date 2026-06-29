@@ -39,6 +39,18 @@ struct ShortPathProblem {
 };
 
 
+// Geometric obstacle for collision-avoidance costs in the short-path planner.
+struct Obstacle {
+	enum Type { SPHERE, BOX } type;
+	int agent_id;              // -1 = apply to all agents
+	Eigen::Vector3d pos;       // obstacle center in world frame
+	double r_agent;            // agent bounding-sphere radius
+	double r_obs;              // obstacle sphere radius (SPHERE only)
+	Eigen::Vector3d half_sizes; // axis-aligned half-extents (BOX only)
+	double weight;             // cost weight
+};
+
+
 ShortPathProblem build_short_path_problem(
 	const GraphOfConstraints* graph,
 	const Eigen::MatrixXd& ref_points,
@@ -47,7 +59,8 @@ ShortPathProblem build_short_path_problem(
 	const Eigen::VectorXd& v0,
 	const Eigen::VectorXi& var_assignments,
 	const std::vector<int> remaining_vertices,
-	double tau);
+	double tau,
+	const std::vector<Obstacle>& obstacles);
 
 
 struct GraphShortPathMPC {
@@ -56,6 +69,9 @@ struct GraphShortPathMPC {
 	unsigned int _num_steps, _num_agents, _dim;
 	double _time_per_step;
 	Eigen::VectorXd _times;
+
+	// Obstacles registered for collision-avoidance costs
+	std::vector<Obstacle> _obstacles;
 
 	// Outputs
 	Eigen::MatrixXd _points;
@@ -71,6 +87,13 @@ struct GraphShortPathMPC {
 			  unsigned int num_agents,
 			  unsigned int dim,
 			  double time_per_step);
+
+	// Obstacle registration
+	void add_sphere_obstacle(int agent_id, Eigen::Vector3d pos,
+	                         double r_agent, double r_obs, double weight = 1.0);
+	void add_box_obstacle(int agent_id, Eigen::Vector3d pos,
+	                      Eigen::Vector3d half_sizes, double r_agent, double weight = 1.0);
+	void clear_obstacles();
 
 	// Core solve routine
 	bool solve(const Eigen::VectorXd& x0,
