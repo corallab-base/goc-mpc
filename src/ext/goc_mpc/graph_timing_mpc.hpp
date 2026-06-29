@@ -123,6 +123,8 @@ struct GraphTimingMPC {
 		   const Eigen::MatrixXd& waypoints,
 		   const Eigen::VectorXi& assignments);
 
+	void Reset();
+
 	int get_agent_spline_length(int agent) const;
 	std::vector<int> get_agent_spline_nodes(int agent) const;
 

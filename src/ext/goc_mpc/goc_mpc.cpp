@@ -232,7 +232,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("solver")            = WaypointSolver::kGurobi,
 		     py::arg("enforce_rigidity")  = false,
 		     py::arg("objective")         = WaypointObjective::kSquaredDistance)
-		.def("solve", &GraphWaypointMPC::solve)
+		.def("solve", &GraphWaypointMPC::solve,
+		     py::call_guard<py::gil_scoped_release>())
 		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
 		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal)
 		.def("view_var_assignments", &GraphWaypointMPC::view_var_assignments, py::return_value_policy::reference_internal)
@@ -241,11 +242,14 @@ void init_submodule_goc_mpc(py::module_& m) {
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
                 .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double, double, double, double>(),
 		     py::keep_alive<1, 3>())
-		.def("solve", &GraphTimingMPC::solve)
+		.def("solve", &GraphTimingMPC::solve,
+		     py::call_guard<py::gil_scoped_release>())
+		.def("reset", &GraphTimingMPC::Reset)
 		.def("get_agent_spline_length", &GraphTimingMPC::get_agent_spline_length)
 		.def("get_agent_spline_nodes", &GraphTimingMPC::get_agent_spline_nodes)
 		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)
-		.def("fill_cubic_splines", &GraphTimingMPC::fill_cubic_splines)
+		.def("fill_cubic_splines", &GraphTimingMPC::fill_cubic_splines,
+		     py::call_guard<py::gil_scoped_release>())
 		.def("get_next_taus", &GraphTimingMPC::get_next_taus)
 		.def("get_next_nodes", &GraphTimingMPC::get_next_nodes)
 		.def("view_wps_list", &GraphTimingMPC::view_wps_list)
@@ -258,7 +262,8 @@ void init_submodule_goc_mpc(py::module_& m) {
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
                 .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double>(),
 		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"), py::arg("time_per_step"))
-		.def("solve", &GraphShortPathMPC::solve)
+		.def("solve", &GraphShortPathMPC::solve,
+		     py::call_guard<py::gil_scoped_release>())
 		.def("view_points", &GraphShortPathMPC::view_points, py::return_value_policy::reference_internal)
 		.def("view_vels", &GraphShortPathMPC::view_vels, py::return_value_policy::reference_internal)
 		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal)

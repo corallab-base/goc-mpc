@@ -685,6 +685,31 @@ bool GraphTimingMPC::solve(
 	}
 }
 
+void GraphTimingMPC::Reset() {
+	int num_agents = _graph->num_agents;
+	int num_nodes = _graph->structure.num_nodes();
+	int ambient_dim = _splines->at(0).ambient_dim();
+	int tangent_dim = _splines->at(0).tangent_dim();
+
+	_wps_list.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		_wps_list[i] = Eigen::MatrixXd::Zero(num_nodes, ambient_dim);
+	}
+	_vs_list.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		_vs_list[i] = Eigen::MatrixXd::Zero(num_nodes, tangent_dim);
+	}
+	_time_deltas_list.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		_time_deltas_list[i] = Eigen::VectorXd::Zero(num_nodes);
+	}
+	_agent_nodes_list.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		_agent_nodes_list[i].clear();
+		_agent_spline_length_map[i] = 0;
+	}
+}
+
 int GraphTimingMPC::get_agent_spline_length(int agent) const {
 	if (!_agent_spline_length_map.contains(agent)) {
 		return 0;

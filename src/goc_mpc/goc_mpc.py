@@ -1,4 +1,6 @@
 import pickle
+import threading
+import time
 import numpy as np
 
 from goc_mpc.graphs import Graph
@@ -84,146 +86,220 @@ class GraphOfConstraintsMPC():
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
                                                 num_agents, dim, short_path_time_per_step)
 
-    def _solve_for_waypoints(self, x: np.ndarray):
-        if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):
-            return True
-        else:
-            success = self.waypoint_mpc.solve(self.remaining_phases, x)
-            self.last_cycle_waypoints = self.waypoint_mpc.view_waypoints()
-            return success
+        # double-buffered splines: timing writes to pending, short path reads committed
+        self.committed_splines = self.last_cycle_splines
+        self.pending_splines = [CubicConfigurationSpline(spline_spec) for _ in range(num_agents)]
+        for s in self.pending_splines:
+            s.set_linear(linear_interpolation)
 
-    def pass_node(self, node: int, assignments: np.ndarray):
-        self.completed_phases |= {node}
-        self.remaining_phases.remove(node)
-        self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
+        # shared solver inputs (written by step(), read by threads)
+        self._latest_x = None
+        self._latest_x_dot = None
+        self._latest_remaining_phases = list(self.remaining_phases)
 
-    def _solve_for_timing(self, time_delta, x, x_dot):
+        # shared solver outputs (written by background threads)
+        self._latest_waypoints = None
+        self._latest_assignments = None
+        self._latest_var_assignments = None
+        self._latest_short_path = None
 
-        # get references to the stored waypoints and assignments solutions from waypoint_mpc
-        waypoints = self.waypoint_mpc.view_waypoints()
-        assignments = self.waypoint_mpc.view_assignments()
-        var_assignments = self.waypoint_mpc.view_var_assignments()
-        self.last_cycle_var_assignments = var_assignments
+        # synchronization
+        self._phases_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._timing_ready_event = threading.Event()   # set after first timing solve fills splines
+        self._first_result_event = threading.Event()
 
-        # PROGRESSION: progress time and potentially change phase
-        # shift timing
-        if len(self.remaining_phases) > 0 and time_delta > 0.0:
-            passed_nodes = self.timing_mpc.set_progressed_time(time_delta, self.time_delta_cutoff)
+        # start perpetual solver threads
+        self._waypoint_thread = threading.Thread(target=self._waypoint_loop, daemon=True)
+        self._timing_thread = threading.Thread(target=self._timing_loop, daemon=True)
+        self._short_path_thread = threading.Thread(target=self._short_path_loop, daemon=True)
+        self._waypoint_thread.start()
+        self._timing_thread.start()
+        self._short_path_thread.start()
 
+    def _waypoint_loop(self):
+        while not self._stop_event.is_set():
+            if self._pause_event.is_set():
+                time.sleep(0.001)
+                continue
+            if self._latest_x is None:
+                time.sleep(0.001)
+                continue
+            if self.solve_for_waypoints_once and self._latest_waypoints is not None:
+                time.sleep(0.01)
+                continue
+            x_snap = self._latest_x.copy()
+            with self._phases_lock:
+                phases_snap = list(self._latest_remaining_phases)
+            success = self.waypoint_mpc.solve(phases_snap, x_snap)
+            if success:
+                self._latest_waypoints = np.array(self.waypoint_mpc.view_waypoints())
+                self._latest_assignments = np.array(self.waypoint_mpc.view_assignments())
+                self._latest_var_assignments = np.array(self.waypoint_mpc.view_var_assignments())
+
+    def _apply_passed_nodes(self, passed_nodes, x_snap, asgn_snap):
+        with self._phases_lock:
             for node in passed_nodes:
                 if node in self.graph.unpassable_nodes:
                     continue
-
                 all_phis_satisfied = all(
-                    [self.graph.evaluate_phi(phi_id, x, assignments, self.phi_tolerance)
-                     for phi_id in self.graph.get_phi_ids(node)])
-
+                    self.graph.evaluate_phi(phi_id, x_snap, asgn_snap, self.phi_tolerance)
+                    for phi_id in self.graph.get_phi_ids(node))
                 if all_phis_satisfied:
                     print(f"Completed {node}")
-                    # breakpoint()
                     self.completed_phases |= {node}
-                    self.remaining_phases.remove(node)
-                    self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
+                    if node in self.remaining_phases:
+                        self.remaining_phases.remove(node)
+                    self.last_grasp_commands.extend(
+                        self.graph.get_grasp_changes(node, asgn_snap))
                 else:
                     print(f"Did not complete {node}")
+            self._latest_remaining_phases = list(self.remaining_phases)
 
-        # if not self.timing_mpc.done():
-        #     # if the closest next phase is further than time_delta_cutoff seconds into the future
-        #     if self.timing_mpc.current_minimum_time_delta() > self.time_delta_cutoff:
-        #         # resolve the timing problem
-        #         # TODO: understand if there is something to do with ctrlErr
+    def _timing_loop(self):
+        last_t = time.monotonic()
+        while not self._stop_event.is_set():
+            if self._pause_event.is_set():
+                time.sleep(0.001)
+                continue
+            if self._latest_waypoints is None or self._latest_x is None:
+                time.sleep(0.001)
+                continue
+            now = time.monotonic()
+            delta = now - last_t
+            last_t = now
+            x_snap = self._latest_x.copy()
+            x_dot_snap = self._latest_x_dot.copy()
+            wps_snap = self._latest_waypoints
+            asgn_snap = self._latest_assignments
+            with self._phases_lock:
+                phases_snap = list(self._latest_remaining_phases)
+            if len(phases_snap) > 0 and delta > 0.0:
+                passed = self.timing_mpc.set_progressed_time(delta, self.time_delta_cutoff)
+                self._apply_passed_nodes(passed, x_snap, asgn_snap)
+                with self._phases_lock:
+                    phases_snap = list(self._latest_remaining_phases)
 
-        success = self.timing_mpc.solve(x, x_dot, self.remaining_phases, waypoints, assignments)
-        if success:
-            self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, x_dot)
-            return True
-        else:
-            return False
+            # only solve timing problem when there are remaining phases
+            if len(phases_snap) > 0:
+                success = self.timing_mpc.solve(x_snap, x_dot_snap, phases_snap, wps_snap, asgn_snap)
 
-    def _solve_for_short_path(self, x, x_dot):
-        var_assignments = self.waypoint_mpc.view_var_assignments()
+            if success:
+                self.timing_mpc.fill_cubic_splines(self.pending_splines, x_snap, x_dot_snap)
+                self.committed_splines, self.pending_splines = \
+                    self.pending_splines, self.committed_splines
+                self._timing_ready_event.set()
 
-        success = self.short_path_mpc.solve(x, x_dot,
-                                            var_assignments,
-                                            self.remaining_phases,
-                                            self.last_cycle_splines)
+    def _short_path_loop(self):
+        while not self._stop_event.is_set():
+            if self._pause_event.is_set():
+                time.sleep(0.001)
+                continue
+            if self._latest_var_assignments is None or self._latest_x is None:
+                time.sleep(0.001)
+                continue
+            if not self._timing_ready_event.is_set():
+                time.sleep(0.001)
+                continue
+            x_snap = self._latest_x.copy()
+            x_dot_snap = self._latest_x_dot.copy()
+            var_assign_snap = self._latest_var_assignments
+            splines_snap = self.committed_splines
+            with self._phases_lock:
+                phases_snap = list(self._latest_remaining_phases)
+            success = self.short_path_mpc.solve(
+                x_snap, x_dot_snap, var_assign_snap, phases_snap, splines_snap)
+            if success:
+                self._latest_short_path = (
+                    np.array(self.short_path_mpc.view_points()),
+                    np.array(self.short_path_mpc.view_vels()),
+                    np.array(self.short_path_mpc.view_times()))
+                self._first_result_event.set()
 
-        if success:
-            points = self.short_path_mpc.view_points()
-            vels = self.short_path_mpc.view_vels()
-            times = self.short_path_mpc.view_times()
-            self.last_cycle_short_path = (points, vels, times)
-
-        return success
+    def pass_node(self, node: int, assignments: np.ndarray):
+        with self._phases_lock:
+            self.completed_phases |= {node}
+            self.remaining_phases.remove(node)
+            self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
+            self._latest_remaining_phases = list(self.remaining_phases)
 
     def _backtrack(self, x, x_dot):
         self.last_cycle_backtracked_phases = {}
 
-        # BACKTRACKING: if the task has been finished
         if len(self.remaining_phases) == 0:
-            # TODO: support final edge phis
-            pass
-        else:
-            remaining_phases_changed = True
+            return
 
-            # otherwise,
-            while remaining_phases_changed:
-                remaining_phases_changed = False
-
-                for edge_phi_id, op in self.graph.get_next_edge_ops(self.remaining_phases).items():
-                    if not self.graph.evaluate_edge_phi(edge_phi_id, x, self.last_cycle_var_assignments, 0.00):
-                        print(f"violated path constraint on {op.u_node}->{op.v_node} (edge phi id: {edge_phi_id})! backtracking.")
-
-                        if edge_phi_id in self.graph.backtrack_map:
-                            for node in self.graph.backtrack_map[edge_phi_id]:
-                                self.completed_phases -= {node}
-                                if node not in self.remaining_phases:
-                                    self.remaining_phases.append(node)
-                                # TODO: This is meant to open the gripper for
-                                # the right agent when backtracking. Replace it
-                                # with edge constraint for gripper preceeding actions
-                                backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
-                                self.last_cycle_backtracked_phases[backtracked_agent] = op.u_node
-                        else:
-                            self.completed_phases -= {op.u_node}
-                            self.remaining_phases.append(op.u_node)
-
+        remaining_phases_changed = True
+        while remaining_phases_changed:
+            remaining_phases_changed = False
+            for edge_phi_id, op in self.graph.get_next_edge_ops(self.remaining_phases).items():
+                if not self.graph.evaluate_edge_phi(edge_phi_id, x, self.last_cycle_var_assignments, 0.00):
+                    print(f"violated path constraint on {op.u_node}->{op.v_node} (edge phi id: {edge_phi_id})! backtracking.")
+                    if edge_phi_id in self.graph.backtrack_map:
+                        for node in self.graph.backtrack_map[edge_phi_id]:
+                            self.completed_phases -= {node}
+                            if node not in self.remaining_phases:
+                                self.remaining_phases.append(node)
                             backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
                             self.last_cycle_backtracked_phases[backtracked_agent] = op.u_node
-
-                        remaining_phases_changed = True
-
-            # while not self.timing_mpc.at_the_start() and phi.maxError(C, 0.5+timingMPC.phase+subSeqStart) > opt.precision:
-            #     # back track appropriately
-            #     self.timing_mpc.update_backtrack();
-            #     phase_changed = True
+                    else:
+                        self.completed_phases -= {op.u_node}
+                        self.remaining_phases.append(op.u_node)
+                        backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
+                        self.last_cycle_backtracked_phases[backtracked_agent] = op.u_node
+                    remaining_phases_changed = True
 
     def reset(self):
-        self.last_cycle_time = 0.0
-        self.remaining_phases = list(range(self.graph.structure.num_nodes))
+        with self._phases_lock:
+            self.last_cycle_time = 0.0
+            self.remaining_phases = list(range(self.graph.structure.num_nodes))
+
+            # clear shared solver inputs
+            self._latest_x = None
+            self._latest_x_dot = None
+            self._latest_remaining_phases = list(self.remaining_phases)
+
+            # clear shared solver outputs
+            self._latest_waypoints = None
+            self._latest_assignments = None
+            self._latest_var_assignments = None
+            self._latest_short_path = None
+
+            # clear internal buffers of timing MPC to prevent premature node passing
+            self.timing_mpc.reset()
+
+            # clear flag indicating computation of first timing and first whole solution
+            self._timing_ready_event.clear()
+            self._first_result_event.clear()
 
     def step(self, t, x, x_dot, teleport=False):
         "Returns the short horizon for the controller to execute."
 
         assert x.size == self.graph.total_dim, f"x.size ({x.size}) != self.graph.total_dim ({self.graph.total_dim})"
 
-        delta = t - self.last_cycle_time
         self.last_cycle_time = t
-
         self.last_grasp_commands = []
 
-        if self.last_cycle_var_assignments is not None:
-            self._backtrack(x, x_dot)
+        # update shared inputs (all three threads pick these up on next iteration)
+        self._latest_x = x
+        self._latest_x_dot = x_dot
 
-        success = self._solve_for_waypoints(x)
+        # backtrack: fast Python, modifies remaining_phases under lock
+        if self._latest_var_assignments is not None:
+            with self._phases_lock:
+                self._backtrack(x, x_dot)
+                self._latest_remaining_phases = list(self.remaining_phases)
 
-        if not success:
-            raise RuntimeError("WaypointsMPC Failed!")
-
-        success = self._solve_for_timing(delta, x, x_dot)
+        self.last_cycle_var_assignments = self._latest_var_assignments
 
         if teleport:
-            wps = self.waypoint_mpc.view_waypoints()
+            # teleport reads waypoint/timing solver outputs; these may lag by one solve cycle
+            wps = self._latest_waypoints
+            if wps is None:
+                self._first_result_event.wait()
+                wps = self._latest_waypoints
+
             next_agent_states = []
             next_agent_deltas = []
 
@@ -251,19 +327,22 @@ class GraphOfConstraintsMPC():
 
             return next_agent_states, None, next_agent_times
 
-        if not success:
-            raise RuntimeError("TimingMPC Failed!")
+        # block only on the very first call until short path has produced a result
+        self._first_result_event.wait()
 
-        success = self._solve_for_short_path(x, x_dot)
+        return self._latest_short_path
 
-        if not success:
-            raise RuntimeError("ShortPathMPC Failed!")
+    def stop(self):
+        self._stop_event.set()
+        self._waypoint_thread.join()
+        self._timing_thread.join()
+        self._short_path_thread.join()
 
-        # tuple:
-        # points: n by d_pos
-        # vels: n by d_vel
-        # times: n
-        return self.last_cycle_short_path
+    def pause(self):
+        self._pause_event.set()
+
+    def unpause(self):
+        self._pause_event.clear()
 
     #
     # utils
