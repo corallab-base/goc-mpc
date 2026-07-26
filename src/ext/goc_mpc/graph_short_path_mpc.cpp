@@ -97,9 +97,9 @@ ShortPathProblem build_short_path_problem(
 
 
 	// TODO: Add path constraint
-	for (const auto& [edge_phi_id, edge_op] : graph->get_next_edge_ops(remaining_vertices)) {
-		edge_op.short_path_builder(*(problem.prog), edge_phi_id, var_assignments, Xi);
-	}
+	// for (const auto& [edge_phi_id, edge_op] : graph->get_next_edge_ops(remaining_vertices)) {
+	// 	edge_op.short_path_builder(*(problem.prog), edge_phi_id, var_assignments, Xi);
+	// }
 
 	return std::move(problem);
 }

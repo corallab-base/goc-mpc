@@ -49,49 +49,53 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("total_dim", &GraphOfConstraints::total_dim)
 		.def_readonly("unpassable_nodes", &GraphOfConstraints::unpassable_nodes)
 		.def_readonly("backtrack_map", &GraphOfConstraints::backtrack_map)
+		.def_readonly("phi_to_variable_map", &GraphOfConstraints::phi_to_variable_map)
+		.def_readonly("phi_to_static_assignment_map", &GraphOfConstraints::_phi_to_static_assignment_map)
+		.def_readonly("node_to_phis_map", &GraphOfConstraints::node_to_phis_map)
+		.def_readonly("edge_to_phis_map", &GraphOfConstraints::edge_to_phis_map)
+		// Raw Formula records for the unified symbolic constraint API
+		// (add_constraint / add_assignable_constraint / add_edge_constraint),
+		// keyed by phi id — introspectable so non-MILP consumers (e.g. the
+		// JAX evolutionary solver) can compile the same constraint
+		// themselves instead of duplicating it by hand. Combine with
+		// node_to_phis_map/edge_to_phis_map (which node/edge each phi
+		// belongs to) and phi_to_variable_map (which var an assignable phi
+		// is gated on, if any).
+		.def_property_readonly("phi_to_formula_map", [](const GraphOfConstraints& self) {
+			std::map<int, drake::symbolic::Formula> out;
+			for (const auto& [id, rec] : self.symbolic_ops) out[id] = rec.formula;
+			return out;
+		})
+		.def_property_readonly("edge_phi_to_formula_map", [](const GraphOfConstraints& self) {
+			std::map<int, drake::symbolic::Formula> out;
+			for (const auto& [id, rec] : self.symbolic_edge_ops) out[id] = rec.formula;
+			return out;
+		})
+		// Which compiled form each edge_phi_to_formula_map entry is: True
+		// for an "along the edge" formula (plain agent_q/object_q/
+		// var_agent_q placeholders, an invariant applied at both endpoints),
+		// False for a relational one (u_agent_q/v_agent_q etc., a single
+		// relation coupling the two endpoints) -- see add_edge_constraint.
+		.def_property_readonly("edge_phi_to_along_edge_map", [](const GraphOfConstraints& self) {
+			std::map<int, bool> out;
+			for (const auto& [id, rec] : self.symbolic_edge_ops) out[id] = rec.along_edge;
+			return out;
+		})
+		.def_readonly("conditional_ordering_map", &GraphOfConstraints::_conditional_ordering_map)
+		.def_readonly("binary_cond_sym_vars", &GraphOfConstraints::_binary_cond_sym_vars)
 		.def("add_variable", &GraphOfConstraints::add_variable)
 		.def("add_grasp_change", &GraphOfConstraints::add_grasp_change)
 		.def("add_assignable_grasp_change", &GraphOfConstraints::add_assignable_grasp_change)
 		.def("get_grasp_changes", &GraphOfConstraints::get_grasp_changes)
 		.def("make_node_unpassable", &GraphOfConstraints::make_node_unpassable)
 		.def("get_phi_ids", &GraphOfConstraints::get_phi_ids)
-		.def("get_next_edge_ops", &GraphOfConstraints::get_next_edge_ops)
+		.def("get_next_edge_phis", &GraphOfConstraints::get_next_edge_phis)
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("evaluate_edge_phi", &GraphOfConstraints::evaluate_edge_phi)
 		.def("get_edge_phi_agent", &GraphOfConstraints::get_edge_phi_agent)
 		.def("add_backtrack_links", &GraphOfConstraints::add_backtrack_links)
 		.def("add_manual_backtrack_links", &GraphOfConstraints::add_manual_backtrack_links)
-		.def("add_linear_eq", &GraphOfConstraints::add_linear_eq)
-		.def("add_robots_linear_eq", &GraphOfConstraints::add_robots_linear_eq)
-		.def("add_robot_linear_eq", &GraphOfConstraints::add_robot_linear_eq)
-		.def("add_assignable_linear_eq", &GraphOfConstraints::add_assignable_linear_eq)
-		.def("add_robot_pos_linear_eq", &GraphOfConstraints::add_robot_pos_linear_eq,
-		     py::arg("k"),
-		     py::arg("robot_id"),
-		     py::arg("A"),
-		     py::arg("b"))
-		.def("add_robot_quat_linear_eq", &GraphOfConstraints::add_robot_quat_linear_eq)
-		.def("add_assignable_robot_quat_linear_eq", &GraphOfConstraints::add_assignable_robot_quat_linear_eq)
-		.def("add_robot_to_point_displacement_constraint", &GraphOfConstraints::add_robot_to_point_displacement_constraint,
-		     py::arg("k"),
-		     py::arg("robot_id"),
-		     py::arg("point_id"),
-		     py::arg("disp"),
-		     py::arg("tol") = 0.0)
-		.def("add_assignable_robot_to_point_displacement_constraint", &GraphOfConstraints::add_assignable_robot_to_point_displacement_constraint)
 		.def("add_robot_to_point_displacement_cost", &GraphOfConstraints::add_robot_to_point_displacement_cost)
-		.def("add_robot_to_point_alignment_constraint", &GraphOfConstraints::add_robot_to_point_alignment_constraint,
-		     py::arg("k"),
-		     py::arg("robot_id"),
-		     py::arg("point_id"),
-		     py::arg("ee_ray_body"),
-		     // optional for roll disambiguation:
-		     py::arg("u_body_opt") = std::nullopt,         // u_b (must be ⟂ ee_ray_body)
-		     py::arg("roll_ref_world") = std::nullopt,     // t (any, not necessarily ⟂ d)
-		     py::arg("roll_ref_flat") = false,
-		     py::arg("require_positive_pointing") = true,
-		     py::arg("eps_d") = 0.05,
-		     py::arg("tau_tperp") = 0.05)
 		.def("add_robot_to_point_alignment_cost", &GraphOfConstraints::add_robot_to_point_alignment_cost,
 		     py::arg("k"),
 		     py::arg("robot_id"),
@@ -108,59 +112,11 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("w_u_stab") = 0.01,
 		     py::arg("eps") = 1e-10,
 		     py::arg("eps_d") = 1e-3)
-		.def("add_robot_above_cube_constraint", &GraphOfConstraints::add_robot_above_cube_constraint,
-		     py::arg("k"),
-		     py::arg("robot_id"),
-		     py::arg("cube_id"),
-		     py::arg("delta_z"),
-		     py::arg("x_offset") = 0.0,
-		     py::arg("y_offset") = 0.0)
-		.def("add_point_linear_eq", &GraphOfConstraints::add_point_linear_eq)
-		.def("add_point_linear_ineq", &GraphOfConstraints::add_point_linear_ineq)
-		.def("add_point_to_point_displacement_constraint", &GraphOfConstraints::add_point_to_point_displacement_constraint,
-		     py::arg("k"),
-		     py::arg("point_a"),
-		     py::arg("point_b"),
-		     py::arg("disp"),
-		     py::arg("tol") = 0.05)
 		.def("add_point_to_point_displacement_cost", &GraphOfConstraints::add_point_to_point_displacement_cost,
 		     py::arg("k"),
 		     py::arg("point_a"),
 		     py::arg("point_b"),
 		     py::arg("disp"))
-		.def("add_point_to_point_alignment_constraint", &GraphOfConstraints::add_point_to_point_alignment_constraint)
-		// EDGE CONSTRAINTS  ///////////////////////////////////
-		.def("add_robot_holding_cube_constraint", &GraphOfConstraints::add_robot_holding_cube_constraint,
-		     py::arg("u"),
-		     py::arg("v"),
-		     py::arg("robot_id"),
-		     py::arg("point_ids"),
-		     py::arg("holding_distance_max") = 0.1,
-		     py::arg("use_l2") = false)
-		.def("add_edge_point_to_point_displacement_constraint", &GraphOfConstraints::add_edge_point_to_point_displacement_constraint,
-		     py::arg("u"),
-		     py::arg("v"),
-		     py::arg("point_a"),
-		     py::arg("point_b"),
-		     py::arg("disp"),
-		     py::arg("tol"))
-		.def("add_robot_relative_rotation_constraint", &GraphOfConstraints::add_robot_relative_rotation_constraint)
-		.def("add_robot_relative_displacement_constraint", &GraphOfConstraints::add_robot_relative_displacement_constraint)
-		// ASSIGNABLE EDGE CONSTRAINTS ////////////////////////////////
-		.def("add_assignable_robot_holding_point_constraint", &GraphOfConstraints::add_assignable_robot_holding_point_constraint,
-		     py::arg("u"),
-		     py::arg("v"),
-		     py::arg("robot_id"),
-		     py::arg("point_ids"),
-		     py::arg("holding_distance_max") = 0.1,
-		     py::arg("use_l2") = false)
-		.def("add_edge_assignable_robot_to_point_displacement_constraint", &GraphOfConstraints::add_edge_assignable_robot_to_point_displacement_constraint,
-		     py::arg("u"),
-		     py::arg("v"),
-		     py::arg("var"),
-		     py::arg("point_id"),
-		     py::arg("disp"),
-		     py::arg("tol"))
 		// EDGE TIMING CONSTRAINTS  ///////////////////////////////////
 		.def("add_edge_min_tau_constraint", &GraphOfConstraints::add_edge_min_tau_constraint,
 		     py::arg("u"),
@@ -172,10 +128,11 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// SYMBOLIC UNIFIED CONSTRAINT API ////////////////////////////
 		.def("object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
 		.def("agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
-		.def("u_object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
-		.def("u_agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
-		.def("v_object_q", &GraphOfConstraints::object_q_2, py::arg("object_q"))
-		.def("v_agent_q", &GraphOfConstraints::agent_q_2, py::arg("agent_q"))
+		.def("var_agent_q", &GraphOfConstraints::var_agent_q, py::arg("var"))
+		.def("u_object_q", &GraphOfConstraints::object_q_u, py::arg("object_q"))
+		.def("u_agent_q", &GraphOfConstraints::agent_q_u, py::arg("agent_q"))
+		.def("v_object_q", &GraphOfConstraints::object_q_v, py::arg("object_q"))
+		.def("v_agent_q", &GraphOfConstraints::agent_q_v, py::arg("agent_q"))
 		// accept either a single Formula or a numpy array of Formulas (from
 		// element-wise == on object arrays) and reduce with conjunction.
 		.def("add_constraint", [](GraphOfConstraints& self, int node,
@@ -207,7 +164,28 @@ void init_submodule_goc_mpc(py::module_& m) {
 				}
 			}
 			return self.add_edge_constraint(u, v, f);
-		}, py::arg("u"), py::arg("v"), py::arg("formula"));
+		}, py::arg("u"), py::arg("v"), py::arg("formula"))
+		// CONDITIONAL ORDERING API ////////////////////////////
+		.def("assignment_sym", &GraphOfConstraints::assignment_sym, py::arg("var"))
+		.def("add_binary_cond_var", &GraphOfConstraints::add_binary_cond_var)
+		.def("add_edge", [](GraphOfConstraints& self, int u, int v, py::object cond) {
+			if (py::isinstance<py::bool_>(cond) || cond.is(py::none())) {
+				self.structure.add_edge(u, v, cond);
+			} else {
+				drake::symbolic::Formula f = drake::symbolic::Formula::True();
+				try {
+					f = py::cast<drake::symbolic::Formula>(cond);
+				} catch (const py::cast_error&) {
+					bool first = true;
+					for (auto h : cond) {
+						auto fh = py::cast<drake::symbolic::Formula>(h);
+						if (first) { f = fh; first = false; }
+						else        f = f && fh;
+					}
+				}
+				self.add_conditional_edge_ordering(u, v, f);
+			}
+		}, py::arg("u"), py::arg("v"), py::arg("cond") = py::cast(true));
 
 	py::enum_<WaypointSolver>(goc_mpc, "WaypointSolver")
 		.value("kGurobi", WaypointSolver::kGurobi)

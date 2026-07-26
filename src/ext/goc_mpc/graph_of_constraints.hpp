@@ -79,6 +79,20 @@ struct DeferredEdgeOp {
 			   const int,
 			   const Eigen::VectorXi&,
 			   const drake::solvers::MatrixXDecisionVariable&)> short_path_builder;
+	// Optional: for edge constraints that check an independent invariant at
+	// each endpoint (rather than a single relation coupling both), applies
+	// that same per-node invariant at an interior subgraph node that may end
+	// up scheduled between u_node and v_node in the solved route. `gate` is
+	// a binary that is 1 whenever the interior node is (weakly) between the
+	// two endpoints in time; unset (default) for edge ops that don't have a
+	// well-defined per-node interior application (e.g. relational formulas).
+	std::function<void(drake::solvers::MathematicalProgram&,
+			   const struct SubgraphOfConstraints&,
+			   const int,
+			   const drake::solvers::MatrixXDecisionVariable&,
+			   const drake::solvers::MatrixXDecisionVariable&,
+			   int,
+			   const drake::symbolic::Variable&)> interior_builder;
 };
 
 struct DeferredVarOp {
@@ -89,6 +103,37 @@ struct DeferredVarOp {
 			   const int,
 			   const drake::solvers::MatrixXDecisionVariable&,
 			   const drake::solvers::MatrixXDecisionVariable&)> builder;
+};
+
+// Raw, introspectable records for the unified symbolic constraint API
+// (add_constraint / add_assignable_constraint / add_edge_constraint). Unlike
+// DeferredOp/DeferredEdgeOp, these store the original drake::symbolic::Formula
+// (with placeholders unsubstituted) instead of a pre-built closure, so that
+// consumers other than MILPWaypointMPC (e.g. the JAX evolutionary solver) can
+// introspect and independently compile the same constraint. Compilation into
+// actual Drake constraints happens at build time in symbolic_constraint_compiler.*,
+// mirroring what the DeferredOp builder closures used to do inline.
+struct SymbolicNodeConstraint {
+	int id;
+	int node;
+	std::optional<int> var_id;         // set iff exactly one assignable var is referenced
+	std::vector<int> multi_var_ids;    // set iff >1 assignable vars are referenced (Or-over-combos case)
+	drake::symbolic::Formula formula;
+};
+
+struct SymbolicEdgeConstraint {
+	int id;
+	int u_node;
+	int v_node;
+	drake::symbolic::Formula formula;
+	// true: `formula` is built from the plain agent_q/object_q/var_agent_q
+	// placeholders ("along the edge" -- an invariant applied independently
+	// at both endpoints, and, in MILP, at any interior node the edge might
+	// span). false: `formula` is built from agent_q_u/v (or object_q_u/v)
+	// -- a single relation coupling the two endpoints, compiled once.
+	bool along_edge;
+	std::optional<int> var_id;  // set iff along_edge and exactly one
+	                             // var_agent_q placeholder is referenced.
 };
 
 struct AgentInteraction {
@@ -129,12 +174,14 @@ struct GraphOfConstraints {
 	std::map<int, int> phi_to_variable_map;
 	std::map<int, int> _phi_to_static_assignment_map;
 	std::map<int, struct DeferredOp> ops;
+	std::map<int, struct SymbolicNodeConstraint> symbolic_ops;
 	std::map<int, std::vector<std::tuple<std::string, std::string, std::string>>> _grasp_change_map;
 	std::map<int, std::vector<std::pair<std::string, std::string>>> _assignable_grasp_change_map;
 
 	// Edge phi maps
 	std::map<int, int> edge_phi_to_variable_map;
 	std::map<int, struct DeferredEdgeOp> edge_ops;
+	std::map<int, struct SymbolicEdgeConstraint> symbolic_edge_ops;
 	std::map<int, int> _edge_phi_to_static_assignment_map;
 
 	// Var phi map
@@ -156,10 +203,54 @@ struct GraphOfConstraints {
 	std::vector<drake::VectorX<drake::symbolic::Variable>> _agent_q_vars;
 	std::vector<drake::VectorX<drake::symbolic::Variable>> _object_q_vars;
 
-	// Symbolic placeholder variables for the second variables in the
-	// unified add_edge_constraint API
-	std::vector<drake::VectorX<drake::symbolic::Variable>> _agent_q_vars_2;
-	std::vector<drake::VectorX<drake::symbolic::Variable>> _object_q_vars_2;
+	// Symbolic placeholder variables for variable-agent assignable constraints.
+	// Keyed by variable id; created lazily by var_agent_q().
+	std::map<int, drake::VectorX<drake::symbolic::Variable>> _var_agent_q_vars;
+
+	// Symbolic placeholder variables for a *relational* edge constraint's u
+	// (start) and v (end) side (see add_edge_constraint) -- a formula built
+	// from these is a single relation coupling both endpoints. Distinct from
+	// _agent_q_vars/_object_q_vars, which are reserved for node constraints
+	// and for "along the edge" edge constraints: an invariant applied
+	// independently at each node the edge might span, not a relation
+	// between two specific endpoints.
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _agent_q_vars_u;
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _object_q_vars_u;
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _agent_q_vars_v;
+	std::vector<drake::VectorX<drake::symbolic::Variable>> _object_q_vars_v;
+
+	// Symbolic variable per assignable variable, used to write conditional
+	// edge ordering formulas (e.g. r0_sym == r1_sym means same agent assigned).
+	std::vector<drake::symbolic::Variable> _assignment_sym_vars;
+	std::map<drake::symbolic::Variable::Id, int> _sym_id_to_variable_id;
+
+	// Free binary symbolic variables for conditional ordering formulas.
+	std::vector<drake::symbolic::Variable> _binary_cond_sym_vars;
+	std::map<drake::symbolic::Variable::Id, int> _sym_id_to_binary_cond_id;
+
+	// Maps DAG edge (u,v) -> Formula that must hold for the ordering t(u)≤t(v)
+	// to be enforced. Edges absent from this map get hard ordering constraints.
+	std::map<std::pair<int,int>, drake::symbolic::Formula> _conditional_ordering_map;
+
+	// Returns the symbolic variable representing the assignment index of variable r.
+	const drake::symbolic::Variable& assignment_sym(int r) const {
+		return _assignment_sym_vars.at(r);
+	}
+
+	// Creates a new free binary symbolic variable for use in conditional ordering formulas.
+	drake::symbolic::Variable add_binary_cond_var() {
+		int id = _binary_cond_sym_vars.size();
+		drake::symbolic::Variable v("bv_" + std::to_string(id));
+		_binary_cond_sym_vars.push_back(v);
+		_sym_id_to_binary_cond_id[v.get_id()] = id;
+		return v;
+	}
+
+	// Adds a conditional ordering edge: t(u)≤t(v) is enforced iff formula f holds.
+	// Does NOT add to the structure graph — conditional edges are invisible to BFS/routing.
+	void add_conditional_edge_ordering(int u, int v, const drake::symbolic::Formula& f) {
+		_conditional_ordering_map[{u, v}] = f;
+	}
 
 	// Constructor
 	GraphOfConstraints(const std::vector<CubicConfigurationSpline::Spec>& robot_specs,
@@ -208,7 +299,7 @@ struct GraphOfConstraints {
 			   const std::vector<int>& remaining_vertices,
 			   const Eigen::VectorXi& assignments) const;
 
-	std::map<int, struct DeferredEdgeOp> get_next_edge_ops(const std::vector<int> completed_vertices) const;
+	std::map<std::pair<int, int>, int> get_next_edge_phis(const std::vector<int> completed_vertices) const;
 
 	const std::map<int, DeferredVarOp>& get_var_ops() const {
 		return var_ops;
@@ -389,10 +480,14 @@ struct GraphOfConstraints {
 	// Symbolic unified constraint API
 	drake::VectorX<drake::symbolic::Expression> agent_q(int agent_id) const;
 	drake::VectorX<drake::symbolic::Expression> object_q(int object_id) const;
+	drake::VectorX<drake::symbolic::Expression> var_agent_q(int var);
 	int add_constraint(int node, const drake::symbolic::Formula& f);
+	int add_assignable_constraint(int node, int var, const drake::symbolic::Formula& f);
 
-	drake::VectorX<drake::symbolic::Expression> agent_q_2(int agent_id) const;
-	drake::VectorX<drake::symbolic::Expression> object_q_2(int object_id) const;
+	drake::VectorX<drake::symbolic::Expression> agent_q_u(int agent_id) const;
+	drake::VectorX<drake::symbolic::Expression> object_q_u(int object_id) const;
+	drake::VectorX<drake::symbolic::Expression> agent_q_v(int agent_id) const;
+	drake::VectorX<drake::symbolic::Expression> object_q_v(int object_id) const;
 	int add_edge_constraint(int u, int v, const drake::symbolic::Formula& f);
 
 private:
@@ -439,6 +534,37 @@ private:
 		var_ops[id] = DeferredVarOp{kind, id, std::forward<F>(f)};
 		return id;
 	}
+
+	int _add_symbolic_op(int node, const drake::symbolic::Formula& f) {
+		const int id = num_phis++;
+		node_to_phis_map[node].push_back(id);
+		symbolic_ops[id] = SymbolicNodeConstraint{id, node, std::nullopt, {}, f};
+		return id;
+	}
+
+	int _add_symbolic_assignable_op(int node, int var, const drake::symbolic::Formula& f) {
+		const int id = num_phis++;
+		node_to_phis_map[node].push_back(id);
+		phi_to_variable_map[id] = var;
+		symbolic_ops[id] = SymbolicNodeConstraint{id, node, var, {}, f};
+		return id;
+	}
+
+	int _add_symbolic_multi_var_op(int node, const std::vector<int>& var_ids, const drake::symbolic::Formula& f) {
+		const int id = num_phis++;
+		node_to_phis_map[node].push_back(id);
+		symbolic_ops[id] = SymbolicNodeConstraint{id, node, std::nullopt, var_ids, f};
+		return id;
+	}
+
+	int _add_symbolic_edge_op(int u, int v, const drake::symbolic::Formula& f,
+				  bool along_edge, std::optional<int> var_id = std::nullopt) {
+		const int id = num_edge_phis++;
+		edge_to_phis_map[std::make_pair(u, v)].push_back(id);
+		if (var_id.has_value()) edge_phi_to_variable_map[id] = var_id.value();
+		symbolic_edge_ops[id] = SymbolicEdgeConstraint{id, u, v, f, along_edge, var_id};
+		return id;
+	}
 };
 
 /*
@@ -450,6 +576,8 @@ struct SubgraphOfConstraints {
 	std::map<int, int> _variable_to_subgraph_variable_id; // unique ids for variables relevant to subgraph.
 	std::map<int, DeferredOp> _subgraph_ops;
 	std::map<int, DeferredEdgeOp> _subgraph_edge_ops;
+	std::map<int, SymbolicNodeConstraint> _subgraph_symbolic_ops;
+	std::map<int, SymbolicEdgeConstraint> _subgraph_symbolic_edge_ops;
 
 	SubgraphOfConstraints(GraphOfConstraints *graph, const std::vector<int>& vertices) :
 		structure(graph->structure, vertices) {
@@ -459,12 +587,16 @@ struct SubgraphOfConstraints {
 		// std::map<int, int> subgraph_assignable_id_to_phi;
 
 		int num_subgraph_variables = 0;
-		
+
 		for (int u : vertices) {
 			// if there is/are phi associated with v
 			if (graph->node_to_phis_map.contains(u)) {
 				for (int phi_id : graph->node_to_phis_map.at(u)) {
-					_subgraph_ops[phi_id] = graph->ops.at(phi_id);
+					if (graph->ops.contains(phi_id)) {
+						_subgraph_ops[phi_id] = graph->ops.at(phi_id);
+					} else if (graph->symbolic_ops.contains(phi_id)) {
+						_subgraph_symbolic_ops[phi_id] = graph->symbolic_ops.at(phi_id);
+					}
 
 					// Record the mapping from phi id to subgraph node and assignable var idxs.
 					if (graph->phi_to_variable_map.contains(phi_id)) {
@@ -487,7 +619,11 @@ struct SubgraphOfConstraints {
 				if (graph->edge_to_phis_map.contains(e)) {
 					// Store the relevant edge ops so they can be applied
 					for (int edge_phi_id : graph->edge_to_phis_map.at(e)) {
-						_subgraph_edge_ops[edge_phi_id] = graph->edge_ops.at(edge_phi_id);
+						if (graph->edge_ops.contains(edge_phi_id)) {
+							_subgraph_edge_ops[edge_phi_id] = graph->edge_ops.at(edge_phi_id);
+						} else if (graph->symbolic_edge_ops.contains(edge_phi_id)) {
+							_subgraph_symbolic_edge_ops[edge_phi_id] = graph->symbolic_edge_ops.at(edge_phi_id);
+						}
 					}
 				}
 			}
@@ -500,6 +636,14 @@ struct SubgraphOfConstraints {
 
 	const std::map<int, DeferredEdgeOp>& get_subgraph_edge_ops() const {
 		return _subgraph_edge_ops;
+	}
+
+	const std::map<int, SymbolicNodeConstraint>& get_subgraph_symbolic_ops() const {
+		return _subgraph_symbolic_ops;
+	}
+
+	const std::map<int, SymbolicEdgeConstraint>& get_subgraph_symbolic_edge_ops() const {
+		return _subgraph_symbolic_edge_ops;
 	}
 
 	int num_nodes() const {

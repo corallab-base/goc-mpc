@@ -1,4 +1,5 @@
 #include "graph_of_constraints.hpp"
+#include "symbolic_constraint_compiler.hpp"
 #include "../utils.hpp"
 
 #include <algorithm>
@@ -83,14 +84,18 @@ GraphOfConstraints::GraphOfConstraints(
 	for (int i = 0; i < num_agents; ++i) {
 		_agent_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
 			dim, fmt::format("agent_{}_q", i)));
-		_agent_q_vars_2.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			dim, fmt::format("agent_{}_q_2", i)));
+		_agent_q_vars_u.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			dim, fmt::format("agent_{}_q_u", i)));
+		_agent_q_vars_v.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			dim, fmt::format("agent_{}_q_v", i)));
 	}
 	for (int o = 0; o < num_objects; ++o) {
 		_object_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
 			non_robot_dim, fmt::format("object_{}_q", o)));
-		_object_q_vars_2.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			non_robot_dim, fmt::format("object_{}_q_2", o)));
+		_object_q_vars_u.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			non_robot_dim, fmt::format("object_{}_q_u", o)));
+		_object_q_vars_v.push_back(drake::symbolic::MakeVectorContinuousVariable(
+			non_robot_dim, fmt::format("object_{}_q_v", o)));
 	}
 
 	int offset = 0;
@@ -124,8 +129,11 @@ GraphOfConstraints::GraphOfConstraints(
 
 int GraphOfConstraints::add_variable()
 {
-	int next_variable_id = num_variables;
-	return num_variables++;
+	int id = num_variables++;
+	drake::symbolic::Variable sym_var("r_" + std::to_string(id));
+	_assignment_sym_vars.push_back(sym_var);
+	_sym_id_to_variable_id[sym_var.get_id()] = id;
+	return id;
 }
 
 
@@ -261,18 +269,18 @@ std::tuple<std::vector<std::optional<int>>,
 	return std::make_tuple(parents, agent_nodes, agent_interactions);
 }
 
-std::map<int, struct DeferredEdgeOp> GraphOfConstraints::get_next_edge_ops(const std::vector<int> remaining_vertices) const {
-	std::map<int, struct DeferredEdgeOp> e_ops;
+std::map<std::pair<int, int>, int> GraphOfConstraints::get_next_edge_phis(const std::vector<int> remaining_vertices) const {
+	std::map<std::pair<int, int>, int> e_to_phi_map;
 
 	for (const auto& e : structure.incoming_cut_edges(remaining_vertices)) {
 		if (this->edge_to_phis_map.contains(e)) {
 			for (int edge_phi_id : this->edge_to_phis_map.at(e)) {
-				e_ops[edge_phi_id] = this->edge_ops.at(edge_phi_id);
+				e_to_phi_map[e] = edge_phi_id;
 			}
 		}
 	}
 
-	return e_ops;
+	return e_to_phi_map;
 }
 
 std::vector<int> GraphOfConstraints::get_phi_ids(int node) const {
@@ -287,27 +295,31 @@ bool GraphOfConstraints::evaluate_phi(int phi_id,
                                       const Eigen::VectorXd& x,
                                       const Eigen::VectorXi& assignments,
                                       double tol) const {
-	if (!ops.contains(phi_id)) {
-		return true;
-	} else {
+	if (ops.contains(phi_id)) {
 		const DeferredOp& op = ops.at(phi_id);
 		double v = op.eval(x, assignments(phi_id));
 		std::cout << "violation: " << v << std::endl;
 		return v < tol;
+	} else if (symbolic_ops.contains(phi_id)) {
+		double v = EvaluateSymbolicNodeConstraint(*this, symbolic_ops.at(phi_id), x, assignments(phi_id));
+		return v < tol;
 	}
+	return true;
 }
 
 bool GraphOfConstraints::evaluate_edge_phi(int phi_id,
 					   const Eigen::VectorXd& x,
 					   const Eigen::VectorXi& var_assignments,
 					   double tol) const {
-	if (!edge_ops.contains(phi_id)) {
-		return true;
-	} else {
+	if (edge_ops.contains(phi_id)) {
 		const DeferredEdgeOp& op = edge_ops.at(phi_id);
 		double v = op.eval(x, var_assignments);
 		return v < tol;
+	} else if (symbolic_edge_ops.contains(phi_id)) {
+		double v = EvaluateSymbolicEdgeConstraint(*this, symbolic_edge_ops.at(phi_id), x, var_assignments);
+		return v < tol;
 	}
+	return true;
 }
 
 int GraphOfConstraints::get_edge_phi_agent(int phi_id, const Eigen::VectorXi& var_assignments) const {
@@ -528,7 +540,7 @@ int GraphOfConstraints::add_robot_linear_eq(int k, int robot_id, const Eigen::Ma
 				       const SubgraphOfConstraints& subgraph,
 				       const int phi_id,
 				       const auto& X,
-				       const auto&) {
+				       const auto& Assignments) {
 
 				     const int node_k = subgraph.subgraph_id(k);
 				     VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
@@ -552,7 +564,7 @@ int GraphOfConstraints::add_robot_linear_ineq(int k, int robot_id, const Eigen::
 				 const SubgraphOfConstraints& subgraph,
 				 const int phi_id,
 				 const auto& X,
-				 const auto&) {
+				 const auto& Assignments) {
 			       const int node_k = subgraph.subgraph_id(k);
 			       VectorXDecisionVariable agent_config_k = X.row(node_k).segment(robot_id*dim, dim);
 			       auto constraint = prog.AddLinearConstraint(A, lb, ub, agent_config_k);
@@ -707,7 +719,7 @@ int GraphOfConstraints::add_robot_pos_linear_eq(int k, int robot_id, const Eigen
 				       const SubgraphOfConstraints& subgraph,
 				       const int phi_id,
 				       const auto& X,
-				       const auto&) {
+				       const auto& Assignments) {
 				     const int node_k = subgraph.subgraph_id(k);
 				     Eigen::Matrix<Expression, Eigen::Dynamic, 1> row = X.row(node_k);
 				     auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", row);
@@ -735,7 +747,7 @@ int GraphOfConstraints::add_robot_quat_linear_eq(int k, int robot_id, const Eige
 				       const SubgraphOfConstraints& subgraph,
 				       const int phi_id,
 				       const auto& X,
-				       const auto&) {
+				       const auto& Assignments) {
 				     const int node_k = subgraph.subgraph_id(k);
 				     VectorXDecisionVariable agent_quat_k = X.row(node_k).segment(robot_id*dim + 3, 4);
 				     prog.AddLinearEqualityConstraint(A, b, agent_quat_k)
@@ -799,8 +811,9 @@ int GraphOfConstraints::add_assignable_robot_quat_linear_eq(int k, int var, cons
 					    const auto& X,
 					    const auto& Assignments) {
 
-					  const int node_k     = subgraph.subgraph_id(k);
+					  const int node_k  = subgraph.subgraph_id(k);
 					  const int variable_k = subgraph.subgraph_variable_id(var);
+					  if (variable_k < 0) return;
 					  const double neg_inf = -std::numeric_limits<double>::infinity();
 
 					  for (int i = 0; i < num_agents; ++i) {
@@ -877,12 +890,13 @@ int GraphOfConstraints::add_assignable_linear_eq(int k,
 
 					  const int node_k = subgraph.subgraph_id(k);
 					  const int variable_k = subgraph.subgraph_variable_id(var);
+					  if (variable_k < 0) return;
 
 					  for (int i = 0; i < num_agents; ++i) {
 						  // Variables [ x_{k,i} ; s ] with s = A(variable_k, i)
 						  VectorXDecisionVariable vars(dim + 1);
 						  for (int j = 0; j < dim; ++j) vars[j] = X(node_k, i*dim + j);
-						  vars[dim] = Assignments(variable_k, i);   // <-- use A as selector
+						  vars[dim] = Assignments(variable_k, i);
 
 						  auto _agent_x_lb = _global_x_lb.segment(i*dim, dim);
 						  auto _agent_x_ub = _global_x_ub.segment(i*dim, dim);
@@ -954,7 +968,7 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 				       const SubgraphOfConstraints& subgraph,
 				       const int phi_id,
 				       const auto& X,
-				       const auto&... /*unused*/) {
+				       const auto& Assignments) {
 
 				     const int node_k = subgraph.subgraph_id(k);
 
@@ -1022,13 +1036,14 @@ int GraphOfConstraints::add_assignable_robot_to_point_displacement_constraint(
 			  const auto& X,                 // decision matrix for X
 			  const auto& Assignments) {     // binary assignment matrix A
 
-			const int node_k     = subgraph.subgraph_id(k);
+			const int node_k = subgraph.subgraph_id(k);
 			const int variable_k = subgraph.subgraph_variable_id(var);
+			if (variable_k < 0) return;
 
 			const double neg_inf = -std::numeric_limits<double>::infinity();
 
 			for (int i = 0; i < num_agents; ++i) {
-				const auto s = Assignments(variable_k, i);   // binary: 0/1
+				const auto s = Assignments(variable_k, i);
 				const int robot_start = i * dim;
 
 				for (int ax = 0; ax < 3; ++ax) {
@@ -1080,7 +1095,7 @@ int GraphOfConstraints::add_robot_to_point_displacement_constraint(
 				       const SubgraphOfConstraints& subgraph,
 				       const int phi_id,
 				       const auto& X,
-				       const auto&... /*unused*/) {
+				       const auto& Assignments) {
 				     const unsigned int node_k = subgraph.subgraph_id(k);
 				     VectorXDecisionVariable row = X.row(node_k);
 
@@ -1230,7 +1245,7 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 				     return residual;
 			     },
 			     [=, this](auto& prog, const SubgraphOfConstraints& subgraph, const int /*phi_id*/,
-				       const auto& X, const auto&...) {
+				       const auto& X, const auto& Assignments) {
 				     const unsigned int node_k = subgraph.subgraph_id(k);
 				     Eigen::Matrix<Expression, Eigen::Dynamic, 1> row = X.row(node_k);
 
@@ -1587,6 +1602,43 @@ int GraphOfConstraints::add_point_to_point_alignment_constraint(
 //                              EDGE CONSTRAINTS                             //
 ///////////////////////////////////////////////////////////////////////////////
 
+// Shared by add_robot_holding_cube_constraint's endpoint (u/v) and interior
+// (any node scheduled between u and v) applications, so both go through the
+// same box-proximity logic. `gate` == nullptr means "always active" (the
+// endpoint case); non-null relaxes the box via big-M so it only binds when
+// `*gate` == 1 (the interior/betweenness case).
+static void AddBoxProximityConstraint(
+	drake::solvers::MathematicalProgram& prog,
+	GraphOfConstraints* graph,
+	int robot_id,
+	int point_id,
+	double d,
+	double M_prox,
+	const drake::solvers::MatrixXDecisionVariable& X,
+	int graph_row,
+	const drake::symbolic::Variable* gate) {
+
+	Eigen::VectorX<Expression> q = X.row(graph_row);
+
+	auto [p_WR, R_WR] = PoseFromRow(graph, robot_id, "ee_link", q);
+	auto p_WC = CubePosFromRow(graph, point_id, q);
+
+	const Eigen::Vector3<Expression> dp = p_WR - p_WC;
+
+	const double kInf = std::numeric_limits<double>::infinity();
+
+	// Box: |dx| <= d, |dy| <= d, |dz| <= d  (no squares, no quadratic)
+	for (int i = 0; i < 3; ++i) {
+		if (gate == nullptr) {
+			prog.AddConstraint(dp(i), -d, d);
+		} else {
+			const Expression slack = M_prox * (1.0 - Expression(*gate));
+			prog.AddLinearConstraint(dp(i) - d - slack, -kInf, 0.0);
+			prog.AddLinearConstraint(-dp(i) - d - slack, -kInf, 0.0);
+		}
+	}
+}
+
 int GraphOfConstraints::add_robot_holding_cube_constraint(
 	int u,
 	int v,
@@ -1598,6 +1650,11 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
 	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
 	// If you track num_objects, you can also check cube_i bounds here.
+
+	// Single-coordinate positions are each within the global bounds, so the
+	// magnitude of their difference (dp(i) above) is bounded by the global
+	// range; double it for a safety margin.
+	const double M_prox = 2.0 * (_global_x_ub - _global_x_lb).maxCoeff();
 
 	int edge_phi_id = _add_edge_op(DeferredOpKind::kNonlinearEq, u, v, std::set<int>({point_id}),
 			    [=, this](const Eigen::VectorXd& x,
@@ -1632,25 +1689,14 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 				      const Eigen::VectorXd& x_u) {
 
 				    const double d = holding_distance_max;
-				    auto add_box_proximity = [&](int graph_row) {
-					    Eigen::VectorX<Expression> q = X.row(graph_row);
-
-					    auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", q);
-					    auto p_WC = CubePosFromRow(this, point_id, q);
-
-					    const Eigen::Vector3<Expression> dp = p_WR - p_WC;
-
-					    // Box: |dx| <= d, |dy| <= d, |dz| <= d  (no squares, no quadratic)
-					    for (int i = 0; i < 3; ++i) {
-						    auto c_i = prog.AddConstraint(dp(i), -d, d);
-					    }
-				    };
 
 				    if (subgraph.structure.contains_node(u)) {
-					    add_box_proximity(subgraph.structure.subgraph_id(u));
+					    AddBoxProximityConstraint(prog, this, robot_id, point_id, d, M_prox,
+								       X, subgraph.structure.subgraph_id(u), nullptr);
 				    }
 				    if (subgraph.structure.contains_node(v)) {
-					    add_box_proximity(subgraph.structure.subgraph_id(v));
+					    AddBoxProximityConstraint(prog, this, robot_id, point_id, d, M_prox,
+								       X, subgraph.structure.subgraph_id(v), nullptr);
 				    }
 			    },
 			    [](drake::solvers::MathematicalProgram& prog,
@@ -1662,6 +1708,22 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 
 	// record that this constraint is statically assigned to this robot.
 	_edge_phi_to_static_assignment_map[edge_phi_id] = robot_id;
+
+	// The holding invariant is an independent per-node check (not a relation
+	// coupling u and v together), so it should also hold at any other node
+	// that ends up scheduled between u and v in the solved route — see
+	// Constraint 13 in graph_waypoint_mpc.cpp for where this gets invoked.
+	edge_ops[edge_phi_id].interior_builder =
+		[=, this](drake::solvers::MathematicalProgram& prog,
+			  const SubgraphOfConstraints& /*subgraph*/,
+			  const int /*phi_id*/,
+			  const drake::solvers::MatrixXDecisionVariable& X,
+			  const drake::solvers::MatrixXDecisionVariable& /*unused*/,
+			  int sg_w,
+			  const drake::symbolic::Variable& gate) {
+			AddBoxProximityConstraint(prog, this, robot_id, point_id, holding_distance_max,
+						   M_prox, X, sg_w, &gate);
+		};
 
 	return edge_phi_id;
 }
@@ -1686,7 +1748,17 @@ int GraphOfConstraints::add_edge_point_to_point_displacement_constraint(
 				    auto p_WC_b = CubePosFromRow(this, point_b, x);
 				    Eigen::Vector3d r  = (p_WC_b - p_WC_a) - disp;   // want r == 0
 				    Eigen::Vector3d err = r.cwiseAbs() - tol;
-				    return err.maxCoeff();
+				    auto violation = err.maxCoeff();
+				    if (violation > 0) {
+					    std::cout << "arranged constraint violation: " << violation << std::endl;
+					    std::cout << "point_a id: " << point_a << std::endl;
+					    std::cout << "point_b id: " << point_b << std::endl;
+					    std::cout << "p_WC_a: " << p_WC_a << std::endl;
+					    std::cout << "p_WC_b: " << p_WC_b << std::endl;
+					    std::cout << "actual disp: " << (p_WC_b - p_WC_a) << std::endl;
+					    std::cout << "r: " << r << std::endl;
+				    }
+				    return violation;
 			    },
 			    [=, this](drake::solvers::MathematicalProgram& prog,
 				      const SubgraphOfConstraints& subgraph,
@@ -1942,6 +2014,7 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 				std::cout << "point id: " << point_id << std::endl;
 				std::cout << "p_WC: " << p_WC << std::endl;
 				std::cout << "p_WR: " << p_WR << std::endl;
+				std::cout << "use_l2: " << use_l2 << std::endl;
 				std::cout << "r: " << r << std::endl;
 			}
 
@@ -1999,8 +2072,9 @@ int GraphOfConstraints::add_variable_constraint(
 			  const auto& X,
 			  const auto & Assignments) {
 
-			// Get the variable we want to constrain
+			// Get the variable row for this variable.
 			const int variable_k = subgraph.subgraph_variable_id(var);
+			if (variable_k < 0) return;
 
 			// For every robot (i) we want to constrain the Assignments to
 			// something like [0, 0, 0, 1, 1, 0, 1] where the 1 entries are the
@@ -2031,11 +2105,10 @@ int GraphOfConstraints::add_variable_ineq_constraint(
 			  const auto& X,
 			  const auto& Assignments) {
 
-			// Get the variable we want to constrain
 			const int variable1_k = subgraph.subgraph_variable_id(var1);
 			const int variable2_k = subgraph.subgraph_variable_id(var2);
 
-			if (variable1_k != -1 && variable2_k != -1) {
+			if (variable1_k >= 0 && variable2_k >= 0) {
 				for (int i = 0; i < num_agents; i++) {
 					const auto s = Assignments(variable1_k, i) + Assignments(variable2_k, i);
 					// 1 <= binary v1 + binary v2 <= 1 implies both
@@ -2054,143 +2127,119 @@ GraphOfConstraints::agent_q(int agent_id) const {
 }
 
 drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::var_agent_q(int var) {
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	if (!_var_agent_q_vars.contains(var)) {
+		_var_agent_q_vars[var] = drake::symbolic::MakeVectorContinuousVariable(
+			dim, fmt::format("var_{}_agent_q", var));
+	}
+	return _var_agent_q_vars.at(var).cast<drake::symbolic::Expression>();
+}
+
+drake::VectorX<drake::symbolic::Expression>
 GraphOfConstraints::object_q(int object_id) const {
 	return _object_q_vars.at(object_id).cast<drake::symbolic::Expression>();
 }
 
-// For unified edge constraint API
+// For unified edge constraint API (relational form)
 
 drake::VectorX<drake::symbolic::Expression>
-GraphOfConstraints::agent_q_2(int agent_id) const {
-	return _agent_q_vars_2.at(agent_id).cast<drake::symbolic::Expression>();
+GraphOfConstraints::agent_q_u(int agent_id) const {
+	return _agent_q_vars_u.at(agent_id).cast<drake::symbolic::Expression>();
 }
 
 drake::VectorX<drake::symbolic::Expression>
-GraphOfConstraints::object_q_2(int object_id) const {
-	return _object_q_vars_2.at(object_id).cast<drake::symbolic::Expression>();
+GraphOfConstraints::object_q_u(int object_id) const {
+	return _object_q_vars_u.at(object_id).cast<drake::symbolic::Expression>();
 }
 
-
-namespace {
-
-double ComputeViolation(const drake::symbolic::Formula& f,
-                        const drake::symbolic::Environment& env) {
-	using drake::symbolic::FormulaKind;
-	switch (f.get_kind()) {
-	case FormulaKind::Eq:
-		return std::abs(get_lhs_expression(f).Evaluate(env) -
-		                get_rhs_expression(f).Evaluate(env));
-	case FormulaKind::Leq:
-		return std::max(0.0, get_lhs_expression(f).Evaluate(env) -
-		                     get_rhs_expression(f).Evaluate(env));
-	case FormulaKind::Geq:
-		return std::max(0.0, get_rhs_expression(f).Evaluate(env) -
-		                     get_lhs_expression(f).Evaluate(env));
-	case FormulaKind::Lt:
-		return std::max(0.0, get_lhs_expression(f).Evaluate(env) -
-		                     get_rhs_expression(f).Evaluate(env));
-	case FormulaKind::Gt:
-		return std::max(0.0, get_rhs_expression(f).Evaluate(env) -
-		                     get_lhs_expression(f).Evaluate(env));
-	case FormulaKind::And: {
-		double v = 0.0;
-		for (const auto& sub : get_operands(f))
-			v = std::max(v, ComputeViolation(sub, env));
-		return v;
-	}
-	default:
-		return f.Evaluate(env) ? 0.0 : 1.0;
-	}
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::agent_q_v(int agent_id) const {
+	return _agent_q_vars_v.at(agent_id).cast<drake::symbolic::Expression>();
 }
 
-} // namespace
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::object_q_v(int object_id) const {
+	return _object_q_vars_v.at(object_id).cast<drake::symbolic::Expression>();
+}
+
 
 int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula& f) {
-	// Capture everything needed for both lambdas by value.
-	auto agent_vars  = _agent_q_vars;
-	auto object_vars = _object_q_vars;
-	const int n_agents = num_agents;
-	const int d = dim;
-	const int n_objects = num_objects;
-	const int obj_dim = non_robot_dim;
+	// Detect variable-agent placeholders in the formula.
+	const drake::symbolic::Variables free_vars = f.GetFreeVariables();
+	std::vector<int> involved_var_ids;
+	for (const auto& [var_id, placeholder_vec] : _var_agent_q_vars) {
+		for (int j = 0; j < placeholder_vec.size(); ++j) {
+			if (free_vars.include(placeholder_vec[j])) {
+				involved_var_ids.push_back(var_id);
+				break;
+			}
+		}
+	}
 
-	auto eval_fn = [f, agent_vars, object_vars, n_agents, d, n_objects, obj_dim]
-	               (const Eigen::VectorXd& x, const int) -> double {
-		drake::symbolic::Environment env;
-		for (int i = 0; i < n_agents; ++i)
-			for (int j = 0; j < d; ++j)
-				env.insert(agent_vars[i][j], x[i * d + j]);
-		for (int o = 0; o < n_objects; ++o)
-			for (int j = 0; j < obj_dim; ++j)
-				env.insert(object_vars[o][j], x[n_agents * d + o * obj_dim + j]);
-		return ComputeViolation(f, env);
-	};
+	if (involved_var_ids.size() == 1) {
+		return add_assignable_constraint(node, involved_var_ids[0], f);
+	}
 
-	auto build_fn = [f, agent_vars, object_vars, n_agents, d, n_objects, obj_dim, node]
-	                (drake::solvers::MathematicalProgram& prog,
-	                 const struct SubgraphOfConstraints& sg,
-	                 const int,
-	                 const drake::solvers::MatrixXDecisionVariable& X,
-	                 const drake::solvers::MatrixXDecisionVariable&) {
-		const int sg_node = sg.subgraph_id(node);
-		drake::symbolic::Substitution sub;
-		for (int i = 0; i < n_agents; ++i)
-			for (int j = 0; j < d; ++j)
-				sub[agent_vars[i][j]] = Expression(X(sg_node, i * d + j));
-		for (int o = 0; o < n_objects; ++o)
-			for (int j = 0; j < obj_dim; ++j)
-				sub[object_vars[o][j]] = Expression(X(sg_node, n_agents * d + o * obj_dim + j));
-		prog.AddConstraint(f.Substitute(sub));
-	};
+	if (involved_var_ids.size() > 1) {
+		// Multi-variable disjunction: compiled at build time by enumerating
+		// all n_agents^k combos and emitting Or (see CompileSymbolicNodeConstraint).
+		return _add_symbolic_multi_var_op(node, involved_var_ids, f);
+	}
 
-	return _add_op(DeferredOpKind::kSymbolic, node, std::move(eval_fn), std::move(build_fn));
+	// No variable-agent placeholders — plain node constraint.
+	return _add_symbolic_op(node, f);
 }
 
 int GraphOfConstraints::add_edge_constraint(int u, int v, const drake::symbolic::Formula& f) {
-	// Capture everything needed for both lambdas by value.
-	auto agent_vars  = _agent_q_vars;
-	auto object_vars = _object_q_vars;
-	auto agent_vars_2  = _agent_q_vars_2;
-	auto object_vars_2 = _object_q_vars_2;
-	const int n_agents = num_agents;
-	const int d = dim;
-	const int n_objects = num_objects;
-	const int obj_dim = non_robot_dim;
+	const drake::symbolic::Variables free_vars = f.GetFreeVariables();
 
-	auto eval_fn = [](const Eigen::VectorXd& x, const Eigen::VectorXi& i) -> double {
-		// TODO
-		return 0.0;
+	auto references_any = [&](const std::vector<drake::VectorX<drake::symbolic::Variable>>& vecs) {
+		for (const auto& pv : vecs)
+			for (int j = 0; j < pv.size(); ++j)
+				if (free_vars.include(pv[j])) return true;
+		return false;
 	};
 
-	auto wp_build_fn = [f, agent_vars, object_vars, agent_vars_2, object_vars_2,
-			    n_agents, d, n_objects, obj_dim, u, v]
-		(drake::solvers::MathematicalProgram& prog,
-		 const struct SubgraphOfConstraints& sg,
-		 const int,
-		 const drake::solvers::MatrixXDecisionVariable& X,
-		 const drake::solvers::MatrixXDecisionVariable&,
-		 const Eigen::VectorXd& x_u) {
-		const int sg_u_node = sg.subgraph_id(u);
-		const int sg_v_node = sg.subgraph_id(v);
-		drake::symbolic::Substitution sub;
-		for (int i = 0; i < n_agents; ++i) {
-			for (int j = 0; j < d; ++j) {
-				sub[agent_vars[i][j]] = Expression(X(sg_u_node, i * d + j));
-				sub[agent_vars_2[i][j]] = Expression(X(sg_v_node, i * d + j));
+	const bool has_relational = references_any(_agent_q_vars_u) || references_any(_object_q_vars_u) ||
+				    references_any(_agent_q_vars_v) || references_any(_object_q_vars_v);
+
+	std::vector<int> involved_var_ids;
+	for (const auto& [var_id, placeholder_vec] : _var_agent_q_vars) {
+		for (int j = 0; j < placeholder_vec.size(); ++j) {
+			if (free_vars.include(placeholder_vec[j])) {
+				involved_var_ids.push_back(var_id);
+				break;
 			}
 		}
-		for (int o = 0; o < n_objects; ++o) {
-			for (int j = 0; j < obj_dim; ++j) {
-				sub[object_vars[o][j]] = Expression(X(sg_u_node, n_agents * d + o * obj_dim + j));
-				sub[object_vars_2[o][j]] = Expression(X(sg_v_node, n_agents * d + o * obj_dim + j));
-			}
-		}
-		prog.AddConstraint(f.Substitute(sub));
-	};
+	}
+	const bool has_plain = references_any(_agent_q_vars) || references_any(_object_q_vars) ||
+			       !involved_var_ids.empty();
 
-	auto sp_build_fn = [](drake::solvers::MathematicalProgram&, const int, const Eigen::VectorXi&,
-			      const drake::solvers::MatrixXDecisionVariable&) { return; };
+	DRAKE_DEMAND(!(has_relational && has_plain));  // can't mix u_/v_ relational placeholders
+							// with plain "along the edge" placeholders
+							// in the same edge formula
 
-	return _add_edge_op(DeferredOpKind::kSymbolic, u, v, std::set<int>({}),
-			    std::move(eval_fn), std::move(wp_build_fn), std::move(sp_build_fn));
+	if (involved_var_ids.size() > 1) {
+		throw std::runtime_error(
+			"add_edge_constraint: an \"along the edge\" formula referencing more "
+			"than one distinct var_agent_q(var) isn't supported");
+	}
+
+	if (involved_var_ids.size() == 1) {
+		_num_total_assignables++;
+		return _add_symbolic_edge_op(u, v, f, /*along_edge=*/true, involved_var_ids[0]);
+	}
+
+	return _add_symbolic_edge_op(u, v, f, /*along_edge=*/has_plain);
+}
+
+int GraphOfConstraints::add_assignable_constraint(
+	int node, int var, const drake::symbolic::Formula& f) {
+
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	DRAKE_DEMAND(_var_agent_q_vars.contains(var));
+
+	_num_total_assignables++;
+	return _add_symbolic_assignable_op(node, var, f);
 }
