@@ -48,6 +48,24 @@ ShortPathProblem build_short_path_problem(
 		problem.prog->AddQuadraticCost(dist);
 	}
 
+	// 1b. Velocity tracking error objective -- `ref_velocities` was
+	// previously only used for `SetInitialGuess(V, ...)` above, which seeds
+	// the solver's starting point but applies no cost, so nothing in the
+	// objective anchored V to it: the QP was free to drift V arbitrarily
+	// far from what `references` (the timing MPC's own spline) actually
+	// prescribed, constrained only indirectly via the acceleration
+	// objective's coupling to Xi. Diagnosed by comparing `spline.eval(0.1)`
+	// against the state PyRoboGym actually executed under `position_velocity`
+	// mode each cycle (po_goc_mpc.experiments.basic_fmm_experiment): position
+	// matched almost exactly (it has this same tracking cost below), but
+	// velocity was found to inflate ~1.7-1.8x per cycle and compound, since
+	// nothing here penalized it drifting from ref_velocities.
+	for (int i = 0; i < num_steps; ++i) {
+		VectorX<Expression> vdiff = V.row(i) - ref_velocities.row(i);
+		Expression vdist = vdiff.squaredNorm();
+		problem.prog->AddQuadraticCost(vdist);
+	}
+
 	double tau2 = tau * tau;
 	double tau3 = tau * tau2;
 

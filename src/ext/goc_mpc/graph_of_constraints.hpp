@@ -293,11 +293,26 @@ struct GraphOfConstraints {
 
 	Graph<py::object> get_structure() const { return structure; }
 
+	// Determines, for each agent, the ordered sequence of nodes it visits,
+	// and the cross-agent timing interactions (shared nodes -> EQUAL,
+	// cross-agent structural edges -> LESS_THAN) needed to keep multiple
+	// agents' schedules correctly coupled. Node ownership is resolved per
+	// phi (assignable-var resolution, then legacy static grasp assignment,
+	// then -- for a plain literal agent_q(i)/object_q formula that goes
+	// through neither -- which agent_q_vars the formula actually
+	// references), NOT assumed from the node alone; see get_agent_paths's
+	// definition for why "no phi at this node resolves to a specific
+	// agent" (a pure object-only node) is the only case that still falls
+	// back to "every agent". `t_by_node` (the waypoint MPC's resolved
+	// per-node arrival-time estimate) orders each agent's own node list;
+	// pass an empty vector to fall back to BFS/topological order (e.g.
+	// before any waypoint solve has produced timings yet).
 	std::tuple<std::vector<std::optional<int>>,
 		   std::vector<std::vector<int>>,
 		   std::vector<struct AgentInteraction>> get_agent_paths(
 			   const std::vector<int>& remaining_vertices,
-			   const Eigen::VectorXi& assignments) const;
+			   const Eigen::VectorXi& assignments,
+			   const Eigen::VectorXd& t_by_node) const;
 
 	std::map<std::pair<int, int>, int> get_next_edge_phis(const std::vector<int> completed_vertices) const;
 

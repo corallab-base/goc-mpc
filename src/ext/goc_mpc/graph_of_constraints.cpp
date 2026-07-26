@@ -158,112 +158,148 @@ int GraphOfConstraints::object_ambient_dim(int ob) const {
 	return d;
 }
 
+namespace {
+
+// Resolves the specific agent(s) that own phi_id, in priority order:
+//   1. an assignable var (var_agent_q) with a resolved MILP assignment,
+//   2. a legacy static grasp assignment (add_grasp_change),
+//   3. (only when neither above applies) which of the graph's literal
+//      agent_q_vars[i] the phi's own Formula actually references -- the
+//      case for a plain add_constraint(node, eq(q0[...], ...)) formula,
+//      which was never routed through the assignable machinery and so
+//      has no entry in phi_to_variable_map at all.
+// Returns an empty set when none of the above resolves anything (a pure
+// object-only phi, or a legacy DeferredOp with no Formula to introspect
+// and no assignment) -- callers must treat that as "this phi has no
+// opinion about agent ownership", not "belongs to every agent": a node
+// can have both an object-only phi (no opinion) and an agent-specific
+// phi (a real opinion) at once, and the object-only one must not drown
+// the real one out.
+std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
+                              const Eigen::VectorXi& assignments) {
+	if (graph.phi_to_variable_map.contains(phi_id)) {
+		const int a = assignments(phi_id);
+		if (a != -1) return {a};
+		return {};
+	}
+	if (graph._phi_to_static_assignment_map.contains(phi_id)) {
+		return {graph._phi_to_static_assignment_map.at(phi_id)};
+	}
+	if (graph.symbolic_ops.contains(phi_id)) {
+		const drake::symbolic::Variables free_vars =
+			graph.symbolic_ops.at(phi_id).formula.GetFreeVariables();
+		std::set<int> owners;
+		for (int ag = 0; ag < graph.num_agents; ++ag) {
+			for (int j = 0; j < graph.dim; ++j) {
+				if (free_vars.include(graph._agent_q_vars[ag][j])) {
+					owners.insert(ag);
+					break;
+				}
+			}
+		}
+		return owners;
+	}
+	return {};
+}
+
+}  // namespace
+
 std::tuple<std::vector<std::optional<int>>,
 	   std::vector<std::vector<int>>,
 	   std::vector<struct AgentInteraction>> GraphOfConstraints::get_agent_paths(
 		   const std::vector<int>& remaining_vertices,
-		   const Eigen::VectorXi& assignments) const {
+		   const Eigen::VectorXi& assignments,
+		   const Eigen::VectorXd& t_by_node) const {
 	const InducedSubgraphView<py::object> sg = InducedSubgraphView<py::object>(
 		structure, remaining_vertices);
 
-	// This function introduces the idea now that every node has exactly one phi. That seems pretty reasonable.
-
 	std::vector<std::vector<int>> agent_nodes(num_agents);
-	std::map<int, std::vector<std::pair<int, int>>> node_to_agent_and_depth_pairs_map;
-	std::vector<std::pair<int, int>> cross_agent_edges;
+	std::map<int, std::set<int>> node_to_agents_map;
 	std::vector<struct AgentInteraction> agent_interactions;
 
-	std::vector<std::optional<int>> parents = sg.bfs_visit_from_sources(
-		[this, &assignments, &agent_nodes, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
-		(int node, int depth, std::optional<int> parent) {
-			// std::cout << "processing " << node << std::endl;
-
-			if (node_to_phis_map.contains(node)) {
-				std::set<int> assignments_for_node;
-
-				for (int phi_id : node_to_phis_map.at(node)) {
-					int assignment = -1;
-
-					assignment = assignments(phi_id);
-
-					// std::cout << phi_id << " belonging to " << node << " is dynamically assigned to " << assignment << std::endl;
-
-					if (_phi_to_static_assignment_map.contains(phi_id) && assignment != -1) {
-						// std::cout << "_phi_to_static_assignment_map for " << phi_id << " gives " << _phi_to_static_assignment_map.at(phi_id) << " but assignment = " << assignment << std::endl;
-						throw std::runtime_error("conflicting assignment");
-					} else if (_phi_to_static_assignment_map.contains(phi_id)) {
-						assignment = _phi_to_static_assignment_map.at(phi_id);
-						// std::cout << phi_id << " belonging to " << node << " is statically assigned to " << assignment << std::endl;
-					}
-
-					// TODO: Clean this up for the case where there
-					// might be multiple phi's on a single node and
-					// we should add the nodes multiple times.
-					if (assignment == -1) {
-						// std::cout << "adding node for all by default" << std::endl;
-						for (int ag = 0; ag < num_agents; ++ag) {
-							assignments_for_node.insert(ag);
-						}
-					} else {
-						assignments_for_node.insert(assignment);
-					}
-				}
-
-				for (int assignment : assignments_for_node) {
-					// std::cout << "assignment for node[" << node << "]: " << assignment << std::endl;
-					int depth = agent_nodes[assignment].size();
-					agent_nodes[assignment].push_back(node);
-					node_to_agent_and_depth_pairs_map[node].emplace_back(assignment, depth);
-				}
-			}
-
-			// if a node is shared in the agent paths it is an equality agent interaction
-			int num_pairs = node_to_agent_and_depth_pairs_map[node].size();
- 			if (num_pairs > 1) {
-				for (int i = 0; i < num_pairs; ++i) {
-					auto& [ag_i, depth_i] = node_to_agent_and_depth_pairs_map[node][i];
-					for (int j = i; j < num_agents; ++j) {
-						auto& [ag_j, depth_j] = node_to_agent_and_depth_pairs_map[node][j];
-						agent_interactions.emplace_back(
-							ag_i, depth_i, ag_j, depth_j, node, node, AgentInteraction::Type::EQUAL);
-					}
-				}
-			}
-
-			// if there is an edge in the bfs tree from one agent's
-			// path to another agent's path, that is a cross agent
-			// edge and will eventually be a less than interaction.
-			if (parent.has_value()) {
-				bool is_cross_agent = false;
-				for (const auto& [ag_u, _] : node_to_agent_and_depth_pairs_map.at(*parent)) {
-					for (const auto& [ag_v, _] : node_to_agent_and_depth_pairs_map.at(node)) {
-						if (ag_u != ag_v) {
-							is_cross_agent = true;
-							break;
-						}
-					}
-				}
-
-				if (is_cross_agent) {
-					cross_agent_edges.emplace_back(*parent, node);
-				}
-			}
-		},
-		[this, &agent_interactions, &node_to_agent_and_depth_pairs_map, &cross_agent_edges]
-		(int u, int u_depth, int v, int v_depth) {
-			// std::cout << "adding cross agent edge " << u << "->" << v << std::endl;
-			cross_agent_edges.emplace_back(u, v);
-		});
-
-	for (auto& [u, v] : cross_agent_edges) {
-		std::vector<std::pair<int, int>> u_agent_and_depth_pairs = node_to_agent_and_depth_pairs_map[u];
-		std::vector<std::pair<int, int>> v_agent_and_depth_pairs = node_to_agent_and_depth_pairs_map[v];
-		for (auto& [ag_i, depth_i] : u_agent_and_depth_pairs) {
-			for (auto& [ag_j, depth_j] : v_agent_and_depth_pairs) {
-				agent_interactions.emplace_back(
-					ag_i, depth_i, ag_j, depth_j, u, v, AgentInteraction::Type::LESS_THAN);
+	// Cross-agent-ness for an edge (or co-ownership of a single node) is
+	// "no agent is common to both owner sets" -- not "some pair of agents
+	// differs" (that's true of almost any two multi-owner sets and would
+	// spuriously flag an edge two agents both legitimately continue
+	// through). A LESS_THAN/EQUAL interaction is only needed for agent
+	// pairs that don't already share continuity through their own,
+	// already-tracked per-agent node list.
+	auto add_interactions = [&](const std::set<int>& owners_u, const std::set<int>& owners_v,
+	                            int node_u, int node_v, AgentInteraction::Type type) {
+		for (int ag_i : owners_u) {
+			for (int ag_j : owners_v) {
+				if (type == AgentInteraction::Type::LESS_THAN && ag_i == ag_j) continue;
+				if (type == AgentInteraction::Type::EQUAL && ag_j <= ag_i) continue;
+				agent_interactions.emplace_back(ag_i, -1, ag_j, -1, node_u, node_v, type);
 			}
 		}
+	};
+
+	auto assign_node = [&](int node) -> const std::set<int>& {
+		auto it = node_to_agents_map.find(node);
+		if (it != node_to_agents_map.end()) return it->second;
+
+		std::set<int> owners;
+		if (node_to_phis_map.contains(node)) {
+			for (int phi_id : node_to_phis_map.at(node)) {
+				const std::set<int> phi_owners = PhiOwningAgents(*this, phi_id, assignments);
+				owners.insert(phi_owners.begin(), phi_owners.end());
+			}
+		}
+		if (owners.empty()) {
+			// No phi at this node reveals agent-specific ownership at all
+			// (e.g. a pure object-only node) -- fall back to every agent,
+			// same as when this function had no per-phi resolution at all.
+			for (int ag = 0; ag < num_agents; ++ag) owners.insert(ag);
+		}
+
+		for (int ag : owners) agent_nodes[ag].push_back(node);
+
+		// A node co-owned by >1 agent is a real synchronization point
+		// (e.g. a handoff node pinning both agents at once): both must
+		// reach it at the same time.
+		if (owners.size() > 1) add_interactions(owners, owners, node, node, AgentInteraction::Type::EQUAL);
+
+		return node_to_agents_map.emplace(node, std::move(owners)).first->second;
+	};
+
+	std::vector<std::optional<int>> parents = sg.bfs_visit_from_sources(
+		[&](int node, int /*depth*/, std::optional<int> parent) {
+			const std::set<int>& owners_v = assign_node(node);
+			if (parent.has_value()) {
+				const std::set<int>& owners_u = assign_node(*parent);
+				add_interactions(owners_u, owners_v, *parent, node, AgentInteraction::Type::LESS_THAN);
+			}
+		},
+		[&](int u, int /*u_depth*/, int v, int /*v_depth*/) {
+			// Both endpoints have necessarily already been discovered (and
+			// so already own-resolved) by the time a non-tree edge is seen.
+			const std::set<int>& owners_u = assign_node(u);
+			const std::set<int>& owners_v = assign_node(v);
+			add_interactions(owners_u, owners_v, u, v, AgentInteraction::Type::LESS_THAN);
+		});
+
+	// Order each agent's own nodes by the waypoint MPC's resolved arrival
+	// time when available; otherwise keep BFS/topological discovery order
+	// (e.g. before any waypoint solve has produced timings yet).
+	if (t_by_node.size() > 0) {
+		for (auto& nodes : agent_nodes) {
+			std::stable_sort(nodes.begin(), nodes.end(), [&](int a, int b) {
+				return t_by_node(a) < t_by_node(b);
+			});
+		}
+	}
+
+	// Depths are resolved last, against each agent's FINAL (sorted) node
+	// list, rather than at discovery time -- discovery order need not
+	// match t_by_node order.
+	for (auto& intr : agent_interactions) {
+		const auto& ni = agent_nodes[intr.agent_i];
+		auto it = std::find(ni.begin(), ni.end(), intr.node_u);
+		if (it != ni.end()) intr.agent_i_depth = static_cast<int>(std::distance(ni.begin(), it));
+		const auto& nj = agent_nodes[intr.agent_j];
+		auto jt = std::find(nj.begin(), nj.end(), intr.node_v);
+		if (jt != nj.end()) intr.agent_j_depth = static_cast<int>(std::distance(nj.begin(), jt));
 	}
 
 	return std::make_tuple(parents, agent_nodes, agent_interactions);

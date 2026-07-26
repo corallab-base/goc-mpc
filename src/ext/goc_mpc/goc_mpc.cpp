@@ -245,9 +245,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_Z", &MILPWaypointMPC::view_Z, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
-                .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double, double, double, double>(),
+                .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double, double, double, double, double>(),
 		     py::keep_alive<1, 3>())
-		.def("solve", &GraphTimingMPC::solve)
+		.def("solve", &GraphTimingMPC::solve,
+		     py::arg("x0"), py::arg("v0"), py::arg("remaining_vertices"),
+		     py::arg("waypoints"), py::arg("assignments"),
+		     py::arg("t_by_node") = Eigen::VectorXd())
 		.def("get_agent_spline_length", &GraphTimingMPC::get_agent_spline_length)
 		.def("get_agent_spline_nodes", &GraphTimingMPC::get_agent_spline_nodes)
 		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)

@@ -47,6 +47,15 @@ class GraphOfConstraintsMPC():
             max_vel: float = -1.0,
             max_acc: float = -1.0,
             max_jerk: float = -1.0,
+            # Convex alternative/complement to acceleration_cost: penalizes
+            # ||xJ-xJm1||^2/tau^3 + ||vJ-vJm1||^2/tau per segment instead of
+            # acceleration_cost's coast-corrected ||(xJ-xJm1) -
+            # 0.5*tau*(vJm1+vJ)||^2/tau^3 -- the latter's cross term can be
+            # non-convex whenever the current velocity already points
+            # roughly toward the target, which is what let NLopt's timing
+            # solve land in two different local optima cycle to cycle (see
+            # graph_timing_mpc.hpp's _stability_cost doc comment).
+            stability_cost: float = 0.0,
             # short path mpc hyperparameters
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
@@ -82,6 +91,7 @@ class GraphOfConstraintsMPC():
         self.acceleration_cost = acceleration_cost
         self.energy_cost = energy_cost
         self.arclength_cost = arclength_cost
+        self.stability_cost = stability_cost
         self.short_path_time_per_step = short_path_time_per_step
 
         # solvers
@@ -103,7 +113,7 @@ class GraphOfConstraintsMPC():
         self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines,
                                          time_cost, time_cost2, acceleration_cost,
                                          energy_cost, arclength_cost,
-                                         max_vel, max_acc, max_jerk)
+                                         max_vel, max_acc, max_jerk, stability_cost)
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
                                                 num_agents, dim, short_path_time_per_step)
 
@@ -156,12 +166,17 @@ class GraphOfConstraintsMPC():
         #         # resolve the timing problem
         #         # TODO: understand if there is something to do with ctrlErr
 
-        success = self.timing_mpc.solve(x, x_dot, self.remaining_phases, waypoints, assignments)
-        if success:
-            self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, x_dot)
-            return True
+        if len(self.remaining_phases) > 0:
+            t_by_node = self.waypoint_mpc.view_t_by_node()
+            success = self.timing_mpc.solve(x, x_dot, self.remaining_phases, waypoints, assignments, t_by_node)
+            if success:
+                self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, x_dot)
+                return True
+            else:
+                return False
         else:
-            return False
+            return True
+
 
     def _solve_for_short_path(self, x, x_dot):
         var_assignments = self.waypoint_mpc.view_var_assignments()

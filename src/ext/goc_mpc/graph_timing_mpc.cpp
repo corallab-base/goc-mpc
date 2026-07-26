@@ -116,109 +116,6 @@ static void PrintSolverReport(GraphTimingProblem* problem,
 }
 
 
-// GraphOrderingProblem build_graph_ordering_problem(
-// 	const Eigen::MatrixXd& wps,
-// 	const Eigen::MatrixXi& graph,
-// 	const Eigen::VectorXd& x0,
-// 	const Eigen::VectorXd& v0) {
-
-// 	using namespace drake::solvers;
-
-// 	const int K = wps.rows();
-// 	const int d = wps.cols();
-
-// 	// Create program
-// 	GraphOrderingProblem problem;
-
-// 	// Create decision variables
-// 	// p(i,j) = 1 iff waypoint i is at position j
-// 	MatrixXDecisionVariable p = problem.prog->NewBinaryVariables(K, K, "p");
-// 	problem.p = p;
-
-// 	// Doubly-Stochastic
-// 	// Each waypoint exactly once: sum_k p(i,k) = 1
-// 	for (int i = 0; i < K; ++i) {
-// 		VectorX<Variable> row = p.row(i);
-// 		problem.prog->AddLinearEqualityConstraint(Eigen::RowVectorXd::Ones(K), 1.0, row);
-// 	}
-// 	// Each position filled: sum_i p(i,k) = 1
-// 	for (int j = 0; j < K; ++j) {
-// 		VectorX<Variable> col = p.col(j);
-// 		problem.prog->AddLinearEqualityConstraint(Eigen::RowVectorXd::Ones(K), 1.0, col);
-// 	}
-
-// 	// Precedence: i must appear before j  ==>  sum_k k*P(i,k) + 1 <= sum_k k*P(j,k)
-// 	for (int i = 0; i < K; ++i) {
-// 		for (int j = 0; j < K; ++j) {
-// 			if (graph(i, j) == 1) {
-// 				VectorX<Variable> lhs_vars(2*K);
-// 				Eigen::RowVectorXd lhs_coeffs = Eigen::RowVectorXd::Zero(2*K);
-// 				// pack as [P(i, 0 through n-1), P(j, 0 through n-1)]
-// 				for (int k = 0; k < K; ++k) {
-// 					lhs_vars(k)     = p(i, k);
-// 					lhs_vars(K + k) = p(j, k);
-// 					lhs_coeffs(k)       = k;       // +k * P(i,k)
-// 					lhs_coeffs(K + k)   = -k;      // -k * P(j,k)
-// 				}
-// 				/* lb occurs when P(i,0) = 1 and P(j, K-1) = 1. Therefore k*P(i, k) - k*P(j, k) = -(K - 1). */
-// 				problem.prog->AddLinearConstraint(lhs_coeffs, -(K-1), -1, lhs_vars); // enforces pos(i)+1 <= pos(j)
-// 			}
-// 		}
-// 	}
-
-// 	// Helpers: squared distances from x0 to xi for all i
-// 	// squared distances between xi and xj for all i,j
-// 	Eigen::VectorXd s2(K);
-// 	Eigen::MatrixXd d2(K, K);
-// 	for (int i = 0; i < K; ++i) {
-// 		s2(i) = (wps.row(i).transpose() - x0).squaredNorm();
-// 		for (int j = 0; j < K; ++j) {
-// 			d2(i,j) = (wps.row(i) - wps.row(j)).squaredNorm();
-// 		}
-// 	}
-
-// 	// Objective: sum_i s2(i)*p(i,0) + sum_{k=1}^{n-1} sum_{i,j} d2(i,j)*p(i,k-1)*p(j,k)
-
-// 	// The second term is quadratic in binaries; to keep MILP, use a *linear* proxy:
-// 	// e.g., sum_{k=1}^{n-1} sum_{j} (min_i D2(i,j)) * p(j,k)  (lower-bound-ish) or just sum over k of degrees.
-// 	// A better linear surrogate: use a fixed "nearest predecessor" cost C(j,k) = min_i D2(i,j).
-// 	Eigen::VectorXd c_min(K);
-// 	for (int j = 0; j < K; ++j) {
-// 		double m = std::numeric_limits<double>::infinity();
-// 		for (int i = 0; i < K; ++i) if (i != j) m = std::min(m, d2(i,j));
-// 		c_min(j) = std::isfinite(m) ? m : 0.0;
-// 	}
-// 	drake::solvers::LinearCost* obj = nullptr;
-// 	// Build linear objective: sum_i s2(i)*p(i,0) + sum_{k=1}^{n-1} sum_j c_min(j)*p(j,k)
-// 	Eigen::VectorXd coeffs(K*K);
-// 	coeffs.setZero();
-// 	int idx = 0;
-// 	for (int i = 0; i < K; ++i) {
-// 		for (int j = 0; j < K; ++j, ++idx) {
-// 			double c = (j == 0) ? s2(i) : c_min(i);
-// 			coeffs(idx) = c;
-// 		}
-// 	}
-// 	drake::VectorX<Variable> allP(K*K);
-// 	idx = 0;
-// 	for (int i = 0; i < K; ++i) for (int j = 0; j < K; ++j) allP[idx++] = p(i, j);
-// 	problem.prog->AddLinearCost(coeffs, 0.0, allP);
-
-// 	return std::move(problem);
-// }
-
-// std::set<unsigned int> GraphTimingMPC::_next_nodes() const {
-// 	std::set<unsigned int> next_nodes;
-
-// 	for (int i = 0; i < _num_nodes; ++i) {
-// 		if (_in_degrees(i) == 0) {
-// 			next_nodes.insert(i);
-// 		}
-// 	}
-
-// 	return next_nodes;
-// }
-
 // double GraphTimingMPC::current_minimum_time_delta() const {
 // 	std::set<unsigned int> next_nodes = _next_nodes();
 // 	double minimum_time_delta = -1; /* negative by default. indicates no next node */
@@ -253,7 +150,10 @@ GraphTimingProblem build_graph_timing_problem(
 	double arclength_cost,
 	double max_vel,
 	double max_acc,
-	double max_jerk) {
+	double max_jerk,
+	double stability_cost,
+	// If non-empty, per-agent node lists are sorted by MILP timestamp instead of BFS order.
+	const Eigen::VectorXd& t_by_node) {
 
 	using namespace drake::solvers;
 
@@ -269,7 +169,13 @@ GraphTimingProblem build_graph_timing_problem(
 	int ambient_dim = splines.at(0).ambient_dim();
 	int tangent_dim = splines.at(0).tangent_dim();
 
-	const auto& [parents, agent_nodes, agent_interactions] = graph.get_agent_paths(remaining_vertices, assignments);
+	// Ownership resolution (per-phi, falling back to formula introspection
+	// for plain literal-placeholder constraints), t_by_node-based ordering,
+	// and cross-agent/same-node interaction depths are all resolved inside
+	// get_agent_paths itself now -- see its definition in
+	// graph_of_constraints.cpp.
+	auto [parents, agent_nodes, agent_interactions] =
+		graph.get_agent_paths(remaining_vertices, assignments, t_by_node);
 
 	// for (auto edge : cross_agent_edges) {
 	// 	std::cout << "edge u: " << edge.first << std::endl;
@@ -390,6 +296,21 @@ GraphTimingProblem build_graph_timing_problem(
 					problem.prog->AddCost(arclength_cost * arclength);
 				}
 
+				// Convex alternative to acceleration_cost -- see
+				// _stability_cost's doc comment in graph_timing_mpc.hpp.
+				// xJ/xJm1 are always fixed constants at this point (only
+				// vJ/vJm1 can be free decision variables, for interior
+				// segments), so ||xJ - xJm1||^2 is a tau-independent
+				// constant per segment -- no cross term with tau, unlike
+				// acceleration_cost's coast-corrected residual.
+				if (stability_cost > 0) {
+					const Expression dist2 = (xJ - xJm1).squaredNorm();
+					const Expression vel_mismatch2 = (vJ - vJm1).squaredNorm();
+					const Expression stability =
+						dist2 * pow(tau, -3.0) + vel_mismatch2 * pow(tau, -1.0);
+					problem.prog->AddCost(stability_cost * stability);
+				}
+
 				// Max Velocity Constraints
 				if (max_vel > 0) {
 					auto [xJ_lin, vJ_lin] = spline.select_linear_blocks(xJ, vJ);
@@ -502,7 +423,8 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 			       double arclength_cost,
 			       double max_vel,
 			       double max_acc,
-			       double max_jerk)
+			       double max_jerk,
+			       double stability_cost)
 	: _graph(&graph),
 	  _splines(std::make_shared<std::vector<CubicConfigurationSpline>>(std::move(splines))),
 	  _time_cost(time_cost),
@@ -513,6 +435,7 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 	  _max_vel(max_vel),
 	  _max_acc(max_acc),
 	  _max_jerk(max_jerk),
+	  _stability_cost(stability_cost),
 	  _vs_list(graph.num_agents),
 	  _time_deltas_list(graph.num_agents) {
 
@@ -544,9 +467,19 @@ bool GraphTimingMPC::solve(
 	const Eigen::VectorXd& v0,
 	const std::vector<int>& remaining_vertices,
 	const Eigen::MatrixXd& waypoints,
-	const Eigen::VectorXi& assignments) {
+	const Eigen::VectorXi& assignments,
+	const Eigen::VectorXd& t_by_node) {
 
 	_timer.Start();
+
+	// Snapshotted before `_agent_nodes_list`/`_vs_list`/`_time_deltas_list`
+	// get overwritten with this cycle's own values below, so the warm-start
+	// block further down can still node-id-match this cycle's decision
+	// variables against last cycle's converged solution.
+	const std::vector<Eigen::MatrixXd> prev_vs_list = _vs_list;
+	const std::vector<Eigen::VectorXd> prev_time_deltas_list = _time_deltas_list;
+	const std::vector<std::vector<int>> prev_agent_nodes_list = _agent_nodes_list;
+	const std::map<int, int> prev_agent_spline_length_map = _agent_spline_length_map;
 
 	/* after the individual agents' positions are totally ordered we
 	 * construct each agent's spline. */
@@ -607,7 +540,7 @@ bool GraphTimingMPC::solve(
 			build_graph_timing_problem(
 				*_graph, *_splines, remaining_vertices, waypoints, assignments, x0, v0,
 				_time_cost, _time_cost2, _acceleration_cost, _energy_cost, _arclength_cost,
-				_max_vel, _max_acc, _max_jerk));
+				_max_vel, _max_acc, _max_jerk, _stability_cost, t_by_node));
 	} catch (const std::exception& e) {
 		std::cout << "Caught exception in timing problem construction: " << e.what() << std::endl;
 		return false;
@@ -619,20 +552,46 @@ bool GraphTimingMPC::solve(
 	// Store nodes on each spline
 	_agent_nodes_list = problem->agent_nodes_list;
 
-	// Warm start vs and taus per agent
-	// for (int i = 0; i < _graph->num_agents; ++i) {
-	// 	const int agent_spline_length = taus.size() + 1;
+	// Warm start vs and taus per agent from last cycle's converged solution,
+	// node-id-matched against this cycle's (possibly shorter, if a leading
+	// node just completed) node list -- `build_graph_timing_problem` above
+	// otherwise resets every decision variable to the same generic guess
+	// (time_deltas=10.0, vs=1.0) every single cycle. NLopt is a local
+	// solver: re-solving a barely-changed problem (x0/v0 advance by one
+	// `position_velocity`-tracked timestep each cycle) from that same
+	// generic guess, rather than from the previous cycle's own solution,
+	// lets it land in a very different local optimum cycle to cycle --
+	// diagnosed via `po_goc_mpc.experiments.basic_fmm_experiment`'s
+	// spline-iterations plot, which showed the planned horizon jumping
+	// from ~2s to 28s over three consecutive cycles before the solve
+	// started failing outright a few cycles later.
+	for (int i = 0; i < _graph->num_agents; ++i) {
+		if (!prev_agent_spline_length_map.contains(i)) {
+			continue;  // no previous solve for this agent yet (e.g. cycle 0)
+		}
 
-	// 	for (int j = 0; j < vs.rows(); ++j) {
-	// 		problem->prog->SetInitialGuess(
-	// 			problem->vs_list[i], _vs_list[i].row(j));
-	// 	}
+		const std::vector<int>& new_nodes = problem->agent_nodes_list[i];
+		const std::vector<int>& old_nodes = prev_agent_nodes_list[i];
 
-	// 	for (int j = 0; j < taus.size(); ++j) {
-	// 		problem->prog->SetInitialGuess(
-	// 			problem->time_deltas_list[i](j), _time_deltas_list[i](j));
-	// 	}
-	// }
+		for (int j_new = 0; j_new < static_cast<int>(new_nodes.size()); ++j_new) {
+			const auto it = std::find(old_nodes.begin(), old_nodes.end(), new_nodes[j_new]);
+			if (it == old_nodes.end()) {
+				continue;  // this node wasn't part of last cycle's plan
+			}
+			const int j_old = static_cast<int>(std::distance(old_nodes.begin(), it));
+
+			if (j_old < prev_time_deltas_list[i].size()) {
+				problem->prog->SetInitialGuess(
+					problem->time_deltas_list[i](j_new), prev_time_deltas_list[i](j_old));
+			}
+			if (j_old < prev_vs_list[i].rows() && j_new < problem->vs_list[i].rows()) {
+				for (int k = 0; k < problem->vs_list[i].cols(); ++k) {
+					problem->prog->SetInitialGuess(
+						problem->vs_list[i](j_new, k), prev_vs_list[i](j_old, k));
+				}
+			}
+		}
+	}
 
 	// for (int v : remaining_vertices) {
 	// 	const int i = problem->subgraph->subgraph_id(v);
@@ -641,8 +600,8 @@ bool GraphTimingMPC::solve(
 
 	// Solve
 	using drake::solvers::IpoptSolver;
-	using drake::solvers::NloptSolver;
-	NloptSolver solver;
+	// using drake::solvers::NloptSolver;
+	IpoptSolver solver;
 
 	// Choose Nlopt algorithm
 	// problem->prog->SetSolverOption(NloptSolver::id(), "algorithm", "LD_SLSQP");

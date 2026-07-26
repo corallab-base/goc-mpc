@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <iostream>
 
 #include <drake/solvers/mathematical_program.h>
@@ -93,6 +94,26 @@ struct GraphTimingMPC {
 	double _max_vel;
 	double _max_acc;
 	double _max_jerk;
+	// Convex alternative/complement to `_acceleration_cost`: penalizes
+	// ||xJ - xJm1||^2 / tau^3 + ||vJ - vJm1||^2 / tau per segment, instead
+	// of acceleration_cost's ||(xJ-xJm1) - 0.5*tau*(vJm1+vJ)||^2 / tau^3.
+	// The difference is that this term's numerator doesn't depend on tau
+	// (it's the raw squared endpoint gap, not a "coast at current velocity"
+	// -corrected residual), so it can't develop the sign-indefinite cross
+	// term (`-2*tau*(A.B)` from expanding the coast-corrected term) that
+	// makes acceleration_cost's contribution non-convex whenever the
+	// current velocity already points roughly toward the target -- see
+	// po_goc_mpc.experiments.basic_fmm_experiment's spline-iterations
+	// diagnostic, which found exactly this: two distinct local minima in
+	// the per-cycle timing solve, with NLopt unreliably landing in either
+	// one cycle to cycle. Every term this adds (linear-in-tau, positive
+	// constant / tau^n, and quadratic-over-linear ||v||^2/tau, which stays
+	// convex even when v is itself a decision variable -- the standard
+	// convex "quadratic-over-linear" perspective function) is convex, so
+	// combined with the already-convex arclength_cost and linear time_cost,
+	// the whole per-cycle problem is convex when acceleration_cost/max_acc
+	// are left off in favor of this term.
+	double _stability_cost;
 
 	// Phase management
 	// std::set<int> _completed_phases;
@@ -114,14 +135,16 @@ struct GraphTimingMPC {
 		       double arclength_cost = 1.0,
 		       double max_vel = -1.0,
 		       double max_acc = -1.0,
-		       double max_jerk = -1.0);
+		       double max_jerk = -1.0,
+		       double stability_cost = 0.0);
 
 	// Core solve routine
 	bool solve(const Eigen::VectorXd& x0,
 		   const Eigen::VectorXd& v0,
 		   const std::vector<int>& remaining_vertices,
 		   const Eigen::MatrixXd& waypoints,
-		   const Eigen::VectorXi& assignments);
+		   const Eigen::VectorXi& assignments,
+		   const Eigen::VectorXd& t_by_node = Eigen::VectorXd());
 
 	int get_agent_spline_length(int agent) const;
 	std::vector<int> get_agent_spline_nodes(int agent) const;
