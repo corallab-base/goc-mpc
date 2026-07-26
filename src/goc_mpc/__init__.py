@@ -16,3 +16,4 @@ from .goc_mpc import (
     EdgeCostFunctor,
     RegularGridInterpolant,
 )
+from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, GraphOrderingSpec
