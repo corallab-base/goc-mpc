@@ -1,13 +1,16 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
+#include <pybind11/stl.h>
 
 #include <drake/bindings/pydrake/symbolic_types_pybind.h>
 
 #include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
+#include "milp_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
+#include "../grid_interpolant.hpp"
 
 using drake::symbolic::Expression;
 namespace py = pybind11;
@@ -194,27 +197,52 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.export_values();
 
 	py::enum_<WaypointObjective>(goc_mpc, "WaypointObjective")
-		.value("kSquaredDistance", WaypointObjective::kSquaredDistance)
-		.value("kL1",              WaypointObjective::kL1)
+		.value("kMinMaxL1",      WaypointObjective::kMinMaxL1)
+		.value("kAvgL1",         WaypointObjective::kAvgL1)
+		.value("kMinMaxL2",      WaypointObjective::kMinMaxL2)
+		.value("kAvgL2",         WaypointObjective::kAvgL2)
+		.value("kMinMaxGeodesic", WaypointObjective::kMinMaxGeodesic)
+		.value("kAvgGeodesic",    WaypointObjective::kAvgGeodesic)
 		.export_values();
 
-        py::class_<GraphWaypointMPC>(goc_mpc, "GraphWaypointMPC")
+	py::class_<EdgeCostFunctor, std::shared_ptr<EdgeCostFunctor>>(goc_mpc, "EdgeCostFunctor");
+
+	py::class_<RegularGridInterpolant, EdgeCostFunctor,
+		   std::shared_ptr<RegularGridInterpolant>>(goc_mpc, "RegularGridInterpolant")
+		.def(py::init<Eigen::VectorXd, Eigen::VectorXd, std::vector<int>, Eigen::VectorXd>(),
+		     py::arg("origin"),
+		     py::arg("spacing"),
+		     py::arg("shape"),
+		     py::arg("values"))
+		.def("dim", &RegularGridInterpolant::dim)
+		.def("interpolate", &RegularGridInterpolant::Interpolate<double>, py::arg("query"));
+
+	py::class_<GraphWaypointMPC, std::shared_ptr<GraphWaypointMPC>>(goc_mpc, "GraphWaypointMPC")
+		.def("solve", &GraphWaypointMPC::Solve)
+		.def("evaluate_edge_cost", &GraphWaypointMPC::EvaluateEdgeCost,
+		     py::arg("agent"), py::arg("w_a"), py::arg("w_b"))
+		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
+		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal)
+		.def("view_var_assignments", &GraphWaypointMPC::view_var_assignments, py::return_value_policy::reference_internal)
+		.def("view_t_by_node", &GraphWaypointMPC::view_t_by_node, py::return_value_policy::reference_internal)
+		.def("get_last_solve_time", &GraphWaypointMPC::get_last_solve_time);
+
+        py::class_<MILPWaypointMPC, GraphWaypointMPC, std::shared_ptr<MILPWaypointMPC>>(goc_mpc, "MILPWaypointMPC")
                 .def(py::init<GraphOfConstraints&,
 			      std::vector<CubicConfigurationSpline>,
 			      WaypointSolver,
 			      bool,
-			      WaypointObjective>(),
+			      WaypointObjective,
+			      std::shared_ptr<EdgeCostFunctor>>(),
 		     py::keep_alive<1, 2>(),
 		     py::arg("graph"),
 		     py::arg("splines"),
 		     py::arg("solver")            = WaypointSolver::kGurobi,
 		     py::arg("enforce_rigidity")  = false,
-		     py::arg("objective")         = WaypointObjective::kSquaredDistance)
-		.def("solve", &GraphWaypointMPC::solve)
-		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
-		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal)
-		.def("view_var_assignments", &GraphWaypointMPC::view_var_assignments, py::return_value_policy::reference_internal)
-		.def("get_last_solve_time", &GraphWaypointMPC::get_last_solve_time);
+		     py::arg("objective")         = WaypointObjective::kMinMaxL1,
+		     py::arg("edge_cost_fn")      = std::shared_ptr<EdgeCostFunctor>())
+		.def("view_t", &MILPWaypointMPC::view_t, py::return_value_policy::reference_internal)
+		.def("view_Z", &MILPWaypointMPC::view_Z, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
                 .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double, double, double, double>(),

@@ -35,8 +35,10 @@ pybind11_add_module(_ext MODULE
     "src/ext/sec_mpc/timing_mpc_problem.cpp"
     "src/ext/goc_mpc/goc_mpc.cpp"
     "src/ext/goc_mpc/graph_of_constraints.cpp"
-    "src/ext/goc_mpc/graph_timing_mpc.cpp"
+    "src/ext/goc_mpc/symbolic_constraint_compiler.cpp"
     "src/ext/goc_mpc/graph_waypoint_mpc.cpp"
+    "src/ext/goc_mpc/milp_waypoint_mpc.cpp"
+    "src/ext/goc_mpc/graph_timing_mpc.cpp"
     "src/ext/goc_mpc/graph_short_path_mpc.cpp"
 )
 target_link_libraries(_ext PRIVATE drake::drake)

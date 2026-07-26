@@ -10,6 +10,9 @@ from .goc_mpc import (
     WaypointSolver,
     WaypointObjective,
     GraphWaypointMPC,
+    MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
+    EdgeCostFunctor,
+    RegularGridInterpolant,
 )
