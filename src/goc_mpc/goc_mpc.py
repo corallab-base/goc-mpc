@@ -33,17 +33,42 @@ class GraphOfConstraintsMPC():
             # instance is already configured. Leave unset (default) to keep
             # auto-building a MILPWaypointMPC from those args, as before.
             waypoint_mpc: GraphWaypointMPC | None = None,
+            # pass an already-constructed timing solver (e.g. a
+            # TracedTimingMPC, duck-typed to GraphTimingMPC's public
+            # surface rather than a real C++ subclass -- see
+            # goc_mpc.traced_timing_mpc) to use it directly; time_cost/.../
+            # stability_cost below are then ignored, since the instance is
+            # already configured. Leave unset (default) to keep
+            # auto-building a GraphTimingMPC from those args, as before.
+            timing_mpc=None,
             # timing mpc hyperparameters
             time_cost: float = 1.0,
             time_cost2: float = 0.0,
             acceleration_cost: float = 0.0,
             energy_cost: float = 0.0,
-            arclength_cost: float = 1.0,
+            # Default off (not on): contains terms bilinear in (tau,
+            # velocity) before being normed (see the per-quadrature-point
+            # sqrt(...) in CubicConfigurationSpline::compute_arclength_cost),
+            # not convex in general -- same failure family as
+            # acceleration_cost's own non-convex residual (see
+            # stability_cost's comment below), confirmed as a real
+            # contributor to both Ipopt IterationLimit failures AND severe
+            # per-cycle slowdowns (its near-unregularized sqrt(x^2+1e-8) is
+            # close to non-differentiable at near-zero velocity, which
+            # Newton-type solvers handle poorly) on
+            # pick_place_task_experiment's branching, multi-segment traced
+            # paths.
+            arclength_cost: float = 0.0,
             time_delta_cutoff: float = 0.4,
             phi_tolerance: float = 0.03,
-            max_vel: float = -1.0,
-            max_acc: float = -1.0,
-            max_jerk: float = -1.0,
+            # A bare float broadcasts to every block in spline_spec; a
+            # list[float] must have exactly one entry per block, in
+            # spline_spec order (e.g. [linear_bound, angular_bound] for a
+            # [Block.R(2), Block.Torus(1)] pos+yaw robot) -- see
+            # GraphTimingMPC's max_vel field doc comment (graph_timing_mpc.hpp).
+            max_vel: float | list[float] = -1.0,
+            max_acc: float | list[float] = -1.0,
+            max_jerk: float | list[float] = -1.0,
             # Convex alternative/complement to acceleration_cost: penalizes
             # ||xJ-xJm1||^2/tau^3 + ||vJ-vJm1||^2/tau per segment instead of
             # acceleration_cost's coast-corrected ||(xJ-xJm1) -
@@ -51,8 +76,12 @@ class GraphOfConstraintsMPC():
             # non-convex whenever the current velocity already points
             # roughly toward the target, which is what let NLopt's timing
             # solve land in two different local optima cycle to cycle (see
-            # graph_timing_mpc.hpp's _stability_cost doc comment).
-            stability_cost: float = 0.0,
+            # graph_timing_mpc.hpp's _stability_cost doc comment). Default
+            # ON (1.0, not 0.0): the only cost term (besides the linear
+            # time_cost) known to keep the timing QP convex -- see
+            # arclength_cost's own comment above for why acceleration_cost/
+            # arclength_cost both default off instead.
+            stability_cost: float = 1.0,
             # short path mpc hyperparameters
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
@@ -123,10 +152,19 @@ class GraphOfConstraintsMPC():
                                                 solver = waypoint_solver,
                                                 objective = waypoint_objective,
                                                 enforce_rigidity = waypoint_enforce_rigidity)
-        self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines,
-                                         time_cost, time_cost2, acceleration_cost,
-                                         energy_cost, arclength_cost,
-                                         max_vel, max_acc, max_jerk, stability_cost)
+        if timing_mpc is not None:
+            # caller is responsible for having constructed timing_mpc with
+            # splines built from the same spline_spec/agent count as this
+            # instance (each C++ solver keeps its own copy of the splines
+            # passed at construction, same as the auto-built path below) --
+            # fill_cubic_splines is called with self.last_cycle_splines
+            # regardless, so that's the buffer that actually ends up filled.
+            self.timing_mpc = timing_mpc
+        else:
+            self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines,
+                                             time_cost, time_cost2, acceleration_cost,
+                                             energy_cost, arclength_cost,
+                                             max_vel, max_acc, max_jerk, stability_cost)
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
                                                 num_agents, dim, short_path_time_per_step)
 

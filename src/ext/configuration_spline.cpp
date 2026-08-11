@@ -13,18 +13,33 @@ void init_submodule_configuration_spline(py::module_& m) {
 	py::module_ q_spline =
 		m.def_submodule("configuration_spline", "General configuration splines module.");
 
+	// BlockType + readonly .type/.size on Block, and .type on BlockOffset:
+	// lets Python code (e.g. po_goc_mpc's per-block max_vel/max_acc bounds
+	// helper) introspect a spec's block composition instead of assuming/
+	// guessing block order -- previously Block was write-only (static
+	// constructors only) and BlockOffset was missing .type from its
+	// otherwise-complete set of readonly fields.
+	py::enum_<CubicConfigurationSpline::Block::Type>(q_spline, "BlockType")
+		.value("R",       CubicConfigurationSpline::Block::Type::R)
+		.value("Torus",   CubicConfigurationSpline::Block::Type::Torus)
+		.value("SO3Quat", CubicConfigurationSpline::Block::Type::SO3Quat)
+		.value("SO3Mat",  CubicConfigurationSpline::Block::Type::SO3Mat);
+
 	// Expose Block + Spec (std::vector<Block>) so you can pass a spec from Python
 	py::class_<CubicConfigurationSpline::Block>(q_spline, "Block")
 		.def_static("R",        &CubicConfigurationSpline::Block::R,      py::arg("k"))
 		.def_static("Torus",    &CubicConfigurationSpline::Block::Torus,  py::arg("k"))
 		.def_static("SO3Quat",  &CubicConfigurationSpline::Block::SO3Quat)
-		.def_static("SO3Mat",   &CubicConfigurationSpline::Block::SO3Mat);
+		.def_static("SO3Mat",   &CubicConfigurationSpline::Block::SO3Mat)
+		.def_readonly("type", &CubicConfigurationSpline::Block::type)
+		.def_readonly("size", &CubicConfigurationSpline::Block::size);
 
 	py::class_<CubicConfigurationSpline::BlockOffset>(q_spline, "BlockOffset")
 		.def_readonly("ambient_offset", &CubicConfigurationSpline::BlockOffset::ambient_offset)
 		.def_readonly("tangent_offset", &CubicConfigurationSpline::BlockOffset::tangent_offset)
 		.def_readonly("ambient_size", &CubicConfigurationSpline::BlockOffset::ambient_size)
-		.def_readonly("tangent_size", &CubicConfigurationSpline::BlockOffset::tangent_size);
+		.def_readonly("tangent_size", &CubicConfigurationSpline::BlockOffset::tangent_size)
+		.def_readonly("type", &CubicConfigurationSpline::BlockOffset::type);
 
 	py::class_<CubicConfigurationSpline>(q_spline, "CubicConfigurationSpline")
 		.def(py::init<>())

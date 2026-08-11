@@ -705,6 +705,60 @@ public:
 		return total;
 	}
 
+	// Per-block position residual between two ambient configurations, in
+	// that block's OWN tangent space: R is a plain difference; Torus wraps
+	// each component to (-pi, pi] first (shortest-angle residual); SO3Quat
+	// is the so(3) log of the relative quaternion. This is exactly the
+	// "disp"/"D"-defining computation compute_ctrl_cost/compute_energy_cost
+	// each independently duplicated per block type below -- factored out
+	// here so both those AND graph_timing_mpc.cpp's max_vel/max_acc bound
+	// construction (which needs the identical per-block residual for its
+	// own cubic-Hermite acceleration formula) can never silently diverge on
+	// the trickiest part (wraparound, quaternion log).
+	//
+	// SO3Mat throws rather than silently returning zero: compute_ctrl_cost/
+	// compute_energy_cost's own SO3Mat branches are still-unimplemented
+	// stubs (DRAKE_DEMAND + break, no cost contribution) predating this
+	// helper -- left untouched below, NOT routed through here, so nothing
+	// about their existing (lack of) behavior changes. This helper is only
+	// reached for SO3Mat by brand-new callers (the max_vel/max_acc bound
+	// code), which should fail loudly on an unsupported block rather than
+	// silently no-op.
+	template <typename T>
+	static VecX<T> BlockPositionDelta(
+		const BlockOffset& off, const VecX<T>& xJ, const VecX<T>& xJm1) {
+		const int a0 = off.ambient_offset, aN = off.ambient_size;
+
+		switch (off.type) {
+		case Block::Type::R: {
+			return xJ.segment(a0, aN) - xJm1.segment(a0, aN);
+		}
+		case Block::Type::Torus: {
+			// ambient == tangent for a Torus block.
+			const auto xj   = xJ.segment(a0, aN);
+			const auto xjm1 = xJm1.segment(a0, aN);
+			VecX<T> Dw(aN);
+			for (int k = 0; k < aN; ++k) {
+				Dw[k] = wrap_to_pi(xj[k] - xjm1[k]);
+			}
+			return Dw;
+		}
+		case Block::Type::SO3Quat: {
+			DRAKE_DEMAND(aN == 4);
+			const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
+			const Eigen::Matrix<T,4,1> qj   = xJ.segment(a0, 4);
+			const auto qrel_vec = drake::math::quatProduct(drake::math::quatConjugate(qjm1), qj);
+			Eigen::Quaternion<T> qrel(qrel_vec(0), qrel_vec(1), qrel_vec(2), qrel_vec(3));
+			return so3::quat::Log(qrel);
+		}
+		case Block::Type::SO3Mat:
+		default:
+			throw std::runtime_error(
+				"CubicConfigurationSpline::BlockPositionDelta: SO3Mat is not "
+				"supported yet (matches compute_ctrl_cost's existing TODO stub)");
+		}
+	}
+
 	template <typename T>
 	T compute_ctrl_cost(
 		const VecX<T>& xJ,
@@ -721,63 +775,26 @@ public:
 		T total = T(0.0);
 
 		for (const BlockOffset& off : block_offsets_) {
-			const int a0 = off.ambient_offset, aN = off.ambient_size;
 			const int t0 = off.tangent_offset, tN = off.tangent_size;
 
 			switch (off.type) {
 
-			case Block::Type::R: {
-				const auto xj   = xJ.segment(a0, aN);
-				const auto xjm1 = xJm1.segment(a0, aN);
+			case Block::Type::R:
+			case Block::Type::Torus:
+			case Block::Type::SO3Quat: {
 				const auto vj   = vJ.segment(t0, tN);
 				const auto vjm1 = vJm1.segment(t0, tN);
 
-				const VecX<T> D = (xj - xjm1) - T(0.5) * tau * (vjm1 + vj);
+				const VecX<T> disp = BlockPositionDelta<T>(off, xJ, xJm1);
+				const VecX<T> D = disp - T(0.5) * tau * (vjm1 + vj);
 				const VecX<T> V = (vj - vjm1);
 
 				total += T(12.0) * inv_tau3 * D.squaredNorm()
 				       + inv_tau * V.squaredNorm();
 				break;
 			}
-			case Block::Type::Torus: {
-				// Torus block: ambient == tangent == aN == tN
-				// Use wrapped angle difference for the position residual (componentwise).
-				const auto xj   = xJ.segment(a0, aN);
-				const auto xjm1 = xJm1.segment(a0, aN);
-				const auto vj   = vJ.segment(t0, tN);
-				const auto vjm1 = vJm1.segment(t0, tN);
-
-				VecX<T> Dw(aN);
-				for (int k = 0; k < aN; ++k) {
-					Dw[k] = wrap_to_pi(xj[k] - xjm1[k]);
-				}
-				const VecX<T> D = Dw - T(0.5) * tau * (vjm1 + vj);
-				const VecX<T> V = (vj - vjm1);
-
-				total += T(12.0) * inv_tau3 * D.squaredNorm()
-					+ inv_tau * V.squaredNorm();
-				break;
-			}
-			case Block::Type::SO3Quat: {
-				DRAKE_DEMAND(aN == 4 && tN == 3);
-
-				const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
-				const Eigen::Matrix<T,4,1> qj   = xJ.segment(a0, 4);
-				const Vec3<T> wjm1 = vJm1.segment(t0, 3);
-				const Vec3<T> wj   = vJ.segment(t0, 3);
-
-				const auto qrel_vec = drake::math::quatProduct(drake::math::quatConjugate(qjm1), qj);
-				Eigen::Quaternion<T> qrel(qrel_vec(0), qrel_vec(1), qrel_vec(2), qrel_vec(3));
-				const Vec3<T> dphi = so3::quat::Log(qrel);
-				const Vec3<T> D = dphi - T(0.5) * tau * (wjm1 + wj);
-				const Vec3<T> V = (wj - wjm1);
-
-				total += T(12.0) * inv_tau3 * D.squaredNorm()
-					+ inv_tau * V.squaredNorm();
-				break;
-			}
 			case Block::Type::SO3Mat: {
-				DRAKE_DEMAND(aN == 9 && tN == 3);
+				DRAKE_DEMAND(off.ambient_size == 9 && tN == 3);
 				break;
 			}
 			default:
@@ -800,80 +817,24 @@ public:
 		T total = T(0.0);
 
 		for (const BlockOffset& off : block_offsets_) {
-			const int a0 = off.ambient_offset, aN = off.ambient_size;
 			const int t0 = off.tangent_offset, tN = off.tangent_size;
 
 			switch (off.type) {
 
-			case Block::Type::R: {
-				const auto xj   = xJ.segment(a0, aN);
-				const auto xjm1 = xJm1.segment(a0, aN);
-				const auto vj   = vJ.segment(t0, tN);
-				const auto vjm1 = vJm1.segment(t0, tN);
-
-				// Displacement (Delta x)
-				const VecX<T> disp = (xj - xjm1); // Use wrap_to_pi for Torus, so3_log for SO3
-
-				// Deviation from constant velocity (your existing D)
-				const VecX<T> D = disp - T(0.5) * tau * (vjm1 + vj);
-
-				// Velocity change (your existing V)
-				const VecX<T> V = (vj - vjm1);
-
-				// Analytical integral of velocity squared:
-				// Term 1: The 'Straight Line' energy (Distance^2 / Time)
-				// Term 2: The 'Wiggle' energy (Deviation from straight)
-				// Term 3: The 'Acceleration' energy (Velocity change)
-				total += inv_tau * disp.squaredNorm()
-					+ T(2.4) * inv_tau * D.squaredNorm()
-					+ T(1.0 / 60.0) * tau * V.squaredNorm();
-				break;
-			}
-			case Block::Type::Torus: {
-				// Use wrapped angle difference for the position residual (componentwise).
-				const auto xj   = xJ.segment(a0, aN);
-				const auto xjm1 = xJm1.segment(a0, aN);
-				const auto vj   = vJ.segment(t0, tN);
-				const auto vjm1 = vJm1.segment(t0, tN);
-
-				// Displacement (Delta x)
-				VecX<T> disp(aN);
-				for (int k = 0; k < aN; ++k) {
-					disp[k] = wrap_to_pi(xj[k] - xjm1[k]);
-				}
-
-				// Deviation from constant velocity (your existing D)
-				const VecX<T> D = disp - T(0.5) * tau * (vjm1 + vj);
-
-				// Velocity change (your existing V)
-				const VecX<T> V = (vj - vjm1);
-
-				// Analytical integral of velocity squared:
-				// Term 1: The 'Straight Line' energy (Distance^2 / Time)
-				// Term 2: The 'Wiggle' energy (Deviation from straight)
-				// Term 3: The 'Acceleration' energy (Velocity change)
-				total += inv_tau * disp.squaredNorm()
-					+ T(2.4) * inv_tau * D.squaredNorm()
-					+ T(1.0 / 60.0) * tau * V.squaredNorm();
-				break;
-			}
+			case Block::Type::R:
+			case Block::Type::Torus:
 			case Block::Type::SO3Quat: {
-				DRAKE_DEMAND(aN == 4 && tN == 3);
+				const auto vj   = vJ.segment(t0, tN);
+				const auto vjm1 = vJm1.segment(t0, tN);
 
-				const Eigen::Matrix<T,4,1> qjm1 = xJm1.segment(a0, 4);
-				const Eigen::Matrix<T,4,1> qj   = xJ.segment(a0, 4);
-				const Vec<T,3> wjm1 = vJm1.segment(t0, 3);
-				const Vec<T,3> wj   = vJ.segment(t0, 3);
-
-				const auto qrel_vec = drake::math::quatProduct(drake::math::quatConjugate(qjm1), qj);
-				Eigen::Quaternion<T> qrel(qrel_vec(0), qrel_vec(1), qrel_vec(2), qrel_vec(3));
-				const Vec<T,3> disp = so3::quat::Log(qrel);
+				// Displacement (Delta x)
+				const VecX<T> disp = BlockPositionDelta<T>(off, xJ, xJm1);
 
 				// Deviation from constant velocity (your existing D)
-				const VecX<T> D = disp - T(0.5) * tau * (wjm1 + wj);
+				const VecX<T> D = disp - T(0.5) * tau * (vjm1 + vj);
 
 				// Velocity change (your existing V)
-				const Vec<T,3> V = (wj - wjm1);
+				const VecX<T> V = (vj - vjm1);
 
 				// Analytical integral of velocity squared:
 				// Term 1: The 'Straight Line' energy (Distance^2 / Time)
@@ -885,7 +846,7 @@ public:
 				break;
 			}
 			case Block::Type::SO3Mat: {
-				DRAKE_DEMAND(aN == 9 && tN == 3);
+				DRAKE_DEMAND(off.ambient_size == 9 && tN == 3);
 				break;
 			}
 			default:
@@ -988,46 +949,6 @@ public:
 		}
 		return total;
 	}
-
-	template <typename T>
-	std::pair<VecX<T>, VecX<T>> select_linear_blocks(
-		const VecX<T>& x,
-		const VecX<T>& v) const {
-
-		int lin_size = 0;
-		for (const BlockOffset& off : block_offsets_) {
-			switch (off.type) {
-			case Block::Type::R: {
-				// ambient size and tangent size are equal here.
-				lin_size += off.ambient_size;
-				break;
-			}
-			default:
-				;
-			}
-		}
-
-		int i = 0;
-		VecX<T> x_lin(lin_size);
-		VecX<T> v_lin(lin_size);
-		for (const BlockOffset& off : block_offsets_) {
-			const int a0 = off.ambient_offset, aN = off.ambient_size;
-			const int t0 = off.tangent_offset, tN = off.tangent_size;
-
-			switch (off.type) {
-			case Block::Type::R: {
-				x_lin.segment(i, aN) = x.segment(a0, aN);
-				v_lin.segment(i, tN) = v.segment(t0, tN);
-				i += aN;
-				break;
-			}
-			default:
-				;
-			}
-		}
-		return std::make_pair(x_lin, v_lin);
-	}
-
 
 private:
 	// -------- Internal per-block piece types ----------

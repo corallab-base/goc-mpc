@@ -340,12 +340,62 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_Z", &MILPWaypointMPC::view_Z, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
-                .def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>, double, double, double, double, double, double, double, double, double>(),
-		     py::keep_alive<1, 3>())
+                .def(py::init([](const GraphOfConstraints& graph,
+                                  std::vector<CubicConfigurationSpline> splines,
+                                  double time_cost, double time_cost2, double acceleration_cost,
+                                  double energy_cost, double arclength_cost,
+                                  py::object max_vel, py::object max_acc, py::object max_jerk,
+                                  double stability_cost) {
+                        // max_vel/max_acc/max_jerk: a bare float broadcasts to every block in
+                        // splines[0]'s spec (back-compat with every existing caller, including
+                        // goc-mpc's own raw examples that construct this with plain floats); a
+                        // list[float] must have exactly one entry per block. Broadcasting lives
+                        // here, at the pybind boundary, rather than in goc_mpc.py/
+                        // traced_timing_mpc.py, since it's the only place that covers every
+                        // caller -- see GraphTimingMPC's max_vel field doc comment.
+                        const size_t num_blocks = splines.at(0).block_offsets_.size();
+                        auto broadcast_bound = [num_blocks](const py::object& val, const char* name) {
+                                if (val.is_none()) return std::vector<double>();
+                                if (py::isinstance<py::float_>(val) || py::isinstance<py::int_>(val)) {
+                                        return std::vector<double>(num_blocks, val.cast<double>());
+                                }
+                                std::vector<double> v;
+                                try {
+                                        v = val.cast<std::vector<double>>();
+                                } catch (const py::cast_error&) {
+                                        throw std::runtime_error(
+                                                std::string(name) + " must be a float (broadcast to every "
+                                                "block) or a list[float] of length matching the spline's "
+                                                "block count");
+                                }
+                                if (!v.empty() && v.size() != num_blocks) {
+                                        throw std::runtime_error(
+                                                std::string(name) + ": expected " + std::to_string(num_blocks)
+                                                + " values (one per spec block), got " + std::to_string(v.size()));
+                                }
+                                return v;
+                        };
+                        return GraphTimingMPC(graph, std::move(splines), time_cost, time_cost2,
+                                acceleration_cost, energy_cost, arclength_cost,
+                                broadcast_bound(max_vel, "max_vel"),
+                                broadcast_bound(max_acc, "max_acc"),
+                                broadcast_bound(max_jerk, "max_jerk"),
+                                stability_cost);
+                     }), py::keep_alive<1, 3>(),
+                     py::arg("graph"), py::arg("splines"),
+                     py::arg("time_cost") = 1e0, py::arg("time_cost2") = 0e0,
+                     py::arg("acceleration_cost") = 0.0, py::arg("energy_cost") = 0.0,
+                     py::arg("arclength_cost") = 0.0,
+                     py::arg("max_vel") = py::float_(-1.0), py::arg("max_acc") = py::float_(-1.0),
+                     py::arg("max_jerk") = py::float_(-1.0),
+                     py::arg("stability_cost") = 1.0)
 		.def("solve", &GraphTimingMPC::solve,
 		     py::arg("x0"), py::arg("v0"), py::arg("remaining_vertices"),
 		     py::arg("waypoints"), py::arg("assignments"),
 		     py::arg("t_by_node") = Eigen::VectorXd())
+		.def("solve_dense", &GraphTimingMPC::solve_dense,
+		     py::arg("x0"), py::arg("v0"), py::arg("agent_dense_wps"),
+		     py::arg("agent_dense_node_ids"), py::arg("agent_interactions"))
 		.def("get_agent_spline_length", &GraphTimingMPC::get_agent_spline_length)
 		.def("get_agent_spline_nodes", &GraphTimingMPC::get_agent_spline_nodes)
 		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)
