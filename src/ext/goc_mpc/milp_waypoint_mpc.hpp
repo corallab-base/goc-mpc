@@ -25,7 +25,6 @@
 #include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
 #include "../configuration_spline.hpp"
-#include "../edge_cost_functor.hpp"
 #include "../utils.hpp"
 
 using namespace pybind11::literals;
@@ -178,8 +177,7 @@ struct MILPWaypointMPC : public GraphWaypointMPC {
 			std::vector<CubicConfigurationSpline> splines,
 			WaypointSolver solver = WaypointSolver::kGurobi,
 			bool enforce_rigidity = false,
-			WaypointObjective objective = WaypointObjective::kMinMaxL1,
-			std::shared_ptr<EdgeCostFunctor> edge_cost_fn = nullptr);
+			WaypointObjective objective = WaypointObjective::kMinMaxL1);
 
 	// Core solve routine, based on the remaining vertices, computes a
 	// subgraph of graph of constraints, solves for the optimal agent

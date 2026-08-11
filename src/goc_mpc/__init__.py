@@ -13,7 +13,5 @@ from .goc_mpc import (
     MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
-    EdgeCostFunctor,
-    RegularGridInterpolant,
 )
 from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, GraphOrderingSpec

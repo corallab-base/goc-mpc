@@ -1,6 +1,7 @@
 #include "milp_waypoint_mpc.hpp"
 #include "symbolic_constraint_compiler.hpp"
 
+#include <algorithm>
 #include <map>
 #include <tuple>
 
@@ -932,12 +933,22 @@ drake::symbolic::Variable GetOrAddBetweennessIndicator(
 }
 
 // Returns (creating and caching if necessary) a binary MILP variable b such
-// that: [t(t_idx_a1), t(t_idx_b1)] overlaps [t(t_idx_a2), t(t_idx_b2)] ⟹ b = 1
-// (intervals overlap iff t(a1) <= t(b2) AND t(a2) <= t(b1)). Same
-// one-directional soundness contract as GetOrAddBetweennessIndicator above
-// (forced to 1 when genuinely overlapping, free to be 0 otherwise) — kept as
-// a separate function/cache so Constraint 13's betweenness gating is
-// untouched; betweenness is the degenerate case a2 == b2 == w.
+// that: [t(t_idx_a1), t(t_idx_b1)] overlaps [t(t_idx_a2), t(t_idx_b2)]  <=>  b = 1
+// (intervals overlap iff t(a1) <= t(b2) AND t(a2) <= t(b1)). Fully
+// bidirectional: b is forced to 0 when the intervals genuinely do NOT
+// overlap (not just free to be 0), via a matched reverse-direction big-M
+// constraint per side, in addition to the existing "genuinely overlapping
+// ⟹ b=1" constraints. Needed because Constraint 14b (the only caller) uses
+// b=1 to RELAX a stationary-object constraint -- a false positive there
+// silently lets an unheld/not-yet-held object drift, which is exactly the
+// bug this fixes (see Constraint 14b's own comment). Only an unavoidable
+// +-eps dead zone remains, right at an exact interval-boundary tie.
+//
+// Kept as a separate function/cache from GetOrAddBetweennessIndicator
+// (which remains one-directional, deliberately not changed here): that one
+// gates Constraint 13/14a, where b=1 APPLIES an extra invariant rather than
+// relaxing one, so a false positive there is redundant rather than unsound,
+// and retightening it isn't needed to fix this bug.
 drake::symbolic::Variable GetOrAddIntervalOverlapIndicator(
 	MathematicalProgram& prog,
 	const VectorXDecisionVariable& t_var,
@@ -952,15 +963,48 @@ drake::symbolic::Variable GetOrAddIntervalOverlapIndicator(
 	const double kInf = std::numeric_limits<double>::infinity();
 	const double eps = 1e-3;
 
-	auto c1 = prog.NewBinaryVariables(1, "c_a1_le_b2")(0);  // t(a1) <= t(b2)  ⟹  c1 = 1
-	auto c2 = prog.NewBinaryVariables(1, "c_a2_le_b1")(0);  // t(a2) <= t(b1)  ⟹  c2 = 1
+	auto c1 = prog.NewBinaryVariables(1, "c_a1_le_b2")(0);  // t(a1) <= t(b2)  <=>  c1 = 1
+	auto c2 = prog.NewBinaryVariables(1, "c_a2_le_b1")(0);  // t(a2) <= t(b1)  <=>  c2 = 1
 
-	prog.AddLinearConstraint(
-		Expression(t_var(t_idx_a1)) - Expression(t_var(t_idx_b2)) + M_time * Expression(c1),
-		eps, kInf);
-	prog.AddLinearConstraint(
-		Expression(t_var(t_idx_a2)) - Expression(t_var(t_idx_b1)) + M_time * Expression(c2),
-		eps, kInf);
+	// t_idx_a1 == t_idx_b2 (or t_idx_a2 == t_idx_b1) means the SAME t_var
+	// entry is being compared to itself -- e.g. an edge that ends exactly at
+	// a hold's own start node (the edge leading up to a pick-up). The two
+	// spans are then merely ADJACENT, not overlapping: the edge's own span
+	// is strictly before the hold even begins (the grasp happens AT the
+	// shared node, not during any part of the edge), so this must resolve
+	// to "no overlap" (0), not "trivially true, therefore overlapping" (1)
+	// -- pinning it to 1 was backwards, and is what was letting the held
+	// object drift free (via the wrongly-activated gated/relaxed branch)
+	// right up to and including the hold's own boundary node. It's also the
+	// case the bidirectional big-M pair below can't encode directly: at an
+	// exact tie the difference is identically zero, not just numerically
+	// close to zero, so demanding a +-eps margin on both sides of it
+	// simultaneously is unsatisfiable regardless of which value we want.
+	if (t_idx_a1 == t_idx_b2) {
+		prog.AddLinearEqualityConstraint(Expression(c1), 0.0);
+	} else {
+		// t(a1) <= t(b2)  ⟹  c1 = 1
+		prog.AddLinearConstraint(
+			Expression(t_var(t_idx_a1)) - Expression(t_var(t_idx_b2)) + M_time * Expression(c1),
+			eps, kInf);
+		// c1 = 1  ⟹  t(a1) <= t(b2) (with margin) -- the previously-missing direction.
+		prog.AddLinearConstraint(
+			Expression(t_var(t_idx_b2)) - Expression(t_var(t_idx_a1)) + M_time * (1.0 - Expression(c1)),
+			eps, kInf);
+	}
+
+	if (t_idx_a2 == t_idx_b1) {
+		prog.AddLinearEqualityConstraint(Expression(c2), 0.0);
+	} else {
+		// t(a2) <= t(b1)  ⟹  c2 = 1
+		prog.AddLinearConstraint(
+			Expression(t_var(t_idx_a2)) - Expression(t_var(t_idx_b1)) + M_time * Expression(c2),
+			eps, kInf);
+		// c2 = 1  ⟹  t(a2) <= t(b1) (with margin) -- the previously-missing direction.
+		prog.AddLinearConstraint(
+			Expression(t_var(t_idx_b1)) - Expression(t_var(t_idx_a2)) + M_time * (1.0 - Expression(c2)),
+			eps, kInf);
+	}
 
 	auto b = prog.NewBinaryVariables(1, "b_overlap")(0);
 	prog.AddLinearConstraint(Expression(b) - Expression(c1), -kInf, 0.0);
@@ -981,14 +1025,6 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	bool enforce_rigidity,
 	bool relax_binary_vars,
 	WaypointObjective objective) {
-
-	if (objective == WaypointObjective::kMinMaxGeodesic ||
-	    objective == WaypointObjective::kAvgGeodesic) {
-		throw std::runtime_error(
-			"Geodesic waypoint objectives are not yet implemented — they require an "
-			"external precomputed distance grid or trained model that is not yet "
-			"integrated. Use kMinMaxL1/kAvgL1/kMinMaxL2/kAvgL2 for now.");
-	}
 
 	const int num_agents = graph->num_agents;
 	const int num_objects = graph->num_objects;
@@ -1151,10 +1187,6 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				case WaypointObjective::kAvgL2:
 					dist = ComputeL2Distance(prog, splines->at(j), w_a, w_b, tag);
 					break;
-				case WaypointObjective::kMinMaxGeodesic:
-				case WaypointObjective::kAvgGeodesic:
-					// Unreachable: guarded at function entry.
-					break;
 				}
 				const Variable e_jab = e_var(e_idx_fn(j, a, b));
 				const Variable z_jab = Z_var(z_idx_fn(j, a, b));
@@ -1236,6 +1268,29 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 			for (int a2 = 0; a2 < n_N; ++a2)
 				if (a2 != rv) in_flow += Expression(Z_var(z_idx_fn(k, a2, rv)));
 			prog.AddLinearEqualityConstraint(in_flow, 1.0);
+		}
+	}
+
+	// Constraint 8b: assignment commits (see add_variable_commit /
+	// GraphOfConstraints::committed_assignments) -- once a plan has pinned a
+	// variable to whichever agent it resolved to at some earlier commit
+	// node, force every remaining node/hold that still references it through
+	// that same agent. Pin the whole row (not just the committed cell) --
+	// the row's other cells aren't otherwise guaranteed to be forced to 0 by
+	// something else (that normally falls out of a var_id node constraint's
+	// own "exactly one agent" emission in CompileSymbolicNodeConstraint, but
+	// a committed variable referenced only via a hold at this point in the
+	// plan would have no such emission left in the subgraph) -- and the
+	// solution-extraction scan in Solve()/SolveCoordinated (`for k: if
+	// val>0.5: ... break`) takes the first 1-valued cell it finds, so a
+	// stray free cell at a lower agent index would silently report the
+	// wrong agent even though the intended one is also pinned to 1.
+	for (const auto& [var, committed_agent] : graph->committed_assignments) {
+		const int variable_k = subgraph.subgraph_variable_id(var);
+		if (variable_k < 0) continue;
+		for (int k = 0; k < num_agents; ++k) {
+			prog.AddLinearEqualityConstraint(
+				Expression(Assignments(variable_k, k)), k == committed_agent ? 1.0 : 0.0);
 		}
 	}
 
@@ -1374,27 +1429,23 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 
 		// 14a: rigidity — the held point's pose relative to the holding
 		// end-effector must stay fixed from pick-up to put-down.
-		for (const auto& [edge_phi_id, edge_op] : subgraph.get_subgraph_edge_ops()) {
-			if (edge_op.cubes.empty()) continue;
+		for (const auto& [hold_id, hold] : subgraph.get_subgraph_hold_ops()) {
+			const bool is_static = hold.robot_ag.has_value();
 
-			const bool is_static = graph->_edge_phi_to_static_assignment_map.contains(edge_phi_id);
-			const bool is_assignable = graph->edge_phi_to_variable_map.contains(edge_phi_id);
-			if (!is_static && !is_assignable) continue;
-
-			const int sg_v14 = subgraph.subgraph_id(edge_op.v_node);
+			const int sg_v14 = subgraph.subgraph_id(hold.v_node);
 			if (sg_v14 < 0) continue;  // target not yet in this horizon
-			const int sg_u14 = subgraph.subgraph_id(edge_op.u_node);
+			const int sg_u14 = subgraph.subgraph_id(hold.u_node);
 
 			HoldSpec static_spec;
 			AssignableHoldSpec assignable_spec;
 			VectorXDecisionVariable A_row;
 			if (is_static) {
-				static_spec.held_point_ids.assign(edge_op.cubes.begin(), edge_op.cubes.end());
-				static_spec.robot_ag = graph->_edge_phi_to_static_assignment_map.at(edge_phi_id);
+				static_spec.held_point_ids = hold.held_point_ids;
+				static_spec.robot_ag = hold.robot_ag.value();
 				static_spec.ee_frame_name = "ee_link";
 			} else {
-				assignable_spec.held_point_ids.assign(edge_op.cubes.begin(), edge_op.cubes.end());
-				assignable_spec.var = graph->edge_phi_to_variable_map.at(edge_phi_id);
+				assignable_spec.held_point_ids = hold.held_point_ids;
+				assignable_spec.var = hold.var_id.value();
 				assignable_spec.ee_frame_name = "ee_link";
 				A_row = GetARowForVar(subgraph, Assignments, assignable_spec.var);
 			}
@@ -1407,11 +1458,11 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 
 				// Endpoint (unconditional): a real, always-traversed DAG edge.
 				if (is_static) {
-					AddHoldRigidityStatic(prog, subgraph, graph, W, edge_op.u_node, edge_op.v_node,
+					AddHoldRigidityStatic(prog, subgraph, graph, W, hold.u_node, hold.v_node,
 							       static_spec, robot_dim, objs_start, non_robot_dim,
 							       /*exact_rigidity=*/true);
 				} else {
-					AddHoldRigidityAssignable(prog, subgraph, graph, W, edge_op.u_node, edge_op.v_node,
+					AddHoldRigidityAssignable(prog, subgraph, graph, W, hold.u_node, hold.v_node,
 								   assignable_spec, robot_dim, objs_start, non_robot_dim, A_row);
 				}
 			} else {
@@ -1420,22 +1471,27 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				t_idx_ref = depot_idx;
 
 				if (is_static) {
-					AddHoldRigidityStaticToX0(prog, subgraph, graph, W, edge_op.v_node,
+					AddHoldRigidityStaticToX0(prog, subgraph, graph, W, hold.v_node,
 								   static_spec, robot_dim, objs_start, non_robot_dim,
 								   x0, /*exact_rigidity=*/true);
 				} else {
-					AddHoldRigidityAssignableToX0(prog, subgraph, graph, W, edge_op.v_node,
+					AddHoldRigidityAssignableToX0(prog, subgraph, graph, W, hold.v_node,
 								       assignable_spec, robot_dim, objs_start, non_robot_dim,
 								       x0, A_row);
 
-					// Don't let the routing solve reassign this hold's holder
-					// mid-grasp: the previous MPC cycle already committed to it.
-					const int prev_assignment = previous_var_assignments(assignable_spec.var);
-					if (prev_assignment != -1) {
-						prog.AddLinearEqualityConstraint(A_row(prev_assignment), 1.0)
-							.evaluator()->set_description(
-								fmt::format("{} non-changing constraint", assignable_spec.var));
-					}
+					// Not pinning the holder here anymore: add_assignable_hold
+					// auto-registers its own `u` (pick-up) node as a commit
+					// trigger for `var` (see commit_trigger_node_to_var), so by
+					// the time hold.u_node has left the subgraph (this branch),
+					// GraphOfConstraintsMPC has already armed
+					// graph->committed_assignments for this variable and
+					// Constraint 8b above pins the whole row -- same "don't
+					// reassign this hold's holder mid-grasp" outcome, on the
+					// same cycle (committed_assignments captures the resolved
+					// agent the cycle `u` completes, same as previous_var_
+					// assignments would have here), but via one shared
+					// mechanism instead of two, and pinning every other cell
+					// to 0 too rather than just the held one.
 				}
 			}
 
@@ -1446,7 +1502,7 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				const Variable& gate = GetOrAddBetweennessIndicator(
 					prog, t_var, t_idx_ref, ri(sg_w14), ri(sg_v14), M_time, betweenness_cache);
 				Eigen::VectorX<Expression> cand_expr = W.row(sg_w14).template cast<Expression>();
-				const std::string desc = fmt::format("interior rigidity {}->{}", edge_op.u_node, edge_op.v_node);
+				const std::string desc = fmt::format("interior rigidity {}->{}", hold.u_node, hold.v_node);
 				if (is_static) {
 					AddHoldRigidityStaticGated(prog, graph, ref_expr, cand_expr, static_spec,
 								    robot_dim, objs_start, non_robot_dim, gate, desc);
@@ -1456,9 +1512,17 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				}
 			}
 		}
+	}
 
-		// 14b: stationary objects — an object not currently being held must
-		// not move between two graph nodes.
+	// 14b: stationary objects — an object not currently being held must not
+	// move between two graph nodes. Unlike 14a, this only ever compares
+	// plain position segments (W.row(...).segment(...)) with no rotation
+	// applied, so it's linear (or, when gated by an overlap indicator,
+	// mixed-integer-linear) regardless of robot kind -- there's no
+	// configuration space for which it becomes nonlinear the way 14a's
+	// rotated relative-offset check can. So it's always enforced,
+	// independent of enforce_rigidity.
+	{
 		std::map<std::tuple<int, int, int, int>, Variable> overlap_cache;
 
 		auto stationary_edge = [&](const Eigen::VectorX<Expression>& seg_a_full, int sg_b,
@@ -1469,18 +1533,21 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				Eigen::VectorX<Expression> seg_b = W.row(sg_b).segment(start, non_robot_dim)
 									.template cast<Expression>();
 
-				// Every edge op (anywhere in the graph) that might move this object.
-				std::vector<int> relevant_ops;
-				for (const auto& [other_phi_id, other_op] : graph->edge_ops) {
-					if (other_op.cubes.contains(obj)) relevant_ops.push_back(other_phi_id);
+				// Every hold (anywhere in the graph) that might move this object.
+				std::vector<int> relevant_holds;
+				for (const auto& [other_hold_id, other_hold] : graph->hold_ops) {
+					if (std::find(other_hold.held_point_ids.begin(), other_hold.held_point_ids.end(), obj) !=
+					    other_hold.held_point_ids.end()) {
+						relevant_holds.push_back(other_hold_id);
+					}
 				}
 
 				Expression gate_sum;
 				bool any_gate = false;
-				for (int other_phi_id : relevant_ops) {
-					const auto& other_op = graph->edge_ops.at(other_phi_id);
-					const int sg_other_u = subgraph.subgraph_id(other_op.u_node);
-					const int sg_other_v = subgraph.subgraph_id(other_op.v_node);
+				for (int other_hold_id : relevant_holds) {
+					const auto& other_hold = graph->hold_ops.at(other_hold_id);
+					const int sg_other_u = subgraph.subgraph_id(other_hold.u_node);
+					const int sg_other_v = subgraph.subgraph_id(other_hold.v_node);
 					if (sg_other_v < 0) continue;  // can't reason about it within this horizon
 					const int t_idx_other_u = (sg_other_u >= 0) ? ri(sg_other_u) : depot_idx;
 					const int t_idx_other_v = ri(sg_other_v);
@@ -1591,10 +1658,6 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		prog.AddLinearCost(total_cost * (1.0 / num_agents));
 		break;
 	}
-	case WaypointObjective::kMinMaxGeodesic:
-	case WaypointObjective::kAvgGeodesic:
-		// Unreachable: guarded at function entry.
-		break;
 	}
 
 	problem.prog = std::move(prog_ptr);
@@ -1610,9 +1673,8 @@ MILPWaypointMPC::MILPWaypointMPC(GraphOfConstraints& graph,
 				   std::vector<CubicConfigurationSpline> splines,
 				   WaypointSolver solver,
 				   bool enforce_rigidity,
-				   WaypointObjective objective,
-				   std::shared_ptr<EdgeCostFunctor> edge_cost_fn)
-	: GraphWaypointMPC(graph, std::move(splines), objective, std::move(edge_cost_fn)),
+				   WaypointObjective objective)
+	: GraphWaypointMPC(graph, std::move(splines), objective),
 	  _solver(solver),
 	  _enforce_rigidity(enforce_rigidity) {
 	// Routing outputs are sized on first successful solve.

@@ -74,6 +74,47 @@ double ComputeSignedViolation(const drake::symbolic::Formula& f,
 	}
 }
 
+// Inserts, into `env`, the world position and/or rotation value of every
+// agent_link_pos(...)/agent_link_rot(...) placeholder (see
+// GraphOfConstraints::agent_link_pos/agent_link_rot) that `formula` actually
+// references -- computed via the CONCRETE fk_fn backend (graph.link_pose,
+// which wraps robot_fk_registry). Mirrors PlaceholderVarFamily::InsertRange,
+// just for these two families, which aren't a plain [0,n) integer range
+// (keyed by (agent_id, link_name) instead) so don't fit InsertRange's
+// contract directly; merged into one function (rather than one per family)
+// so a formula referencing both a link's position and rotation only calls
+// the (possibly Python) fk_fn once per link, not twice. Called only from the
+// two Evaluate* functions below (the *runtime* evaluator -- the JAX
+// evolutionary solver resolves these placeholders itself, directly in
+// Python, and MILPWaypointMPC's compiler path raises via
+// RequireFullySubstituted instead of ever reaching this).
+void InsertAgentLinkPoseEnv(const GraphOfConstraints& graph,
+                            const drake::symbolic::Formula& formula,
+                            const Eigen::VectorXd& x,
+                            drake::symbolic::Environment* env) {
+	const drake::symbolic::Variables free_vars = formula.GetFreeVariables();
+	std::set<std::pair<int, std::string>> keys;
+	for (const auto& key : graph._agent_link_pos.KeysReferencedBy(free_vars)) keys.insert(key);
+	for (const auto& key : graph._agent_link_rot.KeysReferencedBy(free_vars)) keys.insert(key);
+	for (const auto& key : keys) {
+		const auto& [agent_id, link_name] = key;
+		const auto [p_we, R_we] = graph.link_pose(agent_id, x, link_name);
+		if (graph._agent_link_pos.Contains(key)) {
+			const auto& pos_vec = graph._agent_link_pos.Vars(key);
+			DRAKE_DEMAND(p_we.size() == pos_vec.size());
+			for (int j = 0; j < pos_vec.size(); ++j) env->insert(pos_vec[j], p_we[j]);
+		}
+		if (graph._agent_link_rot.Contains(key)) {
+			const auto& rot_vec = graph._agent_link_rot.Vars(key);
+			DRAKE_DEMAND(R_we.size() == rot_vec.size());
+			// Row-major flatten (see _agent_link_rot's doc comment).
+			for (int i = 0; i < graph.workspace_dim; ++i)
+				for (int j = 0; j < graph.workspace_dim; ++j)
+					env->insert(rot_vec[i * graph.workspace_dim + j], R_we(i, j));
+		}
+	}
+}
+
 // Conservative big-M: maximum absolute value any component of x could take.
 double ConservativeStateBigM(const GraphOfConstraints& graph) {
 	return graph._global_x_ub.array().abs().maxCoeff() +
@@ -118,6 +159,31 @@ void AddBigMGatedFormula(drake::solvers::MathematicalProgram& prog,
 	}
 }
 
+// Raises a clear error if `formula` still has free variables `sub` doesn't
+// cover -- the case for a formula referencing agent_link_pos(...)/
+// agent_link_rot(...) (see GraphOfConstraints::agent_link_pos/
+// agent_link_rot), which none of this file's Substitution maps populate
+// (MILP's drake::symbolic::Formula has no way to represent arbitrary/
+// JAX-only forward kinematics; only the JAX evolutionary solver's spec.py
+// can resolve that placeholder, by calling the registered fk_fn directly in
+// Python). Without this check, an unresolved placeholder would instead
+// surface much later as an opaque Drake failure deep inside
+// MathematicalProgram::AddConstraint.
+void RequireFullySubstituted(const drake::symbolic::Formula& formula,
+                             const drake::symbolic::Substitution& sub) {
+	for (const auto& var : formula.GetFreeVariables()) {
+		if (sub.contains(var)) continue;
+		throw std::runtime_error(fmt::format(
+			"MILPWaypointMPC cannot compile a constraint referencing placeholder "
+			"variable '{}' -- this is almost certainly an agent_link_pos(agent_id, "
+			"link_name) or agent_link_rot(agent_id, link_name) forward-kinematics "
+			"placeholder, which drake::symbolic::Formula has no way to represent. "
+			"Use the JAX evolutionary solver (EvolutionaryWaypointSolver) for a "
+			"graph with FK-based constraints instead.",
+			var.get_name()));
+	}
+}
+
 }  // namespace
 
 void CompileSymbolicNodeConstraint(
@@ -129,9 +195,7 @@ void CompileSymbolicNodeConstraint(
 	const drake::solvers::MatrixXDecisionVariable& Assignments) {
 
 	const int n_agents = graph.num_agents;
-	const int d = graph.dim;
 	const int n_objects = graph.num_objects;
-	const int obj_dim = graph.non_robot_dim;
 
 	if (!rec.multi_var_ids.empty()) {
 		// Multi-variable disjunction: enumerate all n_agents^k combos and emit Or.
@@ -153,17 +217,15 @@ void CompileSymbolicNodeConstraint(
 		do {
 			drake::symbolic::Substitution sub;
 			for (int p = 0; p < k; ++p) {
-				const auto& pvec = graph._var_agent_q_vars.at(rec.multi_var_ids[p]);
-				for (int j = 0; j < d; ++j)
-					sub[pvec[j]] = Expression(W(sg_node, combo[p] * d + j));
+				const auto& pvec = graph._var_agent_q.Vars(rec.multi_var_ids[p]);
+				for (int j = 0; j < pvec.size(); ++j)
+					sub[pvec[j]] = Expression(W(sg_node, combo[p] * graph.dim + j));
 			}
-			for (int ag = 0; ag < n_agents; ++ag)
-				for (int j = 0; j < d; ++j)
-					sub[graph._agent_q_vars[ag][j]] = Expression(W(sg_node, ag * d + j));
-			for (int o = 0; o < n_objects; ++o)
-				for (int j = 0; j < obj_dim; ++j)
-					sub[graph._object_q_vars[o][j]] = Expression(
-						W(sg_node, n_agents * d + o * obj_dim + j));
+			graph._agent_q.SubstituteRange(&sub, n_agents, [&](int ag, int j) {
+				return Expression(W(sg_node, ag * graph.dim + j)); });
+			graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
+				return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+			RequireFullySubstituted(rec.formula, sub);
 			drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 			if (first) { f_or = f_sub; first = false; }
 			else        f_or = f_or || f_sub;
@@ -179,20 +241,18 @@ void CompileSymbolicNodeConstraint(
 		const int variable_k = subgraph.subgraph_variable_id(var);
 		if (variable_k < 0) return;
 
-		const auto& var_agent_vars = graph._var_agent_q_vars.at(var);
+		const auto& var_agent_vars = graph._var_agent_q.Vars(var);
 		const double M_sym = ConservativeStateBigM(graph);
 
 		for (int i = 0; i < n_agents; ++i) {
 			drake::symbolic::Substitution sub;
-			for (int j = 0; j < d; ++j)
-				sub[var_agent_vars[j]] = Expression(W(sg_node, i * d + j));
-			for (int kk = 0; kk < n_agents; ++kk)
-				for (int j = 0; j < d; ++j)
-					sub[graph._agent_q_vars[kk][j]] = Expression(W(sg_node, kk * d + j));
-			for (int o = 0; o < n_objects; ++o)
-				for (int j = 0; j < obj_dim; ++j)
-					sub[graph._object_q_vars[o][j]] = Expression(
-						W(sg_node, n_agents * d + o * obj_dim + j));
+			for (int j = 0; j < var_agent_vars.size(); ++j)
+				sub[var_agent_vars[j]] = Expression(W(sg_node, i * graph.dim + j));
+			graph._agent_q.SubstituteRange(&sub, n_agents, [&](int kk, int j) {
+				return Expression(W(sg_node, kk * graph.dim + j)); });
+			graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
+				return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+			RequireFullySubstituted(rec.formula, sub);
 			drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 			Expression s = Assignments(variable_k, i);
 			AddBigMGatedFormula(prog, f_sub, {s}, M_sym);
@@ -210,12 +270,11 @@ void CompileSymbolicNodeConstraint(
 	// Plain node constraint (no assignable var placeholders referenced).
 	const int sg_node = subgraph.subgraph_id(rec.node);
 	drake::symbolic::Substitution sub;
-	for (int i = 0; i < n_agents; ++i)
-		for (int j = 0; j < d; ++j)
-			sub[graph._agent_q_vars[i][j]] = Expression(W(sg_node, i * d + j));
-	for (int o = 0; o < n_objects; ++o)
-		for (int j = 0; j < obj_dim; ++j)
-			sub[graph._object_q_vars[o][j]] = Expression(W(sg_node, n_agents * d + o * obj_dim + j));
+	graph._agent_q.SubstituteRange(&sub, n_agents, [&](int i, int j) {
+		return Expression(W(sg_node, i * graph.dim + j)); });
+	graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
+		return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+	RequireFullySubstituted(rec.formula, sub);
 	prog.AddConstraint(rec.formula.Substitute(sub));
 }
 
@@ -230,29 +289,25 @@ void CompileAlongEdgeConstraintAtNode(
 	const Expression* extra_gate) {
 
 	const int n_agents = graph.num_agents;
-	const int d = graph.dim;
 	const int n_objects = graph.num_objects;
-	const int obj_dim = graph.non_robot_dim;
 
 	if (rec.var_id.has_value()) {
 		const int var = rec.var_id.value();
 		const int variable_k = subgraph.subgraph_variable_id(var);
 		if (variable_k < 0) return;
 
-		const auto& var_agent_vars = graph._var_agent_q_vars.at(var);
+		const auto& var_agent_vars = graph._var_agent_q.Vars(var);
 		const double M_sym = ConservativeStateBigM(graph);
 
 		for (int i = 0; i < n_agents; ++i) {
 			drake::symbolic::Substitution sub;
-			for (int j = 0; j < d; ++j)
-				sub[var_agent_vars[j]] = Expression(W(sg_node, i * d + j));
-			for (int kk = 0; kk < n_agents; ++kk)
-				for (int j = 0; j < d; ++j)
-					sub[graph._agent_q_vars[kk][j]] = Expression(W(sg_node, kk * d + j));
-			for (int o = 0; o < n_objects; ++o)
-				for (int j = 0; j < obj_dim; ++j)
-					sub[graph._object_q_vars[o][j]] = Expression(
-						W(sg_node, n_agents * d + o * obj_dim + j));
+			for (int j = 0; j < var_agent_vars.size(); ++j)
+				sub[var_agent_vars[j]] = Expression(W(sg_node, i * graph.dim + j));
+			graph._agent_q.SubstituteRange(&sub, n_agents, [&](int kk, int j) {
+				return Expression(W(sg_node, kk * graph.dim + j)); });
+			graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
+				return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+			RequireFullySubstituted(rec.formula, sub);
 			drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 			std::vector<Expression> gates = {Assignments(variable_k, i)};
 			if (extra_gate) gates.push_back(*extra_gate);
@@ -263,12 +318,11 @@ void CompileAlongEdgeConstraintAtNode(
 
 	// Literal-agent / object-only formula.
 	drake::symbolic::Substitution sub;
-	for (int i = 0; i < n_agents; ++i)
-		for (int j = 0; j < d; ++j)
-			sub[graph._agent_q_vars[i][j]] = Expression(W(sg_node, i * d + j));
-	for (int o = 0; o < n_objects; ++o)
-		for (int j = 0; j < obj_dim; ++j)
-			sub[graph._object_q_vars[o][j]] = Expression(W(sg_node, n_agents * d + o * obj_dim + j));
+	graph._agent_q.SubstituteRange(&sub, n_agents, [&](int i, int j) {
+		return Expression(W(sg_node, i * graph.dim + j)); });
+	graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
+		return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+	RequireFullySubstituted(rec.formula, sub);
 	drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 
 	if (!extra_gate) {
@@ -300,9 +354,7 @@ void CompileSymbolicEdgeConstraint(
 	}
 
 	const int n_agents = graph.num_agents;
-	const int d = graph.dim;
 	const int n_objects = graph.num_objects;
-	const int obj_dim = graph.non_robot_dim;
 
 	const int sg_u_node = subgraph.subgraph_id(rec.u_node);
 	const int sg_v_node = subgraph.subgraph_id(rec.v_node);
@@ -320,18 +372,15 @@ void CompileSymbolicEdgeConstraint(
 	};
 
 	drake::symbolic::Substitution sub;
-	for (int i = 0; i < n_agents; ++i) {
-		for (int j = 0; j < d; ++j) {
-			sub[graph._agent_q_vars_u[i][j]] = row_expr(sg_u_node, rec.u_node, i * d + j);
-			sub[graph._agent_q_vars_v[i][j]] = row_expr(sg_v_node, rec.v_node, i * d + j);
-		}
-	}
-	for (int o = 0; o < n_objects; ++o) {
-		for (int j = 0; j < obj_dim; ++j) {
-			sub[graph._object_q_vars_u[o][j]] = row_expr(sg_u_node, rec.u_node, n_agents * d + o * obj_dim + j);
-			sub[graph._object_q_vars_v[o][j]] = row_expr(sg_v_node, rec.v_node, n_agents * d + o * obj_dim + j);
-		}
-	}
+	graph._agent_q_u.SubstituteRange(&sub, n_agents, [&](int i, int j) {
+		return row_expr(sg_u_node, rec.u_node, i * graph.dim + j); });
+	graph._agent_q_v.SubstituteRange(&sub, n_agents, [&](int i, int j) {
+		return row_expr(sg_v_node, rec.v_node, i * graph.dim + j); });
+	graph._object_q_u.SubstituteRange(&sub, n_objects, [&](int o, int j) {
+		return row_expr(sg_u_node, rec.u_node, n_agents * graph.dim + o * graph.non_robot_dim + j); });
+	graph._object_q_v.SubstituteRange(&sub, n_objects, [&](int o, int j) {
+		return row_expr(sg_v_node, rec.v_node, n_agents * graph.dim + o * graph.non_robot_dim + j); });
+	RequireFullySubstituted(rec.formula, sub);
 	prog.AddConstraint(rec.formula.Substitute(sub));
 }
 
@@ -347,22 +396,18 @@ double EvaluateSymbolicNodeConstraint(
 	}
 
 	const int n_agents = graph.num_agents;
-	const int d = graph.dim;
 	const int n_objects = graph.num_objects;
-	const int obj_dim = graph.non_robot_dim;
 
 	drake::symbolic::Environment env;
 	if (rec.var_id.has_value()) {
-		const auto& var_agent_vars = graph._var_agent_q_vars.at(rec.var_id.value());
-		for (int j = 0; j < d; ++j)
-			env.insert(var_agent_vars[j], x[assigned_agent * d + j]);
+		const auto& var_agent_vars = graph._var_agent_q.Vars(rec.var_id.value());
+		for (int j = 0; j < var_agent_vars.size(); ++j)
+			env.insert(var_agent_vars[j], x[assigned_agent * graph.dim + j]);
 	}
-	for (int i = 0; i < n_agents; ++i)
-		for (int j = 0; j < d; ++j)
-			env.insert(graph._agent_q_vars[i][j], x[i * d + j]);
-	for (int o = 0; o < n_objects; ++o)
-		for (int j = 0; j < obj_dim; ++j)
-			env.insert(graph._object_q_vars[o][j], x[n_agents * d + o * obj_dim + j]);
+	graph._agent_q.InsertRange(&env, n_agents, [&](int i, int j) { return x[i * graph.dim + j]; });
+	graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
+		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
+	InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
 	return ComputeViolation(rec.formula, env);
 }
 
@@ -373,9 +418,7 @@ double EvaluateSymbolicEdgeConstraint(
 	const Eigen::VectorXi& var_assignments) {
 
 	const int n_agents = graph.num_agents;
-	const int d = graph.dim;
 	const int n_objects = graph.num_objects;
-	const int obj_dim = graph.non_robot_dim;
 
 	drake::symbolic::Environment env;
 
@@ -385,22 +428,20 @@ double EvaluateSymbolicEdgeConstraint(
 		// add_edge_constraint) -- a single joint configuration snapshot
 		// substitutes them all, same as a node constraint's evaluator.
 		if (rec.var_id.has_value()) {
-			const auto& var_agent_vars = graph._var_agent_q_vars.at(rec.var_id.value());
+			const auto& var_agent_vars = graph._var_agent_q.Vars(rec.var_id.value());
 			const int assigned_agent = var_assignments(rec.var_id.value());
-			for (int j = 0; j < d; ++j)
-				env.insert(var_agent_vars[j], x[assigned_agent * d + j]);
+			for (int j = 0; j < var_agent_vars.size(); ++j)
+				env.insert(var_agent_vars[j], x[assigned_agent * graph.dim + j]);
 		}
-		for (int i = 0; i < n_agents; ++i)
-			for (int j = 0; j < d; ++j)
-				env.insert(graph._agent_q_vars[i][j], x[i * d + j]);
-		for (int o = 0; o < n_objects; ++o)
-			for (int j = 0; j < obj_dim; ++j)
-				env.insert(graph._object_q_vars[o][j], x[n_agents * d + o * obj_dim + j]);
+		graph._agent_q.InsertRange(&env, n_agents, [&](int i, int j) { return x[i * graph.dim + j]; });
+		graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
+			return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
+		InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
 		return ComputeSignedViolation(rec.formula, env);
 	}
 
-	// Relational formula coupling agent_q_u/object_q_u (u side) and
-	// agent_q_v/object_q_v (v side). Runtime backtracking only ever has one
+	// Relational formula coupling u_agent_q/u_object_q (u side) and
+	// v_agent_q/v_object_q (v side). Runtime backtracking only ever has one
 	// observed state (the current x), not the two separate solved waypoints
 	// add_edge_constraint's formula was written against for u_node/v_node --
 	// so both sides substitute from that same x. That's moot in practice for
@@ -409,17 +450,11 @@ double EvaluateSymbolicEdgeConstraint(
 	// routes inequality-only formulas through evaluate_edge_phi's tol=0.00
 	// backtracking path (see IsInequalityFormula there); an equality edge
 	// phi's invariant isn't observable from a single snapshot anyway.
-	for (int i = 0; i < n_agents; ++i) {
-		for (int j = 0; j < d; ++j) {
-			env.insert(graph._agent_q_vars_u[i][j], x[i * d + j]);
-			env.insert(graph._agent_q_vars_v[i][j], x[i * d + j]);
-		}
-	}
-	for (int o = 0; o < n_objects; ++o) {
-		for (int j = 0; j < obj_dim; ++j) {
-			env.insert(graph._object_q_vars_u[o][j], x[n_agents * d + o * obj_dim + j]);
-			env.insert(graph._object_q_vars_v[o][j], x[n_agents * d + o * obj_dim + j]);
-		}
-	}
+	graph._agent_q_u.InsertRange(&env, n_agents, [&](int i, int j) { return x[i * graph.dim + j]; });
+	graph._agent_q_v.InsertRange(&env, n_agents, [&](int i, int j) { return x[i * graph.dim + j]; });
+	graph._object_q_u.InsertRange(&env, n_objects, [&](int o, int j) {
+		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
+	graph._object_q_v.InsertRange(&env, n_objects, [&](int o, int j) {
+		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
 	return ComputeSignedViolation(rec.formula, env);
 }

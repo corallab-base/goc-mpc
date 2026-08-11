@@ -10,7 +10,6 @@
 #include "milp_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
-#include "../grid_interpolant.hpp"
 
 using drake::symbolic::Expression;
 namespace py = pybind11;
@@ -315,26 +314,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.value("kAvgL1",         WaypointObjective::kAvgL1)
 		.value("kMinMaxL2",      WaypointObjective::kMinMaxL2)
 		.value("kAvgL2",         WaypointObjective::kAvgL2)
-		.value("kMinMaxGeodesic", WaypointObjective::kMinMaxGeodesic)
-		.value("kAvgGeodesic",    WaypointObjective::kAvgGeodesic)
 		.export_values();
-
-	py::class_<EdgeCostFunctor, std::shared_ptr<EdgeCostFunctor>>(goc_mpc, "EdgeCostFunctor");
-
-	py::class_<RegularGridInterpolant, EdgeCostFunctor,
-		   std::shared_ptr<RegularGridInterpolant>>(goc_mpc, "RegularGridInterpolant")
-		.def(py::init<Eigen::VectorXd, Eigen::VectorXd, std::vector<int>, Eigen::VectorXd>(),
-		     py::arg("origin"),
-		     py::arg("spacing"),
-		     py::arg("shape"),
-		     py::arg("values"))
-		.def("dim", &RegularGridInterpolant::dim)
-		.def("interpolate", &RegularGridInterpolant::Interpolate<double>, py::arg("query"));
 
 	py::class_<GraphWaypointMPC, std::shared_ptr<GraphWaypointMPC>>(goc_mpc, "GraphWaypointMPC")
 		.def("solve", &GraphWaypointMPC::Solve)
-		.def("evaluate_edge_cost", &GraphWaypointMPC::EvaluateEdgeCost,
-		     py::arg("agent"), py::arg("w_a"), py::arg("w_b"))
 		.def("view_waypoints", &GraphWaypointMPC::view_waypoints, py::return_value_policy::reference_internal)
 		.def("view_assignments", &GraphWaypointMPC::view_assignments, py::return_value_policy::reference_internal)
 		.def("view_var_assignments", &GraphWaypointMPC::view_var_assignments, py::return_value_policy::reference_internal)
@@ -346,15 +329,13 @@ void init_submodule_goc_mpc(py::module_& m) {
 			      std::vector<CubicConfigurationSpline>,
 			      WaypointSolver,
 			      bool,
-			      WaypointObjective,
-			      std::shared_ptr<EdgeCostFunctor>>(),
+			      WaypointObjective>(),
 		     py::keep_alive<1, 2>(),
 		     py::arg("graph"),
 		     py::arg("splines"),
 		     py::arg("solver")            = WaypointSolver::kGurobi,
 		     py::arg("enforce_rigidity")  = false,
-		     py::arg("objective")         = WaypointObjective::kMinMaxL1,
-		     py::arg("edge_cost_fn")      = std::shared_ptr<EdgeCostFunctor>())
+		     py::arg("objective")         = WaypointObjective::kMinMaxL1)
 		.def("view_t", &MILPWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		.def("view_Z", &MILPWaypointMPC::view_Z, py::return_value_policy::reference_internal);
 

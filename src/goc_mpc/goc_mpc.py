@@ -12,8 +12,6 @@ from ._ext.goc_mpc import (
     MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
-    EdgeCostFunctor,
-    RegularGridInterpolant,
 )
 
 
@@ -27,12 +25,11 @@ class GraphOfConstraintsMPC():
             waypoint_solver: WaypointSolver = WaypointSolver.kGurobi,
             waypoint_objective: WaypointObjective = WaypointObjective.kMinMaxL1,
             waypoint_enforce_rigidity: bool = False,
-            edge_cost_fn: EdgeCostFunctor | None = None,
             # pass an already-constructed GraphWaypointMPC (e.g. an
             # EvolutionaryWaypointSolver, which is duck-typed to this
             # protocol rather than a real C++ subclass) to use it directly;
             # waypoint_solver/waypoint_objective/
-            # waypoint_enforce_rigidity/edge_cost_fn are then ignored, since the
+            # waypoint_enforce_rigidity are then ignored, since the
             # instance is already configured. Leave unset (default) to keep
             # auto-building a MILPWaypointMPC from those args, as before.
             waypoint_mpc: GraphWaypointMPC | None = None,
@@ -122,14 +119,10 @@ class GraphOfConstraintsMPC():
             # passed at construction, same as the auto-built path below).
             self.waypoint_mpc = waypoint_mpc
         else:
-            waypoint_mpc_kwargs = {}
-            if edge_cost_fn is not None:
-                waypoint_mpc_kwargs["edge_cost_fn"] = edge_cost_fn
             self.waypoint_mpc = MILPWaypointMPC(graph, self.last_cycle_splines,
                                                 solver = waypoint_solver,
                                                 objective = waypoint_objective,
-                                                enforce_rigidity = waypoint_enforce_rigidity,
-                                                **waypoint_mpc_kwargs)
+                                                enforce_rigidity = waypoint_enforce_rigidity)
         self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines,
                                          time_cost, time_cost2, acceleration_cost,
                                          energy_cost, arclength_cost,
