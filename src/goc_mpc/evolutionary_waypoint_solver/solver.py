@@ -1,43 +1,36 @@
-"""Port of examples/new_p1_experiments/lamarckian_al.py's
-build_lamarckian_ga/run_lamarckian_al/warmup_lamarckian_al and their
-supporting Augmented-Lagrangian + batched-L-BFGS + GA-operator internals,
-essentially unchanged -- see that file's module docstring for the full
-design rationale (single jax.lax.scan generation loop, Lamarckian AL+L-BFGS
-local refinement of `wp`, order-crossover + 2-opt/Or-opt local search of
-`t`, smooth combined-score ranking).
+"""Augmented-Lagrangian + batched-L-BFGS + GA-operator solver for
+GraphOrderingRelaxed (problem.py): a single jax.lax.scan generation loop
+combining Lamarckian AL+L-BFGS local refinement of `wp`, order-crossover +
+2-opt/Or-opt local search of `t`, and smooth combined-score ranking.
 
-Changes from the original:
-  1. `problem` now additionally carries a `cond_binary` decision-variable
-     block (see problem.GraphOrderingRelaxed's docstring) threaded alongside
-     `assign` everywhere `problem._batched`/`problem._extract_batch` are
-     called -- `eq_constraints`/`ineq_constraints` functions themselves keep
-     the original `fn(assign, t, wp)` 3-arg contract unchanged, since they
-     never need it.
-  2. `build_lamarckian_ga` no longer builds its own initial population: it
-     returns a jitted `step(carry_in, x0) -> carry_out` over an arbitrary
-     carry (X, mu, lam, rho, F, CV, key, best_X, best_F, best_CV). Building
-     the *first* carry (random population + precedence-heuristic seeding) is
-     now `build_initial_carry_fn`, and `carry_from_population` wraps an
-     existing population (e.g. a previous call's `Result.pop[0]`) into a
-     fresh carry for a new (but same-shaped) problem. This is what lets a
-     caller resume a previous run's population/AL-state/PRNG stream -- via
-     `run_lamarckian_al(_init_carry=...)` -- instead of cold-restarting the
-     search every call; see EvolutionaryWaypointSolver (mpc.py) for how this
-     is used to warm-start consecutive MPC-tick solves.
-  3. `x0` (the depot) is a genuine argument of `step`/`problem._batched`
-     (threaded down through `merit`/`local_refine`/the routing local search/
-     `_evaluate_population_jax`), not a value baked into `problem`'s kernel
-     closures at construction time -- so a compiled `step` (and everything it
-     closes over) stays valid across depot drift between MPC ticks without
-     retracing, as long as `problem`'s *structure* (shapes, edges,
-     constraints -- i.e. `remaining_vertices`) is unchanged. Only
-     `build_initial_carry_fn`'s cold-start `init(key)` still uses a fixed
-     `problem.x0` (via the eager numpy precedence-seeding heuristic, which
-     can't run under a dynamic-x0 trace) -- acceptable since it only runs
-     once per distinct problem shape, never on the warm-started hot path.
+`build_lamarckian_ga` returns a jitted `step(carry_in, x0, anchor) ->
+carry_out` over an arbitrary carry (X, mu, lam, rho, F, CV, key, best_X,
+best_F, best_CV) -- it does not build its own initial population. Building
+the *first* carry (random population + precedence-heuristic seeding) is
+`build_initial_carry_fn`; `carry_from_population` wraps an existing
+population (e.g. a previous call's `Result.pop[0]`) into a fresh carry for a
+new (but same-shaped) problem, letting a caller resume a previous run's
+population/AL-state/PRNG stream -- via `run_lamarckian_al(_init_carry=...)`
+-- instead of cold-restarting the search every call (see
+EvolutionaryWaypointSolver in mpc.py, which warm-starts every MPC tick this
+way).
 
-The self-check functions and __main__ block from the original file are
-example/experiment scaffolding, not part of this production port.
+`x0` (the full configuration -- state_dim-wide, agent depot then object
+depot, see problem.apply_anchor) and `anchor` (problem.AnchorState) are
+genuine arguments of `step`/`problem._batched`, not values baked into
+`problem`'s kernel closures at construction time, so a compiled `step` (and
+everything it closes over) stays valid across depot drift and
+remaining_vertices changes between MPC ticks without retracing, as long as
+`problem`'s structure (shapes, edges, constraints) is unchanged. `x0` is
+both what problem.apply_anchor substitutes in for a "live"-mode constraint's
+passed-node reads, and (sliced down to its (n_agents, dim) agent-only view
+via problem.agent_depot, right where kernel.py's routing math needs it) the
+routing depot -- one real-state value flowing through this whole stack.
+Only `build_initial_carry_fn`'s cold-start `init(key)` uses a fixed
+`problem.x0` (the eager numpy precedence-seeding heuristic can't run under a
+dynamic-x0 trace, and `problem.x0` is itself only ever agent-shaped -- see
+problem.pad_to_state_dim) -- acceptable since it only runs once per distinct
+problem shape, never on the warm-started hot path.
 """
 
 import time
@@ -47,7 +40,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .problem import apply_anchor
+from .problem import apply_anchor, agent_depot, pad_to_state_dim
 
 jax.config.update("jax_enable_x64", True)
 
@@ -57,25 +50,35 @@ jax.config.update("jax_enable_x64", True)
 # ---------------------------------------------------------------------------
 
 def _make_merit_batched(problem, wp_shape):
-    n_dense_nodes, state_dim = wp_shape
+    n_nodes, state_dim = wp_shape
     batched_kernel = problem._batched
     eq_fns, ineq_fns = problem._eq_constraints, problem._ineq_constraints
 
     def merit(wp_flat, assign, cond_binary, t, mu, lam, rho, x0, anchor):
-        wp = wp_flat.reshape(-1, n_dense_nodes, state_dim)
+        wp = wp_flat.reshape(-1, n_nodes, state_dim)
         # anchor splices remaining_vertices state in once here: a node/
-        # variable no longer in remaining_vertices reads back as its last-
-        # committed constant (assign_eff/wp_eff), not the free wp_flat/
-        # assign value being optimized -- see problem.apply_anchor.
-        assign_eff, wp_eff = apply_anchor(problem, assign, wp, anchor)
-        F, _g_kernel = batched_kernel(assign_eff, cond_binary, t, wp_eff, x0, anchor.node_active)
+        # variable no longer in remaining_vertices reads back as either its
+        # last-committed planned constant (wp_eff_frozen) or the current call's
+        # real state (wp_eff_live, straight from `x0` -- see problem.apply_anchor)
+        # -- whichever a given eq/ineq fn was compiled to read -- not the free
+        # wp_flat/assign value being optimized. Routing (batched_kernel) never
+        # reads a passed row either way, so it's handed wp_eff_frozen
+        # arbitrarily; it only ever wants x0's agent-depot slice regardless
+        # (problem.agent_depot).
+        assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
+        F, _g_kernel = batched_kernel(assign_eff, cond_binary, t, wp_eff_frozen, agent_depot(problem, x0),
+                                       anchor.node_active)
 
         total = F
         if eq_fns:
-            h = jnp.concatenate([fn(assign_eff, t, wp_eff) for fn in eq_fns], axis=1)
+            h = jnp.concatenate(
+                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+                 for fn in eq_fns], axis=1)
             total = total + jnp.sum(mu * h, axis=1) + 0.5 * rho * jnp.sum(h * h, axis=1)
         if ineq_fns:
-            g = jnp.concatenate([fn(assign_eff, t, wp_eff) for fn in ineq_fns], axis=1)
+            g = jnp.concatenate(
+                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+                 for fn in ineq_fns], axis=1)
             z = jnp.maximum(0.0, lam + rho[:, None] * g)
             total = total + (jnp.sum(z * z, axis=1) - jnp.sum(lam * lam, axis=1)) / (2.0 * rho)
         return total
@@ -89,11 +92,12 @@ def _make_merit_batched(problem, wp_shape):
     return merit_and_grad
 
 
-def _eval_residuals_batched(fns, assign, t, wp):
-    pop = wp.shape[0]
+def _eval_residuals_batched(fns, assign, cond_binary, t, wp_frozen, wp_live, node_active):
+    pop = wp_frozen.shape[0]
     if not fns:
         return jnp.zeros((pop, 0))
-    return jnp.concatenate([fn(assign, t, wp) for fn in fns], axis=1)
+    return jnp.concatenate(
+        [fn(assign, cond_binary, t, wp_frozen, wp_live, node_active) for fn in fns], axis=1)
 
 
 def _violation_batched(h, g):
@@ -202,9 +206,9 @@ def _lbfgs_solve(merit_and_grad_fixed, wp_flat0, m, inner_maxiter, max_ls_trials
 
 def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, rho_max,
                                 lbfgs_history=10, ls_max_trials=10):
-    n_dense_nodes, state_dim = problem.n_dense_nodes, problem.state_dim
+    n_nodes, state_dim = problem.n_nodes, problem.state_dim
     eq_fns, ineq_fns = problem._eq_constraints, problem._ineq_constraints
-    merit_and_grad = _make_merit_batched(problem, (n_dense_nodes, state_dim))
+    merit_and_grad = _make_merit_batched(problem, (n_nodes, state_dim))
 
     lo = jnp.asarray(problem.xl[problem.wp_offset:])
     hi = jnp.asarray(problem.xu[problem.wp_offset:])
@@ -217,19 +221,23 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             return merit_and_grad(w, assign, cond_binary, t, mu, lam, rho, x0, anchor)
 
         for _ in range(outer_iters):
-            assign_eff, wp_eff0 = apply_anchor(
-                problem, assign, wp_flat.reshape(pop, n_dense_nodes, state_dim), anchor)
-            h0 = _eval_residuals_batched(eq_fns, assign_eff, t, wp_eff0)
-            g0 = _eval_residuals_batched(ineq_fns, assign_eff, t, wp_eff0)
+            assign_eff, wp_eff0_frozen, wp_eff0_live = apply_anchor(
+                problem, assign, wp_flat.reshape(pop, n_nodes, state_dim), anchor, x0)
+            h0 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff0_frozen, wp_eff0_live,
+                                          anchor.node_active)
+            g0 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff0_frozen, wp_eff0_live,
+                                          anchor.node_active)
             v0 = _violation_batched(h0, g0)
 
             wp_flat = _lbfgs_solve(merit_and_grad_fixed, wp_flat, lbfgs_history, inner_maxiter, ls_max_trials)
             wp_flat = jnp.clip(wp_flat, lo, hi)
 
-            wp = wp_flat.reshape(pop, n_dense_nodes, state_dim)
-            assign_eff, wp_eff1 = apply_anchor(problem, assign, wp, anchor)
-            h1 = _eval_residuals_batched(eq_fns, assign_eff, t, wp_eff1)
-            g1 = _eval_residuals_batched(ineq_fns, assign_eff, t, wp_eff1)
+            wp = wp_flat.reshape(pop, n_nodes, state_dim)
+            assign_eff, wp_eff1_frozen, wp_eff1_live = apply_anchor(problem, assign, wp, anchor, x0)
+            h1 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff1_frozen, wp_eff1_live,
+                                          anchor.node_active)
+            g1 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff1_frozen, wp_eff1_live,
+                                          anchor.node_active)
             v1 = _violation_batched(h1, g1)
 
             if eq_fns:
@@ -242,7 +250,7 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
                                       x0=x0, anchor=anchor):
                 return merit_and_grad(w, assign, cond_binary, t, mu, lam, rho, x0, anchor)
 
-        return wp_flat.reshape(pop, n_dense_nodes, state_dim), mu, lam, rho
+        return wp_flat.reshape(pop, n_nodes, state_dim), mu, lam, rho
 
     return batched_local_refine
 
@@ -381,10 +389,14 @@ def _routing_local_search_batched(problem, key, assign, cond_binary, t, wp, x0, 
     """`assign`/`wp` are expected to already be anchor-substituted
     (assign_eff/wp_eff, see problem.apply_anchor) -- callers compute that
     once per generation and pass the effective values straight through here,
-    since this function's own problem._batched calls need it every trial."""
+    since this function's own problem._batched calls need it every trial.
+    `x0` is the full configuration (see problem.apply_anchor) -- sliced down
+    to its agent-depot view once here since that's all problem._batched
+    (routing) ever reads."""
     pop, n_nodes = t.shape
     max_or_opt_seg_len = max(1, min(max_or_opt_seg_len, n_nodes - 1)) if n_nodes > 1 else 0
     or_opt_prob = or_opt_prob if max_or_opt_seg_len > 0 else 0.0
+    agent_x0 = agent_depot(problem, x0)
 
     def body(carry, k):
         t_cur, F_cur = carry
@@ -410,13 +422,13 @@ def _routing_local_search_batched(problem, key, assign, cond_binary, t, wp, x0, 
         rank = jnp.broadcast_to(jnp.arange(n_nodes), (pop, n_nodes))
         t_new = jnp.zeros((pop, n_nodes)).at[row_idx, new_perm].set(rank)
 
-        F_new, _ = problem._batched(assign, cond_binary, t_new, wp, x0, node_active)
+        F_new, _ = problem._batched(assign, cond_binary, t_new, wp, agent_x0, node_active)
         accept = F_new < F_cur
         t_next = jnp.where(accept[:, None], t_new, t_cur)
         F_next = jnp.where(accept, F_new, F_cur)
         return (t_next, F_next), None
 
-    F0, _ = problem._batched(assign, cond_binary, t, wp, x0, node_active)
+    F0, _ = problem._batched(assign, cond_binary, t, wp, agent_x0, node_active)
     keys = jax.random.split(key, n_trials)
     (t_final, _), _ = jax.lax.scan(body, (t, F0), keys)
     return t_final
@@ -438,11 +450,16 @@ def _calc_cv_jax(pop, G, H, eq_eps=1e-4):
 def _evaluate_population_jax(problem, X, x0, anchor):
     pop = X.shape[0]
     assign, cond_binary, t, wp = problem._extract_batch(X)
-    assign_eff, wp_eff = apply_anchor(problem, assign, wp, anchor)
-    F, _G_kernel = problem._batched(assign_eff, cond_binary, t, wp_eff, x0, anchor.node_active)
-    G = (jnp.concatenate([fn(assign_eff, t, wp_eff) for fn in problem._ineq_constraints], axis=1)
+    assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
+    F, _G_kernel = problem._batched(assign_eff, cond_binary, t, wp_eff_frozen, agent_depot(problem, x0),
+                                     anchor.node_active)
+    G = (jnp.concatenate(
+            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+             for fn in problem._ineq_constraints], axis=1)
          if problem._ineq_constraints else None)
-    H = (jnp.concatenate([fn(assign_eff, t, wp_eff) for fn in problem._eq_constraints], axis=1)
+    H = (jnp.concatenate(
+            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+             for fn in problem._eq_constraints], axis=1)
          if problem._eq_constraints else None)
     CV = _calc_cv_jax(pop, G, H)
     return F, CV
@@ -534,10 +551,14 @@ def _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob
         off_X = _write_wp_batch_jax(problem, child_X, child_wp_star)
 
         off_assign, off_cond_binary, off_t, off_wp = problem._extract_batch(off_X)
-        off_assign_eff, off_wp_eff = apply_anchor(problem, off_assign, off_wp, anchor)
-        off_t = _routing_local_search_batched(problem, k_2opt, off_assign_eff, off_cond_binary, off_t, off_wp_eff,
-                                               x0, anchor.node_active, n_2opt_trials, or_opt_prob=or_opt_prob,
-                                               max_or_opt_seg_len=max_or_opt_seg_len)
+        # Routing local search never reads a passed row's value either way
+        # (masked out via node_active regardless -- see kernel.py), so
+        # off_wp_eff_frozen is handed to it arbitrarily; off_wp_eff_live is
+        # unused here.
+        off_assign_eff, off_wp_eff_frozen, _off_wp_eff_live = apply_anchor(problem, off_assign, off_wp, anchor, x0)
+        off_t = _routing_local_search_batched(problem, k_2opt, off_assign_eff, off_cond_binary, off_t,
+                                               off_wp_eff_frozen, x0, anchor.node_active, n_2opt_trials,
+                                               or_opt_prob=or_opt_prob, max_or_opt_seg_len=max_or_opt_seg_len)
         off_X = _write_t_batch_jax(problem, off_X, off_t)
 
         off_F, off_CV = _evaluate_population_jax(problem, off_X, x0, anchor)
@@ -583,13 +604,13 @@ def _seed_initial_population(problem, key, X0, n_seed, seed_jitter_t, seed_jitte
         # holds the wrapped batched closures from _batch_python_constraint_fn,
         # which never copies it over -- so _seed_precedence_permutation's
         # getattr(fn, "node_targets", None) lookup above never matches (pre-
-        # existing behavior, unrelated to the dense wp layout below). Kept
+        # existing behavior, unrelated to the wp row layout below). Kept
         # dimensionally consistent with it regardless, in case that's fixed.
-        n_dense_nodes, state_dim = problem.n_dense_nodes, problem.state_dim
-        wp_lo = jnp.asarray(problem.xl[problem.wp_offset:].reshape(n_dense_nodes, state_dim))
-        wp_hi = jnp.asarray(problem.xu[problem.wp_offset:].reshape(n_dense_nodes, state_dim))
+        n_nodes, state_dim = problem.n_nodes, problem.state_dim
+        wp_lo = jnp.asarray(problem.xl[problem.wp_offset:].reshape(n_nodes, state_dim))
+        wp_hi = jnp.asarray(problem.xu[problem.wp_offset:].reshape(n_nodes, state_dim))
         key, k_seed_wp = jax.random.split(key)
-        jitter_wp = jax.random.normal(k_seed_wp, (n_seed, n_dense_nodes, state_dim), dtype=X0.dtype) * (seed_jitter_wp_frac * (wp_hi - wp_lo))
+        jitter_wp = jax.random.normal(k_seed_wp, (n_seed, n_nodes, state_dim), dtype=X0.dtype) * (seed_jitter_wp_frac * (wp_hi - wp_lo))
         seed_wp = jnp.asarray(seed_wp_np, dtype=X0.dtype)
         seeded_wp = jnp.clip(seed_wp[None, :, :] + jitter_wp, wp_lo, wp_hi)
         seed_block = _write_wp_batch_jax(problem, seed_block, seeded_wp)
@@ -641,9 +662,10 @@ def carry_from_population(problem, X, x0, key, anchor, mu=None, lam=None, rho=No
     final population (e.g. `Result.pop[0]`) and, when given, its AL
     multiplier state too (e.g. `Result.pop[1:4]`) -- see
     `_carry_from_population`'s docstring for what is and isn't preserved.
-    `x0` is the *current* depot (may differ from whatever `problem` was
-    originally built with -- F0/CV0/best are always freshly evaluated here
-    under this `x0`, never a stale one). `anchor` is likewise the *current*
+    `x0` is the *current* full configuration (state_dim-wide -- see
+    problem.apply_anchor; may differ from whatever `problem` was originally
+    built with -- F0/CV0/best are always freshly evaluated here under this
+    `x0`, never a stale one). `anchor` is likewise the *current*
     remaining_vertices state (problem.AnchorState, see EvolutionaryWaypointSolver.
     _compute_anchor in mpc.py) -- reused population values stay meaningful
     across a remaining_vertices change (a node passing doesn't invalidate
@@ -666,10 +688,15 @@ def build_initial_carry_fn(problem, pop_size, anchor, rho0=1.0,
     solver instance (see EvolutionaryWaypointSolver._ensure_built, mpc.py),
     at which point remaining_vertices == every graph node (problem.
     full_active_anchor), so there's no drift to track across calls the way
-    build_lamarckian_ga's `step` must track x0/anchor drift."""
+    build_lamarckian_ga's `step` must track x0/anchor drift. `problem.x0` is
+    only ever agent-shaped (the structural x0 GraphOrderingSpec was built
+    from, see problem.GraphOrderingRelaxed), so it's zero-padded out to the
+    full state_dim width every other `x0` here now carries (problem.
+    pad_to_state_dim) -- inert padding, since full_active_anchor never
+    actually reads it (nothing's passed yet)."""
     n_var = problem.n_var
     xl, xu = jnp.asarray(problem.xl), jnp.asarray(problem.xu)
-    x0 = jnp.asarray(problem.x0)
+    x0 = pad_to_state_dim(jnp.asarray(problem.x0).reshape(-1), problem.state_dim)
     n_seed = pop_size // 10 if n_seed_individuals is None else n_seed_individuals
     n_seed = max(0, min(n_seed, pop_size))
 
@@ -759,19 +786,22 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
                        ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
                        n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05,
                        _ga_fn=None, _init_carry=None, x0=None):
-    """`x0` (n_agents, dim depots) defaults to `problem.x0` when not given --
-    pass it explicitly to run against a depot that may differ from whatever
-    `problem` was originally built with (the whole point of `_ga_fn`/`step`
-    treating x0 as a live argument rather than a baked-in constant; see
-    build_lamarckian_ga's docstring). `anchor` (problem.AnchorState) is
-    required explicitly -- unlike x0 it has no meaningful problem-level
-    default, since silently falling back to "everything active" would mask
-    remaining_vertices being dropped by a caller by mistake; see
-    EvolutionaryWaypointSolver._compute_anchor (mpc.py) for how to build it
-    from a live remaining_vertices set, or problem.full_active_anchor for
-    the "every node still remaining" bootstrap case."""
+    """`x0` (the full configuration -- state_dim-wide, see problem.
+    apply_anchor) defaults to `problem.x0` (zero-padded out from its
+    agent-only structural shape, see problem.pad_to_state_dim) when not
+    given -- pass it explicitly to run against a real state that may differ
+    from whatever `problem` was originally built with (the whole point of
+    `_ga_fn`/`step` treating x0 as a live argument rather than a baked-in
+    constant; see build_lamarckian_ga's docstring). `anchor` (problem.
+    AnchorState) is required explicitly -- unlike x0 it has no meaningful
+    problem-level default, since silently falling back to "everything
+    active" would mask remaining_vertices being dropped by a caller by
+    mistake; see EvolutionaryWaypointSolver._compute_anchor (mpc.py) for how
+    to build it from a live remaining_vertices set, or problem.
+    full_active_anchor for the "every node still remaining" bootstrap case."""
     start = time.perf_counter()
-    x0_arr = jnp.asarray(x0) if x0 is not None else jnp.asarray(problem.x0)
+    x0_arr = jnp.asarray(x0) if x0 is not None else pad_to_state_dim(
+        jnp.asarray(problem.x0).reshape(-1), problem.state_dim)
     ga_fn = _ga_fn if _ga_fn is not None else build_lamarckian_ga(
         problem, pop_size, n_gen, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
         rho_growth=rho_growth, rho_max=rho_max,
@@ -808,8 +838,9 @@ def warmup_lamarckian_al(problem, anchor, pop_size, n_gen, outer_iters=1, inner_
                           ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
                           n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05,
                           x0=None):
-    """`x0` defaults to `problem.x0` when not given; `anchor` is required --
-    see run_lamarckian_al's docstring."""
+    """`x0` (the full configuration) defaults to `problem.x0` (zero-padded,
+    see run_lamarckian_al's docstring) when not given; `anchor` is
+    required -- see run_lamarckian_al's docstring."""
     ga_fn = build_lamarckian_ga(
         problem, pop_size, n_gen, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
         rho_growth=rho_growth, rho_max=rho_max,
@@ -822,7 +853,8 @@ def warmup_lamarckian_al(problem, anchor, pop_size, n_gen, outer_iters=1, inner_
     init_fn = build_initial_carry_fn(
         problem, pop_size, anchor, rho0=rho0, n_seed_individuals=n_seed_individuals,
         seed_jitter_t=seed_jitter_t, seed_jitter_wp_frac=seed_jitter_wp_frac)
-    x0_arr = jnp.asarray(x0) if x0 is not None else jnp.asarray(problem.x0)
+    x0_arr = jnp.asarray(x0) if x0 is not None else pad_to_state_dim(
+        jnp.asarray(problem.x0).reshape(-1), problem.state_dim)
 
     start = time.perf_counter()
     carry_in = init_fn(jax.random.PRNGKey(0))

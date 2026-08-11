@@ -14,4 +14,7 @@ from .goc_mpc import (
     GraphTimingMPC,
     GraphShortPathMPC,
 )
-from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, GraphOrderingSpec
+try:
+    from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, GraphOrderingSpec
+except ModuleNotFoundError:
+    print("Unable to import EvolutionaryWaypointSolver")

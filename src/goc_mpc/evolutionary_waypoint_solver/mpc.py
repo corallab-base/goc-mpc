@@ -5,22 +5,28 @@ protocol via its `waypoint_mpc=` constructor argument, with no isinstance
 check, so no changes are needed there.
 
 Output buffer shapes/conventions match GraphWaypointMPC's exactly:
-  _waypoints:       (num_nodes, num_agents * dim)
+  _waypoints:       (num_nodes, graph.total_dim) -- agent columns followed by
+                     object columns, one row per node, mirroring
+                     MILP's per-node joint configuration `W`
+                     (graph_of_constraints.cpp:79's `total_dim`). view_
+                     waypoints() keeps returning this whole row (matching
+                     GraphWaypointMPC's contract, which callers already slice
+                     down to the agent columns themselves -- see goc_mpc.py's
+                     step()); view_object_waypoints() returns the object-
+                     column slice as a convenience view. An (node, object)
+                     entry no constraint ever referenced is left as NaN (not
+                     a plausible-looking-but-meaningless value) -- see
+                     GraphOrderingSpec._node_objects.
   _assignments:     (num_phis,)
   _var_assignments: (num_variables,)
   _t_by_node_id:    (num_graph_nodes,)
 so GraphOfConstraintsMPC.step()/_solve_for_waypoints/_solve_for_timing
-consume it identically to MILPWaypointMPC. Additionally:
-  _object_waypoints: (num_nodes, num_objects * non_robot_dim) -- solved
-    object positions, read back via view_object_waypoints(). Entries for an
-    (node, object) pair that no constraint ever referenced are left as NaN
-    (not a plausible-looking-but-meaningless value) -- see
-    GraphOrderingSpec._node_objects.
+consume it identically to MILPWaypointMPC.
 
-The underlying JAX kernel now models a full dense per-node configuration
-(every agent's AND every referenced object's position, one row per node --
-see spec.py's module docstring), the same shape of information
-MILPWaypointMPC's joint `W` carries, just solved via GA+AL instead of MILP.
+The underlying JAX kernel models a full per-node configuration (every
+agent's AND every referenced object's position, one row per node -- see
+spec.py's module docstring), the same shape of information MILPWaypointMPC's
+joint `W` carries, just solved via GA+AL instead of MILP.
 
 Build once, reuse forever, remaining_vertices as a runtime input
 ------------------------------------------------------------------
@@ -39,32 +45,45 @@ not re-applied per solve.
 remaining_vertices' actual effect is now a per-call runtime input instead of
 a structural one: `_compute_anchor` builds a `problem.AnchorState` from
 remaining_vertices plus this solver's own persisted `_waypoints`/
-`_object_waypoints`/`_var_assignments` (a passed node's row, or a committed
-variable's assignment, is exactly the last value THIS solver wrote there,
-and is left untouched by the write-back loops below once it's no longer in
-remaining_vertices -- the same "frozen last-committed value" MILP substitutes
-via `previous_X.row(u_node)`). `problem.apply_anchor`/kernel.py's
-`node_active` argument then splice that in wherever a constraint or routing
-decision reads a node's position or a variable's owner: a node/edge
-constraint anchored at an already-passed node stays correctly enforced
+`_var_assignments` (a passed node's row, or a committed variable's
+assignment, is exactly the last value THIS solver wrote there while it was
+still active, and is left untouched by the write-back loops below once it's
+no longer in remaining_vertices -- the same "frozen last-committed value"
+MILP substitutes via `previous_X.row(u_node)`). `problem.apply_anchor`/
+kernel.py's `node_active` argument then splice that in wherever a constraint
+or routing decision reads a node's position or a variable's owner: a node/
+edge constraint anchored at an already-passed node stays correctly enforced
 against that known constant instead of silently disappearing (the bug this
 design fixes -- see spec.py's module docstring), while ordering edges
 touching a passed node are (correctly) dropped, since precedence against an
 already-visited node is moot.
 
-The one exception to "last value THIS solver wrote there": `solve()` also
-diffs remaining_vertices against the previous call's set, and for any node
-that's freshly no longer in it, overwrites that row with the real x0 given
-on THIS call before anything reads it as an anchor -- see the live-rebind
-comment in `solve()`. Without that, a relational edge constraint anchored at
-a passed node (e.g. a rigid-transport edge) would keep propagating the
-*planned* transform at that node forever, even once the real transform has
-diverged (e.g. a grasp whose real standoff doesn't match the planned one).
-This rebind happens once, at the transition, not every cycle after -- the
-anchor stays a frozen constant, just frozen at the real state rather than
-the nominal plan.
+A passed node's "known constant" is one of TWO choices, not one: `anchor_wp`
+above (the frozen, last-committed-while-active value -- "the planned
+position") or this call's real state (the full-configuration `x0` given to
+solve()/warmup(), read straight off by problem.apply_anchor -- "the live
+position"). Which one a given EDGE constraint's `u`-side residual reads is a
+per-constraint choice made where the constraint is defined
+(GraphOfConstraints.add_edge_constraint(..., live=True) --
+graph_of_constraints.hpp's docstring) -- GraphOrderingSpec reads
+`graph.live_edge_phis` straight off the graph itself, not something this
+class threads through as a constructor argument (there is nothing for a
+caller here to legitimately override; see GraphOrderingSpec.__init__'s own
+docstring comment), nor something this class rebinds or tracks per node --
+there is no "rewrite
+this row because the node just passed" step anywhere here, deliberately: a
+constraint that wants the mobile real state (e.g. a rigid-transport edge,
+where the *real* carried-object position should keep tracking the *real*
+carrying-agent position even after the grasp node's nominal pass point, not
+the grasp node's originally-planned position) should be registered live;
+anything else defaults to frozen, matching `main` branch's
+DeferredEdgeOp.waypoint_builder x_u argument (previous_X.row(u_node)) with no
+artificial rebind hack layered on top. Node constraints have no live/frozen
+choice to make at all (graph_of_constraints.hpp's live_edge_phis comment) --
+GraphOrderingSpec._resolve_symbolic_constraints hardcodes "frozen" for every
+one of them.
 
-Because AnchorState is a fixed-shape pytree (n_dense_nodes/n_variables never
+Because AnchorState is a fixed-shape pytree (n_nodes/n_variables never
 change), passing a different `anchor` value on each call -- like `x0` -- adds
 no retracing, only a cheap-in-Python `_compute_anchor` call. Population reuse
 (`_carry`) is therefore unconditional after the first build too: `solve()`
@@ -101,7 +120,8 @@ _CARRY_KWARGS = ("rho0", "n_seed_individuals", "seed_jitter_t", "seed_jitter_wp_
 
 class EvolutionaryWaypointSolver:
     def __init__(self, graph, splines, objective="avg", edge_cost_fn=None,
-                 wp_bounds=(-10.0, 10.0), pop_size=30, n_gen=60, **lamarckian_kwargs):
+                 wp_bounds=(-10.0, 10.0), pop_size=30, n_gen=60,
+                 **lamarckian_kwargs):
         self._graph = graph
         self._splines = splines
         self._objective = objective
@@ -118,8 +138,15 @@ class EvolutionaryWaypointSolver:
         self._python_constraints = []  # (node, fn, kind, name)
 
         num_nodes = graph.structure.num_nodes
-        self._waypoints = np.zeros((num_nodes, graph.num_agents * graph.dim))
-        self._object_waypoints = np.full((num_nodes, graph.num_objects * graph.non_robot_dim), np.nan)
+        agents_width = graph.num_agents * graph.dim
+        # One row per node -- agent columns then object columns,
+        # mirroring MILP's per-node joint configuration `W` (see module
+        # docstring). Object columns start NaN (never-referenced sentinel,
+        # see view_object_waypoints()); agent columns start 0, overwritten
+        # with a real depot value before ever being read (solve()'s
+        # per-active-node reset, the only writer -- see module docstring).
+        self._waypoints = np.zeros((num_nodes, graph.total_dim))
+        self._waypoints[:, agents_width:] = np.nan
         self._assignments = -np.ones(graph.num_phis, dtype=int)
         self._var_assignments = -np.ones(graph.num_variables, dtype=int)
         self._t_by_node_id = np.zeros(num_nodes)
@@ -134,14 +161,6 @@ class EvolutionaryWaypointSolver:
         self._last_solve_was_warm = False
         self._last_population_reused = False
         self._last_compile_time = 0.0
-
-        # remaining_vertices as of the previous solve() call -- lets solve()
-        # detect a node's active->passed transition (see the live-rebind
-        # comment there) instead of just its current active/passed state.
-        # None before the first solve() call, so no transition is possible
-        # (and none should be: the initial remaining_vertices is the graph's
-        # starting condition, not something that "just passed").
-        self._prev_remaining_set = None
 
     def add_python_constraint(self, node, fn, kind="eq", name=None):
         """Registers fn(wp_row) -> (k,) on `node`, baked into `_problem`'s
@@ -178,8 +197,7 @@ class EvolutionaryWaypointSolver:
         GraphOfConstraintsMPC.step() passes (agents then objects -- see
         _agent_depot). Returns None when `x0` is only agent-depot-sized
         (e.g. a direct low-level solve()/warmup() caller with no object
-        state to give), since there's then nothing live to rebind an
-        object row from."""
+        state to give), since there's then no real object state to report."""
         graph = self._graph
         x0 = np.asarray(x0)
         agents_width = graph.num_agents * graph.dim
@@ -187,6 +205,25 @@ class EvolutionaryWaypointSolver:
         if objects_width > 0 and x0.size == agents_width + objects_width:
             return x0[agents_width:agents_width + objects_width]
         return None
+
+    def _full_x0(self, x0):
+        """Builds the full-configuration runtime x0 (graph.total_dim,) this
+        solver threads through solver.py/problem.py (agent_depot, apply_anchor):
+        the agent depot always, plus the object depot when the caller
+        supplied one (see _object_depot). Zero-filled -- never NaN, to keep
+        the JAX-traced path free of NaNs that could otherwise poison
+        autodiff even through masked-out branches -- for any object column
+        no x0 this solver has ever seen covers (e.g. a direct low-level
+        caller that only ever passes an agent-depot-sized x0, see
+        examples/test_evolutionary_object_constraints.py)."""
+        graph = self._graph
+        agents_width = graph.num_agents * graph.dim
+        row = np.zeros(graph.total_dim)
+        row[:agents_width] = self._agent_depot(x0)
+        obj_flat = self._object_depot(x0)
+        if obj_flat is not None:
+            row[agents_width:] = obj_flat
+        return row
 
     def _ensure_built(self, x0_flat):
         if self._spec is not None:
@@ -208,22 +245,22 @@ class EvolutionaryWaypointSolver:
     def _compute_anchor(self, remaining_vertices):
         """Builds this solve()/warmup() call's AnchorState from
         remaining_vertices plus this solver's own persisted _waypoints/
-        _object_waypoints/_var_assignments -- see module docstring. Cheap
-        (small numpy loops over spec's static, graph-global structure), not
-        part of any JIT-traced path."""
+        _var_assignments -- see module docstring. Cheap (small numpy loops
+        over spec's static, graph-global structure), not part of any
+        JIT-traced path. Only ever populates anchor_wp -- the "frozen,
+        planned" reading; the "live, real state" reading is `x0` itself,
+        supplied straight to problem.apply_anchor by the caller (solve()/
+        warmup()), not something this method builds."""
         graph, spec = self._graph, self._spec
         remaining_set = set(remaining_vertices)
-        dim = graph.dim
-        agents_width = graph.num_agents * dim
 
         node_active = np.array([node in remaining_set for node in spec._node_list], dtype=bool)
 
-        anchor_wp = np.zeros((spec.n_dense_nodes, spec.state_dim))
-        for node_local, node in enumerate(spec._node_list):
+        anchor_wp = np.zeros((spec.n_nodes, spec.state_dim))
+        for node in spec._node_list:
             if node in remaining_set:
                 continue
-            anchor_wp[node_local, :agents_width] = self._waypoints[node]
-            anchor_wp[node_local, agents_width:] = np.nan_to_num(self._object_waypoints[node], nan=0.0)
+            anchor_wp[node, :] = np.nan_to_num(self._waypoints[node], nan=0.0)
 
         var_nodes = {}
         for node, (kind, val) in spec._instance_list:
@@ -255,10 +292,9 @@ class EvolutionaryWaypointSolver:
         population, so this cost is paid once up front instead of on the
         first timed solve() -- which then also starts from a genuinely warm
         population rather than a random one. Returns the compile time."""
-        graph = self._graph
         x0_flat = self._agent_depot(x0)
         self._ensure_built(x0_flat)
-        x0_arr = jnp.asarray(np.asarray(x0_flat).reshape(graph.num_agents, graph.dim))
+        x0_arr = jnp.asarray(self._full_x0(x0))
         anchor = self._compute_anchor(remaining_vertices)
 
         init_fn = build_initial_carry_fn(
@@ -282,37 +318,8 @@ class EvolutionaryWaypointSolver:
         was_already_built = self._spec is not None
         self._ensure_built(x0_flat)
         spec, problem, ga_fn = self._spec, self._problem, self._ga_fn
-        x0_arr = jnp.asarray(np.asarray(x0_flat).reshape(graph.num_agents, dim))
+        x0_arr = jnp.asarray(self._full_x0(x0))
         remaining_set = set(remaining_vertices)
-
-        # Live-rebind: a node's anchor (once it leaves remaining_vertices)
-        # is otherwise whatever THIS solver's own write-back loop last
-        # planned for it while it was still active -- the nominal GA
-        # target, not the real state the graph actually reached. That's
-        # stale for a relational edge constraint anchored at that node
-        # (e.g. a rigid-transport edge): it propagates the *planned*
-        # transform forward, even if the real transform diverged (e.g. a
-        # grasp that doesn't preserve the planned standoff). So the first
-        # solve() call that sees a node freshly missing from
-        # remaining_vertices (compared to the previous call) overwrites
-        # that node's row with the real x0 given THIS call, once, before
-        # anything reads it as an anchor -- not every cycle after, since
-        # AnchorState's contract is a frozen constant once a node has
-        # passed, not a continuously-tracked one.
-        if self._prev_remaining_set is not None:
-            newly_passed = self._prev_remaining_set - remaining_set
-            if newly_passed:
-                obj_flat = self._object_depot(x0)
-                for node in newly_passed:
-                    if node not in spec._node_local_id:
-                        continue
-                    self._waypoints[node] = x0_flat
-                    if obj_flat is not None:
-                        for oid in spec._node_objects.get(node, ()):
-                            col = oid * graph.non_robot_dim
-                            self._object_waypoints[node, col:col + graph.non_robot_dim] = \
-                                obj_flat[col:col + graph.non_robot_dim]
-        self._prev_remaining_set = remaining_set
 
         anchor = self._compute_anchor(remaining_vertices)
         # numpy-side copies for the write-back loops below (cheap, small
@@ -346,48 +353,65 @@ class EvolutionaryWaypointSolver:
 
         self._carry = result.pop
 
-        assign, _cond_binary, t, wp_dense = problem._extract_single(np.asarray(result.X))
-        wp_dense = np.asarray(wp_dense)
+        assign, _cond_binary, t, wp = problem._extract_single(np.asarray(result.X))
+        wp = np.asarray(wp)
         owner_variable = (np.argmax(np.asarray(assign), axis=-1) if spec.n_variables > 0
                           else np.zeros(0, dtype=int))
 
-        # spec._node_list/_node_objects/_var_id_to_slot are graph-global
-        # (see spec.py's class docstring) -- restrict every write-back below
-        # to remaining_vertices (or non-committed variable slots) so an
+        # spec._node_objects/_var_id_to_slot are graph-global (see spec.py's
+        # class docstring) -- restrict every write-back below to
+        # remaining_vertices (or non-committed variable slots) so an
         # already-passed node/committed variable's frozen anchor is never
-        # overwritten with this solve's (masked-out / inert) GA output.
-        for node in remaining_set:
-            if node not in spec._node_local_id:
-                continue
-            self._waypoints[node] = x0_flat   # reset once per node, BEFORE writing any of its instances
-            self._object_waypoints[node] = np.nan
-
-        node_t_this_solve = {}
-        for instance_idx, (node, _) in enumerate(spec._instance_list):
-            if node not in remaining_set:
-                continue
-            kind, val = spec._instance_sources[instance_idx]
-            if kind == "fixed":
-                agent = val
-            else:
-                agent = int(var_anchor_np[val]) if var_committed_np[val] else int(owner_variable[val])
-            node_local = spec._node_local_id[node]
-            self._waypoints[node, agent * dim:(agent + 1) * dim] = \
-                wp_dense[node_local, agent * dim:(agent + 1) * dim]
-            node_t_this_solve[node] = max(node_t_this_solve.get(node, float("-inf")), float(t[instance_idx]))
-        for node, t_val in node_t_this_solve.items():
-            self._t_by_node_id[node] = t_val
-
+        # overwritten with this solve's (masked-out / inert) GA output. A
+        # node id is directly its own row index into wp/t (spec.py
+        # gives every graph node a row, matching MILP), so no node-id ->
+        # row-index conversion is needed anywhere below.
+        #
+        # Agent columns: the GA already solves a full per-node configuration
+        # row -- constrained wherever any formula (a node constraint OR an
+        # edge constraint, e.g. a rigid-transport equality tying a release
+        # node's agent position back to a grasp node's) touches them, its
+        # own AL-driven values elsewhere -- so copy the whole solved row
+        # through unconditionally here, exactly like MILPWaypointMPC.
+        # view_waypoints() (which likewise always returns its whole solved W
+        # row, not filtered by which agent "owns" each node). Downstream
+        # readers (GraphTimingMPC/TracedTimingMPC) only ever index a node's
+        # row for an agent that graph.get_agent_paths actually routes
+        # through that node, so an agent's column at a node it never visits
+        # is simply never read, whatever it holds. A per-instance write-back
+        # used to gate this on spec._instance_list/_instance_sources (a node
+        # gets an "instance" only from its OWN phis referencing agent_q --
+        # see GraphOrderingSpec._resolve_phi_agent_source, which never scans
+        # edge formulas), silently leaving any node reachable only via an
+        # edge formula stuck at this reset's x0 baseline forever instead of
+        # the GA's actual solved value.
         agents_width = graph.num_agents * dim
+        for node in remaining_set:
+            self._waypoints[node, :agents_width] = wp[node, :agents_width]
+            self._waypoints[node, agents_width:] = np.nan
+
+        # Report the DECODED visiting-order rank, not the raw priority `t`:
+        # `t` only carries a meaningful order after kernel.py's topological
+        # decode (see kernel.py's module docstring) -- writing back the raw
+        # value here would silently reintroduce the exact bug that decoder
+        # exists to fix, one level up (GraphOfConstraints.get_agent_paths
+        # sorts nodes by view_t_by_node() too, and needs the same
+        # already-topologically-valid order the route-cost computation
+        # actually used). One value per node (kernel.py), so no
+        # per-instance collapsing is needed here -- just index it directly.
+        node_rank = np.asarray(problem._decode_node_rank(
+            owner_variable, np.asarray(_cond_binary), t, np.asarray(anchor.node_active)))
+        for node in remaining_set:
+            self._t_by_node_id[node] = float(node_rank[node])
+
         non_robot_dim = graph.non_robot_dim
         for node, object_ids in spec._node_objects.items():
             if node not in remaining_set:
                 continue
-            node_local = spec._node_local_id[node]
-            row = wp_dense[node_local]
+            row = wp[node]
             for oid in object_ids:
                 col_start = agents_width + oid * non_robot_dim
-                self._object_waypoints[node, oid * non_robot_dim:(oid + 1) * non_robot_dim] = \
+                self._waypoints[node, col_start:col_start + non_robot_dim] = \
                     row[col_start:col_start + non_robot_dim]
 
         for var_id, slot in spec._var_id_to_slot.items():
@@ -414,10 +438,12 @@ class EvolutionaryWaypointSolver:
         return self._waypoints
 
     def view_object_waypoints(self):
-        """(num_nodes, num_objects * non_robot_dim) solved object positions,
-        matching _waypoints' node-indexed convention. NaN for any (node,
-        object) pair no constraint ever referenced this solve."""
-        return self._object_waypoints
+        """(num_nodes, num_objects * non_robot_dim) solved object positions --
+        a view onto _waypoints' object-column slice (see view_waypoints()),
+        matching its node-indexed convention. NaN for any (node, object) pair
+        no constraint ever referenced this solve."""
+        agents_width = self._graph.num_agents * self._graph.dim
+        return self._waypoints[:, agents_width:]
 
     def view_assignments(self):
         return self._assignments
