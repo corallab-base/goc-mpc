@@ -74,32 +74,43 @@ PoseFromRow_PosRotMatrix(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
 	return std::make_pair(p_WE, R_WE);
 }
 
+// `workspace_dim` (2 or 3) is the robot's ambient Cartesian workspace --
+// see GraphOfConstraints::workspace_dim. Position is the row's leading
+// workspace_dim-wide block; rotation is the workspace_dim x workspace_dim
+// identity (a point mass has no orientation).
 template <typename T>
-std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+std::pair<Eigen::Matrix<T,Eigen::Dynamic,1>, Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>
 PoseFromRow_PointMass(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
-		      int robot_offset) {
-	Eigen::Matrix<T,3,1> p_WE = row.template segment<3>(robot_offset + 0);
-	Eigen::Matrix<T,3,3> R_WE;
-	R_WE << T(1.0), T(0.0), T(0.0),
-		T(0.0), T(1.0), T(0.0),
-		T(0.0), T(0.0), T(1.0);
+		      int robot_offset, int workspace_dim) {
+	Eigen::Matrix<T,Eigen::Dynamic,1> p_WE = row.segment(robot_offset, workspace_dim);
+	Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> R_WE =
+		Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(workspace_dim, workspace_dim);
+	for (int i = 0; i < workspace_dim; ++i) R_WE(i, i) = T(1.0);
 	return std::make_pair(p_WE, R_WE);
 }
 
-// State layout: [x, y, z, θ]  (R³ × T¹, yaw = rotation about world Z)
+// State layout: [x, y, θ] (workspace_dim == 2, R² × T¹) or [x, y, z, θ]
+// (workspace_dim == 3, R³ × T¹) -- yaw = rotation about the (2D) plane or
+// (3D) world Z axis, immediately following the position block either way.
 template <typename T>
-std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+std::pair<Eigen::Matrix<T,Eigen::Dynamic,1>, Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>
 PoseFromRow_PosYaw(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
-		   int robot_offset) {
+		   int robot_offset, int workspace_dim) {
 	using std::cos; using std::sin;
-	Eigen::Matrix<T,3,1> p_WE = row.template segment<3>(robot_offset + 0);
-	const T theta = row(robot_offset + 3);
+	DRAKE_DEMAND(workspace_dim == 2 || workspace_dim == 3);
+	Eigen::Matrix<T,Eigen::Dynamic,1> p_WE = row.segment(robot_offset, workspace_dim);
+	const T theta = row(robot_offset + workspace_dim);
 	const T c = cos(theta);
 	const T s = sin(theta);
-	Eigen::Matrix<T,3,3> R_WE;
-	R_WE <<    c,  -s, T(0),
-		   s,   c, T(0),
-		T(0), T(0), T(1);
+	Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> R_WE(workspace_dim, workspace_dim);
+	if (workspace_dim == 2) {
+		R_WE << c, -s,
+			s,  c;
+	} else {
+		R_WE <<    c,  -s, T(0),
+			   s,   c, T(0),
+			T(0), T(0), T(1);
+	}
 	return std::make_pair(p_WE, R_WE);
 }
 
@@ -128,24 +139,42 @@ CubePosFromRow(const struct GraphOfConstraints* graph,
 	return q.segment(cube_pos_offset, 3);
 }
 
+// Return size follows graph->workspace_dim (2 or 3 -- see GraphOfConstraints'
+// own doc comment on that member). kPointMass/kPosYaw are workspace_dim-aware
+// (PoseFromRow_PointMass/PoseFromRow_PosYaw above); kPosQuat/kPosRotMat are
+// inherently 3D rotation representations with no 2D reduction in this
+// codebase, so they DEMAND workspace_dim == 3 rather than silently
+// misbehave. Every caller (structured-binding `auto [p, R] = PoseFromRow(...)`
+// throughout graph_of_constraints.cpp's constraint builders) is unaffected
+// by the switch to a dynamic-size return: those callers only ever run
+// against the default workspace_dim == 3, where the runtime values are
+// identical to before, just held in a dynamic- rather than fixed-size
+// Eigen type.
 template <typename T>
-std::pair<Eigen::Matrix<T,3,1>, Eigen::Matrix<T,3,3>>
+std::pair<Eigen::Matrix<T,Eigen::Dynamic,1>, Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>
 PoseFromRow(const struct GraphOfConstraints* graph,
 	    const int agent_index,
 	    const std::string ee_frame_name,
 	    const Eigen::Matrix<T,Eigen::Dynamic,1>& q) {
 
 	const int agent_config_offset = agent_index * graph->dim;
+	const int workspace_dim = graph->workspace_dim;
 
 	switch (graph->robot_kind(agent_index)) {
 	case RobotKind::kPosQuat:
+		if (workspace_dim != 3)
+			throw std::runtime_error("PoseFromRow: kPosQuat requires workspace_dim == 3 "
+						 "(quaternion rotation has no 2D reduction).");
 		return PoseFromRow_PosQuat(q, agent_config_offset);
 	case RobotKind::kPosRotMat:
+		if (workspace_dim != 3)
+			throw std::runtime_error("PoseFromRow: kPosRotMat requires workspace_dim == 3 "
+						 "(3x3 rotation matrix has no 2D reduction).");
 		return PoseFromRow_PosRotMatrix(q, agent_config_offset);
 	case RobotKind::kPointMass:
-		return PoseFromRow_PointMass(q, agent_config_offset);
+		return PoseFromRow_PointMass(q, agent_config_offset, workspace_dim);
 	case RobotKind::kPosYaw:
-		return PoseFromRow_PosYaw(q, agent_config_offset);
+		return PoseFromRow_PosYaw(q, agent_config_offset, workspace_dim);
 	case RobotKind::kArticulated:
 		throw std::runtime_error("PoseFromRow: articulated robots require FK, not yet supported.");
 	}

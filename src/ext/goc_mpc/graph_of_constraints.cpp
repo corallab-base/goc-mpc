@@ -3,6 +3,7 @@
 #include "../utils.hpp"
 
 #include <algorithm>
+#include <numeric>
 
 
 using drake::solvers::Binding;
@@ -19,7 +20,8 @@ GraphOfConstraints::GraphOfConstraints(
 		double global_x_lb,
 		double global_x_ub,
 		const std::vector<std::string>& robot_names,
-		const std::vector<std::string>& object_names)
+		const std::vector<std::string>& object_names,
+		int workspace_dim)
 	: _robot_specs(robot_specs),
 	  _robot_names(robot_names),
 	  _object_specs(object_specs),
@@ -27,15 +29,19 @@ GraphOfConstraints::GraphOfConstraints(
 	  num_phis(0),
 	  num_edge_phis(0),
 	  num_var_phis(0),
+	  num_holds(0),
 	  num_variables(0),
 	  _num_total_assignables(0),
 	  num_agents(robot_specs.size()),
 	  num_objects(object_specs.size()),
 	  dim(0),
-	  non_robot_dim(0) {
+	  non_robot_dim(0),
+	  workspace_dim(workspace_dim) {
 
 	if (!robot_names.empty() && robot_names.size() != robot_specs.size())
 		throw std::runtime_error("robot_names size must match robot_specs size.");
+	if (workspace_dim != 2 && workspace_dim != 3)
+		throw std::runtime_error("workspace_dim must be 2 or 3.");
 	if (!object_names.empty() && object_names.size() != object_specs.size())
 		throw std::runtime_error("object_names size must match object_specs size.");
 
@@ -81,22 +87,30 @@ GraphOfConstraints::GraphOfConstraints(
 	_global_x_lb = Eigen::VectorXd::Constant(total_dim, global_x_lb);
 	_global_x_ub = Eigen::VectorXd::Constant(total_dim, global_x_ub);
 
-	for (int i = 0; i < num_agents; ++i) {
-		_agent_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			dim, fmt::format("agent_{}_q", i)));
-		_agent_q_vars_u.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			dim, fmt::format("agent_{}_q_u", i)));
-		_agent_q_vars_v.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			dim, fmt::format("agent_{}_q_v", i)));
-	}
-	for (int o = 0; o < num_objects; ++o) {
-		_object_q_vars.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			non_robot_dim, fmt::format("object_{}_q", o)));
-		_object_q_vars_u.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			non_robot_dim, fmt::format("object_{}_q_u", o)));
-		_object_q_vars_v.push_back(drake::symbolic::MakeVectorContinuousVariable(
-			non_robot_dim, fmt::format("object_{}_q_v", o)));
-	}
+	// Placeholder families -- see PlaceholderVarFamily's docstring for why
+	// these are assigned here (constructor body) rather than in the
+	// initializer list: their width depends on dim/non_robot_dim/
+	// workspace_dim, none of which are known until the computations above
+	// run. Every family is lazily populated regardless -- this assignment
+	// doesn't itself create any placeholder Variables, just records each
+	// family's width/namer for when agent_q()/object_q()/etc. first do.
+	_agent_q = PlaceholderVarFamily<int>(dim, [](const int& i) { return fmt::format("agent_{}_q", i); });
+	_object_q = PlaceholderVarFamily<int>(non_robot_dim, [](const int& o) { return fmt::format("object_{}_q", o); });
+	_var_agent_q = PlaceholderVarFamily<int>(dim, [](const int& v) { return fmt::format("var_{}_agent_q", v); });
+	_agent_link_pos = PlaceholderVarFamily<std::pair<int, std::string>>(
+		workspace_dim, [](const std::pair<int, std::string>& k) {
+			return fmt::format("agent_{}_link_{}_pos", k.first, k.second);
+		});
+	_agent_link_rot = PlaceholderVarFamily<std::pair<int, std::string>>(
+		workspace_dim * workspace_dim, [](const std::pair<int, std::string>& k) {
+			return fmt::format("agent_{}_link_{}_rot", k.first, k.second);
+		});
+	_agent_q_u = PlaceholderVarFamily<int>(dim, [](const int& i) { return fmt::format("agent_{}_q_u", i); });
+	_agent_q_v = PlaceholderVarFamily<int>(dim, [](const int& i) { return fmt::format("agent_{}_q_v", i); });
+	_object_q_u = PlaceholderVarFamily<int>(non_robot_dim, [](const int& o) { return fmt::format("object_{}_q_u", o); });
+	_object_q_v = PlaceholderVarFamily<int>(non_robot_dim, [](const int& o) { return fmt::format("object_{}_q_v", o); });
+	_var_agent_q_u = PlaceholderVarFamily<int>(dim, [](const int& v) { return fmt::format("var_{}_agent_q_u", v); });
+	_var_agent_q_v = PlaceholderVarFamily<int>(dim, [](const int& v) { return fmt::format("var_{}_agent_q_v", v); });
 
 	int offset = 0;
 	for (int ag = 0; ag < num_agents; ++ag) {
@@ -158,6 +172,69 @@ int GraphOfConstraints::object_ambient_dim(int ob) const {
 	return d;
 }
 
+void GraphOfConstraints::set_robot_fk(int agent_id, const std::string& link_name, py::function fk_fn) {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	robot_fk_registry[{agent_id, link_name}] = std::move(fk_fn);
+}
+
+std::pair<Eigen::VectorXd, Eigen::MatrixXd> GraphOfConstraints::link_pose(int agent_id, const Eigen::VectorXd& x,
+									  const std::string& link_name) const {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	DRAKE_DEMAND(x.size() == total_dim);
+
+	auto it = robot_fk_registry.find({agent_id, link_name});
+	if (it != robot_fk_registry.end()) {
+		const Eigen::VectorXd q_agent = x.segment(agent_id * dim, dim);
+		py::tuple result = it->second(q_agent);
+		DRAKE_DEMAND(result.size() == 2);
+		// Coerce through numpy.asarray explicitly rather than relying on
+		// pybind11/eigen's implicit conversion: fk_fn may be written in
+		// jax.numpy (see set_robot_fk's doc comment) and return jax.Array
+		// values rather than plain numpy.ndarray -- asarray guarantees a
+		// real numpy array (via jax.Array's __array__) before the Eigen
+		// cast, regardless of pybind11's own implicit-conversion coverage.
+		static const py::object asarray = py::module_::import("numpy").attr("asarray");
+		Eigen::VectorXd position = asarray(result[0]).cast<Eigen::VectorXd>();
+		Eigen::MatrixXd rotation = asarray(result[1]).cast<Eigen::MatrixXd>();
+		// fk_fn is expected to return a pose in this graph's own
+		// workspace_dim (2 or 3) -- checked here, at the one place every
+		// fk_fn result passes through, so a mismatched registration fails
+		// clearly instead of surfacing later as a confusing shape error
+		// in whatever formula/expression consumes it.
+		if (position.size() != workspace_dim || rotation.rows() != workspace_dim ||
+		    rotation.cols() != workspace_dim) {
+			throw std::runtime_error(fmt::format(
+				"link_pose: fk_fn registered for (agent {}, link '{}') returned a "
+				"position of size {} and a rotation of shape {}x{}, but this graph's "
+				"workspace_dim is {} -- fk_fn must return (position: ({},), rotation: "
+				"({}, {})).",
+				agent_id, link_name, position.size(), rotation.rows(), rotation.cols(),
+				workspace_dim, workspace_dim, workspace_dim, workspace_dim));
+		}
+		return {position, rotation};
+	}
+
+	return PoseFromRow(this, agent_id, "", x);
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::agent_link_pos(int agent_id, const std::string& link_name) {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	return _agent_link_pos.Get({agent_id, link_name});
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::agent_link_rot(int agent_id, const std::string& link_name) {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	return _agent_link_rot.Get({agent_id, link_name});
+}
+
+Eigen::Vector3d GraphOfConstraints::point_position(int point_id, const Eigen::VectorXd& x) const {
+	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
+	DRAKE_DEMAND(x.size() == total_dim);
+	return CubePosFromRow(this, point_id, x);
+}
+
 namespace {
 
 // Resolves the specific agent(s) that own phi_id, in priority order:
@@ -188,15 +265,47 @@ std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
 	if (graph.symbolic_ops.contains(phi_id)) {
 		const drake::symbolic::Variables free_vars =
 			graph.symbolic_ops.at(phi_id).formula.GetFreeVariables();
+		const std::vector<int> owners = graph._agent_q.KeysReferencedBy(free_vars);
+		return std::set<int>(owners.begin(), owners.end());
+	}
+	return {};
+}
+
+// Edge counterpart of PhiOwningAgents, for resolving a node's ownership
+// through an incident edge constraint when the node has no owning phi of
+// its own (see EdgePhiOwningAgents' caller in assign_node below): a node
+// can constrain only its object at the node itself, with the agent's
+// position there pinned entirely by an edge constraint to a neighboring
+// node (add_edge_constraint) -- that's real, specific ownership, not "no
+// opinion".
+//
+// Node phi ids and edge phi ids are separate counters (num_phis vs.
+// num_edge_phis, see graph_of_constraints.hpp), so an edge phi id can't be
+// looked up in the node-indexed `assignments` vector `PhiOwningAgents`
+// takes -- an assignable edge constraint (edge_phi_to_variable_map) would
+// need its own resolved-assignment vector, which get_agent_paths doesn't
+// currently receive. No current constraint generator gives a node ITS
+// ONLY ownership through an assignable edge constraint, so that priority
+// tier is left unresolved here (falls through to {}) rather than guessing
+// -- a real gap if that ever changes, not a silent miscompute today.
+std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_id) {
+	if (graph._edge_phi_to_static_assignment_map.contains(edge_phi_id)) {
+		return {graph._edge_phi_to_static_assignment_map.at(edge_phi_id)};
+	}
+	if (graph.symbolic_edge_ops.contains(edge_phi_id)) {
+		const drake::symbolic::Variables free_vars =
+			graph.symbolic_edge_ops.at(edge_phi_id).formula.GetFreeVariables();
+		// An edge formula references either the plain agent_q placeholders
+		// (an "along the edge" invariant, SymbolicEdgeConstraint::along_edge
+		// == true) or the relational u_agent_q/v_agent_q pair (a single
+		// u<->v relation, along_edge == false) -- checking all three
+		// families is simpler than branching on along_edge and correct
+		// either way, since a given formula only ever references one of
+		// these three (disjoint) placeholder sets.
 		std::set<int> owners;
-		for (int ag = 0; ag < graph.num_agents; ++ag) {
-			for (int j = 0; j < graph.dim; ++j) {
-				if (free_vars.include(graph._agent_q_vars[ag][j])) {
-					owners.insert(ag);
-					break;
-				}
-			}
-		}
+		for (int ag : graph._agent_q.KeysReferencedBy(free_vars)) owners.insert(ag);
+		for (int ag : graph._agent_q_u.KeysReferencedBy(free_vars)) owners.insert(ag);
+		for (int ag : graph._agent_q_v.KeysReferencedBy(free_vars)) owners.insert(ag);
 		return owners;
 	}
 	return {};
@@ -212,6 +321,18 @@ std::tuple<std::vector<std::optional<int>>,
 		   const Eigen::VectorXd& t_by_node) const {
 	const InducedSubgraphView<py::object> sg = InducedSubgraphView<py::object>(
 		structure, remaining_vertices);
+
+	// Unrestricted view (every node, not just remaining_vertices), used
+	// ONLY for assign_node's edge-based ownership fallback below -- see
+	// that fallback's own comment for why this needs to see edges to
+	// already-completed neighbors too, unlike the BFS traversal/
+	// interaction-detection logic further down, which stays scoped to
+	// `sg` (only remaining, not-yet-completed nodes matter for ordering
+	// and cross-agent synchronization going forward).
+	std::vector<int> all_nodes(structure.num_nodes());
+	std::iota(all_nodes.begin(), all_nodes.end(), 0);
+	const InducedSubgraphView<py::object> full_sg = InducedSubgraphView<py::object>(
+		structure, all_nodes);
 
 	std::vector<std::vector<int>> agent_nodes(num_agents);
 	std::map<int, std::set<int>> node_to_agents_map;
@@ -246,10 +367,63 @@ std::tuple<std::vector<std::optional<int>>,
 				owners.insert(phi_owners.begin(), phi_owners.end());
 			}
 		}
+		// TODO: I think this shouldn't be applied ONLY when owners is
+		// empty. This may need to be on an agent's path due to an edge
+		// constraint even when some node constraint forces it to be
+		// on another agent's path
 		if (owners.empty()) {
-			// No phi at this node reveals agent-specific ownership at all
-			// (e.g. a pure object-only node) -- fall back to every agent,
-			// same as when this function had no per-phi resolution at all.
+			// No NODE phi reveals agent-specific ownership -- check this
+			// node's incident edges before giving up: an agent's position
+			// at this node may be pinned entirely by an edge constraint to
+			// a neighboring node (add_edge_constraint) rather than by
+			// anything at the node itself, which is real, specific
+			// ownership through the edge, not "no opinion". E.g. Place's
+			// own node constraint is object-only by design (the robot's
+			// position there comes purely from the transport edge back to
+			// Pick -- see pyrobosim_gymnasium's _place_add/_place_edge_add),
+			// so Place's only ownership evidence lives on that edge.
+			//
+			// Uses `full_sg` (every node), NOT `sg` (remaining_vertices
+			// only): node completion in this codebase is one-directional --
+			// the only way a node re-enters `remaining_vertices` is
+			// backtracking, which explicitly re-adds it (goc_mpc.py's
+			// `_backtrack`), so a genuinely no-longer-relevant edge would
+			// already show up in `sg` again by the time it matters. Using
+			// `sg` here instead made a node's edge-based ownership evidence
+			// vanish the moment its predecessor completed and dropped out
+			// of `remaining_vertices` -- e.g. Place losing sight of the
+			// Pick->Place transport edge that's its ONLY ownership evidence
+			// right after Pick completes -- which fell through to the
+			// "genuinely agent-agnostic" branch below and spuriously
+			// assigned Place to every agent, injecting a bogus cross-agent
+			// EQUAL timing-sync constraint between agents that were never
+			// meant to interact (confirmed: this is what was producing
+			// GraphTimingMPC's intermittent Ipopt "Error in step
+			// computation" failures on po_goc_mpc's pick_place_task
+			// experiment -- the spurious EQUAL constraint tied one agent's
+			// well-scaled remaining-path costs to another agent's
+			// already-arrived, near-zero ones in the same shared QP).
+			for (const auto& e : full_sg.neighbors(node)) {
+				const auto phis_it = edge_to_phis_map.find({node, e.to});
+				if (phis_it == edge_to_phis_map.end()) continue;
+				for (int edge_phi_id : phis_it->second) {
+					const std::set<int> edge_owners = EdgePhiOwningAgents(*this, edge_phi_id);
+					owners.insert(edge_owners.begin(), edge_owners.end());
+				}
+			}
+			for (const auto& in : full_sg.incoming_neighbors(node)) {
+				const auto phis_it = edge_to_phis_map.find({in.from, node});
+				if (phis_it == edge_to_phis_map.end()) continue;
+				for (int edge_phi_id : phis_it->second) {
+					const std::set<int> edge_owners = EdgePhiOwningAgents(*this, edge_phi_id);
+					owners.insert(edge_owners.begin(), edge_owners.end());
+				}
+			}
+		}
+		if (owners.empty()) {
+			// Still nothing, even from incident edges -- a genuinely
+			// agent-agnostic node: fall back to every agent, same as when
+			// this function had no per-phi resolution at all.
 			for (int ag = 0; ag < num_agents; ++ag) owners.insert(ag);
 		}
 
@@ -292,17 +466,29 @@ std::tuple<std::vector<std::optional<int>>,
 
 	// Depths are resolved last, against each agent's FINAL (sorted) node
 	// list, rather than at discovery time -- discovery order need not
-	// match t_by_node order.
+	// match t_by_node order. get_agent_paths' own agent_nodes lists are
+	// themselves a (trivial) "dense" node-id sequence -- one real id per
+	// row, nothing synthetic -- so this is the same lookup a caller doing
+	// its own dense expansion needs, just reused here instead of
+	// duplicated.
+	agent_interactions = GraphOfConstraints::reindex_agent_interactions(
+		std::move(agent_interactions), agent_nodes);
+
+	return std::make_tuple(parents, agent_nodes, agent_interactions);
+}
+
+std::vector<AgentInteraction> GraphOfConstraints::reindex_agent_interactions(
+		std::vector<AgentInteraction> agent_interactions,
+		const std::vector<std::vector<int>>& agent_node_ids) {
 	for (auto& intr : agent_interactions) {
-		const auto& ni = agent_nodes[intr.agent_i];
+		const auto& ni = agent_node_ids.at(intr.agent_i);
 		auto it = std::find(ni.begin(), ni.end(), intr.node_u);
 		if (it != ni.end()) intr.agent_i_depth = static_cast<int>(std::distance(ni.begin(), it));
-		const auto& nj = agent_nodes[intr.agent_j];
+		const auto& nj = agent_node_ids.at(intr.agent_j);
 		auto jt = std::find(nj.begin(), nj.end(), intr.node_v);
 		if (jt != nj.end()) intr.agent_j_depth = static_cast<int>(std::distance(nj.begin(), jt));
 	}
-
-	return std::make_tuple(parents, agent_nodes, agent_interactions);
+	return agent_interactions;
 }
 
 std::map<std::pair<int, int>, int> GraphOfConstraints::get_next_edge_phis(const std::vector<int> remaining_vertices) const {
@@ -317,6 +503,19 @@ std::map<std::pair<int, int>, int> GraphOfConstraints::get_next_edge_phis(const 
 	}
 
 	return e_to_phi_map;
+}
+
+std::map<int, HoldDeclaration> GraphOfConstraints::get_current_holds(const std::vector<int>& remaining_vertices) const {
+	std::set<int> remaining(remaining_vertices.begin(), remaining_vertices.end());
+
+	std::map<int, HoldDeclaration> current;
+	for (const auto& [hold_id, hold] : hold_ops) {
+		if (!remaining.contains(hold.u_node) && remaining.contains(hold.v_node)) {
+			current[hold_id] = hold;
+		}
+	}
+
+	return current;
 }
 
 std::vector<int> GraphOfConstraints::get_phi_ids(int node) const {
@@ -391,6 +590,24 @@ void GraphOfConstraints::add_manual_backtrack_links(int edge_id, std::vector<int
 	existing_nodes.erase(std::unique(existing_nodes.begin(), existing_nodes.end()), existing_nodes.end());
 }
 
+void GraphOfConstraints::add_variable_commit(int var, int node) {
+	commit_trigger_node_to_var[node] = var;
+}
+
+void GraphOfConstraints::commit_variable_assignment(int var, int agent) {
+	committed_assignments[var] = agent;
+}
+
+void GraphOfConstraints::clear_variable_commitment(int var) {
+	committed_assignments.erase(var);
+}
+
+std::optional<int> GraphOfConstraints::get_commit_trigger_var(int node) const {
+	auto it = commit_trigger_node_to_var.find(node);
+	if (it == commit_trigger_node_to_var.end()) return std::nullopt;
+	return it->second;
+}
+
 // Grasp util
 
 void GraphOfConstraints::add_grasp_change(int phi_id,
@@ -447,6 +664,37 @@ std::vector<std::tuple<std::string, std::string, std::string>> GraphOfConstraint
 
 void GraphOfConstraints::make_node_unpassable(int k) {
 	unpassable_nodes.insert(k);
+}
+
+int GraphOfConstraints::add_node(std::optional<std::string> name) {
+	const int id = structure.add_node();
+	if (name.has_value()) node_names[id] = std::move(name.value());
+	return id;
+}
+
+std::vector<int> GraphOfConstraints::add_nodes(int n, std::optional<std::vector<std::string>> names) {
+	std::vector<int> ids = structure.add_nodes(n);
+	if (names.has_value()) {
+		if (names->size() != ids.size())
+			throw std::runtime_error("add_nodes: names must be the same size as n.");
+		for (size_t i = 0; i < ids.size(); ++i) node_names[ids[i]] = (*names)[i];
+	}
+	return ids;
+}
+
+void GraphOfConstraints::set_node_name(int k, const std::string& name) {
+	node_names[k] = name;
+}
+
+void GraphOfConstraints::set_node_names(const std::vector<int>& ks, const std::vector<std::string>& names) {
+	if (ks.size() != names.size())
+		throw std::runtime_error("set_node_names: ks and names must be the same size.");
+	for (size_t i = 0; i < ks.size(); ++i) node_names[ks[i]] = names[i];
+}
+
+std::string GraphOfConstraints::get_node_name(int k) const {
+	auto it = node_names.find(k);
+	return it != node_names.end() ? it->second : std::to_string(k);
 }
 
 // Joint-Agent Constraint Adders (typed)
@@ -1761,7 +2009,42 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 						   M_prox, X, sg_w, &gate);
 		};
 
+	// DEPRECATED path: dual-populate the canonical hold registry (see
+	// HoldDeclaration) for backward compat -- new code should call
+	// add_hold directly instead of this function.
+	add_hold(u, v, robot_id, {point_id});
+
 	return edge_phi_id;
+}
+
+int GraphOfConstraints::add_hold(int u, int v, int robot_ag, std::vector<int> held_point_ids) {
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(robot_ag >= 0 && robot_ag < num_agents);
+
+	const int id = num_holds++;
+	hold_ops[id] = HoldDeclaration{id, u, v, held_point_ids, robot_ag, std::nullopt};
+	return id;
+}
+
+int GraphOfConstraints::add_assignable_hold(int u, int v, int var, std::vector<int> held_point_ids) {
+	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
+	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+
+	const int id = num_holds++;
+	hold_ops[id] = HoldDeclaration{id, u, v, held_point_ids, std::nullopt, var};
+
+	// Once `u` (pick-up) completes, `var` is physically committed -- the
+	// routing solve must not reassign the hold's holder mid-grasp. Reuses
+	// the same commit mechanism add_variable_commit exposes to plans
+	// directly (see commit_trigger_node_to_var/committed_assignments and
+	// Constraint 8b in milp_waypoint_mpc.cpp), so every assignable hold gets
+	// this protection automatically rather than needing every call site to
+	// declare it by hand.
+	add_variable_commit(var, u);
+
+	return id;
 }
 
 int GraphOfConstraints::add_edge_point_to_point_displacement_constraint(
@@ -2023,7 +2306,7 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
 	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
 
-	return _add_assignable_edge_op(
+	const int edge_phi_id = _add_assignable_edge_op(
 		DeferredOpKind::kAgentLinearEq, u, v, var, std::set<int>({point_id}),
 		[=, this](const Eigen::VectorXd& x,
 			  const Eigen::VectorXi& assignments) {
@@ -2070,6 +2353,13 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 		   const drake::solvers::MatrixXDecisionVariable& Xi) {
 			return;
 		});
+
+	// DEPRECATED path: dual-populate the canonical hold registry (see
+	// HoldDeclaration) for backward compat -- new code should call
+	// add_assignable_hold directly instead of this function.
+	add_assignable_hold(u, v, var, {point_id});
+
+	return edge_phi_id;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -2159,59 +2449,65 @@ int GraphOfConstraints::add_variable_ineq_constraint(
 
 drake::VectorX<drake::symbolic::Expression>
 GraphOfConstraints::agent_q(int agent_id) const {
-	return _agent_q_vars.at(agent_id).cast<drake::symbolic::Expression>();
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	return _agent_q.Get(agent_id);
 }
 
 drake::VectorX<drake::symbolic::Expression>
 GraphOfConstraints::var_agent_q(int var) {
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
-	if (!_var_agent_q_vars.contains(var)) {
-		_var_agent_q_vars[var] = drake::symbolic::MakeVectorContinuousVariable(
-			dim, fmt::format("var_{}_agent_q", var));
-	}
-	return _var_agent_q_vars.at(var).cast<drake::symbolic::Expression>();
+	return _var_agent_q.Get(var);
 }
 
 drake::VectorX<drake::symbolic::Expression>
 GraphOfConstraints::object_q(int object_id) const {
-	return _object_q_vars.at(object_id).cast<drake::symbolic::Expression>();
+	DRAKE_DEMAND(object_id >= 0 && object_id < num_objects);
+	return _object_q.Get(object_id);
 }
 
 // For unified edge constraint API (relational form)
 
 drake::VectorX<drake::symbolic::Expression>
-GraphOfConstraints::agent_q_u(int agent_id) const {
-	return _agent_q_vars_u.at(agent_id).cast<drake::symbolic::Expression>();
+GraphOfConstraints::u_agent_q(int agent_id) const {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	return _agent_q_u.Get(agent_id);
 }
 
 drake::VectorX<drake::symbolic::Expression>
-GraphOfConstraints::object_q_u(int object_id) const {
-	return _object_q_vars_u.at(object_id).cast<drake::symbolic::Expression>();
+GraphOfConstraints::u_object_q(int object_id) const {
+	DRAKE_DEMAND(object_id >= 0 && object_id < num_objects);
+	return _object_q_u.Get(object_id);
 }
 
 drake::VectorX<drake::symbolic::Expression>
-GraphOfConstraints::agent_q_v(int agent_id) const {
-	return _agent_q_vars_v.at(agent_id).cast<drake::symbolic::Expression>();
+GraphOfConstraints::v_agent_q(int agent_id) const {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	return _agent_q_v.Get(agent_id);
 }
 
 drake::VectorX<drake::symbolic::Expression>
-GraphOfConstraints::object_q_v(int object_id) const {
-	return _object_q_vars_v.at(object_id).cast<drake::symbolic::Expression>();
+GraphOfConstraints::v_object_q(int object_id) const {
+	DRAKE_DEMAND(object_id >= 0 && object_id < num_objects);
+	return _object_q_v.Get(object_id);
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::u_var_agent_q(int var) {
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	return _var_agent_q_u.Get(var);
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::v_var_agent_q(int var) {
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	return _var_agent_q_v.Get(var);
 }
 
 
 int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula& f) {
 	// Detect variable-agent placeholders in the formula.
 	const drake::symbolic::Variables free_vars = f.GetFreeVariables();
-	std::vector<int> involved_var_ids;
-	for (const auto& [var_id, placeholder_vec] : _var_agent_q_vars) {
-		for (int j = 0; j < placeholder_vec.size(); ++j) {
-			if (free_vars.include(placeholder_vec[j])) {
-				involved_var_ids.push_back(var_id);
-				break;
-			}
-		}
-	}
+	const std::vector<int> involved_var_ids = _var_agent_q.KeysReferencedBy(free_vars);
 
 	if (involved_var_ids.size() == 1) {
 		return add_assignable_constraint(node, involved_var_ids[0], f);
@@ -2227,30 +2523,30 @@ int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula&
 	return _add_symbolic_op(node, f);
 }
 
-int GraphOfConstraints::add_edge_constraint(int u, int v, const drake::symbolic::Formula& f) {
+int GraphOfConstraints::add_edge_constraint(int u, int v, const drake::symbolic::Formula& f, bool live) {
 	const drake::symbolic::Variables free_vars = f.GetFreeVariables();
 
-	auto references_any = [&](const std::vector<drake::VectorX<drake::symbolic::Variable>>& vecs) {
-		for (const auto& pv : vecs)
-			for (int j = 0; j < pv.size(); ++j)
-				if (free_vars.include(pv[j])) return true;
-		return false;
-	};
+	// u_var_agent_q/v_var_agent_q are relational-only (see their docstring):
+	// a formula referencing either is inherently a two-sided relation, same
+	// as _agent_q_u/_v -- included here so the mixing DRAKE_DEMAND below
+	// still catches an erroneous formula combining them with the plain
+	// "along the edge" placeholder set. Note this doesn't extend
+	// symbolic_constraint_compiler.cpp's substitution -- MILP can't compile
+	// a relational formula referencing these regardless of how it's
+	// classified here (see _var_agent_q_u/_v's docstring).
+	const bool has_relational = _agent_q_u.ReferencesAny(free_vars) || _object_q_u.ReferencesAny(free_vars) ||
+				    _agent_q_v.ReferencesAny(free_vars) || _object_q_v.ReferencesAny(free_vars) ||
+				    _var_agent_q_u.ReferencesAny(free_vars) || _var_agent_q_v.ReferencesAny(free_vars);
 
-	const bool has_relational = references_any(_agent_q_vars_u) || references_any(_object_q_vars_u) ||
-				    references_any(_agent_q_vars_v) || references_any(_object_q_vars_v);
-
-	std::vector<int> involved_var_ids;
-	for (const auto& [var_id, placeholder_vec] : _var_agent_q_vars) {
-		for (int j = 0; j < placeholder_vec.size(); ++j) {
-			if (free_vars.include(placeholder_vec[j])) {
-				involved_var_ids.push_back(var_id);
-				break;
-			}
-		}
-	}
-	const bool has_plain = references_any(_agent_q_vars) || references_any(_object_q_vars) ||
-			       !involved_var_ids.empty();
+	const std::vector<int> involved_var_ids = _var_agent_q.KeysReferencedBy(free_vars);
+	// agent_link_pos/agent_link_rot have no u_/v_ relational counterpart
+	// (see their doc comments -- tied to one fixed agent+link at authoring
+	// time, not a two-sided relation), so a formula referencing either is
+	// always classified as "along the edge", same as a plain
+	// agent_q/object_q reference.
+	const bool has_plain = _agent_q.ReferencesAny(free_vars) || _object_q.ReferencesAny(free_vars) ||
+			       !involved_var_ids.empty() || _agent_link_pos.ReferencesAny(free_vars) ||
+			       _agent_link_rot.ReferencesAny(free_vars);
 
 	DRAKE_DEMAND(!(has_relational && has_plain));  // can't mix u_/v_ relational placeholders
 							// with plain "along the edge" placeholders
@@ -2264,17 +2560,17 @@ int GraphOfConstraints::add_edge_constraint(int u, int v, const drake::symbolic:
 
 	if (involved_var_ids.size() == 1) {
 		_num_total_assignables++;
-		return _add_symbolic_edge_op(u, v, f, /*along_edge=*/true, involved_var_ids[0]);
+		return _add_symbolic_edge_op(u, v, f, /*along_edge=*/true, live, involved_var_ids[0]);
 	}
 
-	return _add_symbolic_edge_op(u, v, f, /*along_edge=*/has_plain);
+	return _add_symbolic_edge_op(u, v, f, /*along_edge=*/has_plain, live);
 }
 
 int GraphOfConstraints::add_assignable_constraint(
 	int node, int var, const drake::symbolic::Formula& f) {
 
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
-	DRAKE_DEMAND(_var_agent_q_vars.contains(var));
+	DRAKE_DEMAND(_var_agent_q.Contains(var));
 
 	_num_total_assignables++;
 	return _add_symbolic_assignable_op(node, var, f);

@@ -62,6 +62,20 @@ class GraphOfConstraintsMPC():
             # misc. options
             solve_for_waypoints_once: bool = False,
             linear_interpolation: bool = False,
+            # Runtime drift check for add_hold/add_assignable_hold spans (see
+            # _hold_violated): how far (per-axis, same units as x) a held
+            # point may stray from where the holding robot's *current*
+            # end-effector pose (graph.link_pose's forward kinematics)
+            # predicts it should be, given the nominal end-effector -> point
+            # offset captured when the hold was established
+            # (_maybe_start_holds) -- before _backtrack treats the hold as
+            # broken (e.g. a real grasp slip) and reopens the hold's u_node.
+            # This is a coarse "did it fall out of the hand" sanity check,
+            # not a rigidity tolerance -- plans no longer need to hand-roll
+            # their own proximity edge constraint (formerly add_holding_box/
+            # add_robot_holding_cube_constraint + add_manual_backtrack_links)
+            # just to get this.
+            hold_drift_tolerance: float = 0.3,
     ):
         # problem definition data
         num_agents = graph.num_agents
@@ -80,6 +94,11 @@ class GraphOfConstraintsMPC():
         self.last_grasp_commands = []
         self.completed_phases = set()
         self.remaining_phases = list(range(graph.structure.num_nodes))
+        # Nominal end-effector -> held-point transform for each currently
+        # active hold (see _maybe_start_holds/_hold_violated), keyed by
+        # hold_id. Populated the instant a hold's u_node completes; dropped
+        # once its v_node completes or its u_node gets reopened (backtrack).
+        self._hold_nominal_offsets = {}
 
         # configuration
         self.time_delta_cutoff = time_delta_cutoff
@@ -93,6 +112,7 @@ class GraphOfConstraintsMPC():
         self.arclength_cost = arclength_cost
         self.stability_cost = stability_cost
         self.short_path_time_per_step = short_path_time_per_step
+        self.hold_drift_tolerance = hold_drift_tolerance
 
         # solvers
         if waypoint_mpc is not None:
@@ -126,6 +146,7 @@ class GraphOfConstraintsMPC():
             return success
 
     def pass_node(self, node: int, assignments: np.ndarray):
+        print(f"Completed {self.graph.get_node_name(node)}")
         self.completed_phases |= {node}
         self.remaining_phases.remove(node)
         self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
@@ -152,13 +173,16 @@ class GraphOfConstraintsMPC():
                      for phi_id in self.graph.get_phi_ids(node)])
 
                 if all_phis_satisfied:
-                    print(f"Completed {node}")
+                    print(f"Completed {self.graph.get_node_name(node)}")
                     # breakpoint()
                     self.completed_phases |= {node}
                     self.remaining_phases.remove(node)
                     self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
+                    self._maybe_commit(node, var_assignments)
+                    self._maybe_start_holds(node, x)
+                    self._maybe_end_holds(node)
                 else:
-                    print(f"Did not complete {node}")
+                    print(f"Did not complete {self.graph.get_node_name(node)}")
 
         # if not self.timing_mpc.done():
         #     # if the closest next phase is further than time_delta_cutoff seconds into the future
@@ -194,6 +218,91 @@ class GraphOfConstraintsMPC():
 
         return success
 
+    def _maybe_commit(self, node, var_assignments) -> None:
+        # If `node` is a registered commit trigger (add_variable_commit, or
+        # auto-registered by add_assignable_hold at its pick-up node), pin
+        # the variable to whatever agent it just resolved to -- the routing
+        # solve can no longer reassign it on subsequent cycles (see
+        # Constraint 8b in milp_waypoint_mpc.cpp) until _maybe_clear_commit
+        # reopens this same node via backtracking.
+        var = self.graph.get_commit_trigger_var(node)
+        if var is not None:
+            self.graph.commit_variable_assignment(var, int(var_assignments[var]))
+
+    def _maybe_clear_commit(self, node) -> None:
+        # Symmetric undo for _maybe_commit: reopening a commit-trigger node
+        # (backtracking past a broken grasp/placement) un-pins its variable
+        # so the next MILP solve is free to resolve it fresh -- possibly to
+        # a different agent -- rather than staying stuck on the agent that
+        # just failed.
+        var = self.graph.get_commit_trigger_var(node)
+        if var is not None:
+            self.graph.clear_variable_commitment(var)
+
+    def _hold_agent(self, hold) -> int:
+        if hold.robot_ag is not None:
+            return hold.robot_ag
+        return int(self.last_cycle_var_assignments[hold.var_id])
+
+    def _maybe_start_holds(self, node, x) -> None:
+        # Any hold (add_hold/add_assignable_hold) whose pick-up (u_node) is
+        # `node` becomes active now -- capture the nominal end-effector pose
+        # (via graph.link_pose's forward kinematics -- a Python-registered
+        # override if the holding robot has one via graph.set_robot_fk,
+        # otherwise the built-in per-robot-kind dispatch; never a raw
+        # workspace-point read of x) and, from it, each held point's offset
+        # expressed in the end-effector's own frame at this instant. This is
+        # what _hold_violated later measures drift against, instead of
+        # comparing raw positions against a fixed absolute tolerance -- see
+        # hold_drift_tolerance's doc comment on __init__.
+        for hold_id, hold in self.graph.hold_ops.items():
+            if hold.u_node != node:
+                continue
+            agent_id = self._hold_agent(hold)
+            p_we, R_we = self.graph.link_pose(agent_id, x)
+            self._hold_nominal_offsets[hold_id] = {
+                point_id: R_we.T @ (self.graph.point_position(point_id, x) - p_we)
+                for point_id in hold.held_point_ids
+            }
+
+    def _maybe_end_holds(self, node) -> None:
+        # Symmetric undo for _maybe_start_holds: once a hold's release
+        # (v_node) completes, its nominal offset is no longer meaningful.
+        for hold_id, hold in self.graph.hold_ops.items():
+            if hold.v_node == node:
+                self._hold_nominal_offsets.pop(hold_id, None)
+
+    def _maybe_clear_holds(self, node) -> None:
+        # Reopening a hold's pick-up node via backtracking invalidates
+        # whatever nominal offset was captured there -- the next time this
+        # node completes (possibly with a different agent/grasp), a fresh
+        # one must be captured via _maybe_start_holds.
+        for hold_id, hold in self.graph.hold_ops.items():
+            if hold.u_node == node:
+                self._hold_nominal_offsets.pop(hold_id, None)
+
+    def _hold_violated(self, hold_id, hold, x) -> bool:
+        # Coarse "did it fall out of the hand" sanity check (not a rigidity
+        # tolerance): has each held point drifted more than
+        # hold_drift_tolerance (per axis) from where it should be given the
+        # holding robot's *current* end-effector pose and the nominal
+        # offset captured when the hold was established (_maybe_start_holds)?
+        # See hold_drift_tolerance's doc comment on __init__.
+        offsets = self._hold_nominal_offsets.get(hold_id)
+        if offsets is None:
+            # Hold just became current this cycle, before its u_node's
+            # completion handler ran (or a fresh offset hasn't been
+            # captured yet after a backtrack) -- nothing to compare against.
+            return False
+        agent_id = self._hold_agent(hold)
+        p_we, R_we = self.graph.link_pose(agent_id, x)
+        for point_id in hold.held_point_ids:
+            predicted = p_we + R_we @ offsets[point_id]
+            actual = self.graph.point_position(point_id, x)
+            if np.any(np.abs(actual - predicted) > self.hold_drift_tolerance):
+                return True
+        return False
+
     def _backtrack(self, x, x_dot):
         self.last_cycle_backtracked_phases = {}
 
@@ -210,13 +319,15 @@ class GraphOfConstraintsMPC():
 
                 for (u_node, v_node), edge_phi_id in self.graph.get_next_edge_phis(self.remaining_phases).items():
                     if not self.graph.evaluate_edge_phi(edge_phi_id, x, self.last_cycle_var_assignments, 0.00):
-                        print(f"violated path constraint on {u_node}->{v_node} (edge phi id: {edge_phi_id})! backtracking.")
+                        print(f"Violated path constraint on {self.graph.get_node_name(u_node)}->{self.graph.get_node_name(v_node)} (edge phi id: {edge_phi_id})! backtracking.")
 
                         if edge_phi_id in self.graph.backtrack_map:
                             for node in self.graph.backtrack_map[edge_phi_id]:
                                 self.completed_phases -= {node}
                                 if node not in self.remaining_phases:
                                     self.remaining_phases.append(node)
+                                self._maybe_clear_commit(node)
+                                self._maybe_clear_holds(node)
                                 # TODO: This is meant to open the gripper for
                                 # the right agent when backtracking. Replace it
                                 # with edge constraint for gripper preceeding actions
@@ -225,10 +336,30 @@ class GraphOfConstraintsMPC():
                         else:
                             self.completed_phases -= {u_node}
                             self.remaining_phases.append(u_node)
+                            self._maybe_clear_commit(u_node)
+                            self._maybe_clear_holds(u_node)
 
                             backtracked_agent = self.graph.get_edge_phi_agent(edge_phi_id, self.last_cycle_var_assignments)
                             self.last_cycle_backtracked_phases[backtracked_agent] = u_node
 
+                        remaining_phases_changed = True
+
+                # Holds (add_hold/add_assignable_hold) currently in progress:
+                # plans no longer need to hand-roll a proximity edge
+                # constraint (formerly add_holding_box + add_manual_
+                # backtrack_links) just to detect a dropped/slipped grasp --
+                # backtrack straight to the hold's own u_node instead.
+                for hold_id, hold in self.graph.get_current_holds(self.remaining_phases).items():
+                    if self._hold_violated(hold_id, hold, x):
+                        print(f"Violated hold on {self.graph.get_node_name(hold.u_node)}->{self.graph.get_node_name(hold.v_node)} (hold id: {hold_id})! backtracking.")
+
+                        self.completed_phases -= {hold.u_node}
+                        if hold.u_node not in self.remaining_phases:
+                            self.remaining_phases.append(hold.u_node)
+                        self._maybe_clear_commit(hold.u_node)
+                        self._maybe_clear_holds(hold.u_node)
+
+                        self.last_cycle_backtracked_phases[self._hold_agent(hold)] = hold.u_node
                         remaining_phases_changed = True
 
             # while not self.timing_mpc.at_the_start() and phi.maxError(C, 0.5+timingMPC.phase+subSeqStart) > opt.precision:
@@ -239,6 +370,7 @@ class GraphOfConstraintsMPC():
     def reset(self):
         self.last_cycle_time = 0.0
         self.remaining_phases = list(range(self.graph.structure.num_nodes))
+        self._hold_nominal_offsets = {}
 
     def step(self, t, x, x_dot, teleport=False):
         "Returns the short horizon for the controller to execute."

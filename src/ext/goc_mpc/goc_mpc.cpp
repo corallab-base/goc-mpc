@@ -26,6 +26,33 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("u_node", &DeferredEdgeOp::u_node)
 		.def_readonly("v_node", &DeferredEdgeOp::v_node);
 
+	// Canonical hold registry record -- see HoldDeclaration's own docstring
+	// (graph_of_constraints.hpp). Exactly one of robot_ag/var_id is set.
+	py::class_<HoldDeclaration>(goc_mpc, "HoldDeclaration")
+		.def_readonly("id", &HoldDeclaration::id)
+		.def_readonly("u_node", &HoldDeclaration::u_node)
+		.def_readonly("v_node", &HoldDeclaration::v_node)
+		.def_readonly("held_point_ids", &HoldDeclaration::held_point_ids)
+		.def_readonly("robot_ag", &HoldDeclaration::robot_ag)
+		.def_readonly("var_id", &HoldDeclaration::var_id);
+
+	py::class_<AgentInteraction> agent_interaction(goc_mpc, "AgentInteraction");
+	agent_interaction
+		.def(py::init<int, int, int, int, int, int, AgentInteraction::Type>(),
+		     py::arg("agent_i"), py::arg("agent_i_depth"),
+		     py::arg("agent_j"), py::arg("agent_j_depth"),
+		     py::arg("node_u"), py::arg("node_v"), py::arg("type"))
+		.def_readwrite("agent_i", &AgentInteraction::agent_i)
+		.def_readwrite("agent_i_depth", &AgentInteraction::agent_i_depth)
+		.def_readwrite("agent_j", &AgentInteraction::agent_j)
+		.def_readwrite("agent_j_depth", &AgentInteraction::agent_j_depth)
+		.def_readwrite("node_u", &AgentInteraction::node_u)
+		.def_readwrite("node_v", &AgentInteraction::node_v)
+		.def_readwrite("type", &AgentInteraction::type);
+	py::enum_<AgentInteraction::Type>(agent_interaction, "Type")
+		.value("LESS_THAN", AgentInteraction::Type::LESS_THAN)
+		.value("EQUAL", AgentInteraction::Type::EQUAL)
+		.export_values();
 
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
 		.def(py::init<const std::vector<CubicConfigurationSpline::Spec>&,
@@ -33,13 +60,18 @@ void init_submodule_goc_mpc(py::module_& m) {
 		              double,
 		              double,
 		              const std::vector<std::string>&,
-		              const std::vector<std::string>&>(),
+		              const std::vector<std::string>&,
+		              int>(),
 		     py::arg("robot_specs"),
 		     py::arg("object_specs"),
 		     py::arg("state_lower_bound"),
 		     py::arg("state_upper_bound"),
 		     py::arg("robot_names") = std::vector<std::string>{},
-		     py::arg("object_names") = std::vector<std::string>{})
+		     py::arg("object_names") = std::vector<std::string>{},
+		     // Ambient Cartesian workspace dimensionality (2 or 3) --
+		     // see GraphOfConstraints::workspace_dim's doc comment.
+		     py::arg("workspace_dim") = 3)
+		.def_readonly("workspace_dim", &GraphOfConstraints::workspace_dim)
 		.def_readonly("_robot_specs", &GraphOfConstraints::_robot_specs)
 		.def_readonly("_object_specs", &GraphOfConstraints::_object_specs)
 		.def_readonly("structure", &GraphOfConstraints::structure)
@@ -56,6 +88,20 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("phi_to_static_assignment_map", &GraphOfConstraints::_phi_to_static_assignment_map)
 		.def_readonly("node_to_phis_map", &GraphOfConstraints::node_to_phis_map)
 		.def_readonly("edge_to_phis_map", &GraphOfConstraints::edge_to_phis_map)
+		// Edge phi ids registered via add_edge_constraint(..., live=True) --
+		// see that method's docstring. EvolutionaryWaypointSolver reads this
+		// directly off the graph instead of taking a separate live_phi_ids
+		// constructor argument, so the live/frozen choice lives with the
+		// constraint that defines it, not with whichever solver happens to
+		// run it.
+		.def_readonly("live_edge_phis", &GraphOfConstraints::live_edge_phis)
+		// Canonical hold registry (see HoldDeclaration) -- populated by
+		// add_robot_holding_cube_constraint/add_assignable_robot_holding_
+		// point_constraint. Single source of truth for "which edges hold
+		// which objects" for non-MILP consumers (e.g. the JAX evolutionary
+		// solver), instead of each re-deriving it from the legacy
+		// DeferredEdgeOp::cubes + static/assignable edge-phi maps.
+		.def_readonly("hold_ops", &GraphOfConstraints::hold_ops)
 		// Raw Formula records for the unified symbolic constraint API
 		// (add_constraint / add_assignable_constraint / add_edge_constraint),
 		// keyed by phi id — introspectable so non-MILP consumers (e.g. the
@@ -91,13 +137,58 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_assignable_grasp_change", &GraphOfConstraints::add_assignable_grasp_change)
 		.def("get_grasp_changes", &GraphOfConstraints::get_grasp_changes)
 		.def("make_node_unpassable", &GraphOfConstraints::make_node_unpassable)
+		.def("set_robot_fk", &GraphOfConstraints::set_robot_fk,
+		     py::arg("agent_id"), py::arg("link_name"), py::arg("fk_fn"))
+		// Raw (agent_id, link_name) -> fk_fn registry (see set_robot_fk's
+		// doc comment) -- exposed read-only so the JAX evolutionary
+		// solver (src/goc_mpc/evolutionary_waypoint_solver/spec.py) can
+		// call a registered fk_fn DIRECTLY in Python (with a JAX tracer,
+		// under jax.jit/vmap tracing) to resolve an agent_link_pos(...)/
+		// agent_link_rot(...) constraint placeholder, bypassing
+		// link_pose's C++/pybind boundary entirely (which requires a
+		// concrete Eigen::VectorXd and cannot accept a tracer).
+		.def_readonly("robot_fk_registry", &GraphOfConstraints::robot_fk_registry)
+		.def("link_pose", &GraphOfConstraints::link_pose,
+		     py::arg("agent_id"), py::arg("x"), py::arg("link_name") = "ee")
+		.def("point_position", &GraphOfConstraints::point_position,
+		     py::arg("point_id"), py::arg("x"))
+		.def("add_node", &GraphOfConstraints::add_node,
+		     py::arg("name") = py::none())
+		.def("add_nodes", &GraphOfConstraints::add_nodes,
+		     py::arg("n"), py::arg("names") = py::none())
+		.def("set_node_name", &GraphOfConstraints::set_node_name,
+		     py::arg("k"), py::arg("name"))
+		.def("set_node_names", &GraphOfConstraints::set_node_names,
+		     py::arg("ks"), py::arg("names"))
+		.def("get_node_name", &GraphOfConstraints::get_node_name,
+		     py::arg("k"))
+		.def_readonly("node_names", &GraphOfConstraints::node_names)
 		.def("get_phi_ids", &GraphOfConstraints::get_phi_ids)
 		.def("get_next_edge_phis", &GraphOfConstraints::get_next_edge_phis)
+		.def("get_agent_paths", &GraphOfConstraints::get_agent_paths,
+		     py::arg("remaining_vertices"), py::arg("assignments"), py::arg("t_by_node"))
+		.def_static("reindex_agent_interactions", &GraphOfConstraints::reindex_agent_interactions,
+		     py::arg("agent_interactions"), py::arg("agent_node_ids"))
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
 		.def("evaluate_edge_phi", &GraphOfConstraints::evaluate_edge_phi)
 		.def("get_edge_phi_agent", &GraphOfConstraints::get_edge_phi_agent)
 		.def("add_backtrack_links", &GraphOfConstraints::add_backtrack_links)
 		.def("add_manual_backtrack_links", &GraphOfConstraints::add_manual_backtrack_links)
+		// ASSIGNMENT COMMIT  //////////////////////////////////////////
+		// Declares that completing `node` pins variable `var`'s resolved
+		// agent for as long as anything downstream still references it --
+		// see commit_trigger_node_to_var/committed_assignments.
+		// GraphOfConstraintsMPC drives the runtime pin/unpin via
+		// commit_variable_assignment/clear_variable_commitment as `node`
+		// completes or gets reopened by backtracking.
+		.def("add_variable_commit", &GraphOfConstraints::add_variable_commit,
+		     py::arg("var"), py::arg("node"))
+		.def("commit_variable_assignment", &GraphOfConstraints::commit_variable_assignment,
+		     py::arg("var"), py::arg("agent"))
+		.def("clear_variable_commitment", &GraphOfConstraints::clear_variable_commitment,
+		     py::arg("var"))
+		.def("get_commit_trigger_var", &GraphOfConstraints::get_commit_trigger_var,
+		     py::arg("node"))
 		.def("add_robot_to_point_displacement_cost", &GraphOfConstraints::add_robot_to_point_displacement_cost)
 		.def("add_robot_to_point_alignment_cost", &GraphOfConstraints::add_robot_to_point_alignment_cost,
 		     py::arg("k"),
@@ -120,6 +211,23 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("point_a"),
 		     py::arg("point_b"),
 		     py::arg("disp"))
+		// HOLD DECLARATIONS  //////////////////////////////////////////
+		// Canonical way to declare that held_point_ids are rigidly held by
+		// a robot over edge (u -> v) -- see HoldDeclaration/hold_ops above.
+		.def("add_hold", &GraphOfConstraints::add_hold,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("robot_ag"),
+		     py::arg("held_point_ids"))
+		.def("add_assignable_hold", &GraphOfConstraints::add_assignable_hold,
+		     py::arg("u"),
+		     py::arg("v"),
+		     py::arg("var"),
+		     py::arg("held_point_ids"))
+		// Holds currently in progress given remaining_vertices -- see
+		// get_current_holds's own doc comment.
+		.def("get_current_holds", &GraphOfConstraints::get_current_holds,
+		     py::arg("remaining_vertices"))
 		// EDGE TIMING CONSTRAINTS  ///////////////////////////////////
 		.def("add_edge_min_tau_constraint", &GraphOfConstraints::add_edge_min_tau_constraint,
 		     py::arg("u"),
@@ -132,10 +240,16 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
 		.def("agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
 		.def("var_agent_q", &GraphOfConstraints::var_agent_q, py::arg("var"))
-		.def("u_object_q", &GraphOfConstraints::object_q_u, py::arg("object_q"))
-		.def("u_agent_q", &GraphOfConstraints::agent_q_u, py::arg("agent_q"))
-		.def("v_object_q", &GraphOfConstraints::object_q_v, py::arg("object_q"))
-		.def("v_agent_q", &GraphOfConstraints::agent_q_v, py::arg("agent_q"))
+		.def("agent_link_pos", &GraphOfConstraints::agent_link_pos,
+		     py::arg("agent_id"), py::arg("link_name"))
+		.def("agent_link_rot", &GraphOfConstraints::agent_link_rot,
+		     py::arg("agent_id"), py::arg("link_name"))
+		.def("u_object_q", &GraphOfConstraints::u_object_q, py::arg("object_q"))
+		.def("u_agent_q", &GraphOfConstraints::u_agent_q, py::arg("agent_q"))
+		.def("v_object_q", &GraphOfConstraints::v_object_q, py::arg("object_q"))
+		.def("v_agent_q", &GraphOfConstraints::v_agent_q, py::arg("agent_q"))
+		.def("u_var_agent_q", &GraphOfConstraints::u_var_agent_q, py::arg("var"))
+		.def("v_var_agent_q", &GraphOfConstraints::v_var_agent_q, py::arg("var"))
 		// accept either a single Formula or a numpy array of Formulas (from
 		// element-wise == on object arrays) and reduce with conjunction.
 		.def("add_constraint", [](GraphOfConstraints& self, int node,
@@ -154,7 +268,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 			return self.add_constraint(node, f);
 		}, py::arg("node"), py::arg("formula"))
 		.def("add_edge_constraint", [](GraphOfConstraints& self, int u, int v,
-					       py::object formula_obj) -> int {
+					       py::object formula_obj, bool live) -> int {
 			drake::symbolic::Formula f;
 			try {
 				f = py::cast<drake::symbolic::Formula>(formula_obj);
@@ -166,8 +280,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 					else        f = f && fh;
 				}
 			}
-			return self.add_edge_constraint(u, v, f);
-		}, py::arg("u"), py::arg("v"), py::arg("formula"))
+			return self.add_edge_constraint(u, v, f, live);
+		}, py::arg("u"), py::arg("v"), py::arg("formula"), py::arg("live") = false)
 		// CONDITIONAL ORDERING API ////////////////////////////
 		.def("assignment_sym", &GraphOfConstraints::assignment_sym, py::arg("var"))
 		.def("add_binary_cond_var", &GraphOfConstraints::add_binary_cond_var)
