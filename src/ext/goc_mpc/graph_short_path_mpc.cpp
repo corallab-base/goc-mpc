@@ -141,9 +141,18 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 	  _obstacles(&obstacles) {
 
         /* short path times */
+	// Xi.row(i) is offset by one tau from x0/v0's own time -- the
+	// acceleration cost's i==0 branch already treats Xi.row(0) as the
+	// state ONE tau after x0 (x0/v0 stand in as "xKm1"/"vKm1" for it).
+	// _times must agree, so ref_points/ref_velocities (used by the
+	// tracking cost) are sampled at the SAME offset times -- otherwise
+	// the tracking cost pulls Xi.row(0) toward the reference at t=0
+	// (which fill_cubic_splines sets to literally BE x0) while the
+	// acceleration cost simultaneously treats it as t=tau, fighting each
+	// other at every step 0 of every cycle.
 	_times = Eigen::VectorXd(_num_steps);
 	for (int i = 0; i < _num_steps; ++i) {
-		_times(i) = (i) * _time_per_step;
+		_times(i) = (i + 1) * _time_per_step;
 	}
 
 	/* short path points */
