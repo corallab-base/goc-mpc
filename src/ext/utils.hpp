@@ -130,13 +130,25 @@ Eigen::Vector3<Expression> PointWorldFromRow(
 	return row.segment(objs_start + obj_id * non_robot_dim, 3).transpose();
 }
 
+// Returns a Vector3 regardless of the object's own declared width
+// (graph->non_robot_dim) -- every caller of this (and of PoseFromRow, which
+// this pairs with) expects a fixed 3D point. For a workspace_dim==3 graph
+// (or any object whose non_robot_dim >= 3) this reads the same 3 components
+// as before; for a genuinely 2D object (non_robot_dim < 3, e.g. a
+// PyRoboGym-style planar item with no z/yaw of its own) it reads only the
+// object's own real components and leaves the rest at 0 (a z==0 point in
+// the workspace's plane), instead of reading past the end of that object's
+// own slice in q into whatever happens to sit next in memory.
 template <typename T>
 Eigen::Vector3<T>
-CubePosFromRow(const struct GraphOfConstraints* graph,
-	       const int cube_index,
-	       const Eigen::Matrix<T,Eigen::Dynamic,1>& q) {
-	const int cube_pos_offset = graph->num_agents * graph->dim + cube_index * graph->non_robot_dim;
-	return q.segment(cube_pos_offset, 3);
+PointPosFromRow(const struct GraphOfConstraints* graph,
+		const int point_index,
+		const Eigen::Matrix<T,Eigen::Dynamic,1>& q) {
+	const int point_pos_offset = graph->num_agents * graph->dim + point_index * graph->non_robot_dim;
+	const int n = std::min(graph->non_robot_dim, 3);
+	Eigen::Vector3<T> p_WC = Eigen::Vector3<T>::Zero();
+	p_WC.segment(0, n) = q.segment(point_pos_offset, n);
+	return p_WC;
 }
 
 // Return size follows graph->workspace_dim (2 or 3 -- see GraphOfConstraints'

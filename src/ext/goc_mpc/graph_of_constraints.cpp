@@ -229,10 +229,11 @@ GraphOfConstraints::agent_link_rot(int agent_id, const std::string& link_name) {
 	return _agent_link_rot.Get({agent_id, link_name});
 }
 
-Eigen::Vector3d GraphOfConstraints::point_position(int point_id, const Eigen::VectorXd& x) const {
+Eigen::VectorXd GraphOfConstraints::point_position(int point_id, const Eigen::VectorXd& x) const {
 	DRAKE_DEMAND(point_id >= 0 && point_id < num_objects);
 	DRAKE_DEMAND(x.size() == total_dim);
-	return CubePosFromRow(this, point_id, x);
+	Eigen::Vector3d p_WC = PointPosFromRow(this, point_id, x);
+	return p_WC.head(workspace_dim);
 }
 
 namespace {
@@ -1235,7 +1236,7 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 				       const int... /*unused*/) {
 
 				     auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
-				     auto p_WC = CubePosFromRow(this, cube_id, x);
+				     auto p_WC = PointPosFromRow(this, cube_id, x);
 
 				     Eigen::Vector3d g;
 				     g << (p_WR(0) - p_WC(0) - x_offset),
@@ -1263,7 +1264,7 @@ int GraphOfConstraints::add_robot_above_cube_constraint(
 				     }
 
 				     auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", q_all);
-				     auto p_WC = CubePosFromRow(this, cube_id, q_all);
+				     auto p_WC = PointPosFromRow(this, cube_id, q_all);
 
 				     Eigen::Vector3<Expression> g;
 				     g << (p_WR(0) - p_WC(0) - x_offset),
@@ -1465,7 +1466,7 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 
 				     // --- Extract pose & point from the numeric state ---
 				     auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", x);
-				     auto p_WC = CubePosFromRow(this, point_id, x);
+				     auto p_WC = PointPosFromRow(this, point_id, x);
 
 				     // --- Build r, d ---
 				     const Vector3d r = R_WE * ee_ray_body;    // body ray in world
@@ -1534,7 +1535,7 @@ int GraphOfConstraints::add_robot_to_point_alignment_constraint(
 				     Eigen::Matrix<Expression, Eigen::Dynamic, 1> row = X.row(node_k);
 
 				     auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", row);
-				     auto p_WC = CubePosFromRow(this, point_id, row);
+				     auto p_WC = PointPosFromRow(this, point_id, row);
 
 				     // r = R * v_b, d = P - E
 				     Eigen::Matrix<Expression,3,1> r = R_WE * ee_ray_body;
@@ -1618,7 +1619,7 @@ int GraphOfConstraints::add_robot_to_point_alignment_cost(
 
 		// Pose at node k
 		auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", x);
-		auto p_WC = CubePosFromRow(this, point_id, x);
+		auto p_WC = PointPosFromRow(this, point_id, x);
 
 		const Vector3d r = R_WE * ee_ray_body;       // body ray in world
 		const Vector3d d = p_WC - p_WE;
@@ -1674,7 +1675,7 @@ int GraphOfConstraints::add_robot_to_point_alignment_cost(
 		Eigen::Matrix<Expression, Eigen::Dynamic, 1> row = X.row(node_k);
 
 		auto [p_WE, R_WE] = PoseFromRow(this, robot_id, "ee_link", row);
-		auto p_WC = CubePosFromRow(this, point_id, row);
+		auto p_WC = PointPosFromRow(this, point_id, row);
 
 		const Eigen::Matrix<Expression,3,1> r = R_WE * ee_ray_body;
 		const Eigen::Matrix<Expression,3,1> d = p_WC - p_WE;
@@ -1905,7 +1906,7 @@ static void AddBoxProximityConstraint(
 	Eigen::VectorX<Expression> q = X.row(graph_row);
 
 	auto [p_WR, R_WR] = PoseFromRow(graph, robot_id, "ee_link", q);
-	auto p_WC = CubePosFromRow(graph, point_id, q);
+	auto p_WC = PointPosFromRow(graph, point_id, q);
 
 	const Eigen::Vector3<Expression> dp = p_WR - p_WC;
 
@@ -1944,7 +1945,7 @@ int GraphOfConstraints::add_robot_holding_cube_constraint(
 			    [=, this](const Eigen::VectorXd& x,
 				      const Eigen::VectorXi&/*unused*/) {
 				    auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
-				    auto p_WC = CubePosFromRow(this, point_id, x);
+				    auto p_WC = PointPosFromRow(this, point_id, x);
 
 				    Eigen::Vector3d r = (p_WC - p_WR);
 
@@ -2063,8 +2064,8 @@ int GraphOfConstraints::add_edge_point_to_point_displacement_constraint(
 	int edge_phi_id = _add_edge_op(DeferredOpKind::kLinearEq, u, v, std::set<int>({}),
 			    [=, this](const Eigen::VectorXd& x,
 				      const Eigen::VectorXi&/*unused*/) {
-				    auto p_WC_a = CubePosFromRow(this, point_a, x);
-				    auto p_WC_b = CubePosFromRow(this, point_b, x);
+				    auto p_WC_a = PointPosFromRow(this, point_a, x);
+				    auto p_WC_b = PointPosFromRow(this, point_b, x);
 				    Eigen::Vector3d r  = (p_WC_b - p_WC_a) - disp;   // want r == 0
 				    Eigen::Vector3d err = r.cwiseAbs() - tol;
 				    auto violation = err.maxCoeff();
@@ -2272,7 +2273,7 @@ int GraphOfConstraints::add_edge_assignable_robot_to_point_displacement_constrai
 			if (robot_id == -1) { return 99.0; }
 
 			auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
-			auto p_WC = CubePosFromRow(this, point_id, x);
+			auto p_WC = PointPosFromRow(this, point_id, x);
 			Eigen::Vector3d r  = (p_WC - p_WR) - disp;   // want r == 0
 			Eigen::Vector3d err = r.cwiseAbs() - tol;
 			return err.maxCoeff();
@@ -2316,7 +2317,7 @@ int GraphOfConstraints::add_assignable_robot_holding_point_constraint(
 			if (robot_id == -1) { return 99.0; }
 
 			auto [p_WR, R_WR] = PoseFromRow(this, robot_id, "ee_link", x);
-			auto p_WC = CubePosFromRow(this, point_id, x);
+			auto p_WC = PointPosFromRow(this, point_id, x);
 
 			Eigen::Vector3d r = (p_WC - p_WR);
 

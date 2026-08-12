@@ -374,12 +374,15 @@ struct GraphOfConstraints {
 	// configuration width, e.g. dim=4 for a pos_yaw robot in a 3D
 	// workspace). Defaults to 3 for full backward compatibility. Sizes
 	// agent_link_pos's placeholder width, so a 2-workspace graph can
-	// compare it against a 2-wide object_q. NOT consulted by the built-in
-	// RobotKind fallback in link_pose (PoseFromRow, utils.hpp) or by
-	// point_position (CubePosFromRow) -- both remain hardcoded to a 3D
-	// workspace regardless of this setting; a graph mixing workspace_dim=2
-	// with either of those (e.g. the runtime hold-drift check, which reads
-	// both link_pose and point_position together) is not yet supported.
+	// compare it against a 2-wide object_q. Also consulted by link_pose's
+	// built-in RobotKind fallback (PoseFromRow, utils.hpp -- kPointMass/
+	// kPosYaw are workspace_dim-aware; kPosQuat/kPosRotMat demand
+	// workspace_dim == 3) and by the point_position wrapper (which
+	// truncates PointPosFromRow's always-3D result to workspace_dim) -- so
+	// the runtime hold-drift check (GraphOfConstraintsMPC, which reads both
+	// link_pose and point_position together) works for a 2-workspace graph
+	// as long as workspace_dim is actually set to 2 (it does NOT follow
+	// non_robot_dim/dim automatically).
 	int workspace_dim;
 
 	// Required for big-M computation
@@ -575,10 +578,14 @@ struct GraphOfConstraints {
 	std::pair<Eigen::VectorXd, Eigen::MatrixXd> link_pose(int agent_id, const Eigen::VectorXd& x,
 							      const std::string& link_name = "ee") const;
 
-	// World position of object/point `point_id` from a full state row `x`
-	// (first 3 components of that object's block -- see utils.hpp's
-	// CubePosFromRow, which this wraps).
-	Eigen::Vector3d point_position(int point_id, const Eigen::VectorXd& x) const;
+	// World position of object/point `point_id` from a full state row `x`,
+	// sized to workspace_dim (matching link_pose's position sizing --
+	// GraphOfConstraintsMPC's runtime hold-drift check, the only caller
+	// that needs this Python-facing wrapper rather than the internal
+	// always-3D PointPosFromRow directly, combines the two:
+	// `R_we.T @ (point_position(...) - p_we)`). See utils.hpp's
+	// PointPosFromRow, which this wraps and truncates to workspace_dim.
+	Eigen::VectorXd point_position(int point_id, const Eigen::VectorXd& x) const;
 
 	Graph<py::object> get_structure() const { return structure; }
 
