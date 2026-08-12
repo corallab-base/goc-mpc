@@ -87,17 +87,22 @@ class GraphOfConstraintsMPC():
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
             # Static (per-episode) obstacle geometry consumed by the short
-            # path MPC. Stage 1 of the collision-avoidance work: this is
-            # currently pure plumbing -- GraphShortPathMPC stores whatever
-            # ObstacleSet is passed here but no cost/constraint reads it yet
-            # (a later stage adds that). Pass an ObstacleSet you've already
+            # path MPC (stage 2: sphere obstacles only -- see
+            # ObstacleSet.add_sphere). Pass an ObstacleSet you've already
             # called add_sphere(...) on, or leave unset for an empty one
-            # (byte-identical behavior to before this parameter existed).
+            # (byte-identical behavior to before obstacle avoidance existed
+            # -- an empty ObstacleSet keeps the short path MPC on its
+            # original QP-only fast path, no IPOPT involved).
             # GraphShortPathMPC stores it BY POINTER, not by copy, so
-            # further add_sphere calls on the SAME object after
+            # further add_sphere/clear calls on the SAME object after
             # construction remain visible to every future solve() -- see
             # `self.obstacles` below, which is what keeps it alive.
             obstacles: ObstacleSet | None = None,
+            # Weight on the soft Lorentzian obstacle-repulsion cost added
+            # alongside the hard per-sphere clearance constraint (see
+            # graph_short_path_mpc.cpp's build_short_path_problem). Has no
+            # effect when `obstacles` is empty.
+            obstacle_repulsion_weight: float = 0.5,
             # misc. options
             solve_for_waypoints_once: bool = False,
             linear_interpolation: bool = False,
@@ -185,7 +190,7 @@ class GraphOfConstraintsMPC():
         self.obstacles = obstacles if obstacles is not None else ObstacleSet()
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
                                                 num_agents, dim, short_path_time_per_step,
-                                                self.obstacles)
+                                                self.obstacles, obstacle_repulsion_weight)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):

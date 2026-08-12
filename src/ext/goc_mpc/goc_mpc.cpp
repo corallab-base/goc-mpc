@@ -425,13 +425,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def(py::init<>())
 		.def("add_sphere", &ObstacleSet::add_sphere,
 		     py::arg("center"), py::arg("radius"), py::arg("margin") = 0.0)
+		.def("clear", &ObstacleSet::clear)
 		.def("obstacles", &ObstacleSet::obstacles, py::return_value_policy::reference_internal);
 
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
                 .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
-		     const ObstacleSet&>(),
+		     const ObstacleSet&, double>(),
 		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
-		     py::arg("time_per_step"), py::arg("obstacles"),
+		     py::arg("time_per_step"), py::arg("obstacles"), py::arg("obstacle_repulsion_weight") = 0.5,
 		     // `graph` and `obstacles` are both stored by the C++ side as raw
 		     // pointers (see GraphShortPathMPC::_graph/_obstacles) -- keep
 		     // both Python arguments alive at least as long as this

@@ -48,6 +48,14 @@ public:
 		_obstacles.push_back(std::move(obstacle));
 	}
 
+	// Drops every registered obstacle. Needed to MOVE a registered obstacle
+	// (e.g. an interactively-dragged sphere): clear() + add_sphere(new
+	// position) each update, rather than accumulating a new record per
+	// frame -- there's no update_sphere(index, ...) yet, this is the
+	// simplest correct way to represent "the sphere moved" with today's
+	// API.
+	void clear() { _obstacles.clear(); }
+
 	// Future extension points, not built in this stage:
 	//   void add_box(const Eigen::Vector3d& center,
 	//                const Eigen::Vector3d& half_extents, double margin = 0.0);

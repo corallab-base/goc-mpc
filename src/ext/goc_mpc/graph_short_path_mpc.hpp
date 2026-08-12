@@ -4,6 +4,7 @@
 
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/ipopt_solver.h>
+#include <drake/solvers/nlopt_solver.h>
 #include <drake/solvers/branch_and_bound.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/gurobi_solver.h>
@@ -40,10 +41,18 @@ struct ShortPathProblem {
 };
 
 
+// `initial_guess_points`: same shape as `ref_points` (num_steps x
+// ambient_dim), used ONLY to seed the solver's starting point (`ref_points`
+// itself still drives the tracking cost) -- see GraphShortPathMPC::solve's
+// own comment for why these two need to differ in the obstacle-avoidance
+// path (symmetry-breaking nudge + cross-cycle warm-start).
 ShortPathProblem build_short_path_problem(
 	const GraphOfConstraints* graph,
+	const ObstacleSet* obstacles,
+	double obstacle_repulsion_weight,
 	const Eigen::MatrixXd& ref_points,
 	const Eigen::MatrixXd& ref_velocities,
+	const Eigen::MatrixXd& initial_guess_points,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
 	const Eigen::VectorXi& var_assignments,
@@ -62,14 +71,24 @@ struct GraphShortPathMPC {
 	// `_graph` above. The caller (see ObstacleSet's own doc comment) keeps
 	// the real ObstacleSet alive and can keep registering/updating
 	// obstacles on it over the episode; every solve() call reads whatever
-	// is currently in it, not a construction-time snapshot. Not yet read
-	// anywhere in build_short_path_problem -- a later stage adds the
-	// cost/constraint that consumes it.
+	// is currently in it, not a construction-time snapshot.
 	const ObstacleSet* _obstacles;
+
+	// Weight on the soft Lorentzian obstacle-repulsion cost (stage 2) --
+	// see build_short_path_problem's doc comment in graph_short_path_mpc.cpp.
+	// Has no effect when _obstacles is empty.
+	double _obstacle_repulsion_weight;
 
 	// Outputs
 	Eigen::MatrixXd _points;
 	Eigen::MatrixXd _vels;
+	// Whether _points/_vels hold a real converged solve() result yet, as
+	// opposed to the constructor's all-zero placeholder -- distinct from a
+	// shape check, since a zero-filled _points would otherwise pass a bare
+	// "does the shape match ref_points" test and get used as a (terrible)
+	// warm-start seed on the very first obstacle-avoidance solve. See
+	// solve()'s own comment on warm-starting.
+	bool _has_solved = false;
 
 	// Recording Metrics
 	drake::SteadyTimer _timer;
@@ -84,7 +103,8 @@ struct GraphShortPathMPC {
 			  unsigned int num_agents,
 			  unsigned int dim,
 			  double time_per_step,
-			  const ObstacleSet& obstacles);
+			  const ObstacleSet& obstacles,
+			  double obstacle_repulsion_weight = 0.5);
 
 	// Core solve routine
 	bool solve(const Eigen::VectorXd& x0,
