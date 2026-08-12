@@ -14,6 +14,7 @@
 #include <pybind11/numpy.h>
 
 #include "graph_of_constraints.hpp"
+#include "obstacle_set.hpp"
 #include "../configuration_spline.hpp"
 #include "../splines.hpp"
 #include "../utils.hpp"
@@ -57,6 +58,15 @@ struct GraphShortPathMPC {
 	double _time_per_step;
 	Eigen::VectorXd _times;
 
+	// Obstacle geometry, stored BY POINTER (not an owned copy) -- mirrors
+	// `_graph` above. The caller (see ObstacleSet's own doc comment) keeps
+	// the real ObstacleSet alive and can keep registering/updating
+	// obstacles on it over the episode; every solve() call reads whatever
+	// is currently in it, not a construction-time snapshot. Not yet read
+	// anywhere in build_short_path_problem -- a later stage adds the
+	// cost/constraint that consumes it.
+	const ObstacleSet* _obstacles;
+
 	// Outputs
 	Eigen::MatrixXd _points;
 	Eigen::MatrixXd _vels;
@@ -65,12 +75,16 @@ struct GraphShortPathMPC {
 	drake::SteadyTimer _timer;
 	double _last_solve_time;
 
-	// Constructor
+	// Constructor. No default value for `obstacles` -- storing a pointer to
+	// a default-constructed temporary argument would dangle the instant the
+	// constructor call's full expression ends; callers must pass a real,
+	// long-lived ObstacleSet (an empty one is fine).
 	GraphShortPathMPC(const GraphOfConstraints& graph,
 			  unsigned int num_steps,
 			  unsigned int num_agents,
 			  unsigned int dim,
-			  double time_per_step);
+			  double time_per_step,
+			  const ObstacleSet& obstacles);
 
 	// Core solve routine
 	bool solve(const Eigen::VectorXd& x0,
@@ -82,5 +96,6 @@ struct GraphShortPathMPC {
 	const Eigen::MatrixXd &view_points() { return _points; }
 	const Eigen::MatrixXd &view_vels() { return _vels; }
 	const Eigen::VectorXd &view_times() { return _times; }
+	const ObstacleSet &view_obstacles() { return *_obstacles; }
 	const double get_last_solve_time() { return _last_solve_time; }
 };

@@ -13,6 +13,7 @@ from .goc_mpc import (
     MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
+    ObstacleSet,
 )
 try:
     from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, GraphOrderingSpec

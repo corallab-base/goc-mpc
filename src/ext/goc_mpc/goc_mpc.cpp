@@ -409,12 +409,42 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_agent_spline_length_map", &GraphTimingMPC::view_agent_spline_length_map)
 		.def("get_last_solve_time", &GraphTimingMPC::get_last_solve_time);
 
+	// Extensible obstacle registry passed into GraphShortPathMPC -- see
+	// obstacle_set.hpp's own doc comment for why this is one open-ended
+	// class (kept alive by the Python caller, held by pointer on the C++
+	// side) rather than a per-primitive-kind array parameter.
+	py::enum_<ObstacleKind>(goc_mpc, "ObstacleKind")
+		.value("kSphere", ObstacleKind::kSphere);
+
+	py::class_<Obstacle>(goc_mpc, "Obstacle")
+		.def_readonly("kind", &Obstacle::kind)
+		.def_readonly("params", &Obstacle::params)
+		.def_readonly("margin", &Obstacle::margin);
+
+	py::class_<ObstacleSet>(goc_mpc, "ObstacleSet")
+		.def(py::init<>())
+		.def("add_sphere", &ObstacleSet::add_sphere,
+		     py::arg("center"), py::arg("radius"), py::arg("margin") = 0.0)
+		.def("obstacles", &ObstacleSet::obstacles, py::return_value_policy::reference_internal);
+
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
-                .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double>(),
-		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"), py::arg("time_per_step"))
+                .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
+		     const ObstacleSet&>(),
+		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
+		     py::arg("time_per_step"), py::arg("obstacles"),
+		     // `graph` and `obstacles` are both stored by the C++ side as raw
+		     // pointers (see GraphShortPathMPC::_graph/_obstacles) -- keep
+		     // both Python arguments alive at least as long as this
+		     // GraphShortPathMPC instance (pybind's own default `_graph`
+		     // handling has always relied on the Python-side caller doing
+		     // this too, e.g. GraphOfConstraintsMPC.self.graph; keep_alive
+		     // makes the `obstacles` half of that contract explicit and
+		     // safe even if a caller forgets to hold its own reference).
+		     py::keep_alive<1, 2>(), py::keep_alive<1, 7>())
 		.def("solve", &GraphShortPathMPC::solve)
 		.def("view_points", &GraphShortPathMPC::view_points, py::return_value_policy::reference_internal)
 		.def("view_vels", &GraphShortPathMPC::view_vels, py::return_value_policy::reference_internal)
 		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal)
+		.def("view_obstacles", &GraphShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
 		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time);
 }

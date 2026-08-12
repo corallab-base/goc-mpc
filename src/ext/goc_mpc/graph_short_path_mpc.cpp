@@ -131,12 +131,14 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 				     unsigned int num_steps,
 				     unsigned int num_agents,
 				     unsigned int dim,
-				     double time_per_step)
+				     double time_per_step,
+				     const ObstacleSet& obstacles)
 	: _graph(&graph),
 	  _num_steps(num_steps),
 	  _num_agents(num_agents),
 	  _dim(dim),
-	  _time_per_step(time_per_step) {
+	  _time_per_step(time_per_step),
+	  _obstacles(&obstacles) {
 
         /* short path times */
 	_times = Eigen::VectorXd(_num_steps);

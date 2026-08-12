@@ -12,6 +12,7 @@ from ._ext.goc_mpc import (
     MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
+    ObstacleSet,
 )
 
 
@@ -85,6 +86,18 @@ class GraphOfConstraintsMPC():
             # short path mpc hyperparameters
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
+            # Static (per-episode) obstacle geometry consumed by the short
+            # path MPC. Stage 1 of the collision-avoidance work: this is
+            # currently pure plumbing -- GraphShortPathMPC stores whatever
+            # ObstacleSet is passed here but no cost/constraint reads it yet
+            # (a later stage adds that). Pass an ObstacleSet you've already
+            # called add_sphere(...) on, or leave unset for an empty one
+            # (byte-identical behavior to before this parameter existed).
+            # GraphShortPathMPC stores it BY POINTER, not by copy, so
+            # further add_sphere calls on the SAME object after
+            # construction remain visible to every future solve() -- see
+            # `self.obstacles` below, which is what keeps it alive.
+            obstacles: ObstacleSet | None = None,
             # misc. options
             solve_for_waypoints_once: bool = False,
             linear_interpolation: bool = False,
@@ -165,8 +178,14 @@ class GraphOfConstraintsMPC():
                                              time_cost, time_cost2, acceleration_cost,
                                              energy_cost, arclength_cost,
                                              max_vel, max_acc, max_jerk, stability_cost)
+        # self.obstacles keeps the ObstacleSet alive for as long as this
+        # GraphOfConstraintsMPC lives (mirrors self.graph = graph above) --
+        # required since GraphShortPathMPC stores it by pointer, not by
+        # value (see obstacle_set.hpp's doc comment).
+        self.obstacles = obstacles if obstacles is not None else ObstacleSet()
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
-                                                num_agents, dim, short_path_time_per_step)
+                                                num_agents, dim, short_path_time_per_step,
+                                                self.obstacles)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):
