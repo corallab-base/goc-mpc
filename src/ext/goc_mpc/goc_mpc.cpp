@@ -414,7 +414,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 	// class (kept alive by the Python caller, held by pointer on the C++
 	// side) rather than a per-primitive-kind array parameter.
 	py::enum_<ObstacleKind>(goc_mpc, "ObstacleKind")
-		.value("kSphere", ObstacleKind::kSphere);
+		.value("kSphere", ObstacleKind::kSphere)
+		.value("kBox", ObstacleKind::kBox);
 
 	py::class_<Obstacle>(goc_mpc, "Obstacle")
 		.def_readonly("kind", &Obstacle::kind)
@@ -425,14 +426,24 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def(py::init<>())
 		.def("add_sphere", &ObstacleSet::add_sphere,
 		     py::arg("center"), py::arg("radius"), py::arg("margin") = 0.0)
+		.def("add_box", &ObstacleSet::add_box,
+		     py::arg("center"), py::arg("half_extents"), py::arg("margin") = 0.0)
 		.def("clear", &ObstacleSet::clear)
+		.def("set_point_cloud", &ObstacleSet::set_point_cloud,
+		     py::arg("points"), py::arg("margin") = 0.0)
+		.def("query_point_cloud_radius", &ObstacleSet::query_point_cloud_radius,
+		     py::arg("center"), py::arg("radius"))
+		.def("point_cloud", &ObstacleSet::point_cloud, py::return_value_policy::reference_internal)
+		.def("point_cloud_margin", &ObstacleSet::point_cloud_margin)
+		.def("has_point_cloud", &ObstacleSet::has_point_cloud)
 		.def("obstacles", &ObstacleSet::obstacles, py::return_value_policy::reference_internal);
 
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
                 .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
-		     const ObstacleSet&, double>(),
+		     const ObstacleSet&, double, bool>(),
 		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
 		     py::arg("time_per_step"), py::arg("obstacles"), py::arg("obstacle_repulsion_weight") = 0.5,
+		     py::arg("use_hard_constraints") = true,
 		     // `graph` and `obstacles` are both stored by the C++ side as raw
 		     // pointers (see GraphShortPathMPC::_graph/_obstacles) -- keep
 		     // both Python arguments alive at least as long as this

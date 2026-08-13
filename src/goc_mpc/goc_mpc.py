@@ -99,10 +99,22 @@ class GraphOfConstraintsMPC():
             # `self.obstacles` below, which is what keeps it alive.
             obstacles: ObstacleSet | None = None,
             # Weight on the soft Lorentzian obstacle-repulsion cost added
-            # alongside the hard per-sphere clearance constraint (see
+            # alongside the hard per-obstacle clearance constraint (see
             # graph_short_path_mpc.cpp's build_short_path_problem). Has no
             # effect when `obstacles` is empty.
             obstacle_repulsion_weight: float = 0.5,
+            # True (default): add the hard per-obstacle clearance constraint
+            # and solve with NloptSolver/LD_SLSQP -- a real safety guarantee
+            # when it converges, but can report the whole short-path NLP
+            # infeasible once several obstacle constraints are active at
+            # once (see GraphShortPathMPC::_use_hard_constraints's own
+            # comment). False drops the hard constraint, keeps only the
+            # soft repulsion cost -- still routed through NloptSolver/
+            # LD_SLSQP, but with nothing to report infeasible about, so it
+            # reduces to ordinary local quasi-Newton minimization of a
+            # smooth function -- structurally can't fail the same way, no
+            # hard safety guarantee.
+            use_hard_constraints: bool = True,
             # misc. options
             solve_for_waypoints_once: bool = False,
             linear_interpolation: bool = False,
@@ -190,7 +202,8 @@ class GraphOfConstraintsMPC():
         self.obstacles = obstacles if obstacles is not None else ObstacleSet()
         self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
                                                 num_agents, dim, short_path_time_per_step,
-                                                self.obstacles, obstacle_repulsion_weight)
+                                                self.obstacles, obstacle_repulsion_weight,
+                                                use_hard_constraints)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):

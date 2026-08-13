@@ -41,18 +41,28 @@ struct ShortPathProblem {
 };
 
 
-// `initial_guess_points`: same shape as `ref_points` (num_steps x
-// ambient_dim), used ONLY to seed the solver's starting point (`ref_points`
-// itself still drives the tracking cost) -- see GraphShortPathMPC::solve's
-// own comment for why these two need to differ in the obstacle-avoidance
-// path (symmetry-breaking nudge + cross-cycle warm-start).
+// `initial_guess_points`/`initial_guess_velocities`: same shape as
+// `ref_points`/`ref_velocities` (num_steps x ambient_dim / tangent_dim),
+// used ONLY to seed the solver's starting point (`ref_points`/
+// `ref_velocities` themselves still drive the tracking costs) -- see
+// GraphShortPathMPC::solve's own comment for why these need to differ from
+// the plain reference (cross-cycle warm-start from the previous solve, plus,
+// in the obstacle-avoidance path, a symmetry-breaking nudge away from any
+// obstacle center a reference point happens to coincide with).
+// `use_hard_constraints`: true adds the real per-obstacle clearance
+// constraint (a safety guarantee, but can make the whole NLP infeasible --
+// see GraphShortPathMPC::_use_hard_constraints's own comment); false keeps
+// only the soft penalty cost, no obstacle constraint at all (never
+// infeasible, no safety guarantee).
 ShortPathProblem build_short_path_problem(
 	const GraphOfConstraints* graph,
 	const ObstacleSet* obstacles,
 	double obstacle_repulsion_weight,
+	bool use_hard_constraints,
 	const Eigen::MatrixXd& ref_points,
 	const Eigen::MatrixXd& ref_velocities,
 	const Eigen::MatrixXd& initial_guess_points,
+	const Eigen::MatrixXd& initial_guess_velocities,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
 	const Eigen::VectorXi& var_assignments,
@@ -79,6 +89,22 @@ struct GraphShortPathMPC {
 	// Has no effect when _obstacles is empty.
 	double _obstacle_repulsion_weight;
 
+	// true (default): add the real hard clearance constraint per obstacle,
+	// solved via NloptSolver/LD_SLSQP -- a genuine safety guarantee when it
+	// converges, but SLSQP is a local SQP method and can report the whole
+	// NLP infeasible once several such constraints are simultaneously
+	// active (confirmed empirically: 35-53% failure rate with 2 agents x 2
+	// box obstacles, both in isolated tests and in a real multi-robot
+	// pick-and-place scenario -- not fixable by tuning, an inherent
+	// property of linearizing many nonconvex constraints at once).
+	// false: drop the hard constraint entirely, keep only the soft
+	// repulsion cost -- still routed through NloptSolver/LD_SLSQP (see
+	// GraphShortPathMPC::solve), but with no AddConstraint calls SLSQP has
+	// nothing to report infeasible about, so it reduces to ordinary local
+	// quasi-Newton minimization of a smooth function -- structurally can't
+	// fail the same way, no hard safety guarantee.
+	bool _use_hard_constraints;
+
 	// Outputs
 	Eigen::MatrixXd _points;
 	Eigen::MatrixXd _vels;
@@ -104,7 +130,8 @@ struct GraphShortPathMPC {
 			  unsigned int dim,
 			  double time_per_step,
 			  const ObstacleSet& obstacles,
-			  double obstacle_repulsion_weight = 0.5);
+			  double obstacle_repulsion_weight = 0.5,
+			  bool use_hard_constraints = true);
 
 	// Core solve routine
 	bool solve(const Eigen::VectorXd& x0,

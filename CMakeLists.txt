@@ -21,6 +21,11 @@ find_package(pybind11 2.13.6 REQUIRED)
 
 find_package(drake CONFIG REQUIRED)
 
+# Point-cloud obstacle nearest-neighbor queries (ObstacleSet::
+# query_point_cloud_radius, see obstacle_set.cpp) -- header-only, system-
+# installed (libnanoflann-dev), not vendored.
+find_package(nanoflann REQUIRED)
+
 #
 # _ext module stuff
 #
@@ -40,8 +45,9 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/milp_waypoint_mpc.cpp"
     "src/ext/goc_mpc/graph_timing_mpc.cpp"
     "src/ext/goc_mpc/graph_short_path_mpc.cpp"
+    "src/ext/goc_mpc/obstacle_set.cpp"
 )
-target_link_libraries(_ext PRIVATE drake::drake)
+target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann)
 target_compile_definitions(_ext PRIVATE
     MODULE_NAME=_ext
     VERSION_INFO="${PY_FULL_VERSION}"
