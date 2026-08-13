@@ -68,9 +68,8 @@ available as an escape hatch (single agent-instance scope only)."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pydrake.symbolic as sym
-from pydrake.math import eq
 
+from .default_fk import resolve_link_fk
 from .formula_compiler import as_variable, compile_condition, compile_relational_formula
 from .kernel import build_decode_node_rank
 from .problem import GraphOrderingRelaxed
@@ -808,13 +807,38 @@ class GraphOrderingSpec:
         binds side 0 -- see _make_row_resolver's docstring) and would need a
         bespoke resolver; deferred until that's written.
 
-        For each held point, synthesizes exactly the relation the manual
-        pattern in examples/test_evolutionary_object_constraints.py writes by
-        hand -- the object moves exactly as the holding robot moves:
-            v_object_q(oid) - u_object_q(oid) == v_agent_q(robot_ag) - u_agent_q(robot_ag)
-        and compiles it through the same compile_relational_formula path a
-        real registered edge_phi's relational formula would use (see
-        _resolve_symbolic_constraints), registered mode="live" -- unlike an
+        For each held point, enforces that the object's held position moves
+        exactly as the holding robot's end-effector (its "ee" link, or
+        whatever fk_fn is registered for it) moves in world space:
+            v_object_q(oid)[:workspace_dim] - u_object_q(oid)[:workspace_dim]
+                == fk(v_agent_q(robot_ag)) - fk(u_agent_q(robot_ag))
+        (position-only -- workspace_dim, not the object's full non_robot_dim
+        -- matching "translation-only" above). This is deliberately NOT the
+        raw agent_q(robot_ag) delta the old version of this method used:
+        agent_q is a robot's raw CONFIGURATION row (e.g. joint angles for an
+        articulated arm), which has no fixed relation to its end-effector's
+        world-space delta, and (for any robot whose dim != non_robot_dim,
+        e.g. any articulated arm) doesn't even have a matching shape to
+        subtract against the object's row -- eq() would throw on the length
+        mismatch. fk_fn is resolved via default_fk.resolve_link_fk: a
+        graph.set_robot_fk-registered override for (robot_ag, "ee") if
+        present, else a built-in closed-form pose keyed by the robot's
+        inferred configuration-space kind (point-mass/pos+yaw/pos+quaternion
+        /pos+rotation-matrix -- see that module's docstring), matching
+        GraphOfConstraints::link_pose's own registry-then-builtin fallback.
+        Raises (via default_fk_for) if robot_ag's configuration space is
+        articulated and has no registered fk_fn -- there's no default for
+        that case, a real fk_fn is required.
+
+        Since fk_fn is called directly here rather than substituted through
+        the unified symbolic placeholder API (agent_link_pos has no u_/v_
+        relational counterpart -- see spec.py's module docstring and
+        _make_row_resolver's), this bypasses compile_relational_formula's
+        eq()-formula path entirely and builds the residual fn by hand,
+        matching its exact fn(row_u, row_v, owner_variable) -> (k,) jnp
+        array contract (compile_relational_formula's own docstring) so it
+        still plugs into the same registration/interior-reinforcement
+        machinery below unmodified. Registered mode="live" -- unlike an
         ordinary edge constraint (frozen by default), a hold's u-side should
         track the REAL state once u has passed, not the frozen plan: see
         mpc.py's module docstring -- pyrobosim's actual grasp model snaps
@@ -828,24 +852,32 @@ class GraphOrderingSpec:
         own interior-reinforcement loop -- since another agent's route might
         otherwise schedule a node in between that leaves the held object's
         value there completely unconstrained."""
+        dim = self.graph.dim
+        agents_width = self.graph.num_agents * dim
+        non_robot_dim = self.graph.non_robot_dim
+        workspace_dim = self.graph.workspace_dim
+
         for hold_id, hold in self.graph.hold_ops.items():
             if hold.robot_ag is None:
                 continue  # assignable hold -- deferred, see docstring above
             u, v, robot_ag = hold.u_node, hold.v_node, hold.robot_ag
             mode = "live"
+            fk_fn = resolve_link_fk(self.graph, robot_ag)
+            agent_col0 = robot_ag * dim
             for oid in hold.held_point_ids:
-                # eq() on vector Expressions returns an ndarray of per-
-                # component Formula (elementwise ==), not a single conjoined
-                # Formula -- add_constraint/add_edge_constraint's pybind
-                # wrappers reduce this with conjunction on the C++ side
-                # (goc_mpc.cpp); do the same here since this formula is
-                # synthesized directly in Python, not passed through those
-                # wrappers.
-                formula = sym.logical_and(*eq(
-                    self.graph.v_object_q(oid) - self.graph.u_object_q(oid),
-                    self.graph.v_agent_q(robot_ag) - self.graph.u_agent_q(robot_ag)))
-                resolver = lambda var, self=self: self._resolver(var, 2)
-                fn, kind = compile_relational_formula(formula, resolver)
+                obj_col0 = agents_width + oid * non_robot_dim
+
+                def fn(row_u, row_v, owner_variable, fk_fn=fk_fn,
+                       agent_col0=agent_col0, dim=dim, obj_col0=obj_col0,
+                       workspace_dim=workspace_dim):
+                    del owner_variable  # robot_ag is static, not GA-searched
+                    u_pos, _u_rot = fk_fn(row_u[agent_col0:agent_col0 + dim])
+                    v_pos, _v_rot = fk_fn(row_v[agent_col0:agent_col0 + dim])
+                    obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
+                    obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
+                    return (obj_v - obj_u) - (v_pos - u_pos)
+
+                kind = "eq"
                 name = f"hold_{hold_id}_obj_{oid}"
                 self._symbolic_constraints.append(((u, v), fn, kind, mode, name))
                 interior_batched = _batch_relational_interior_fn(
