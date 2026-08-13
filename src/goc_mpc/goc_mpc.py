@@ -12,6 +12,7 @@ from ._ext.goc_mpc import (
     MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
+    AdmmShortPathMPC,
     ObstacleSet,
 )
 
@@ -115,6 +116,21 @@ class GraphOfConstraintsMPC():
             # smooth function -- structurally can't fail the same way, no
             # hard safety guarantee.
             use_hard_constraints: bool = True,
+            # Caller-supplied short-path solver, bypassing the
+            # GraphShortPathMPC auto-construction below entirely -- mirrors
+            # waypoint_mpc/timing_mpc's own override pattern. Lets a caller
+            # swap in AdmmShortPathMPC (see admm_short_path_mpc.hpp) instead
+            # of the default Drake-MathematicalProgram/NLopt-based
+            # GraphShortPathMPC; both classes expose an identical solve()
+            # signature (var_assignments/remaining_vertices are accepted but
+            # unused by either today) so this class's call site
+            # (_solve_for_short_path) works unmodified either way. As with
+            # waypoint_mpc/timing_mpc, the caller is responsible for having
+            # built it against the same graph/spline_spec/short_path_length,
+            # and for keeping its own ObstacleSet alive (this class's
+            # `self.obstacles` below is only populated in the
+            # auto-constructed path).
+            short_path_mpc=None,
             # misc. options
             solve_for_waypoints_once: bool = False,
             linear_interpolation: bool = False,
@@ -195,15 +211,18 @@ class GraphOfConstraintsMPC():
                                              time_cost, time_cost2, acceleration_cost,
                                              energy_cost, arclength_cost,
                                              max_vel, max_acc, max_jerk, stability_cost)
-        # self.obstacles keeps the ObstacleSet alive for as long as this
-        # GraphOfConstraintsMPC lives (mirrors self.graph = graph above) --
-        # required since GraphShortPathMPC stores it by pointer, not by
-        # value (see obstacle_set.hpp's doc comment).
-        self.obstacles = obstacles if obstacles is not None else ObstacleSet()
-        self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
-                                                num_agents, dim, short_path_time_per_step,
-                                                self.obstacles, obstacle_repulsion_weight,
-                                                use_hard_constraints)
+        if short_path_mpc is not None:
+            self.short_path_mpc = short_path_mpc
+        else:
+            # self.obstacles keeps the ObstacleSet alive for as long as this
+            # GraphOfConstraintsMPC lives (mirrors self.graph = graph above)
+            # -- required since GraphShortPathMPC stores it by pointer, not
+            # by value (see obstacle_set.hpp's doc comment).
+            self.obstacles = obstacles if obstacles is not None else ObstacleSet()
+            self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
+                                                    num_agents, dim, short_path_time_per_step,
+                                                    self.obstacles, obstacle_repulsion_weight,
+                                                    use_hard_constraints)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):

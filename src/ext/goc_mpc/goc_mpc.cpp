@@ -10,6 +10,7 @@
 #include "milp_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
+#include "admm_short_path_mpc.hpp"
 
 using drake::symbolic::Expression;
 namespace py = pybind11;
@@ -459,4 +460,19 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal)
 		.def("view_obstacles", &GraphShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
 		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time);
+
+	py::class_<AdmmShortPathMPC>(goc_mpc, "AdmmShortPathMPC")
+		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
+		     const ObstacleSet&, double, unsigned int, double>(),
+		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
+		     py::arg("time_per_step"), py::arg("obstacles"), py::arg("rho") = 5.0,
+		     py::arg("num_iterations") = 8, py::arg("point_cloud_query_margin") = 1.0,
+		     // Same lifetime discipline as GraphShortPathMPC's binding above.
+		     py::keep_alive<1, 2>(), py::keep_alive<1, 7>())
+		.def("solve", &AdmmShortPathMPC::solve)
+		.def("view_points", &AdmmShortPathMPC::view_points, py::return_value_policy::reference_internal)
+		.def("view_vels", &AdmmShortPathMPC::view_vels, py::return_value_policy::reference_internal)
+		.def("view_times", &AdmmShortPathMPC::view_times, py::return_value_policy::reference_internal)
+		.def("view_obstacles", &AdmmShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
+		.def("get_last_solve_time", &AdmmShortPathMPC::get_last_solve_time);
 }
