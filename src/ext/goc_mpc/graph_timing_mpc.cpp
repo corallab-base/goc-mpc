@@ -255,9 +255,16 @@ AgentSegmentVars add_agent_timing_segments(
 		// constants at this point (only vJ/vJm1 can be free decision
 		// variables, for interior segments), so ||xJ - xJm1||^2 is a
 		// tau-independent constant per segment -- no cross term with tau,
-		// unlike acceleration_cost's coast-corrected residual.
+		// unlike acceleration_cost's coast-corrected residual. Uses
+		// CubicConfigurationSpline::PositionDelta (wrap-aware per block,
+		// e.g. shortest-angle for Torus), not a raw ambient subtraction --
+		// the same per-block residual compute_ctrl_cost's max_acc bound
+		// already uses, so a Torus block's target sitting near the +/-pi
+		// wraparound doesn't register as a near-2*pi "distance" whenever
+		// the real state happens to read back on the other side of the
+		// branch cut.
 		if (stability_cost > 0) {
-			const Expression dist2 = (xJ - xJm1).squaredNorm();
+			const Expression dist2 = spline.PositionDelta<Expression>(xJ, xJm1).squaredNorm();
 			const Expression vel_mismatch2 = (vJ - vJm1).squaredNorm();
 			const Expression stability =
 				dist2 * pow(tau, -3.0) + vel_mismatch2 * pow(tau, -1.0);

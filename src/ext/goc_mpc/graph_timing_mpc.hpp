@@ -194,6 +194,20 @@ struct GraphTimingMPC {
 	// combined with the already-convex arclength_cost and linear time_cost,
 	// the whole per-cycle problem is convex when acceleration_cost/max_acc
 	// are left off in favor of this term.
+	//
+	// ||xJ - xJm1||^2 is computed via CubicConfigurationSpline::
+	// PositionDelta (wrap-aware per block, e.g. shortest-angle for Torus),
+	// not a raw ambient subtraction -- see add_agent_timing_segments. xJ/
+	// xJm1 are always fixed constants at this point (see above), so this
+	// stays a plain constant coefficient and the convexity argument above
+	// is unaffected -- PositionDelta's wrap_to_pi is only non-convex/
+	// discontinuous as a function of FREE reals, and nothing here is free.
+	// What DOES change: that constant is now discontinuous as a function
+	// of the INPUT data (x0_i) at the wrap seam -- a real position
+	// crossing +/-pi between two solves can flip which branch wrap_to_pi
+	// resolves to, so the resolved tau/vs_i can jump between consecutive
+	// cycles right at that boundary, even though each individual solve
+	// stays exactly as convex/well-posed as before.
 	double _stability_cost;
 
 	// Phase management

@@ -759,6 +759,28 @@ public:
 		}
 	}
 
+	// Whole-vector counterpart to BlockPositionDelta: assembles every
+	// block's own wrap-aware residual into one tangent-space vector, for a
+	// caller that wants a genuine positional distance between two ambient
+	// configurations without also wanting compute_ctrl_cost's coast-
+	// corrected "D = disp - 0.5*tau*(v0+v1)" residual -- e.g.
+	// graph_timing_mpc.cpp's stability_cost, which needs plain
+	// ||xJ - xJm1||^2. Throws for SO3Mat (via BlockPositionDelta) -- NOT
+	// swallowed here, unlike compute_ctrl_cost/compute_energy_cost's own
+	// SO3Mat branches below, which predate BlockPositionDelta and are left
+	// as still-unimplemented no-cost stubs; this is a new entry point, so
+	// it fails loudly on an unsupported block rather than silently
+	// contributing zero.
+	template <typename T>
+	VecX<T> PositionDelta(const VecX<T>& xJ, const VecX<T>& xJm1) const {
+		VecX<T> out(tan_dim_);
+		for (const BlockOffset& off : block_offsets_) {
+			out.segment(off.tangent_offset, off.tangent_size) =
+				BlockPositionDelta<T>(off, xJ, xJm1);
+		}
+		return out;
+	}
+
 	template <typename T>
 	T compute_ctrl_cost(
 		const VecX<T>& xJ,
