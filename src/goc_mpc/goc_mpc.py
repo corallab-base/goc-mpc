@@ -1,7 +1,11 @@
+import logging
 import pickle
 import numpy as np
 
 from goc_mpc.graphs import Graph
+
+# Configure verbosity via logging.getLogger("goc_mpc").setLevel(...).
+logger = logging.getLogger(__name__)
 
 from ._ext.configuration_spline import CubicConfigurationSpline, Block
 from ._ext.goc_mpc import (
@@ -171,6 +175,11 @@ class GraphOfConstraintsMPC():
         # hold_id. Populated the instant a hold's u_node completes; dropped
         # once its v_node completes or its u_node gets reopened (backtrack).
         self._hold_nominal_offsets = {}
+        # Previous cycle's first dense waypoint per agent, DEBUG-logging
+        # only (_log_timing_progression) -- lets that log flag whether the
+        # near-term target is jittering cycle to cycle instead of holding
+        # still while the robot closes in on it.
+        self._debug_prev_first_wp = {}
 
         # configuration
         self.time_delta_cutoff = time_delta_cutoff
@@ -233,10 +242,53 @@ class GraphOfConstraintsMPC():
             return success
 
     def pass_node(self, node: int, assignments: np.ndarray):
-        print(f"Completed {self.graph.get_node_name(node)}")
+        logger.info("Completed %s", self.graph.get_node_name(node))
         self.completed_phases |= {node}
         self.remaining_phases.remove(node)
         self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
+
+    def _log_timing_progression(self, time_delta, x):
+        """DEBUG-only: per agent, walks the same cumulative-tau rows
+        set_progressed_time is about to walk, marking the first row it
+        won't consider passed yet -- shows directly whether/where that
+        walk falls short of time_delta_cutoff, instead of only seeing the
+        aggregate passed_nodes result. Also reports the real distance from
+        `x` to the current first dense waypoint, and whether that
+        waypoint's own position moved since last cycle -- a tau that stays
+        flat while distance is genuinely shrinking points at the timing
+        solve itself; a first waypoint that jitters cycle to cycle instead
+        of holding still points at the retraced target, not set_progressed_
+        time."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        dim = self.graph.dim
+        agent_nodes_list = self.timing_mpc.view_agent_nodes_list()
+        time_deltas_list = self.timing_mpc.view_time_deltas_list()
+        wps_list = self.timing_mpc.view_wps_list()
+        for i, (nodes, taus) in enumerate(zip(agent_nodes_list, time_deltas_list)):
+            cumulative = 0.0
+            rows = []
+            for node_id, tau in zip(nodes, taus):
+                cumulative += tau
+                label = self.graph.get_node_name(node_id) if node_id >= 0 else "interior"
+                not_reached = time_delta < cumulative - self.time_delta_cutoff
+                rows.append(f"{label}(tau={tau:.4f},cum={cumulative:.4f})"
+                            + (" [NOT REACHED]" if not_reached else " [passed]"))
+                if not_reached:
+                    break
+            logger.debug("agent %d progression: delta=%.4f tau_cutoff=%.4f rows=%s",
+                         i, time_delta, self.time_delta_cutoff, rows)
+
+            if wps_list[i].shape[0] == 0:
+                continue
+            first_wp = wps_list[i][0].copy()
+            x_i = x[i * dim:(i + 1) * dim]
+            distance = np.linalg.norm(x_i - first_wp)
+            prev = self._debug_prev_first_wp.get(i)
+            jitter = np.linalg.norm(first_wp - prev) if prev is not None else 0.0
+            logger.debug("agent %d first_wp: distance_to_x=%.4f jitter_since_last_cycle=%.4f",
+                         i, distance, jitter)
+            self._debug_prev_first_wp[i] = first_wp
 
     def _solve_for_timing(self, time_delta, x, x_dot):
 
@@ -249,19 +301,20 @@ class GraphOfConstraintsMPC():
         # PROGRESSION: progress time and potentially change phase
         # shift timing
         if len(self.remaining_phases) > 0 and time_delta > 0.0:
+            self._log_timing_progression(time_delta, x)
             passed_nodes = self.timing_mpc.set_progressed_time(time_delta, self.time_delta_cutoff)
+            logger.debug("passed_nodes: %s", passed_nodes)
 
             for node in passed_nodes:
                 if node in self.graph.unpassable_nodes:
                     continue
 
-                all_phis_satisfied = all(
-                    [self.graph.evaluate_phi(phi_id, x, assignments, self.phi_tolerance)
-                     for phi_id in self.graph.get_phi_ids(node)])
+                phi_results = {phi_id: self.graph.evaluate_phi(phi_id, x, assignments, self.phi_tolerance)
+                               for phi_id in self.graph.get_phi_ids(node)}
+                all_phis_satisfied = all(phi_results.values())
 
                 if all_phis_satisfied:
-                    print(f"Completed {self.graph.get_node_name(node)}")
-                    # breakpoint()
+                    logger.info("Completed %s", self.graph.get_node_name(node))
                     self.completed_phases |= {node}
                     self.remaining_phases.remove(node)
                     self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
@@ -269,7 +322,9 @@ class GraphOfConstraintsMPC():
                     self._maybe_start_holds(node, x)
                     self._maybe_end_holds(node)
                 else:
-                    print(f"Did not complete {self.graph.get_node_name(node)}")
+                    failed_phi_ids = [phi_id for phi_id, ok in phi_results.items() if not ok]
+                    logger.info("Did not complete %s -- failed phi id(s): %s",
+                                self.graph.get_node_name(node), failed_phi_ids)
 
         # if not self.timing_mpc.done():
         #     # if the closest next phase is further than time_delta_cutoff seconds into the future
@@ -406,7 +461,8 @@ class GraphOfConstraintsMPC():
 
                 for (u_node, v_node), edge_phi_id in self.graph.get_next_edge_phis(self.remaining_phases).items():
                     if not self.graph.evaluate_edge_phi(edge_phi_id, x, self.last_cycle_var_assignments, 0.00):
-                        print(f"Violated path constraint on {self.graph.get_node_name(u_node)}->{self.graph.get_node_name(v_node)} (edge phi id: {edge_phi_id})! backtracking.")
+                        logger.warning("Violated path constraint on %s->%s (edge phi id: %d)! backtracking.",
+                                       self.graph.get_node_name(u_node), self.graph.get_node_name(v_node), edge_phi_id)
 
                         if edge_phi_id in self.graph.backtrack_map:
                             for node in self.graph.backtrack_map[edge_phi_id]:
@@ -438,7 +494,8 @@ class GraphOfConstraintsMPC():
                 # backtrack straight to the hold's own u_node instead.
                 for hold_id, hold in self.graph.get_current_holds(self.remaining_phases).items():
                     if self._hold_violated(hold_id, hold, x):
-                        print(f"Violated hold on {self.graph.get_node_name(hold.u_node)}->{self.graph.get_node_name(hold.v_node)} (hold id: {hold_id})! backtracking.")
+                        logger.warning("Violated hold on %s->%s (hold id: %d)! backtracking.",
+                                       self.graph.get_node_name(hold.u_node), self.graph.get_node_name(hold.v_node), hold_id)
 
                         self.completed_phases -= {hold.u_node}
                         if hold.u_node not in self.remaining_phases:
