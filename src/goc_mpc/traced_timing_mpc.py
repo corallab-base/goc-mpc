@@ -70,6 +70,63 @@ def _trim_trailing_duplicates(path, eps=1e-9):
     return trimmed
 
 
+def _rdp(path, epsilon):
+    """Ramer-Douglas-Peucker simplification: keeps only the points needed
+    to represent a (K, dim) polyline's actual SHAPE within `epsilon`
+    perpendicular distance of the straight chord spanning each kept span
+    -- endpoints always kept, an interior point only if some point in its
+    span deviates from that chord by more than `epsilon`. Iterative
+    (explicit stack, not recursion) since a raw trace can be a few hundred
+    points long.
+
+    Replaces a flat per-segment point count (`_resample_by_arclength`)
+    as the primary way `_agent_dense_wps_and_ids` thins a traced polyline:
+    a near-straight segment (no real obstacle interaction, or one that's
+    shrunk down to almost nothing as the agent approaches its goal)
+    collapses to just its two endpoints regardless of how many raw
+    descent steps produced it, while a segment that genuinely bends
+    around an obstacle keeps the points that capture the bend. A flat
+    count instead pads a near-straight/near-zero-length segment out to
+    the same point budget as a real detour -- and since each point is a
+    free velocity/time-delta pair with its own effectively nonzero
+    minimum tau (add_agent_timing_segments / stability_cost's 1/tau
+    term), that inflates the minimum time required to traverse a segment
+    far past what its real shape needs -- see `_agent_dense_wps_and_ids`
+    for how this showed up as the timing MPC stalling indefinitely just
+    short of a real waypoint.
+    """
+    path = np.asarray(path)
+    n = len(path)
+    if n <= 2:
+        return path
+
+    keep = np.zeros(n, dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        a, b = path[start], path[end]
+        ab = b - a
+        ab_norm = np.linalg.norm(ab)
+        if ab_norm < 1e-12:
+            dists = np.linalg.norm(path[start + 1:end] - a, axis=1)
+        else:
+            ab_unit = ab / ab_norm
+            proj = np.clip((path[start + 1:end] - a) @ ab_unit, 0.0, ab_norm)
+            closest = a + np.outer(proj, ab_unit)
+            dists = np.linalg.norm(path[start + 1:end] - closest, axis=1)
+        idx = int(np.argmax(dists))
+        if dists[idx] > epsilon:
+            split = start + 1 + idx
+            keep[split] = True
+            stack.append((start, split))
+            stack.append((split, end))
+
+    return path[keep]
+
+
 def _resample_by_arclength(path, n_points):
     """Downsamples a traced (K, dim) polyline to `n_points` evenly spaced
     (by world arc length) points, endpoints included exactly. A raw
@@ -125,15 +182,32 @@ class TracedTimingMPC:
             max_vel: float | list[float] = -1.0,
             max_acc: float | list[float] = -1.0,
             max_jerk: float | list[float] = -1.0,
-            # Downsample each segment's traced polyline to at most this many
-            # points (arc-length-even, endpoints exact) before handing it to
-            # the timing QP -- see _resample_by_arclength's doc comment for
-            # why. None disables resampling (use the raw trace as-is).
+            # Primary mechanism for thinning each segment's traced polyline
+            # before handing it to the timing QP: Ramer-Douglas-Peucker
+            # simplification (see _rdp's doc comment) with epsilon set to
+            # `rdp_tolerance` FRACTION of that segment's own straight-line
+            # chord length (‖goal - start‖), not an absolute world-unit
+            # distance -- keeps the tolerance scale-free across differently
+            # -scaled scenarios and automatically tight on a segment that's
+            # shrunk down toward its goal. 0.02 (2%) is an empirically
+            # reasonable starting point, not a derived value -- tune lower
+            # for more shape fidelity, higher for fewer points. None
+            # disables simplification entirely, falling back to the old
+            # flat-count `_resample_by_arclength(traced,
+            # max_points_per_segment)` behavior.
+            rdp_tolerance: float | None = 0.02,
+            # Safety cap, not the primary mechanism: if RDP still returns
+            # more than this many points (a genuinely convoluted segment),
+            # arc-length-resample ITS output down to this count so QP size
+            # stays bounded in the worst case. None disables the cap (use
+            # RDP's output as-is). Also doubles as the flat point count
+            # `_resample_by_arclength` uses when rdp_tolerance is None.
             max_points_per_segment: int | None = 8,
     ):
         self.graph = graph
         self.field = field
         self.ambient_dim = graph.dim
+        self.rdp_tolerance = rdp_tolerance
         self.max_points_per_segment = max_points_per_segment
 
         cost_args = (time_cost, time_cost2, acceleration_cost, energy_cost,
@@ -173,7 +247,13 @@ class TracedTimingMPC:
 
             traced = np.asarray(self.field.trace_path(agent, start, goal))
             traced = _trim_trailing_duplicates(traced)
-            if self.max_points_per_segment is not None:
+            if self.rdp_tolerance is not None:
+                chord = np.linalg.norm(np.asarray(goal) - np.asarray(start))
+                traced = _rdp(traced, self.rdp_tolerance * chord)
+                if (self.max_points_per_segment is not None
+                        and len(traced) > self.max_points_per_segment):
+                    traced = _resample_by_arclength(traced, self.max_points_per_segment)
+            elif self.max_points_per_segment is not None:
                 traced = _resample_by_arclength(traced, self.max_points_per_segment)
             # traced[0] == start (already accounted for -- either dropped
             # here for k==0 since x0_i isn't part of the dense array, or
