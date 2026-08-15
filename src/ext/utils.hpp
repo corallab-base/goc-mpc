@@ -120,14 +120,23 @@ Eigen::RowVectorX<Expression> AsExprRow(const Eigen::MatrixBase<Derived>& row) {
 	return row.template cast<Expression>();
 }
 
-// World position of a "point" from a row of X (first 3 coords of the object block).
+// World position of a "point" from a row of X, sized to workspace_dim --
+// stays shape-compatible with PoseFromRow's own R_WE/p_WE (workspace_dim x
+// workspace_dim / workspace_dim x 1 for a kPosYaw robot at workspace_dim ==
+// 2), instead of always 3. Padded/truncated the same way PointPosFromRow
+// already is for an object whose own non_robot_dim is narrower than
+// workspace_dim (e.g. a PyRoboGym-style planar item with no z of its own),
+// never reading past that object's own slice in row_in.
 template <class DerivedRow>
-Eigen::Vector3<Expression> PointWorldFromRow(
+Eigen::VectorX<Expression> PointWorldFromRow(
 	const Eigen::MatrixBase<DerivedRow>& row_in,
-	int objs_start, int non_robot_dim, int obj_id) {
+	int objs_start, int non_robot_dim, int obj_id, int workspace_dim) {
 
 	Eigen::RowVectorX<Expression> row = AsExprRow(row_in);
-	return row.segment(objs_start + obj_id * non_robot_dim, 3).transpose();
+	const int n = std::min(non_robot_dim, workspace_dim);
+	Eigen::VectorX<Expression> p_WP = Eigen::VectorX<Expression>::Zero(workspace_dim);
+	p_WP.segment(0, n) = row.segment(objs_start + obj_id * non_robot_dim, n).transpose();
+	return p_WP;
 }
 
 // Returns a Vector3 regardless of the object's own declared width
