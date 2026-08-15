@@ -1,38 +1,35 @@
 """
-Interactive waypoint/timing demo, comparing GnTimingMPC and SqpTimingMPC
-live.
+Interactive waypoint/timing demo for GraphTimingMPC.
 
 Each of N_AGENTS agents has a chain of M_WAYPOINTS draggable 3-D waypoints
 (viser transform-controls gizmos, one color per agent). Dragging any gizmo
 -- or changing a GUI control -- rebuilds the graph from scratch, resolves it
 (MILPWaypointMPC for the trivial literal-target waypoint assignment, then
-whichever timing solver the "Solver" dropdown picks, for the cubic-Hermite
-timing/spline), and redraws each agent's resulting spline. Unlike
-short_horizon_collision_avoidance.py's reused solver instance + live
-obstacle parameter, every waypoint target here is baked into a Drake `eq()`
-Formula at `add_constraint()` time, so there's no live-reference shortcut --
-a full rebuild-and-resolve is genuinely required on every drag, not just a
-convenience choice.
+GraphTimingMPC for the cubic-Hermite timing/spline), and redraws each
+agent's resulting spline. Unlike short_horizon_collision_avoidance.py's
+reused solver instance + live obstacle parameter, every waypoint target
+here is baked into a Drake `eq()` Formula at `add_constraint()` time, so
+there's no live-reference shortcut -- a full rebuild-and-resolve is
+genuinely required on every drag, not just a convenience choice.
 
-The two solvers (see their own header comments -- gn_timing_mpc.hpp,
-sqp_timing_mpc.hpp) solve the IDENTICAL problem (same gn_timing::
-ProblemLayout/AssembleObjective) two different ways:
-  - GnTimingMPC: one raw-IPOPT solve, given an exact Gauss-Newton Hessian.
-  - SqpTimingMPC: a trust-region Gauss-Newton outer loop, qpOASES QP
-    subproblems (hot-started).
-A stress test across randomized multi-agent scenarios with active timing
-constraints found GnTimingMPC failing (IPOPT MAXITER/RESTORATION_FAILURE)
-on the large majority of harder cases while SqpTimingMPC kept succeeding
-and stayed roughly 20-30x faster -- this dropdown is for seeing that
-difference live on whatever scenario you drag together, not just trusting
-the aggregate numbers.
+GraphTimingMPC itself (see graph_timing_mpc.hpp's own doc comment) is a
+trust-region Gauss-Newton solver with qpOASES QP subproblems, not the
+earlier Drake/IPOPT implementation this class used to be -- a stress test
+across randomized multi-agent scenarios with active cross-agent timing
+constraints found the old implementation failing (IPOPT MAXITER_EXCEEDED/
+RESTORATION_FAILED) on the large majority of harder cases, while this one
+keeps succeeding, ~20-30x faster on average. The status line reports the
+trust-region loop's own diagnostics (iterations run, final trust radius --
+pinned at the radius floor signals a converged stall, not a failure) so
+that's visible live too, not just the end result.
 
 Cross-agent timing constraints (LESS_THAN / EQUAL between two agents' own
 waypoint arrivals) are expressed the same way every other constraint in this
 graph is -- via GraphOfConstraints.add_constraint on graph nodes -- rather
-than through any separate solver-level API. GnTimingMPC.solve() only ever
-enforces the LESS_THAN/EQUAL interactions GraphOfConstraints::get_agent_paths
-derives from the graph itself (see that function, graph_of_constraints.cpp):
+than through any separate solver-level API. GraphTimingMPC.solve() only
+ever enforces the LESS_THAN/EQUAL interactions
+GraphOfConstraints::get_agent_paths derives from the graph itself (see that
+function, graph_of_constraints.cpp):
   - A node CO-OWNED by >1 agent (i.e. add_constraint'd on that same node for
     more than one agent) automatically becomes an EQUAL interaction between
     those agents -- the same pattern test_waypoint_mpc.py's
@@ -47,7 +44,7 @@ add_constraint to the CURRENT position of whichever existing draggable
 waypoint the GUI has selected (so it tracks that point live, same as
 everything else here being rebuilt from the gizmos' current state). These
 extra nodes are singly-/co-owned exactly like any other node -- nothing
-about GnTimingMPC or get_agent_paths needed to change to support this.
+about GraphTimingMPC or get_agent_paths needed to change to support this.
 
 One consequence worth knowing: since the constraint nodes are owned by the
 same agent(s) whose waypoint they're pinned to, they become one MORE segment
@@ -69,9 +66,8 @@ import numpy as np
 import viser
 from pydrake.math import eq
 
-from goc_mpc import GraphOfConstraints, MILPWaypointMPC, WaypointSolver, WaypointObjective
+from goc_mpc import GraphOfConstraints, MILPWaypointMPC, GraphTimingMPC, WaypointSolver, WaypointObjective
 from goc_mpc._ext.configuration_spline import CubicConfigurationSpline, Block
-from goc_mpc._ext.goc_mpc import GnTimingMPC, SqpTimingMPC
 
 DIM = 3
 N_AGENTS = 2
@@ -89,18 +85,10 @@ INITIAL_WP = [
 
 CONSTRAINT_KINDS = ("LESS_THAN (A arrives <= B)", "EQUAL (A arrives == B)")
 
-# SqpTimingMPC first/default: the stress test (this file's own module
-# docstring) found it reliably beating GnTimingMPC on harder scenarios, not
-# just matching it on easy ones -- so "compare both live" starts from the
-# one that's actually expected to work, with IPOPT available to switch to
-# for comparison.
-SOLVERS = ("SqpTimingMPC (qpOASES)", "GnTimingMPC (IPOPT)")
-
 
 def main():
     server = viser.ViserServer()
 
-    solver_dropdown = server.gui.add_dropdown("Solver", SOLVERS, initial_value=SOLVERS[0])
     enable_checkbox = server.gui.add_checkbox("Enable timing constraint", initial_value=False)
     agent_a_dropdown = server.gui.add_dropdown(
         "Agent A", tuple(str(i) for i in range(N_AGENTS)), initial_value="0")
@@ -114,7 +102,7 @@ def main():
         "Constraint kind", CONSTRAINT_KINDS, initial_value=CONSTRAINT_KINDS[0])
     status_text = server.gui.add_text("Status", initial_value="")
 
-    # Fixed start markers (not draggable -- X0/V0 feed GnTimingMPC.solve()
+    # Fixed start markers (not draggable -- X0/V0 feed GraphTimingMPC.solve()
     # directly, not through the graph, so there's no add_constraint to
     # rebuild for them).
     for i in range(N_AGENTS):
@@ -203,15 +191,11 @@ def main():
         assignments = waypoint_mpc.view_assignments()
         t_by_node = waypoint_mpc.view_t_by_node()
 
-        solver_name = solver_dropdown.value
-        is_sqp = solver_name.startswith("SqpTimingMPC")
-        solver_cls = SqpTimingMPC if is_sqp else GnTimingMPC
-
         timing_splines = [CubicConfigurationSpline([Block.R(DIM)]) for _ in range(N_AGENTS)]
-        timing_mpc = solver_cls(
+        timing_mpc = GraphTimingMPC(
             graph, timing_splines, time_cost=1.0, time_cost2=0.0, acceleration_cost=1.0)
         if not timing_mpc.solve(x0_flat, V0, remaining, waypoints, assignments, t_by_node):
-            status_text.value = f"{solver_name} FAILED"
+            status_text.value = "GraphTimingMPC FAILED"
             return
 
         fill_splines = [CubicConfigurationSpline([Block.R(DIM)]) for _ in range(N_AGENTS)]
@@ -222,10 +206,9 @@ def main():
             pts, _ = sp.eval_multiple(times)
             path_vis[i].points = pts
 
-        msg = f"{solver_name} ok  |  solve_time={timing_mpc.get_last_solve_time() * 1000:.2f} ms"
-        if is_sqp:
-            msg += (f"  |  iters={timing_mpc.get_last_iterations()}"
-                    f"  trust_radius={timing_mpc.get_last_trust_radius():.2g}")
+        msg = (f"solve ok  |  solve_time={timing_mpc.get_last_solve_time() * 1000:.2f} ms"
+               f"  |  iters={timing_mpc.get_last_iterations()}"
+               f"  trust_radius={timing_mpc.get_last_trust_radius():.2g}")
         if sync_agents is not None:
             a, b, is_equal = sync_agents
             time_deltas = timing_mpc.view_time_deltas_list()
@@ -249,17 +232,16 @@ def main():
             def _(_):
                 resolve()
 
-    for control in (solver_dropdown, enable_checkbox, agent_a_dropdown, wp_a_dropdown,
+    for control in (enable_checkbox, agent_a_dropdown, wp_a_dropdown,
                     agent_b_dropdown, wp_b_dropdown, kind_dropdown):
         @control.on_update
         def _(_):
             resolve()
 
     resolve()
-    print("Open the printed URL above. Drag any waypoint gizmo, switch the "
-          "Solver dropdown to compare GnTimingMPC vs SqpTimingMPC live, and "
-          "use the timing-constraint GUI controls to add/change a "
-          "cross-agent LESS_THAN or EQUAL arrival-time constraint.")
+    print("Open the printed URL above. Drag any waypoint gizmo, and use the "
+          "timing-constraint GUI controls to add/change a cross-agent "
+          "LESS_THAN or EQUAL arrival-time constraint.")
     while True:
         time.sleep(1.0)
 

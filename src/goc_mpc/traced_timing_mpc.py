@@ -164,21 +164,25 @@ class TracedTimingMPC:
             field,
             time_cost: float = 1.0,
             time_cost2: float = 0.0,
-            acceleration_cost: float = 0.0,
+            # Default ON (1.0) -- see GraphOfConstraintsMPC's matching
+            # acceleration_cost comment (goc_mpc.py) for why: GraphTimingMPC
+            # is a trust-region Gauss-Newton/qpOASES solver, which converges
+            # to a local optimum regardless of convexity, so the old
+            # default-off/stability_cost-proxy workaround (needed only
+            # because that non-convex residual could make IPOPT fail
+            # outright) no longer applies or exists.
+            acceleration_cost: float = 1.0,
+            # energy_cost/arclength_cost: NOT supported by GraphTimingMPC's
+            # current (trust-region SQP) implementation -- constructing it
+            # with either nonzero throws. See GraphOfConstraintsMPC's
+            # matching comment (goc_mpc.py).
             energy_cost: float = 0.0,
-            # Default off, and stability_cost default ON below -- see
-            # GraphOfConstraintsMPC's matching arclength_cost/stability_cost
-            # comments (goc_mpc.py) for why: both acceleration_cost and
-            # arclength_cost contain terms bilinear in (tau, velocity)
-            # before being squared/normed, not convex in general, confirmed
-            # as a real source of Ipopt IterationLimit failures and (for
-            # arclength_cost specifically) severe per-cycle slowdowns.
             arclength_cost: float = 0.0,
-            stability_cost: float = 1.0,
             # A bare float broadcasts to every block in splines[0]'s spec; a
             # list[float] must have exactly one entry per block, in spec
-            # order -- see GraphTimingMPC's max_vel field doc comment
-            # (graph_timing_mpc.hpp).
+            # order. NOT supported by GraphTimingMPC's current (trust-region
+            # SQP) implementation -- constructing it with an actual (> 0)
+            # bound throws; the unbounded sentinel <= 0 (the default) is fine.
             max_vel: float | list[float] = -1.0,
             max_acc: float | list[float] = -1.0,
             max_jerk: float | list[float] = -1.0,
@@ -211,7 +215,7 @@ class TracedTimingMPC:
         self.max_points_per_segment = max_points_per_segment
 
         cost_args = (time_cost, time_cost2, acceleration_cost, energy_cost,
-                     arclength_cost, max_vel, max_acc, max_jerk, stability_cost)
+                     arclength_cost, max_vel, max_acc, max_jerk)
 
         # Own internal spline copy -- fill_cubic_splines is never called on
         # this; it's only used inside solve_dense() for ambient_dim()/

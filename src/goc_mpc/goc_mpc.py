@@ -42,52 +42,49 @@ class GraphOfConstraintsMPC():
             # pass an already-constructed timing solver (e.g. a
             # TracedTimingMPC, duck-typed to GraphTimingMPC's public
             # surface rather than a real C++ subclass -- see
-            # goc_mpc.traced_timing_mpc) to use it directly; time_cost/.../
-            # stability_cost below are then ignored, since the instance is
-            # already configured. Leave unset (default) to keep
-            # auto-building a GraphTimingMPC from those args, as before.
+            # goc_mpc.traced_timing_mpc) to use it directly; time_cost/...
+            # below are then ignored, since the instance is already
+            # configured. Leave unset (default) to keep auto-building a
+            # GraphTimingMPC from those args, as before.
             timing_mpc=None,
             # timing mpc hyperparameters
             time_cost: float = 1.0,
             time_cost2: float = 0.0,
-            acceleration_cost: float = 0.0,
+            # Default ON (1.0): GraphTimingMPC is a trust-region Gauss-
+            # Newton/qpOASES solver (graph_timing_mpc.hpp), not the earlier
+            # Drake/IPOPT implementation this default used to be tuned
+            # around -- that implementation needed acceleration_cost OFF by
+            # default (and a separate "stability_cost" convex proxy ON
+            # instead) specifically because its non-convex coast-corrected
+            # residual could make IPOPT fail outright. The trust-region
+            # solver converges to a local optimum regardless of convexity
+            # (see graph_timing_mpc.hpp's own doc comment), so that
+            # workaround -- and the stability_cost parameter itself -- no
+            # longer exists; acceleration_cost is just the real min-
+            # acceleration cost, on by default.
+            acceleration_cost: float = 1.0,
+            # energy_cost/arclength_cost: NOT supported by GraphTimingMPC's
+            # current (trust-region SQP) implementation -- constructing it
+            # with either nonzero throws. arclength_cost in particular
+            # contains terms bilinear in (tau, velocity) before being
+            # normed (see the per-quadrature-point sqrt(...) in
+            # CubicConfigurationSpline::compute_arclength_cost), and was a
+            # real contributor to both Ipopt IterationLimit failures AND
+            # severe per-cycle slowdowns under the old implementation.
             energy_cost: float = 0.0,
-            # Default off (not on): contains terms bilinear in (tau,
-            # velocity) before being normed (see the per-quadrature-point
-            # sqrt(...) in CubicConfigurationSpline::compute_arclength_cost),
-            # not convex in general -- same failure family as
-            # acceleration_cost's own non-convex residual (see
-            # stability_cost's comment below), confirmed as a real
-            # contributor to both Ipopt IterationLimit failures AND severe
-            # per-cycle slowdowns (its near-unregularized sqrt(x^2+1e-8) is
-            # close to non-differentiable at near-zero velocity, which
-            # Newton-type solvers handle poorly) on
-            # pick_place_task_experiment's branching, multi-segment traced
-            # paths.
             arclength_cost: float = 0.0,
             time_delta_cutoff: float = 0.4,
             phi_tolerance: float = 0.03,
             # A bare float broadcasts to every block in spline_spec; a
             # list[float] must have exactly one entry per block, in
             # spline_spec order (e.g. [linear_bound, angular_bound] for a
-            # [Block.R(2), Block.Torus(1)] pos+yaw robot) -- see
-            # GraphTimingMPC's max_vel field doc comment (graph_timing_mpc.hpp).
+            # [Block.R(2), Block.Torus(1)] pos+yaw robot). NOT supported by
+            # GraphTimingMPC's current (trust-region SQP) implementation --
+            # constructing it with an actual (> 0) bound throws; the
+            # unbounded sentinel <= 0 (the default) is fine.
             max_vel: float | list[float] = -1.0,
             max_acc: float | list[float] = -1.0,
             max_jerk: float | list[float] = -1.0,
-            # Convex alternative/complement to acceleration_cost: penalizes
-            # ||xJ-xJm1||^2/tau^3 + ||vJ-vJm1||^2/tau per segment instead of
-            # acceleration_cost's coast-corrected ||(xJ-xJm1) -
-            # 0.5*tau*(vJm1+vJ)||^2/tau^3 -- the latter's cross term can be
-            # non-convex whenever the current velocity already points
-            # roughly toward the target, which is what let NLopt's timing
-            # solve land in two different local optima cycle to cycle (see
-            # graph_timing_mpc.hpp's _stability_cost doc comment). Default
-            # ON (1.0, not 0.0): the only cost term (besides the linear
-            # time_cost) known to keep the timing QP convex -- see
-            # arclength_cost's own comment above for why acceleration_cost/
-            # arclength_cost both default off instead.
-            stability_cost: float = 1.0,
             # short path mpc hyperparameters
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
@@ -191,7 +188,6 @@ class GraphOfConstraintsMPC():
         self.acceleration_cost = acceleration_cost
         self.energy_cost = energy_cost
         self.arclength_cost = arclength_cost
-        self.stability_cost = stability_cost
         self.short_path_time_per_step = short_path_time_per_step
         self.hold_drift_tolerance = hold_drift_tolerance
 
@@ -219,7 +215,7 @@ class GraphOfConstraintsMPC():
             self.timing_mpc = GraphTimingMPC(graph, self.last_cycle_splines,
                                              time_cost, time_cost2, acceleration_cost,
                                              energy_cost, arclength_cost,
-                                             max_vel, max_acc, max_jerk, stability_cost)
+                                             max_vel, max_acc, max_jerk)
         if short_path_mpc is not None:
             self.short_path_mpc = short_path_mpc
         else:

@@ -56,9 +56,9 @@ void AssembleObjective(
 			for (const auto& off : seg.spline->block_offsets_) {
 				if (off.type == CubicConfigurationSpline::Block::Type::SO3Mat) {
 					throw std::runtime_error(
-						"gn_timing::AssembleObjective: SO3Mat blocks are not "
-						"supported (matches BlockPositionDelta's own "
-						"unsupported-SO3Mat stub)");
+						"GraphTimingMPC: SO3Mat blocks are not supported "
+						"(matches BlockPositionDelta's own unsupported-"
+						"SO3Mat stub)");
 				}
 
 				const int tN = off.tangent_size;
@@ -131,55 +131,42 @@ void AssembleObjective(
 	if (hess_out) *hess_out = std::move(triplets);
 }
 
-ProblemLayout BuildProblemLayout(
-		const GraphOfConstraints& graph,
+namespace {
+
+// Shared core: builds segments/interactions/x_init given each agent's
+// already-resolved (node_ids, wps) pair (real node ids, or -1 for a
+// synthetic/traced interior point in the dense case) and already-resolved
+// interactions -- both BuildProblemLayout (sparse) and
+// BuildDenseProblemLayout share this; they differ only in HOW agent_wps/
+// agent_node_ids/interactions get resolved before calling in.
+ProblemLayout BuildProblemLayoutCore(
 		const std::vector<CubicConfigurationSpline>& splines,
-		const std::vector<int>& remaining_vertices,
-		const Eigen::MatrixXd& waypoints,
-		const Eigen::VectorXi& assignments,
+		const std::vector<std::vector<int>>& agent_node_ids,
+		const std::vector<Eigen::MatrixXd>& agent_wps,
+		const std::vector<AgentInteraction>& agent_interactions,
+		const std::map<std::pair<int, int>, double>& edge_to_min_tau_map,
 		const Eigen::VectorXd& x0,
 		const Eigen::VectorXd& v0,
-		const Eigen::VectorXd& t_by_node,
-		std::vector<Eigen::MatrixXd>* wps_list_out,
-		std::vector<std::vector<int>>* agent_nodes_list_out,
 		const std::vector<Eigen::MatrixXd>& prev_vs_list,
 		const std::vector<Eigen::VectorXd>& prev_time_deltas_list,
 		const std::vector<std::vector<int>>& prev_agent_nodes_list,
 		const std::map<int, int>& prev_agent_spline_length_map) {
 
 	ProblemLayout layout;
-	const int num_agents = graph.num_agents;
+	const int num_agents = static_cast<int>(splines.size());
 	const int ambient_dim = splines.at(0).ambient_dim();
 	const int tangent_dim = splines.at(0).tangent_dim();
 
-	auto [parents, agent_nodes, agent_interactions] =
-		graph.get_agent_paths(remaining_vertices, assignments, t_by_node);
-
 	layout.agents.resize(num_agents);
-	wps_list_out->resize(num_agents);
-	agent_nodes_list_out->resize(num_agents);
 
 	// First pass: settle every agent's tau/v ranges (an interaction row can
 	// reference any agent regardless of loop order, so every range must be
 	// known before the interaction-row pass below).
-	std::vector<Eigen::MatrixXd> wps_list(num_agents);
 	int n = 0;
 	for (int i = 0; i < num_agents; ++i) {
-		const std::vector<int>& agent_i_nodes = agent_nodes[i];
-		(*agent_nodes_list_out)[i] = agent_i_nodes;
-		const int K = static_cast<int>(agent_i_nodes.size());
+		const int K = static_cast<int>(agent_node_ids[i].size());
 		layout.agents[i].K = K;
 		if (K == 0) continue;
-
-		Eigen::MatrixXd wps_i(K, ambient_dim);
-		for (int j = 0; j < K; ++j) {
-			const int node = agent_i_nodes[j];
-			for (int k = 0; k < ambient_dim; ++k) {
-				wps_i(j, k) = waypoints(node, i * ambient_dim + k);
-			}
-		}
-		wps_list[i] = wps_i;
-		(*wps_list_out)[i] = wps_i;
 
 		layout.agents[i].tau_offset = n;
 		n += K;
@@ -208,7 +195,7 @@ ProblemLayout BuildProblemLayout(
 	for (int i = 0; i < num_agents; ++i) {
 		const AgentLayout& al = layout.agents[i];
 		if (al.K == 0) continue;
-		const Eigen::MatrixXd& wps_i = wps_list[i];
+		const Eigen::MatrixXd& wps_i = agent_wps[i];
 		const Eigen::VectorXd x0_i = x0.segment(i * ambient_dim, ambient_dim);
 		const Eigen::VectorXd v0_i = v0.segment(i * tangent_dim, tangent_dim);
 		const CubicConfigurationSpline& spline = splines.at(i);
@@ -250,23 +237,28 @@ ProblemLayout BuildProblemLayout(
 		ir.count_j = p.agent_j_depth + 1;
 		ir.type = p.type;
 		const auto key = std::make_pair(p.node_u, p.node_v);
-		ir.min_tau = graph.edge_to_min_tau_map.contains(key)
-			? graph.edge_to_min_tau_map.at(key) : 0.0;
+		ir.min_tau = edge_to_min_tau_map.contains(key) ? edge_to_min_tau_map.at(key) : 0.0;
 		layout.interactions.push_back(ir);
 	}
 
 	// Warm start: node-id-matched against the previous cycle's converged
 	// solution -- same purpose as GraphTimingMPC::solve()'s own warm-start
-	// block (see that function's comment: an NLP solver re-solving a
+	// block used to have (see git history): an NLP/QP solver re-solving a
 	// barely-changed problem from a generic guess every cycle can land in a
-	// very different local optimum cycle to cycle).
+	// very different local optimum cycle to cycle. Skips synthetic (-1)
+	// rows in the dense case -- unlike a real graph node, a synthetic
+	// traced interior point can legitimately change point-for-point between
+	// cycles (the traced polyline itself shifts as x0 moves), so matching
+	// one arbitrary -1 to another would seed the solver from an unrelated
+	// point instead of just leaving it at the generic guess above.
 	for (int i = 0; i < num_agents; ++i) {
 		if (!prev_agent_spline_length_map.contains(i)) continue;
 		const AgentLayout& al = layout.agents[i];
-		const std::vector<int>& new_nodes = (*agent_nodes_list_out)[i];
+		const std::vector<int>& new_nodes = agent_node_ids[i];
 		const std::vector<int>& old_nodes = prev_agent_nodes_list[i];
 
 		for (int j_new = 0; j_new < static_cast<int>(new_nodes.size()); ++j_new) {
+			if (new_nodes[j_new] < 0) continue;
 			const auto it = std::find(old_nodes.begin(), old_nodes.end(), new_nodes[j_new]);
 			if (it == old_nodes.end()) continue;
 			const int j_old = static_cast<int>(std::distance(old_nodes.begin(), it));
@@ -284,6 +276,83 @@ ProblemLayout BuildProblemLayout(
 	}
 
 	return layout;
+}
+
+}  // namespace
+
+ProblemLayout BuildProblemLayout(
+		const GraphOfConstraints& graph,
+		const std::vector<CubicConfigurationSpline>& splines,
+		const std::vector<int>& remaining_vertices,
+		const Eigen::MatrixXd& waypoints,
+		const Eigen::VectorXi& assignments,
+		const Eigen::VectorXd& x0,
+		const Eigen::VectorXd& v0,
+		const Eigen::VectorXd& t_by_node,
+		std::vector<Eigen::MatrixXd>* wps_list_out,
+		std::vector<std::vector<int>>* agent_nodes_list_out,
+		const std::vector<Eigen::MatrixXd>& prev_vs_list,
+		const std::vector<Eigen::VectorXd>& prev_time_deltas_list,
+		const std::vector<std::vector<int>>& prev_agent_nodes_list,
+		const std::map<int, int>& prev_agent_spline_length_map) {
+
+	const int num_agents = graph.num_agents;
+	const int ambient_dim = splines.at(0).ambient_dim();
+
+	auto [parents, agent_nodes, agent_interactions] =
+		graph.get_agent_paths(remaining_vertices, assignments, t_by_node);
+
+	wps_list_out->resize(num_agents);
+	agent_nodes_list_out->resize(num_agents);
+	std::vector<Eigen::MatrixXd> agent_wps(num_agents);
+
+	for (int i = 0; i < num_agents; ++i) {
+		const std::vector<int>& agent_i_nodes = agent_nodes[i];
+		(*agent_nodes_list_out)[i] = agent_i_nodes;
+		const int K = static_cast<int>(agent_i_nodes.size());
+		if (K == 0) continue;
+
+		Eigen::MatrixXd wps_i(K, ambient_dim);
+		for (int j = 0; j < K; ++j) {
+			const int node = agent_i_nodes[j];
+			for (int k = 0; k < ambient_dim; ++k) {
+				wps_i(j, k) = waypoints(node, i * ambient_dim + k);
+			}
+		}
+		agent_wps[i] = wps_i;
+		(*wps_list_out)[i] = wps_i;
+	}
+
+	return BuildProblemLayoutCore(
+		splines, *agent_nodes_list_out, agent_wps, agent_interactions,
+		graph.edge_to_min_tau_map, x0, v0,
+		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
+		prev_agent_spline_length_map);
+}
+
+ProblemLayout BuildDenseProblemLayout(
+		const std::vector<CubicConfigurationSpline>& splines,
+		const std::vector<Eigen::MatrixXd>& agent_dense_wps,
+		const std::vector<std::vector<int>>& agent_dense_node_ids,
+		const std::vector<AgentInteraction>& agent_interactions,
+		const std::map<std::pair<int, int>, double>& edge_to_min_tau_map,
+		const Eigen::VectorXd& x0,
+		const Eigen::VectorXd& v0,
+		std::vector<Eigen::MatrixXd>* wps_list_out,
+		std::vector<std::vector<int>>* agent_nodes_list_out,
+		const std::vector<Eigen::MatrixXd>& prev_vs_list,
+		const std::vector<Eigen::VectorXd>& prev_time_deltas_list,
+		const std::vector<std::vector<int>>& prev_agent_nodes_list,
+		const std::map<int, int>& prev_agent_spline_length_map) {
+
+	*wps_list_out = agent_dense_wps;
+	*agent_nodes_list_out = agent_dense_node_ids;
+
+	return BuildProblemLayoutCore(
+		splines, agent_dense_node_ids, agent_dense_wps, agent_interactions,
+		edge_to_min_tau_map, x0, v0,
+		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
+		prev_agent_spline_length_map);
 }
 
 }  // namespace gn_timing

@@ -9,8 +9,6 @@
 #include "graph_waypoint_mpc.hpp"
 #include "milp_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
-#include "gn_timing_mpc.hpp"
-#include "sqp_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
 #include "admm_short_path_mpc.hpp"
 
@@ -348,14 +346,18 @@ void init_submodule_goc_mpc(py::module_& m) {
                                   double time_cost, double time_cost2, double acceleration_cost,
                                   double energy_cost, double arclength_cost,
                                   py::object max_vel, py::object max_acc, py::object max_jerk,
-                                  double stability_cost) {
+                                  int max_iterations, double initial_trust_radius,
+                                  double max_trust_radius, double min_trust_radius,
+                                  double grad_tol) {
                         // max_vel/max_acc/max_jerk: a bare float broadcasts to every block in
                         // splines[0]'s spec (back-compat with every existing caller, including
                         // goc-mpc's own raw examples that construct this with plain floats); a
                         // list[float] must have exactly one entry per block. Broadcasting lives
                         // here, at the pybind boundary, rather than in goc_mpc.py/
                         // traced_timing_mpc.py, since it's the only place that covers every
-                        // caller -- see GraphTimingMPC's max_vel field doc comment.
+                        // caller. (max_vel/max_acc must still resolve to <= 0/empty -- an actual
+                        // bound throws inside the constructor, see GraphTimingMPC's own doc
+                        // comment for why.)
                         const size_t num_blocks = splines.at(0).block_offsets_.size();
                         auto broadcast_bound = [num_blocks](const py::object& val, const char* name) {
                                 if (val.is_none()) return std::vector<double>();
@@ -383,15 +385,20 @@ void init_submodule_goc_mpc(py::module_& m) {
                                 broadcast_bound(max_vel, "max_vel"),
                                 broadcast_bound(max_acc, "max_acc"),
                                 broadcast_bound(max_jerk, "max_jerk"),
-                                stability_cost);
+                                max_iterations, initial_trust_radius, max_trust_radius,
+                                min_trust_radius, grad_tol);
                      }), py::keep_alive<1, 3>(),
                      py::arg("graph"), py::arg("splines"),
                      py::arg("time_cost") = 1e0, py::arg("time_cost2") = 0e0,
-                     py::arg("acceleration_cost") = 0.0, py::arg("energy_cost") = 0.0,
+                     py::arg("acceleration_cost") = 1.0, py::arg("energy_cost") = 0.0,
                      py::arg("arclength_cost") = 0.0,
                      py::arg("max_vel") = py::float_(-1.0), py::arg("max_acc") = py::float_(-1.0),
                      py::arg("max_jerk") = py::float_(-1.0),
-                     py::arg("stability_cost") = 1.0)
+                     py::arg("max_iterations") = 50,
+                     py::arg("initial_trust_radius") = 1.0,
+                     py::arg("max_trust_radius") = 50.0,
+                     py::arg("min_trust_radius") = 1e-6,
+                     py::arg("grad_tol") = 1e-6)
 		.def("solve", &GraphTimingMPC::solve,
 		     py::arg("x0"), py::arg("v0"), py::arg("remaining_vertices"),
 		     py::arg("waypoints"), py::arg("assignments"),
@@ -410,62 +417,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_time_deltas_list", &GraphTimingMPC::view_time_deltas_list)
 		.def("view_agent_nodes_list", &GraphTimingMPC::view_agent_nodes_list)
 		.def("view_agent_spline_length_map", &GraphTimingMPC::view_agent_spline_length_map)
-		.def("get_last_solve_time", &GraphTimingMPC::get_last_solve_time);
-
-	py::class_<GnTimingMPC>(goc_mpc, "GnTimingMPC")
-		.def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>,
-			      double, double, double>(),
-		     py::keep_alive<1, 2>(),
-		     py::arg("graph"), py::arg("splines"),
-		     py::arg("time_cost") = 1e0, py::arg("time_cost2") = 0e0,
-		     py::arg("acceleration_cost") = 1.0)
-		.def("solve", &GnTimingMPC::solve,
-		     py::arg("x0"), py::arg("v0"), py::arg("remaining_vertices"),
-		     py::arg("waypoints"), py::arg("assignments"),
-		     py::arg("t_by_node") = Eigen::VectorXd())
-		.def("get_agent_spline_length", &GnTimingMPC::get_agent_spline_length)
-		.def("get_agent_spline_nodes", &GnTimingMPC::get_agent_spline_nodes)
-		.def("set_progressed_time", &GnTimingMPC::set_progressed_time)
-		.def("fill_cubic_splines", &GnTimingMPC::fill_cubic_splines)
-		.def("get_next_taus", &GnTimingMPC::get_next_taus)
-		.def("get_next_nodes", &GnTimingMPC::get_next_nodes)
-		.def("view_wps_list", &GnTimingMPC::view_wps_list)
-		.def("view_vs_list", &GnTimingMPC::view_vs_list)
-		.def("view_time_deltas_list", &GnTimingMPC::view_time_deltas_list)
-		.def("view_agent_nodes_list", &GnTimingMPC::view_agent_nodes_list)
-		.def("view_agent_spline_length_map", &GnTimingMPC::view_agent_spline_length_map)
-		.def("get_last_solve_time", &GnTimingMPC::get_last_solve_time);
-
-	py::class_<SqpTimingMPC>(goc_mpc, "SqpTimingMPC")
-		.def(py::init<const GraphOfConstraints&, std::vector<CubicConfigurationSpline>,
-			      double, double, double, int, double, double, double, double>(),
-		     py::keep_alive<1, 2>(),
-		     py::arg("graph"), py::arg("splines"),
-		     py::arg("time_cost") = 1e0, py::arg("time_cost2") = 0e0,
-		     py::arg("acceleration_cost") = 1.0,
-		     py::arg("max_iterations") = 50,
-		     py::arg("initial_trust_radius") = 1.0,
-		     py::arg("max_trust_radius") = 50.0,
-		     py::arg("min_trust_radius") = 1e-6,
-		     py::arg("grad_tol") = 1e-6)
-		.def("solve", &SqpTimingMPC::solve,
-		     py::arg("x0"), py::arg("v0"), py::arg("remaining_vertices"),
-		     py::arg("waypoints"), py::arg("assignments"),
-		     py::arg("t_by_node") = Eigen::VectorXd())
-		.def("get_agent_spline_length", &SqpTimingMPC::get_agent_spline_length)
-		.def("get_agent_spline_nodes", &SqpTimingMPC::get_agent_spline_nodes)
-		.def("set_progressed_time", &SqpTimingMPC::set_progressed_time)
-		.def("fill_cubic_splines", &SqpTimingMPC::fill_cubic_splines)
-		.def("get_next_taus", &SqpTimingMPC::get_next_taus)
-		.def("get_next_nodes", &SqpTimingMPC::get_next_nodes)
-		.def("view_wps_list", &SqpTimingMPC::view_wps_list)
-		.def("view_vs_list", &SqpTimingMPC::view_vs_list)
-		.def("view_time_deltas_list", &SqpTimingMPC::view_time_deltas_list)
-		.def("view_agent_nodes_list", &SqpTimingMPC::view_agent_nodes_list)
-		.def("view_agent_spline_length_map", &SqpTimingMPC::view_agent_spline_length_map)
-		.def("get_last_solve_time", &SqpTimingMPC::get_last_solve_time)
-		.def("get_last_iterations", &SqpTimingMPC::get_last_iterations)
-		.def("get_last_trust_radius", &SqpTimingMPC::get_last_trust_radius);
+		.def("get_last_solve_time", &GraphTimingMPC::get_last_solve_time)
+		.def("get_last_iterations", &GraphTimingMPC::get_last_iterations)
+		.def("get_last_trust_radius", &GraphTimingMPC::get_last_trust_radius);
 
 	// Extensible obstacle registry passed into GraphShortPathMPC -- see
 	// obstacle_set.hpp's own doc comment for why this is one open-ended

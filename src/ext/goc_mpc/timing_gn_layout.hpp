@@ -3,14 +3,10 @@
 // Shared Gauss-Newton timing-problem plumbing -- the flat decision-vector
 // layout (per-agent tau/v ranges, per-segment constant PositionDelta data,
 // linear interaction rows) and the objective assembly (value/gradient/
-// Gauss-Newton-Hessian-triplets) that both GnTimingMPC (gn_timing_mpc.cpp,
-// solved via a hand-written Ipopt::TNLP) and SqpTimingMPC
-// (sqp_timing_mpc.cpp, solved via a trust-region Gauss-Newton loop with
-// qpOASES QP subproblems) build on. Factored out here specifically so both
-// solvers run the SAME, already-derivative-checked residual/Jacobian/
-// Hessian math -- see gn_timing_mpc.hpp's own doc comment for the math
-// itself (D/V residuals, why disp needs no autodiff, etc.); nothing here
-// duplicates that reasoning, only the code.
+// Gauss-Newton-Hessian-triplets) GraphTimingMPC (graph_timing_mpc.cpp,
+// solved via a trust-region Gauss-Newton loop with qpOASES QP subproblems)
+// builds on. See graph_timing_mpc.hpp's own doc comment for the math
+// itself (D/V residuals, why disp needs no autodiff, etc.).
 
 #include <map>
 #include <vector>
@@ -25,9 +21,8 @@ namespace gn_timing {
 
 constexpr double kTauMin = 0.01;
 constexpr double kTauMax = 100.0;
-// A generic "no bound" convention shared by both consumers (matches Ipopt's
-// own nlp_lower_bound_inf/nlp_upper_bound_inf default of +/-1e19, and is
-// used verbatim as qpOASES' box bound for an "unbounded" variable too).
+// A generic "no bound" convention (used as qpOASES' box bound for an
+// "unbounded" variable).
 constexpr double kInf = 1e19;
 
 // One agent's tau/v decision-variable ranges within the flat global vector.
@@ -41,7 +36,7 @@ struct AgentLayout {
 // PositionDelta ("disp") data compute_ctrl_cost's D/V residuals are built
 // from. xJ/xJm1 are fixed constants at this phase (upstream waypoint-solve
 // output), so `disp` is computed ONCE in double via
-// CubicConfigurationSpline::PositionDelta -- see gn_timing_mpc.hpp's own
+// CubicConfigurationSpline::PositionDelta -- see graph_timing_mpc.hpp's own
 // doc comment for why that means no autodiff is ever needed through the
 // wrap/quaternion-log branches themselves.
 struct SegmentLayout {
@@ -56,8 +51,9 @@ struct SegmentLayout {
 
 // One cross-agent LESS_THAN/EQUAL row (add_agent_interaction_constraints'
 // counterpart) -- taus_i.head(depth+1)/taus_j.head(depth+1) are contiguous
-// global-index ranges by construction (see BuildProblemLayout), so the
-// row's Jacobian is a fixed +1/-1 pattern -- exactly linear, no autodiff.
+// global-index ranges by construction (see the *ProblemLayout builders
+// below), so the row's Jacobian is a fixed +1/-1 pattern -- exactly linear,
+// no autodiff.
 struct InteractionRow {
 	int tau_offset_i = 0, count_i = 0;
 	int tau_offset_j = 0, count_j = 0;
@@ -80,9 +76,19 @@ Eigen::VectorXd CumsumWithZero(const Eigen::VectorXd& x, int n);
 // Any of f_out/grad_out/hess_out may be null when the caller doesn't need
 // that piece. time_cost/time_cost2 contribute EXACTLY (already linear/
 // diagonal-quadratic -- no Gauss-Newton approximation needed).
-// acceleration_cost's psi is the only approximated part -- see the .cpp for
-// the per-block residual derivation. H_GN triplets may repeat the same
-// (row, col) pair many times -- the caller is expected to sum duplicates
+//
+// acceleration_cost's psi is the only approximated part: each block's D/V
+// residual pair is differentiated locally (only tau and that block's own
+// free v0/v1 are ever seeded -- different blocks within a segment never
+// share v variables, and disp is a precomputed constant, itself already
+// manifold-correct -- CubicConfigurationSpline::PositionDelta wrap-adjusts
+// Torus and quaternion-logs SO3Quat, not a raw ambient subtraction), and
+// every residual's contribution to f/grad/H_GN is accumulated into the
+// GLOBAL arrays at that residual's own global variable indices. H_GN
+// triplets may repeat the same (row, col) pair many times (e.g. every block
+// within a segment touches that segment's shared tau; a shared interior v
+// is touched by both the segment ending there and the one starting there)
+// -- the caller is expected to sum duplicates
 // (Eigen::SparseMatrix::setFromTriplets does this, or a caller building a
 // dense Hessian can just accumulate directly), not treat this list as
 // already-deduplicated.
@@ -98,10 +104,9 @@ void AssembleObjective(
 
 // Builds the flat decision-vector layout (agent tau/v ranges, per-segment
 // constant data, interaction rows, initial guess) for one solve() call.
-// Sparse/real-node-only counterpart to build_graph_timing_problem
-// (graph_timing_mpc.cpp) -- same graph.get_agent_paths call, same
-// per-segment branching (j==0/j==K-1 boundary handling), just recorded as
-// index ranges into a flat vector instead of Drake decision variables.
+// Sparse/real-node-only path: ordering/cross-agent interactions are
+// resolved via graph.get_agent_paths, and each agent's waypoint positions
+// looked up from the full `waypoints` matrix by resolved node id.
 ProblemLayout BuildProblemLayout(
 	const GraphOfConstraints& graph,
 	const std::vector<CubicConfigurationSpline>& splines,
@@ -111,6 +116,30 @@ ProblemLayout BuildProblemLayout(
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
 	const Eigen::VectorXd& t_by_node,
+	std::vector<Eigen::MatrixXd>* wps_list_out,
+	std::vector<std::vector<int>>* agent_nodes_list_out,
+	const std::vector<Eigen::MatrixXd>& prev_vs_list,
+	const std::vector<Eigen::VectorXd>& prev_time_deltas_list,
+	const std::vector<std::vector<int>>& prev_agent_nodes_list,
+	const std::map<int, int>& prev_agent_spline_length_map);
+
+// Dense-waypoint counterpart to BuildProblemLayout: the caller has already
+// resolved graph ordering + cross-agent interactions itself (e.g. via
+// graph.get_agent_paths, possibly reindexed against a denser per-agent
+// sequence with traced interior waypoints spliced in -- see
+// GraphOfConstraints::reindex_agent_interactions) and expanded each agent's
+// node sequence into `agent_dense_wps`/`agent_dense_node_ids` (one row per
+// decision-variable segment target; node id -1 for a synthetic/traced
+// interior point). Everything else (per-segment layout, warm start) is
+// identical to BuildProblemLayout's own -- both share BuildProblemLayoutCore.
+ProblemLayout BuildDenseProblemLayout(
+	const std::vector<CubicConfigurationSpline>& splines,
+	const std::vector<Eigen::MatrixXd>& agent_dense_wps,
+	const std::vector<std::vector<int>>& agent_dense_node_ids,
+	const std::vector<AgentInteraction>& agent_interactions,
+	const std::map<std::pair<int, int>, double>& edge_to_min_tau_map,
+	const Eigen::VectorXd& x0,
+	const Eigen::VectorXd& v0,
 	std::vector<Eigen::MatrixXd>* wps_list_out,
 	std::vector<std::vector<int>>* agent_nodes_list_out,
 	const std::vector<Eigen::MatrixXd>& prev_vs_list,
