@@ -105,6 +105,30 @@ struct DeferredVarOp {
 			   const drake::solvers::MatrixXDecisionVariable&)> builder;
 };
 
+// A fully-covered manifold block (Torus/SO3Quat/SO3Mat) referenced by an
+// Eq-kind formula, detected once at add_constraint/add_edge_constraint time
+// (see PopulateBlockResidualGroups) and cached on the owning record below.
+// Runtime evaluation (ComputeViolation/ComputeSignedViolation,
+// symbolic_constraint_compiler.cpp) uses this instead of checking each
+// component independently, which can't express e.g. quaternion geodesic
+// distance -- inherently a joint function of all 4 components together --
+// any more than raw per-component subtraction can express a Torus angle's
+// shortest-arc distance (the same reason add_agent_timing_segments'
+// stability_cost had to stop using a raw ambient subtraction -- see
+// graph_timing_mpc.hpp's _stability_cost doc comment). `components[j]` is
+// the (lhs, rhs) Expression pair pulled directly from whichever Eq leaf
+// pins ambient component j of the block; evaluating and feeding them
+// through CubicConfigurationSpline::BlockPositionDelta -- the SAME
+// per-block residual add_agent_timing_segments' stability_cost and max_acc
+// bound already use -- gives the correct wrap-aware/quaternion-log
+// residual, whose norm is the group's scalar violation.
+struct BlockResidualGroup {
+	CubicConfigurationSpline::Block::Type type;
+	int agent_id;
+	int block_index;   // index into graph._robot_specs[agent_id]
+	std::vector<std::pair<drake::symbolic::Expression, drake::symbolic::Expression>> components;
+};
+
 // Raw, introspectable records for the unified symbolic constraint API
 // (add_constraint / add_assignable_constraint / add_edge_constraint). Unlike
 // DeferredOp/DeferredEdgeOp, these store the original drake::symbolic::Formula
@@ -119,6 +143,14 @@ struct SymbolicNodeConstraint {
 	std::optional<int> var_id;         // set iff exactly one assignable var is referenced
 	std::vector<int> multi_var_ids;    // set iff >1 assignable vars are referenced (Or-over-combos case)
 	drake::symbolic::Formula formula;
+	// Cached once at construction (see PopulateBlockResidualGroups), not
+	// re-derived from `formula` on every runtime evaluate_phi call (every
+	// control cycle). `ungrouped_leaves` is every Eq/Leq/... leaf NOT
+	// covered by a complete block group (an R-typed component, a lone
+	// incomplete manifold-block reference, or a non-Eq atom) -- evaluated
+	// exactly as `formula` was before block grouping existed.
+	std::vector<BlockResidualGroup> block_residual_groups;
+	std::vector<drake::symbolic::Formula> ungrouped_leaves;
 };
 
 struct SymbolicEdgeConstraint {
@@ -134,7 +166,31 @@ struct SymbolicEdgeConstraint {
 	bool along_edge;
 	std::optional<int> var_id;  // set iff along_edge and exactly one
 	                             // var_agent_q placeholder is referenced.
+	// Same as SymbolicNodeConstraint's own fields -- see there.
+	std::vector<BlockResidualGroup> block_residual_groups;
+	std::vector<drake::symbolic::Formula> ungrouped_leaves;
 };
+
+// Populates *groups/*ungrouped from `f` -- see BlockResidualGroup's own doc
+// comment for what a "group" is and why. Flattens `f`'s top-level
+// And-conjunction into its Eq/Leq/.../generic leaf atoms, groups any Eq
+// leaf whose lhs or rhs is a single manifold-block-typed Variable
+// (Torus/SO3Quat/SO3Mat, resolved against `graph`'s STATIC agent_q/
+// agent_q_u/agent_q_v placeholder families only -- var_agent_q's
+// dynamically-resolved agent isn't known until evaluation time, so a
+// formula referencing it never groups, same limitation _resolve_holds
+// (evolutionary_waypoint_solver/spec.py) already has for assignable holds)
+// by (side, agent_id, block_index), and keeps only COMPLETE groups (every
+// ambient component of the block present as a sibling leaf). Everything
+// else (R-typed leaves, incomplete manifold-block references, non-Eq
+// atoms) is left in *ungrouped untouched, evaluated exactly as before.
+// Defined in graph_of_constraints.cpp; called once per add_constraint/
+// add_assignable_constraint/add_edge_constraint call, not on every
+// runtime evaluate_phi.
+void PopulateBlockResidualGroups(
+	const struct GraphOfConstraints& graph, const drake::symbolic::Formula& f,
+	std::vector<BlockResidualGroup>* groups,
+	std::vector<drake::symbolic::Formula>* ungrouped);
 
 // Canonical, introspectable declaration that `held_point_ids` are rigidly
 // held by a robot over edge (u_node -> v_node) -- either a statically
@@ -988,7 +1044,11 @@ private:
 	int _add_symbolic_op(int node, const drake::symbolic::Formula& f) {
 		const int id = num_phis++;
 		node_to_phis_map[node].push_back(id);
-		symbolic_ops[id] = SymbolicNodeConstraint{id, node, std::nullopt, {}, f};
+		std::vector<BlockResidualGroup> groups;
+		std::vector<drake::symbolic::Formula> ungrouped;
+		PopulateBlockResidualGroups(*this, f, &groups, &ungrouped);
+		symbolic_ops[id] = SymbolicNodeConstraint{
+			id, node, std::nullopt, {}, f, std::move(groups), std::move(ungrouped)};
 		return id;
 	}
 
@@ -996,14 +1056,22 @@ private:
 		const int id = num_phis++;
 		node_to_phis_map[node].push_back(id);
 		phi_to_variable_map[id] = var;
-		symbolic_ops[id] = SymbolicNodeConstraint{id, node, var, {}, f};
+		std::vector<BlockResidualGroup> groups;
+		std::vector<drake::symbolic::Formula> ungrouped;
+		PopulateBlockResidualGroups(*this, f, &groups, &ungrouped);
+		symbolic_ops[id] = SymbolicNodeConstraint{
+			id, node, var, {}, f, std::move(groups), std::move(ungrouped)};
 		return id;
 	}
 
 	int _add_symbolic_multi_var_op(int node, const std::vector<int>& var_ids, const drake::symbolic::Formula& f) {
 		const int id = num_phis++;
 		node_to_phis_map[node].push_back(id);
-		symbolic_ops[id] = SymbolicNodeConstraint{id, node, std::nullopt, var_ids, f};
+		std::vector<BlockResidualGroup> groups;
+		std::vector<drake::symbolic::Formula> ungrouped;
+		PopulateBlockResidualGroups(*this, f, &groups, &ungrouped);
+		symbolic_ops[id] = SymbolicNodeConstraint{
+			id, node, std::nullopt, var_ids, f, std::move(groups), std::move(ungrouped)};
 		return id;
 	}
 
@@ -1012,7 +1080,11 @@ private:
 		const int id = num_edge_phis++;
 		edge_to_phis_map[std::make_pair(u, v)].push_back(id);
 		if (var_id.has_value()) edge_phi_to_variable_map[id] = var_id.value();
-		symbolic_edge_ops[id] = SymbolicEdgeConstraint{id, u, v, f, along_edge, var_id};
+		std::vector<BlockResidualGroup> groups;
+		std::vector<drake::symbolic::Formula> ungrouped;
+		PopulateBlockResidualGroups(*this, f, &groups, &ungrouped);
+		symbolic_edge_ops[id] = SymbolicEdgeConstraint{
+			id, u, v, f, along_edge, var_id, std::move(groups), std::move(ungrouped)};
 		if (live) live_edge_phis.insert(id);
 		return id;
 	}

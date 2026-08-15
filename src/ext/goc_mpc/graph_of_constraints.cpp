@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <numeric>
+#include <map>
+#include <optional>
+#include <tuple>
 
 
 using drake::solvers::Binding;
@@ -312,7 +315,161 @@ std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_
 	return {};
 }
 
+// Flattens `f`'s top-level And-conjunction into its non-And leaf atoms
+// (Eq/Leq/Geq/Lt/Gt/a bare bool-valued formula), appending them to *out* in
+// encounter order. Recurses through nested And (And-of-And, however
+// constructed) so every leaf ends up at the top level of *out* regardless of
+// how deeply the original conjunction was nested.
+void FlattenConjunction(const drake::symbolic::Formula& f,
+                        std::vector<drake::symbolic::Formula>* out) {
+	using drake::symbolic::FormulaKind;
+	if (f.get_kind() == FormulaKind::And) {
+		for (const auto& sub : drake::symbolic::get_operands(f)) {
+			FlattenConjunction(sub, out);
+		}
+		return;
+	}
+	out->push_back(f);
+}
+
+// Which side of an edge formula (or neither, for a plain node formula) a
+// resolved agent_id was found on -- keys BlockResidualGroup grouping so a
+// u-side and v-side reference to the same (agent_id, block_index) never
+// merge into one group.
+enum class PlaceholderSide { kPlain, kU, kV };
+
+struct ResolvedColumn {
+	PlaceholderSide side;
+	int agent_id;
+	int column;  // offset within that agent's dim-wide row
+};
+
+// Resolves `var` against graph._agent_q/_agent_q_u/_agent_q_v ONLY, not
+// _var_agent_q(_u/_v) -- an assignable hold/constraint's actual agent isn't
+// known until MILP resolves it (or, for the evolutionary solver, until
+// solve time), so a formula built from a var_agent_q placeholder can't be
+// grouped by (agent_id, block_index) at add_constraint time. Same
+// limitation _resolve_holds (evolutionary_waypoint_solver/spec.py) already
+// has for assignable holds -- see PopulateBlockResidualGroups' own doc
+// comment (graph_of_constraints.hpp). Returns std::nullopt if `var` isn't a
+// component of any currently-created placeholder row in any of the three
+// families (e.g. an object_q variable, or simply not one of these
+// placeholders at all).
+std::optional<ResolvedColumn> ResolveVariable(const GraphOfConstraints& graph,
+                                              const drake::symbolic::Variable& var) {
+	struct FamilyBinding {
+		const PlaceholderVarFamily<int>* family;
+		PlaceholderSide side;
+	};
+	const FamilyBinding families[] = {
+		{&graph._agent_q,   PlaceholderSide::kPlain},
+		{&graph._agent_q_u, PlaceholderSide::kU},
+		{&graph._agent_q_v, PlaceholderSide::kV},
+	};
+	for (const auto& binding : families) {
+		for (int agent_id = 0; agent_id < graph.num_agents; ++agent_id) {
+			if (!binding.family->Contains(agent_id)) continue;
+			const auto& row = binding.family->Vars(agent_id);
+			for (int col = 0; col < row.size(); ++col) {
+				if (row(col).equal_to(var)) {
+					return ResolvedColumn{binding.side, agent_id, col};
+				}
+			}
+		}
+	}
+	return std::nullopt;
+}
+
 }  // namespace
+
+void PopulateBlockResidualGroups(
+	const GraphOfConstraints& graph, const drake::symbolic::Formula& f,
+	std::vector<BlockResidualGroup>* groups,
+	std::vector<drake::symbolic::Formula>* ungrouped) {
+
+	using drake::symbolic::Expression;
+	using drake::symbolic::FormulaKind;
+
+	std::vector<drake::symbolic::Formula> leaves;
+	FlattenConjunction(f, &leaves);
+
+	struct InProgressGroup {
+		BlockResidualGroup group;
+		std::vector<bool> filled;
+		std::vector<int> leaf_indices;  // which `leaves` entries fed this group
+	};
+	std::map<std::tuple<int, int, int>, InProgressGroup> in_progress;
+	std::vector<bool> leaf_grouped(leaves.size(), false);
+
+	for (int i = 0; i < static_cast<int>(leaves.size()); ++i) {
+		const drake::symbolic::Formula& leaf = leaves[i];
+		if (leaf.get_kind() != FormulaKind::Eq) continue;
+
+		const Expression lhs = get_lhs_expression(leaf);
+		const Expression rhs = get_rhs_expression(leaf);
+
+		// Whichever side (if either) is a single Variable -- the other side
+		// is whatever pins that ambient component's value; only the
+		// manifold-block SIDE needs to resolve to a placeholder.
+		std::optional<drake::symbolic::Variable> candidate;
+		if (is_variable(lhs)) candidate = get_variable(lhs);
+		else if (is_variable(rhs)) candidate = get_variable(rhs);
+		if (!candidate.has_value()) continue;
+
+		const auto resolved = ResolveVariable(graph, *candidate);
+		if (!resolved.has_value()) continue;
+
+		const auto& spec = graph._robot_specs.at(resolved->agent_id);
+		int block_index = -1, component = -1, block_offset = 0;
+		for (int b = 0; b < static_cast<int>(spec.size()); ++b) {
+			if (resolved->column < block_offset + spec[b].size) {
+				block_index = b;
+				component = resolved->column - block_offset;
+				break;
+			}
+			block_offset += spec[b].size;
+		}
+		if (block_index < 0) continue;  // defensive; shouldn't happen
+		const auto& block = spec[block_index];
+		// R blocks are already correct under raw per-component subtraction
+		// -- only Torus (wrap-around) and SO3Quat/SO3Mat (rotation) need the
+		// whole-block treatment BlockPositionDelta gives them.
+		if (block.type == CubicConfigurationSpline::Block::Type::R) continue;
+
+		const auto key = std::make_tuple(static_cast<int>(resolved->side),
+		                                 resolved->agent_id, block_index);
+		auto it = in_progress.find(key);
+		if (it == in_progress.end()) {
+			InProgressGroup ip;
+			ip.group.type = block.type;
+			ip.group.agent_id = resolved->agent_id;
+			ip.group.block_index = block_index;
+			ip.group.components.resize(block.size);
+			ip.filled.assign(block.size, false);
+			it = in_progress.emplace(key, std::move(ip)).first;
+		}
+		auto& ip = it->second;
+		if (component < 0 || component >= static_cast<int>(ip.filled.size()) ||
+		    ip.filled[component]) {
+			continue;  // out-of-range or duplicate pin -- leave this leaf ungrouped
+		}
+		ip.group.components[component] = std::make_pair(lhs, rhs);
+		ip.filled[component] = true;
+		ip.leaf_indices.push_back(i);
+	}
+
+	for (auto& [key, ip] : in_progress) {
+		const bool complete = std::all_of(ip.filled.begin(), ip.filled.end(),
+		                                  [](bool b) { return b; });
+		if (!complete) continue;  // its leaves stay in *ungrouped, added below
+		for (int idx : ip.leaf_indices) leaf_grouped[idx] = true;
+		groups->push_back(std::move(ip.group));
+	}
+
+	for (int i = 0; i < static_cast<int>(leaves.size()); ++i) {
+		if (!leaf_grouped[i]) ungrouped->push_back(leaves[i]);
+	}
+}
 
 std::tuple<std::vector<std::optional<int>>,
 	   std::vector<std::vector<int>>,

@@ -6,8 +6,14 @@ using drake::symbolic::Expression;
 
 namespace {
 
-double ComputeViolation(const drake::symbolic::Formula& f,
-                        const drake::symbolic::Environment& env) {
+// Per-leaf (never And -- FlattenConjunction/PopulateBlockResidualGroups,
+// graph_of_constraints.cpp, already reduced every formula down to its
+// non-And atoms at construction time, caching the result as
+// SymbolicNodeConstraint/EdgeConstraint's block_residual_groups/
+// ungrouped_leaves) violation, exactly as ComputeViolation used to compute
+// it inline before block grouping existed.
+double ComputeLeafViolation(const drake::symbolic::Formula& f,
+                            const drake::symbolic::Environment& env) {
 	using drake::symbolic::FormulaKind;
 	switch (f.get_kind()) {
 	case FormulaKind::Eq:
@@ -25,31 +31,15 @@ double ComputeViolation(const drake::symbolic::Formula& f,
 	case FormulaKind::Gt:
 		return std::max(0.0, get_rhs_expression(f).Evaluate(env) -
 		                     get_lhs_expression(f).Evaluate(env));
-	case FormulaKind::And: {
-		double v = 0.0;
-		for (const auto& sub : get_operands(f))
-			v = std::max(v, ComputeViolation(sub, env));
-		return v;
-	}
 	default:
 		return f.Evaluate(env) ? 0.0 : 1.0;
 	}
 }
 
-// Signed counterpart to ComputeViolation, for callers that compare against a
-// hard tol=0.00 (GraphOfConstraintsMPC._backtrack's edge-phi check) rather
-// than a small positive fuzz tolerance (phi_tolerance's node-completion
-// check). ComputeViolation clips inequality residuals to >= 0, so a
-// comfortably-satisfied Leq/Geq atom reads identically (0.0) to one sitting
-// exactly on the boundary -- fine against tol > 0, but indistinguishable
-// from "violated" against tol == 0. This version leaves the sign in place so
-// "satisfied with margin" is strictly negative and passes a hard `< 0.0`
-// check. Only meaningful for inequality-only formulas (see
-// get_next_edge_ops's IsInequalityFormula gate) -- the Eq/default cases
-// below exist only as a safe fallback, not as an intended calling
-// convention, since an exact-equality residual can never read as negative.
-double ComputeSignedViolation(const drake::symbolic::Formula& f,
-                               const drake::symbolic::Environment& env) {
+// Signed counterpart to ComputeLeafViolation -- see ComputeSignedViolation's
+// own doc comment below for why this exists.
+double ComputeLeafSignedViolation(const drake::symbolic::Formula& f,
+                                  const drake::symbolic::Environment& env) {
 	using drake::symbolic::FormulaKind;
 	switch (f.get_kind()) {
 	case FormulaKind::Eq:
@@ -63,15 +53,73 @@ double ComputeSignedViolation(const drake::symbolic::Formula& f,
 	case FormulaKind::Gt:
 		return get_rhs_expression(f).Evaluate(env) -
 		       get_lhs_expression(f).Evaluate(env);
-	case FormulaKind::And: {
-		double v = -std::numeric_limits<double>::infinity();
-		for (const auto& sub : get_operands(f))
-			v = std::max(v, ComputeSignedViolation(sub, env));
-		return v;
-	}
 	default:
 		return f.Evaluate(env) ? -1.0 : 1.0;
 	}
+}
+
+// A BlockResidualGroup's scalar violation: evaluates every component's
+// (lhs, rhs) Expression pair against `env`, then reduces through
+// CubicConfigurationSpline::BlockPositionDelta -- the SAME per-block
+// residual add_agent_timing_segments' stability_cost and max_acc bound
+// already use -- to the correct wrap-aware (Torus) or quaternion-log
+// (SO3Quat/SO3Mat) tangent-space residual. Its norm is the group's
+// violation: the geodesic angle between the two rotations for SO3Quat/Mat,
+// the wrapped angular gap for Torus -- always >= 0, so this is shared
+// as-is between ComputeViolation and ComputeSignedViolation (an Eq
+// residual can never read as negative regardless -- see
+// ComputeSignedViolation's own doc comment).
+double ComputeGroupViolation(const BlockResidualGroup& group,
+                             const drake::symbolic::Environment& env) {
+	const int n = static_cast<int>(group.components.size());
+	Eigen::VectorXd lhs_vals(n), rhs_vals(n);
+	for (int j = 0; j < n; ++j) {
+		lhs_vals(j) = group.components[j].first.Evaluate(env);
+		rhs_vals(j) = group.components[j].second.Evaluate(env);
+	}
+	const bool is_rotation = group.type == CubicConfigurationSpline::Block::Type::SO3Quat ||
+	                         group.type == CubicConfigurationSpline::Block::Type::SO3Mat;
+	const CubicConfigurationSpline::BlockOffset offset{
+		0, 0, n, is_rotation ? 3 : n, group.type};
+	return CubicConfigurationSpline::BlockPositionDelta<double>(offset, lhs_vals, rhs_vals).norm();
+}
+
+// Combines every cached BlockResidualGroup (see that struct's own doc
+// comment, graph_of_constraints.hpp, for why a manifold-block equality --
+// e.g. two quaternions, or a Torus angle -- can't be evaluated correctly
+// leaf-by-leaf) with every leftover ungrouped leaf, both computed ONCE at
+// add_constraint/add_edge_constraint time (PopulateBlockResidualGroups),
+// not re-derived from a raw Formula on every call -- this runs every
+// control cycle (phi_tolerance's node-completion check).
+double ComputeViolation(const std::vector<BlockResidualGroup>& groups,
+                        const std::vector<drake::symbolic::Formula>& ungrouped,
+                        const drake::symbolic::Environment& env) {
+	double v = 0.0;
+	for (const auto& group : groups) v = std::max(v, ComputeGroupViolation(group, env));
+	for (const auto& leaf : ungrouped) v = std::max(v, ComputeLeafViolation(leaf, env));
+	return v;
+}
+
+// Signed counterpart to ComputeViolation, for callers that compare against a
+// hard tol=0.00 (GraphOfConstraintsMPC._backtrack's edge-phi check) rather
+// than a small positive fuzz tolerance (phi_tolerance's node-completion
+// check). ComputeViolation clips inequality residuals to >= 0, so a
+// comfortably-satisfied Leq/Geq atom reads identically (0.0) to one sitting
+// exactly on the boundary -- fine against tol > 0, but indistinguishable
+// from "violated" against tol == 0. This version leaves the sign in place so
+// "satisfied with margin" is strictly negative and passes a hard `< 0.0`
+// check. Only meaningful for inequality-only formulas (see
+// get_next_edge_ops's IsInequalityFormula gate) -- the Eq/default cases
+// (and so every BlockResidualGroup, which only ever comes from Eq leaves)
+// exist only as a safe fallback, not as an intended calling convention,
+// since an exact-equality residual can never read as negative.
+double ComputeSignedViolation(const std::vector<BlockResidualGroup>& groups,
+                              const std::vector<drake::symbolic::Formula>& ungrouped,
+                              const drake::symbolic::Environment& env) {
+	double v = -std::numeric_limits<double>::infinity();
+	for (const auto& group : groups) v = std::max(v, ComputeGroupViolation(group, env));
+	for (const auto& leaf : ungrouped) v = std::max(v, ComputeLeafSignedViolation(leaf, env));
+	return v;
 }
 
 // Inserts, into `env`, the world position and/or rotation value of every
@@ -408,7 +456,7 @@ double EvaluateSymbolicNodeConstraint(
 	graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
 		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
 	InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
-	return ComputeViolation(rec.formula, env);
+	return ComputeViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 }
 
 double EvaluateSymbolicEdgeConstraint(
@@ -437,7 +485,7 @@ double EvaluateSymbolicEdgeConstraint(
 		graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
 			return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
 		InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
-		return ComputeSignedViolation(rec.formula, env);
+		return ComputeSignedViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 	}
 
 	// Relational formula coupling u_agent_q/u_object_q (u side) and
@@ -456,5 +504,5 @@ double EvaluateSymbolicEdgeConstraint(
 		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
 	graph._object_q_v.InsertRange(&env, n_objects, [&](int o, int j) {
 		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
-	return ComputeSignedViolation(rec.formula, env);
+	return ComputeSignedViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 }
