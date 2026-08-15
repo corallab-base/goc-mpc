@@ -172,10 +172,7 @@ def main():
         box_margin_mesh.visible = is_box
 
         mpc = mpc_holder["mpc"]
-        if mpc_holder["is_admm"]:
-            ok = mpc.solve(START, np.zeros(DIM), [spline])
-        else:
-            ok = mpc.solve(START, np.zeros(DIM), np.array([], dtype=np.int32), [], [spline])
+        ok = mpc.solve(START, np.zeros(DIM), np.array([], dtype=np.int32), [], [spline])
         if not ok:
             status_text.value = "solve FAILED (obstacle likely blocking all feasible paths)"
             return
