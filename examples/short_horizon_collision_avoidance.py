@@ -8,7 +8,7 @@ drag it -- or change a GUI control -- the selected solver's `.solve()` is
 re-run from scratch against the (unchanged) nominal reference, and the
 resulting short-horizon trajectory (blue line) is redrawn.
 
-Three solvers, picked live via the "Solver" dropdown:
+Four solvers, picked live via the "Solver" dropdown:
   - SLSQP (hard constraint): GraphShortPathMPC, use_hard_constraints=True.
     A real clearance guarantee when it converges, but can report the whole
     solve infeasible with several obstacles simultaneously active.
@@ -26,6 +26,14 @@ Three solvers, picked live via the "Solver" dropdown:
     of the three (microseconds to low-milliseconds even with a point cloud)
     and, unlike the SLSQP-soft-penalty path, its "rho" doesn't trade away
     speed for clearance the way that path's weight does.
+  - SQP: SqpShortPathMPC (see sqp_short_path_mpc.hpp) -- Riemannian
+    trust-region SQP over qpOASES. Every obstacle constraint is a
+    slack-relaxed exact-penalty row, so the QP subproblem is feasible by
+    construction at every outer iteration (fixing SLSQP's hard-constraint
+    infeasibility failure directly, not by tuning), plus a closed-form
+    safety-projection final pass gives the same hard clearance guarantee
+    ADMM has regardless of SQP convergence. The weight slider maps to its
+    penalty weight.
 
 This deliberately calls the solver classes directly (not the full
 `GraphOfConstraintsMPC.step()` closed loop) and always resolves from the same
@@ -47,7 +55,8 @@ import time
 import numpy as np
 import viser
 
-from goc_mpc import GraphOfConstraints, GraphShortPathMPC, AdmmShortPathMPC, ObstacleSet
+from goc_mpc import (GraphOfConstraints, GraphShortPathMPC, AdmmShortPathMPC, SqpShortPathMPC,
+                      ObstacleSet)
 from goc_mpc._ext.configuration_spline import CubicConfigurationSpline, Block
 
 DIM = 3
@@ -62,7 +71,7 @@ OBSTACLE_INITIAL_CENTER = np.array([0.6, 0.5, 1.0])  # off to the side initially
 NUM_STEPS = 10
 TIME_PER_STEP = 0.1
 
-SOLVERS = ("ADMM", "SLSQP (hard constraint)", "SLSQP (soft penalty)")
+SOLVERS = ("ADMM", "SQP", "SLSQP (hard constraint)", "SLSQP (soft penalty)")
 
 
 def make_graph() -> GraphOfConstraints:
@@ -94,7 +103,8 @@ def main():
     kind_dropdown = server.gui.add_dropdown("Obstacle kind", ("sphere", "box"), initial_value="box")
     solver_dropdown = server.gui.add_dropdown("Solver", SOLVERS, initial_value="ADMM")
     weight_slider = server.gui.add_slider(
-        "Repulsion weight (SLSQP) / rho (ADMM)", min=0.1, max=2000.0, step=0.1, initial_value=5.0)
+        "Repulsion weight (SLSQP) / rho (ADMM) / penalty weight (SQP)",
+        min=0.1, max=2000.0, step=0.1, initial_value=5.0)
     admm_iters_slider = server.gui.add_slider(
         "ADMM iterations", min=1, max=50, step=1, initial_value=15)
     status_text = server.gui.add_text("Status", initial_value="")
@@ -151,6 +161,10 @@ def main():
             mpc_holder["mpc"] = AdmmShortPathMPC(
                 graph, NUM_STEPS, 1, DIM, TIME_PER_STEP, obstacles,
                 rho=weight_slider.value, num_iterations=int(admm_iters_slider.value))
+        elif solver == "SQP":
+            mpc_holder["mpc"] = SqpShortPathMPC(
+                graph, NUM_STEPS, 1, DIM, TIME_PER_STEP, obstacles,
+                penalty_weight=weight_slider.value)
         else:
             use_hard = solver == "SLSQP (hard constraint)"
             mpc_holder["mpc"] = GraphShortPathMPC(
