@@ -33,6 +33,10 @@ SqpShortPathMPC::SqpShortPathMPC(const GraphOfConstraints& graph,
 				  unsigned int dim,
 				  double time_per_step,
 				  const ObstacleSet& obstacles,
+				  Eigen::VectorXd agent_radii,
+				  double tracking_weight,
+				  double velocity_tracking_weight,
+				  double acceleration_weight,
 				  double penalty_weight,
 				  int max_iterations,
 				  double initial_trust_radius,
@@ -45,12 +49,20 @@ SqpShortPathMPC::SqpShortPathMPC(const GraphOfConstraints& graph,
 	  _dim(dim),
 	  _time_per_step(time_per_step),
 	  _obstacles(&obstacles),
+	  _agent_radii(agent_radii.size() == 0 ? Eigen::VectorXd::Zero(num_agents) : std::move(agent_radii)),
+	  _smooth_cost_weights{tracking_weight, velocity_tracking_weight, acceleration_weight},
 	  _penalty_weight(penalty_weight),
 	  _max_iterations(max_iterations),
 	  _initial_trust_radius(initial_trust_radius),
 	  _max_trust_radius(max_trust_radius),
 	  _min_trust_radius(min_trust_radius),
 	  _grad_tol(grad_tol) {
+
+	if (_agent_radii.size() != static_cast<int>(num_agents)) {
+		throw std::runtime_error(
+			"SqpShortPathMPC: agent_radii must be empty (defaults every agent to "
+			"radius 0) or have exactly num_agents entries.");
+	}
 
 	_agent_shapes = BuildAgentShapes(graph, static_cast<int>(num_agents));
 	for (unsigned int ag = 0; ag < num_agents; ++ag) {
@@ -72,7 +84,8 @@ SqpShortPathMPC::SqpShortPathMPC(const GraphOfConstraints& graph,
 	}
 	_axes = BuildAxisList(_agent_shapes);
 	_agent_axis_offsets = BuildAgentAxisOffsets(_agent_shapes);
-	_smooth_hessian_normal = AssembleSmoothHessian(_axes, static_cast<int>(num_steps), time_per_step);
+	_smooth_hessian_normal =
+		AssembleSmoothHessian(_axes, static_cast<int>(num_steps), time_per_step, _smooth_cost_weights);
 
 	// Xi.row(i) is offset by one tau from x0/v0's own time -- see
 	// GraphShortPathMPC's constructor for the full rationale (Xi.row(0) is
@@ -123,13 +136,14 @@ void ApplyStep(const std::vector<CubicConfigurationSpline>& agent_shapes,
 }
 
 double TotalSmoothCost(const std::vector<CubicConfigurationSpline>& agent_shapes, int num_steps, double tau,
+			const SmoothCostWeights& weights,
 			int dim, const Eigen::VectorXd& x0, const Eigen::VectorXd& v0,
 			const Eigen::MatrixXd& points, const Eigen::MatrixXd& vels,
 			const Eigen::MatrixXd& ref_points, const Eigen::MatrixXd& ref_velocities) {
 	double f = 0.0;
 	for (int ag = 0; ag < static_cast<int>(agent_shapes.size()); ++ag) {
 		f += EvaluateSmoothCost(
-			agent_shapes[ag], num_steps, tau,
+			agent_shapes[ag], num_steps, tau, weights,
 			x0.segment(ag * dim, dim), v0.segment(ag * dim, dim),
 			points.block(0, ag * dim, num_steps, dim), vels.block(0, ag * dim, num_steps, dim),
 			ref_points.block(0, ag * dim, num_steps, dim),
@@ -208,7 +222,9 @@ Eigen::VectorXd EscapeAlongAxis(const Eigen::VectorXd& p, const std::vector<Cand
 // projection) followed by EscapeAlongAxis for anything that's STILL
 // violated (the two-obstacle oscillation case above -- confirmed to
 // actually occur via a real stress-test trial, not just a theoretical
-// worry).
+// worry). Fast-path-only, like everything below -- see
+// ApplyAgentPairSafetyProjection's own comment for why, and for the
+// intended future toggle once that stops being universally true.
 void ApplySafetyProjection(int num_steps, int num_agents, int dim, int workspace_dim,
 			    const ObstacleSet& obstacles, Eigen::MatrixXd* points) {
 	if (obstacles.obstacles().empty() && !obstacles.has_point_cloud()) {
@@ -242,6 +258,63 @@ void ApplySafetyProjection(int num_steps, int num_agents, int dim, int workspace
 	}
 }
 
+// Final hard-feasibility safety net for INTER-AGENT separation, mirroring
+// ApplySafetyProjection above but BILATERAL: a violated pair is pushed
+// apart symmetrically (each agent moves half the required separation)
+// rather than one point being projected against a fixed obstacle. Same
+// repeated-rounds rationale (a single sweep isn't enough once several
+// pairs interact at once -- see ApplySafetyProjection's own comment).
+//
+// Fast-path-only, same as ApplySafetyProjection: both write directly into
+// ambient position columns, which is only valid while fk(q)=q[:workspace_
+// dim]. Neither is gated on that today because every agent IS fast-path
+// today -- there's nothing yet to gate against. Once a general (non-
+// selection) fk exists for some agent (out of scope for this solver, see
+// the project plan), this closed-form projection has no equivalent for
+// that agent (no closed form for "solve fk(q)=target_point", an IK
+// problem) -- calling it would be wrong, not just imprecise. The intended
+// fix at that point is a per-agent "is this agent's fk trivial" check
+// (which the constraint-linearization code will ALSO need by then, to
+// decide whether to chain through a real Jacobian -- see that discussion
+// in the project plan) gating which agents these two passes touch, rather
+// than a separate flag a caller has to keep in sync with which agents
+// have a registered FK.
+void ApplyAgentPairSafetyProjection(int num_steps, int num_agents, int dim, int workspace_dim,
+				     const Eigen::VectorXd& agent_radii, Eigen::MatrixXd* points) {
+	if (num_agents < 2) {
+		return;
+	}
+	constexpr int kSafetyPassRounds = 10;
+	for (int round = 0; round < kSafetyPassRounds; ++round) {
+		for (int i = 0; i < num_steps; ++i) {
+			for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
+				for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
+					Eigen::VectorXd p_a = points->row(i).segment(ag_a * dim, workspace_dim).transpose();
+					Eigen::VectorXd p_b = points->row(i).segment(ag_b * dim, workspace_dim).transpose();
+					const double R = agent_radii(ag_a) + agent_radii(ag_b);
+					const Eigen::VectorXd diff = p_b - p_a;
+					const double d = diff.norm();
+					if (d >= R) {
+						continue;
+					}
+					Eigen::VectorXd dir;
+					if (d < 1.0e-9) {
+						dir = Eigen::VectorXd::Zero(workspace_dim);
+						dir(0) = 1.0;
+					} else {
+						dir = diff / d;
+					}
+					const double push = 0.5 * (R - d);
+					p_a -= push * dir;
+					p_b += push * dir;
+					points->row(i).segment(ag_a * dim, workspace_dim) = p_a.transpose();
+					points->row(i).segment(ag_b * dim, workspace_dim) = p_b.transpose();
+				}
+			}
+		}
+	}
+}
+
 struct SqpResult {
 	Eigen::MatrixXd points, vels;
 	int iterations = 0;
@@ -253,10 +326,11 @@ SqpResult RunTrustRegionSqp(
 		const std::vector<AxisLayout>& axes,
 		const std::vector<int>& agent_axis_offsets,
 		const Eigen::MatrixXd& smooth_hessian_normal,
+		const SmoothCostWeights& smooth_cost_weights,
 		int num_steps, int num_agents, int dim, int workspace_dim, double tau,
 		const Eigen::VectorXd& x0, const Eigen::VectorXd& v0,
 		const Eigen::MatrixXd& ref_points, const Eigen::MatrixXd& ref_velocities,
-		const ObstacleSet& obstacles,
+		const ObstacleSet& obstacles, const Eigen::VectorXd& agent_radii,
 		double penalty_weight, int max_iterations,
 		double initial_trust_radius, double max_trust_radius, double min_trust_radius, double grad_tol,
 		Eigen::MatrixXd points, Eigen::MatrixXd vels,
@@ -265,11 +339,13 @@ SqpResult RunTrustRegionSqp(
 	const int per_axis = 2 * num_steps;
 	const int n_smooth = static_cast<int>(axes.size()) * per_axis;
 	// Fixed for the whole solve() call (design decision 6): obstacle count
-	// times step count times agent count never changes mid-call, only each
-	// row's coefficients/value do (re-linearized every outer iteration) --
-	// so qpOASES::SQProblem can be reused (init once, hotstart thereafter)
-	// across every outer iteration, and across MPC cycles at a stable size.
-	const int m = num_steps * num_agents * static_cast<int>(obstacles.obstacles().size());
+	// (and now agent-pair count) times step count never changes mid-call,
+	// only each row's coefficients/value do (re-linearized every outer
+	// iteration) -- so qpOASES::SQProblem can be reused (init once,
+	// hotstart thereafter) across every outer iteration, and across MPC
+	// cycles at a stable size.
+	const int num_pairs = num_agents * (num_agents - 1) / 2;
+	const int m = num_steps * (num_agents * static_cast<int>(obstacles.obstacles().size()) + num_pairs);
 	const int m_eff = std::max(m, 1);
 	const int n = n_smooth + m_eff;
 
@@ -289,10 +365,11 @@ SqpResult RunTrustRegionSqp(
 	H_qp.topLeftCorner(n_smooth, n_smooth) = (2.0 * smooth_hessian_normal).cast<qpOASES::real_t>();
 	for (int i = 0; i < n; ++i) H_qp(i, i) += qpOASES::real_t(1e-10);
 
-	double f_current = TotalSmoothCost(agent_shapes, num_steps, tau, dim, x0, v0, points, vels,
-					    ref_points, ref_velocities);
+	double f_current = TotalSmoothCost(agent_shapes, num_steps, tau, smooth_cost_weights, dim, x0, v0,
+					    points, vels, ref_points, ref_velocities);
 	double violation_current =
-		EvaluateObstacleViolation(num_steps, num_agents, dim, workspace_dim, points, obstacles);
+		EvaluateObstacleViolation(num_steps, num_agents, dim, workspace_dim, points, obstacles) +
+		EvaluateAgentPairViolation(num_steps, num_agents, dim, workspace_dim, points, agent_radii);
 	double phi_current = f_current + penalty_weight * violation_current;
 
 	double trust_radius = initial_trust_radius;
@@ -316,7 +393,7 @@ SqpResult RunTrustRegionSqp(
 				ref_velocities.block(0, ag * dim, num_steps, dim);
 			for (int k = 0; k < dim; ++k) {
 				const Eigen::VectorXd g_axis = BuildAxisRhs(
-					AxisLayout{ag, k}, agent_shapes[ag], num_steps, tau,
+					AxisLayout{ag, k}, agent_shapes[ag], num_steps, tau, smooth_cost_weights,
 					x0_agent, v0_agent, points_agent, vels_agent,
 					ref_points_agent, ref_velocities_agent);
 				g_smooth.segment((off + k) * per_axis, per_axis) = g_axis;
@@ -324,8 +401,12 @@ SqpResult RunTrustRegionSqp(
 		}
 		const Eigen::VectorXd grad_smooth = -2.0 * g_smooth;
 
-		const std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
+		std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
 			agent_axis_offsets, num_steps, num_agents, dim, workspace_dim, points, obstacles);
+		std::vector<ConstraintRow> pair_rows = LinearizeAgentPairConstraints(
+			agent_axis_offsets, num_steps, num_agents, dim, workspace_dim, points, agent_radii);
+		rows.insert(rows.end(), std::make_move_iterator(pair_rows.begin()),
+			    std::make_move_iterator(pair_rows.end()));
 
 		if (m == 0 && grad_smooth.norm() < grad_tol) break;
 
@@ -388,10 +469,11 @@ SqpResult RunTrustRegionSqp(
 		ApplyStep(agent_shapes, agent_axis_offsets, num_steps, dim, points, vels, dx_smooth,
 			  &candidate_points, &candidate_vels);
 
-		const double f_new = TotalSmoothCost(agent_shapes, num_steps, tau, dim, x0, v0,
+		const double f_new = TotalSmoothCost(agent_shapes, num_steps, tau, smooth_cost_weights, dim, x0, v0,
 						      candidate_points, candidate_vels, ref_points, ref_velocities);
-		const double violation_new = EvaluateObstacleViolation(
-			num_steps, num_agents, dim, workspace_dim, candidate_points, obstacles);
+		const double violation_new =
+			EvaluateObstacleViolation(num_steps, num_agents, dim, workspace_dim, candidate_points, obstacles) +
+			EvaluateAgentPairViolation(num_steps, num_agents, dim, workspace_dim, candidate_points, agent_radii);
 		const double phi_new = f_new + penalty_weight * violation_new;
 
 		const Eigen::MatrixXd H_smooth_d = (2.0 * smooth_hessian_normal);
@@ -429,6 +511,7 @@ SqpResult RunTrustRegionSqp(
 	}
 
 	ApplySafetyProjection(num_steps, num_agents, dim, workspace_dim, obstacles, &points);
+	ApplyAgentPairSafetyProjection(num_steps, num_agents, dim, workspace_dim, agent_radii, &points);
 
 	return SqpResult{points, vels, iter, trust_radius};
 }
@@ -469,9 +552,9 @@ bool SqpShortPathMPC::solve(const Eigen::VectorXd& x0,
 		}
 
 		SqpResult result = RunTrustRegionSqp(
-			_agent_shapes, _axes, _agent_axis_offsets, _smooth_hessian_normal,
+			_agent_shapes, _axes, _agent_axis_offsets, _smooth_hessian_normal, _smooth_cost_weights,
 			H, num_agents, dim, workspace_dim, _time_per_step,
-			x0, v0, ref_points, ref_velocities, *_obstacles,
+			x0, v0, ref_points, ref_velocities, *_obstacles, _agent_radii,
 			_penalty_weight, _max_iterations,
 			_initial_trust_radius, _max_trust_radius, _min_trust_radius, _grad_tol,
 			points, vels, &_qp_state);

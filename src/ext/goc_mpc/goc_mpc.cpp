@@ -490,9 +490,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 
 	py::class_<SqpShortPathMPC>(goc_mpc, "SqpShortPathMPC")
 		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
-		     const ObstacleSet&, double, int, double, double, double, double>(),
+		     const ObstacleSet&, Eigen::VectorXd, double, double, double, double, int, double, double,
+		     double, double>(),
 		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
-		     py::arg("time_per_step"), py::arg("obstacles"), py::arg("penalty_weight") = 1.0e3,
+		     py::arg("time_per_step"), py::arg("obstacles"),
+		     py::arg("agent_radii") = Eigen::VectorXd(),
+		     py::arg("tracking_weight") = 1.0, py::arg("velocity_tracking_weight") = 1.0,
+		     py::arg("acceleration_weight") = 1.0,
+		     py::arg("penalty_weight") = 1.0e3,
 		     py::arg("max_iterations") = 30, py::arg("initial_trust_radius") = 0.5,
 		     py::arg("max_trust_radius") = 5.0, py::arg("min_trust_radius") = 1.0e-6,
 		     py::arg("grad_tol") = 1.0e-6,

@@ -50,20 +50,39 @@ std::vector<int> BuildAgentAxisOffsets(const std::vector<CubicConfigurationSplin
 inline int IdxP(int axis, int step, int num_steps) { return axis * 2 * num_steps + 2 * step; }
 inline int IdxV(int axis, int step, int num_steps) { return axis * 2 * num_steps + 2 * step + 1; }
 
+// Relative weight on each smooth-cost term -- multiplies that term's
+// squared residual (same "just a scalar multiplier on the whole term"
+// semantics as GraphTimingMPC's own `acceleration_cost`, not a change to
+// any term's internal shape). Defaults (all 1.0) reproduce this solver's
+// original, un-tunable behavior byte-for-byte. `acceleration` in
+// particular already has a huge built-in stiffness relative to tracking
+// (the coast-corrected residual's own coefficients scale as ~1/tau^2, e.g.
+// 600 at tau=0.1s vs tracking's un-weighted 1) -- raising `tracking`/
+// `velocity_tracking` (or lowering `acceleration`) is how to make
+// reference-tracking more competitive with smoothness, e.g. to keep a
+// short-horizon obstacle detour from drifting off the reference for the
+// rest of the horizon instead of returning to it.
+struct SmoothCostWeights {
+	double tracking = 1.0;
+	double velocity_tracking = 1.0;
+	double acceleration = 1.0;
+};
+
 // The smooth (tracking + velocity-tracking + acceleration-smoothing)
 // cost's per-axis (2*num_steps x 2*num_steps) Hessian block. IDENTICAL for
 // every axis -- the coefficient pattern never depends on which axis/agent
-// it's for, only `tau` (see this class's project-plan design decision 3) --
-// and constant across outer SQP iterations within one solve() call, since
-// it's an honest quadratic form in the STEP variables, independent of the
-// current iterate.
-Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau);
+// it's for, only `tau`/`weights` (see this class's project-plan design
+// decision 3) -- and constant across outer SQP iterations within one
+// solve() call, since it's an honest quadratic form in the STEP variables,
+// independent of the current iterate.
+Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau, const SmoothCostWeights& weights);
 
 // Assembles the full block-diagonal (n x n) smooth-cost Hessian, `n =
 // axes.size() * 2 * num_steps`, by placing BuildAxisHessianBlock's block
 // once per axis. Call once per solve() call, reuse across every outer
 // iteration.
-Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int num_steps, double tau);
+Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int num_steps, double tau,
+				       const SmoothCostWeights& weights);
 
 // Per-axis RHS/target vector (length 2*num_steps) for the smooth cost,
 // evaluated AT THE CURRENT ITERATE (`points_agent`/`vels_agent`, H x
@@ -74,10 +93,13 @@ Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int n
 // acceleration term's inter-step displacement) -- see the .cpp for the
 // full derivation (linearizing each already-quadratic-in-absolute-
 // coordinates term around the current iterate). Depends on the current
-// iterate, unlike the Hessian -- rebuild every outer iteration.
+// iterate, unlike the Hessian -- rebuild every outer iteration. `weights`
+// MUST match whatever was passed to BuildAxisHessianBlock for this same
+// solve -- the two build the two halves (H, g) of the SAME normal
+// equations and will silently disagree if they diverge.
 Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 			      const CubicConfigurationSpline& agent_shape,
-			      int num_steps, double tau,
+			      int num_steps, double tau, const SmoothCostWeights& weights,
 			      const Eigen::VectorXd& x0_agent, const Eigen::VectorXd& v0_agent,
 			      const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
 			      const Eigen::MatrixXd& ref_points_agent,
@@ -100,8 +122,13 @@ struct ConstraintRow {
 // equations are derived from, evaluated directly rather than through the
 // per-outer-iteration linear model. Used by the solver's merit function
 // (actual, not predicted, cost at a candidate step) -- NOT part of the QP
-// assembly itself.
+// assembly itself. `weights` MUST match BuildAxisHessianBlock/BuildAxisRhs's
+// (see those functions' own comments) -- this is the merit function's
+// "ground truth" f(x); if it scores a different objective than the one the
+// QP is actually stepping toward, the trust-region ratio test (predicted
+// vs. actual reduction) becomes meaningless.
 double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_steps, double tau,
+			   const SmoothCostWeights& weights,
 			   const Eigen::VectorXd& x0_agent, const Eigen::VectorXd& v0_agent,
 			   const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
 			   const Eigen::MatrixXd& ref_points_agent, const Eigen::MatrixXd& ref_velocities_agent);
@@ -124,5 +151,35 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, int dim, int wor
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int dim,
 	int workspace_dim, const Eigen::MatrixXd& points, const ObstacleSet& obstacles);
+
+// Inter-agent avoidance: every (step, agent-pair) is treated as a sphere
+// constraint on the PAIR's separation (same sdf-style shape as
+// LinearizeObstacleConstraints's sphere case), except now BOTH endpoints
+// are decision variables (agent b's position is agent a's "obstacle center"
+// and vice versa), so the linearized row has nonzero coefficients on both
+// agents' position steps. Deliberately position-based, not velocity-based
+// (ORCA/velocity-obstacle was tried and rejected for this solver -- see the
+// project plan's Stage 2 notes: this solver already plans full-horizon
+// POSITIONS jointly for every agent, which already gives per-step
+// anticipation and rules out the reciprocal-double-counting concern
+// velocity-obstacle constructions solve for, so there was no offsetting
+// benefit to pay for the indirect, weight-dependent, and non-guaranteed
+// velocity-to-position coupling a velocity-space constraint would have
+// needed). `agent_radii` is one entry per agent (index-aligned with
+// `agent_axis_offsets`); a pair's combined avoidance radius is
+// `agent_radii(ag_i) + agent_radii(ag_j)` (0 is a valid default -- agents
+// are still treated as points that must not occupy the same position at
+// the same step, exactly like every other point-agent assumption already
+// made in this fast-path solver).
+//
+// Fast path only (same assumption as LinearizeObstacleConstraints): agent
+// positions are read directly from the leading `workspace_dim` ambient
+// columns, no fk chain rule.
+double EvaluateAgentPairViolation(int num_steps, int num_agents, int dim, int workspace_dim,
+				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii);
+
+std::vector<ConstraintRow> LinearizeAgentPairConstraints(
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int dim,
+	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii);
 
 }  // namespace sqp_short_path

@@ -49,7 +49,7 @@ std::vector<int> BuildAgentAxisOffsets(const std::vector<CubicConfigurationSplin
 	return offsets;
 }
 
-Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau) {
+Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau, const SmoothCostWeights& weights) {
 	const int n = 2 * num_steps;
 	Eigen::MatrixXd H = Eigen::MatrixXd::Zero(n, n);
 	const double tau2 = tau * tau;
@@ -59,7 +59,10 @@ Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau) {
 	// coast-corrected acceleration residual's linear-in-(p,v) coefficients,
 	// none of which depend on the current iterate (only the RHS/target
 	// does, see BuildAxisRhs) -- so this block is reused unchanged across
-	// every outer SQP iteration within one solve() call.
+	// every outer SQP iteration within one solve() call. `weights` scales
+	// each TERM's contribution (a plain multiplier on that term's squared
+	// residual, same semantics as GraphTimingMPC's `acceleration_cost`),
+	// not the coefficient PATTERN itself.
 	auto add_h = [&](std::initializer_list<std::pair<int, double>> terms, double weight) {
 		for (auto [i, ci] : terms) {
 			for (auto [j, cj] : terms) {
@@ -69,21 +72,23 @@ Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau) {
 	};
 
 	for (int i = 0; i < num_steps; ++i) {
-		add_h({{IdxP(0, i, num_steps), 1.0}}, 1.0);  // tracking (axis-local index 0 below)
-		add_h({{IdxV(0, i, num_steps), 1.0}}, 1.0);  // velocity tracking
+		add_h({{IdxP(0, i, num_steps), 1.0}}, weights.tracking);  // axis-local index 0 below
+		add_h({{IdxV(0, i, num_steps), 1.0}}, weights.velocity_tracking);
 		if (i == 0) {
-			add_h({{IdxP(0, 0, num_steps), -6.0 / tau2}, {IdxV(0, 0, num_steps), 4.0 / tau}}, 1.0);
+			add_h({{IdxP(0, 0, num_steps), -6.0 / tau2}, {IdxV(0, 0, num_steps), 4.0 / tau}},
+			      weights.acceleration);
 		} else {
 			add_h({{IdxP(0, i, num_steps), -6.0 / tau2}, {IdxP(0, i - 1, num_steps), 6.0 / tau2},
 			       {IdxV(0, i, num_steps), 4.0 / tau}, {IdxV(0, i - 1, num_steps), 2.0 / tau}},
-			      1.0);
+			      weights.acceleration);
 		}
 	}
 	return H;
 }
 
-Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int num_steps, double tau) {
-	const Eigen::MatrixXd block = BuildAxisHessianBlock(num_steps, tau);
+Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int num_steps, double tau,
+				       const SmoothCostWeights& weights) {
+	const Eigen::MatrixXd block = BuildAxisHessianBlock(num_steps, tau, weights);
 	const int per_axis = 2 * num_steps;
 	const int n = static_cast<int>(axes.size()) * per_axis;
 	Eigen::MatrixXd H = Eigen::MatrixXd::Zero(n, n);
@@ -95,7 +100,7 @@ Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int n
 
 Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 			      const CubicConfigurationSpline& agent_shape,
-			      int num_steps, double tau,
+			      int num_steps, double tau, const SmoothCostWeights& weights,
 			      const Eigen::VectorXd& x0_agent, const Eigen::VectorXd& v0_agent,
 			      const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
 			      const Eigen::MatrixXd& ref_points_agent,
@@ -126,13 +131,13 @@ Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 		// in project memory); being explicit here costs nothing.
 		const Eigen::VectorXd track_delta = agent_shape.PositionDelta<double>(
 			ref_points_agent.row(i).transpose(), points_agent.row(i).transpose());
-		add_g({{IdxP(0, i, num_steps), 1.0}}, track_delta(k), 1.0);
+		add_g({{IdxP(0, i, num_steps), 1.0}}, track_delta(k), weights.tracking);
 
 		// Velocity tracking: velocities live in a flat tangent space
 		// already (no manifold/wraparound), so this is always a plain
 		// subtraction, R or Torus alike.
 		const double vtrack_target = ref_velocities_agent(i, k) - vels_agent(i, k);
-		add_g({{IdxV(0, i, num_steps), 1.0}}, vtrack_target, 1.0);
+		add_g({{IdxV(0, i, num_steps), 1.0}}, vtrack_target, weights.velocity_tracking);
 
 		if (i == 0) {
 			// disp0 = p_current(0) - x0, wrap-aware -- the coefficient
@@ -146,7 +151,8 @@ Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 				agent_shape.PositionDelta<double>(points_agent.row(0).transpose(), x0_agent);
 			const double target0 =
 				(6.0 / tau2) * disp0(k) - (4.0 / tau) * vels_agent(0, k) - (2.0 / tau) * v0_agent(k);
-			add_g({{IdxP(0, 0, num_steps), -6.0 / tau2}, {IdxV(0, 0, num_steps), 4.0 / tau}}, target0, 1.0);
+			add_g({{IdxP(0, 0, num_steps), -6.0 / tau2}, {IdxV(0, 0, num_steps), 4.0 / tau}},
+			      target0, weights.acceleration);
 		} else {
 			const Eigen::VectorXd disp = agent_shape.PositionDelta<double>(
 				points_agent.row(i).transpose(), points_agent.row(i - 1).transpose());
@@ -154,13 +160,14 @@ Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 				(6.0 / tau2) * disp(k) - (4.0 / tau) * vels_agent(i, k) - (2.0 / tau) * vels_agent(i - 1, k);
 			add_g({{IdxP(0, i, num_steps), -6.0 / tau2}, {IdxP(0, i - 1, num_steps), 6.0 / tau2},
 			       {IdxV(0, i, num_steps), 4.0 / tau}, {IdxV(0, i - 1, num_steps), 2.0 / tau}},
-			      target, 1.0);
+			      target, weights.acceleration);
 		}
 	}
 	return g;
 }
 
 double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_steps, double tau,
+			   const SmoothCostWeights& weights,
 			   const Eigen::VectorXd& x0_agent, const Eigen::VectorXd& v0_agent,
 			   const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
 			   const Eigen::MatrixXd& ref_points_agent, const Eigen::MatrixXd& ref_velocities_agent) {
@@ -169,11 +176,11 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 	for (int i = 0; i < num_steps; ++i) {
 		const Eigen::VectorXd track_delta = agent_shape.PositionDelta<double>(
 			ref_points_agent.row(i).transpose(), points_agent.row(i).transpose());
-		f += track_delta.squaredNorm();
+		f += weights.tracking * track_delta.squaredNorm();
 
 		const Eigen::VectorXd vtrack_delta =
 			(ref_velocities_agent.row(i) - vels_agent.row(i)).transpose();
-		f += vtrack_delta.squaredNorm();
+		f += weights.velocity_tracking * vtrack_delta.squaredNorm();
 
 		Eigen::VectorXd disp;
 		Eigen::VectorXd v_km1;
@@ -187,7 +194,7 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 		}
 		const Eigen::VectorXd v_k = vels_agent.row(i).transpose();
 		const Eigen::VectorXd accel = -(6.0 / tau2) * disp + (2.0 / tau) * (2.0 * v_k + v_km1);
-		f += accel.squaredNorm();
+		f += weights.acceleration * accel.squaredNorm();
 	}
 	return f;
 }
@@ -206,12 +213,22 @@ struct SdfResult {
 	Eigen::VectorXd grad;  // d(value)/d(p), workspace_dim
 };
 
-SdfResult SphereSdf(const Eigen::VectorXd& p, const Obstacle& obstacle, int workspace_dim) {
-	const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
-	const double R = obstacle.params(workspace_dim) + obstacle.margin;
+// Core sphere sdf math, independent of where `center`/`R` come from --
+// shared by SphereSdf (obstacle case, `center` fixed) and
+// LinearizeAgentPairConstraints (inter-agent case, `center` is the OTHER
+// agent's own position, itself a decision variable -- see that function's
+// own comment for how this single-point gradient becomes a two-endpoint
+// row via the chain rule).
+SdfResult SphereSdfCore(const Eigen::VectorXd& p, const Eigen::VectorXd& center, double R) {
 	const Eigen::VectorXd diff = p - center;
 	const double d = std::sqrt(diff.squaredNorm() + kSqrtEps2);
 	return SdfResult{d - R, diff / d};
+}
+
+SdfResult SphereSdf(const Eigen::VectorXd& p, const Obstacle& obstacle, int workspace_dim) {
+	const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
+	const double R = obstacle.params(workspace_dim) + obstacle.margin;
+	return SphereSdfCore(p, center, R);
 }
 
 SdfResult BoxSdf(const Eigen::VectorXd& p, const Obstacle& obstacle, int workspace_dim) {
@@ -301,6 +318,67 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 					// column k and tangent column k coincide.
 					const int axis = agent_axis_offsets[ag] + k;
 					row.coeffs.emplace_back(IdxP(axis, i, num_steps), sdf.grad(k));
+				}
+				rows.push_back(std::move(row));
+			}
+		}
+	}
+	return rows;
+}
+
+double EvaluateAgentPairViolation(int num_steps, int num_agents, int dim, int workspace_dim,
+				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii) {
+	if (num_agents < 2) {
+		return 0.0;
+	}
+	double violation = 0.0;
+	for (int i = 0; i < num_steps; ++i) {
+		for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
+			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * dim, workspace_dim).transpose();
+			for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
+				const Eigen::VectorXd p_b = points.row(i).segment(ag_b * dim, workspace_dim).transpose();
+				const double R = agent_radii(ag_a) + agent_radii(ag_b);
+				const double value = SphereSdfCore(p_b, p_a, R).value;
+				violation += std::max(0.0, -value);
+			}
+		}
+	}
+	return violation;
+}
+
+std::vector<ConstraintRow> LinearizeAgentPairConstraints(
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int dim,
+	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii) {
+	std::vector<ConstraintRow> rows;
+	if (num_agents < 2) {
+		return rows;
+	}
+	for (int i = 0; i < num_steps; ++i) {
+		for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
+			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * dim, workspace_dim).transpose();
+			for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
+				const Eigen::VectorXd p_b = points.row(i).segment(ag_b * dim, workspace_dim).transpose();
+				const double R = agent_radii(ag_a) + agent_radii(ag_b);
+
+				// Treat agent b's own position as agent a's "obstacle
+				// center" (SphereSdfCore's math doesn't care which side is
+				// "the obstacle" -- value/gradient are symmetric in shape,
+				// only the sign of the chain rule below differs per side).
+				const SdfResult sdf = SphereSdfCore(p_b, p_a, R);
+
+				ConstraintRow row;
+				row.value = sdf.value;
+				row.coeffs.reserve(2 * workspace_dim);
+				for (int k = 0; k < workspace_dim; ++k) {
+					// value = ||p_b - p_a|| - R, so d(value)/d(p_b) =
+					// +sdf.grad, d(value)/d(p_a) = -sdf.grad (chain rule
+					// through p_b - p_a) -- fk fast path, same
+					// column-equals-axis identification
+					// LinearizeObstacleConstraints uses.
+					const int axis_a = agent_axis_offsets[ag_a] + k;
+					const int axis_b = agent_axis_offsets[ag_b] + k;
+					row.coeffs.emplace_back(IdxP(axis_a, i, num_steps), -sdf.grad(k));
+					row.coeffs.emplace_back(IdxP(axis_b, i, num_steps), sdf.grad(k));
 				}
 				rows.push_back(std::move(row));
 			}

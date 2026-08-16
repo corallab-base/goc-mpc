@@ -70,7 +70,14 @@ struct SqpShortPathMPC {
 	Eigen::VectorXd _times;
 
 	const ObstacleSet* _obstacles;
+	// One entry per agent -- a pair's combined inter-agent avoidance radius
+	// is _agent_radii(a)+_agent_radii(b). Owned (not by-pointer like
+	// `_obstacles`): unlike ObstacleSet, there's no live-mutation use case
+	// for this yet, so a plain owned copy is simpler and avoids one more
+	// caller-must-keep-alive lifetime contract.
+	Eigen::VectorXd _agent_radii;
 
+	sqp_short_path::SmoothCostWeights _smooth_cost_weights;
 	double _penalty_weight;
 	int _max_iterations;
 	double _initial_trust_radius, _max_trust_radius, _min_trust_radius, _grad_tol;
@@ -110,12 +117,31 @@ struct SqpShortPathMPC {
 	// No default value for `obstacles` -- same lifetime discipline as
 	// GraphShortPathMPC/AdmmShortPathMPC (storing a pointer to a
 	// default-constructed temporary would dangle immediately).
+	// agent_radii: one entry per agent, default EMPTY meaning "every agent
+	// has radius 0" (point agents that still must not occupy the same
+	// position at the same step -- see LinearizeAgentPairConstraints's own
+	// comment for why this is position-, not velocity-, based). Passing a
+	// non-empty vector requires exactly `num_agents` entries.
+	// tracking_weight/velocity_tracking_weight/acceleration_weight: relative
+	// weight on each smooth-cost term (see SmoothCostWeights's own doc
+	// comment in sqp_short_path_layout.hpp) -- defaults (all 1.0) reproduce
+	// this solver's original behavior byte-for-byte. The acceleration term
+	// already has a large BUILT-IN stiffness relative to tracking (its own
+	// coefficients scale as ~1/time_per_step^2), so raising tracking_weight/
+	// velocity_tracking_weight (or lowering acceleration_weight) is how to
+	// make reference-tracking more competitive with smoothness -- e.g. to
+	// stop a short-horizon obstacle detour from drifting off the reference
+	// for the rest of the horizon instead of returning to it.
 	SqpShortPathMPC(const GraphOfConstraints& graph,
 			 unsigned int num_steps,
 			 unsigned int num_agents,
 			 unsigned int dim,
 			 double time_per_step,
 			 const ObstacleSet& obstacles,
+			 Eigen::VectorXd agent_radii = Eigen::VectorXd(),
+			 double tracking_weight = 1.0,
+			 double velocity_tracking_weight = 1.0,
+			 double acceleration_weight = 1.0,
 			 double penalty_weight = 1.0e3,
 			 int max_iterations = 30,
 			 double initial_trust_radius = 0.5,
