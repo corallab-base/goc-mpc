@@ -60,6 +60,8 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/graph_short_path_mpc.cpp"
     "src/ext/goc_mpc/obstacle_set.cpp"
     "src/ext/goc_mpc/admm_short_path_mpc.cpp"
+    "src/ext/goc_mpc/sqp_short_path_layout.cpp"
+    "src/ext/goc_mpc/sqp_short_path_mpc.cpp"
 )
 target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann ${qpOASES_LIBRARY})
 target_include_directories(_ext PRIVATE ${qpOASES_INCLUDE_DIR})

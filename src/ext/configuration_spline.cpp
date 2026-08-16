@@ -71,6 +71,24 @@ void init_submodule_configuration_spline(py::module_& m) {
 		.def("set_linear",    &CubicConfigurationSpline::set_linear,  py::arg("linear"))
 		.def("is_linear",     &CubicConfigurationSpline::is_linear)
 		.def("eval_multiple", &CubicConfigurationSpline::eval_multiple)
+		.def("ambient_dim",   &CubicConfigurationSpline::ambient_dim)
+		.def("tangent_dim",   &CubicConfigurationSpline::tangent_dim)
+		.def("position_delta",
+		     [](const CubicConfigurationSpline& self,
+			const Eigen::Ref<const Eigen::VectorXd>& xJ,
+			const Eigen::Ref<const Eigen::VectorXd>& xJm1) {
+			     return self.PositionDelta<double>(xJ, xJm1);
+		     },
+		     py::arg("xJ"),
+		     py::arg("xJm1"))
+		.def("retract",
+		     [](const CubicConfigurationSpline& self,
+			const Eigen::Ref<const Eigen::VectorXd>& xJm1,
+			const Eigen::Ref<const Eigen::VectorXd>& delta) {
+			     return self.Retract<double>(xJm1, delta);
+		     },
+		     py::arg("xJm1"),
+		     py::arg("delta"))
 		.def("compute_ctrl_cost",
 		     [](const CubicConfigurationSpline& self,
 			const Eigen::Ref<const Eigen::VectorXd>& xJ,

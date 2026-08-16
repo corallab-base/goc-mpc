@@ -781,6 +781,63 @@ public:
 		return out;
 	}
 
+	// Inverse direction of BlockPositionDelta: retracts a tangent-space step
+	// onto an ambient configuration -- R is a plain add; Torus wraps each
+	// component back to (-pi, pi] after adding (so xJm1's own wraparound
+	// convention is preserved, matching BlockPositionDelta's wrap-aware
+	// residual on the way back). `delta` is a full tangent-space vector
+	// (same shape PositionDelta returns), sliced here via
+	// off.tangent_offset/tangent_size -- callers applying a per-block step
+	// pass the whole-vector Retract below instead of calling this per block.
+	//
+	// SO3Quat/SO3Mat throw for now: SO3Quat's retraction (q ⊗ Exp(delta)) is
+	// deferred to the stage that also adds its residual-Jacobian helper (see
+	// BlockPositionDelta's own SO3Quat case for the forward/delta half, which
+	// already works); SO3Mat is unsupported everywhere in this file.
+	template <typename T>
+	static VecX<T> BlockRetract(
+		const BlockOffset& off, const VecX<T>& xJm1, const VecX<T>& delta) {
+		const int a0 = off.ambient_offset, aN = off.ambient_size;
+		const int t0 = off.tangent_offset, tN = off.tangent_size;
+
+		switch (off.type) {
+		case Block::Type::R: {
+			return xJm1.segment(a0, aN) + delta.segment(t0, tN);
+		}
+		case Block::Type::Torus: {
+			// ambient == tangent for a Torus block.
+			const auto xjm1 = xJm1.segment(a0, aN);
+			const auto d = delta.segment(t0, tN);
+			VecX<T> out(aN);
+			for (int k = 0; k < aN; ++k) {
+				out[k] = wrap_to_pi(xjm1[k] + d[k]);
+			}
+			return out;
+		}
+		case Block::Type::SO3Quat:
+		case Block::Type::SO3Mat:
+		default:
+			throw std::runtime_error(
+				"CubicConfigurationSpline::BlockRetract: SO3Quat/SO3Mat are "
+				"not supported yet");
+		}
+	}
+
+	// Whole-vector counterpart to BlockRetract, inverse of PositionDelta:
+	// BlockPositionDelta<T>(off, Retract(xJm1, delta), xJm1) recovers `delta`
+	// exactly for R, and for Torus as long as `delta` doesn't cross the
+	// (-pi, pi] branch cut (see BlockPositionDelta's own doc comment on
+	// wraparound). Throws for SO3Quat/SO3Mat (via BlockRetract).
+	template <typename T>
+	VecX<T> Retract(const VecX<T>& xJm1, const VecX<T>& delta) const {
+		VecX<T> out(ambient_dim_);
+		for (const BlockOffset& off : block_offsets_) {
+			out.segment(off.ambient_offset, off.ambient_size) =
+				BlockRetract<T>(off, xJm1, delta);
+		}
+		return out;
+	}
+
 	template <typename T>
 	T compute_ctrl_cost(
 		const VecX<T>& xJ,

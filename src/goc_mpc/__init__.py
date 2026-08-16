@@ -14,6 +14,7 @@ from .goc_mpc import (
     GraphTimingMPC,
     GraphShortPathMPC,
     AdmmShortPathMPC,
+    SqpShortPathMPC,
     ObstacleSet,
 )
 try:

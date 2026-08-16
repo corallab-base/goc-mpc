@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "obstacle_projection.hpp"
+
 using namespace pybind11::literals;
 namespace py = pybind11;
 
@@ -124,139 +126,9 @@ Eigen::VectorXd build_rhs(int k, int num_steps, double tau, const Eigen::VectorX
 	return g;
 }
 
-// One obstacle candidate in workspace-dim coordinates, dimension-agnostic
-// (2 or 3), unified across ObstacleSet's spheres/boxes AND pruned
-// point-cloud points (each point-cloud point becomes a zero-radius
-// sphere -- see this file's own top comment on why that's exactly right,
-// not an approximation: Euclidean distance is symmetric, so "distance from
-// robot to this fixed point" needs no different formula than "distance to
-// a sphere's center").
-struct Candidate {
-	Eigen::VectorXd center;	// workspace_dim
-	Eigen::VectorXd half_extents;	// box only, empty otherwise
-	double radius = 0.0;		// sphere/point
-	double margin = 0.0;
-	bool is_box = false;
-};
-
-// Closed-form projection of `p` onto "outside `c`, by at least its
-// margin" -- see this file's own top comment for the sphere/box formulas.
-// Always well-defined (mod the ignorable exact-center degenerate case) --
-// this is the operation that makes the whole algorithm structurally unable
-// to report infeasible.
-Eigen::VectorXd project_out(const Eigen::VectorXd& p, const Candidate& c) {
-	if (c.is_box) {
-		// Isotropic margin approximated as a uniform per-axis expansion of
-		// the box: exact on the faces, slightly conservative at
-		// edges/corners relative to the true (rounded) isotropic-offset
-		// surface GraphShortPathMPC's hard-constraint sdf uses -- chosen
-		// so the projection stays a closed-form O(workspace_dim) op.
-		const Eigen::VectorXd he = c.half_extents.array() + c.margin;
-		const Eigen::VectorXd lo = c.center - he;
-		const Eigen::VectorXd hi = c.center + he;
-		const bool inside = (p.array() >= lo.array()).all() && (p.array() <= hi.array()).all();
-		if (!inside) {
-			// Already outside the margin-expanded box, i.e. already
-			// FEASIBLE -- a no-op. NOT a clamp-to-box-surface: that
-			// formula finds the nearest point ON the box (useful for
-			// collision/contact queries), which is the wrong direction
-			// here and would pull an already-clear point BACK toward the
-			// obstacle regardless of how far away it already is (this was
-			// a real bug: any point sharing so much as one axis's range
-			// with the box, however far clear on the other axis, was
-			// getting yanked onto the box's surface).
-			return p;
-		}
-		// Interior: push out along the LEAST-penetrated axis (shortest
-		// exit path) -- same argmax-of-per-axis-excess logic as
-		// GraphShortPathMPC's box sdf/nudge (graph_short_path_mpc.cpp).
-		const Eigen::VectorXd diff = p - c.center;
-		const Eigen::VectorXd excess = diff.cwiseAbs() - he;  // all <= 0 here
-		int kstar = 0;
-		excess.maxCoeff(&kstar);
-		Eigen::VectorXd result = p;
-		result(kstar) = c.center(kstar) + (diff(kstar) >= 0.0 ? 1.0 : -1.0) * he(kstar);
-		return result;
-	} else {
-		const double R = c.radius + c.margin;
-		const Eigen::VectorXd diff = p - c.center;
-		const double d = diff.norm();
-		if (d >= R) {
-			return p;
-		}
-		if (d < 1.0e-9) {
-			// Degenerate (p exactly at the obstacle's center) -- push
-			// along an arbitrary fixed axis. Ignorable by design:
-			// obstacles are assumed to never sit exactly on the path's
-			// centerline.
-			Eigen::VectorXd dir = Eigen::VectorXd::Zero(p.size());
-			dir(0) = 1.0;
-			return c.center + R * dir;
-		}
-		return c.center + (R / d) * diff;
-	}
-}
-
-// Every registered sphere/box (unconditionally -- cheap, small counts)
-// plus, if a point cloud is registered, every cloud point within ONE
-// bounding-sphere query covering the agent's WHOLE reference trajectory
-// (not just its current position) + `query_margin` -- mirrors why
-// GraphShortPathMPC checks box/sphere obstacles at every horizon step, not
-// just step 0. One KD-tree query per agent per solve() call, not per ADMM
-// iteration -- see ObstacleSet::query_point_cloud_radius's own comment.
-std::vector<Candidate> gather_candidates(const ObstacleSet& obstacles,
-					  const Eigen::MatrixXd& ref_points_workspace,
-					  int workspace_dim, double query_margin) {
-	std::vector<Candidate> candidates;
-	for (const Obstacle& obstacle : obstacles.obstacles()) {
-		Candidate c;
-		c.center = obstacle.params.segment(0, workspace_dim);
-		c.margin = obstacle.margin;
-		if (obstacle.kind == ObstacleKind::kSphere) {
-			c.is_box = false;
-			c.radius = obstacle.params(workspace_dim);
-		} else {
-			c.is_box = true;
-			c.half_extents = obstacle.params.segment(workspace_dim, workspace_dim);
-		}
-		candidates.push_back(std::move(c));
-	}
-
-	if (obstacles.has_point_cloud()) {
-		const Eigen::VectorXd center = ref_points_workspace.colwise().mean().transpose();
-		double max_dist = 0.0;
-		for (int i = 0; i < ref_points_workspace.rows(); ++i) {
-			max_dist = std::max(
-				max_dist, (ref_points_workspace.row(i).transpose() - center).norm());
-		}
-		const double query_radius = max_dist + query_margin;
-		std::vector<int> indices = obstacles.query_point_cloud_radius(center, query_radius);
-		// Defensive cap: per-candidate work (RHS assembly + projection) is
-		// O(num_candidates) per step per ADMM iteration, so a pathological
-		// query (e.g. a dense sensor cloud with a large nearby surface)
-		// could otherwise blow the solve-time budget even though a typical
-		// pruned cluster is small (tens to low hundreds -- see this file's
-		// own benchmarking notes). nanoflann's radiusSearch returns results
-		// SORTED by distance (nearest first) by default, so truncating is
-		// free -- and correct, since the nearest points are what matter
-		// most for avoidance.
-		constexpr size_t kMaxPointCandidates = 300;
-		if (indices.size() > kMaxPointCandidates) {
-			indices.resize(kMaxPointCandidates);
-		}
-		const Eigen::MatrixXd& cloud = obstacles.point_cloud();
-		const double point_margin = obstacles.point_cloud_margin();
-		for (int idx : indices) {
-			Candidate c;
-			c.center = cloud.row(idx).transpose();
-			c.radius = 0.0;
-			c.margin = point_margin;
-			c.is_box = false;
-			candidates.push_back(std::move(c));
-		}
-	}
-	return candidates;
-}
+// Candidate/project_out/gather_candidates (obstacle-proximity geometry) now
+// live in obstacle_projection.hpp, shared with SqpShortPathMPC's own
+// safety-projection pass -- see that header for the sphere/box math.
 
 }  // namespace
 

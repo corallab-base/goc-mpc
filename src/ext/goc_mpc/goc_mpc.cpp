@@ -11,6 +11,7 @@
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
 #include "admm_short_path_mpc.hpp"
+#include "sqp_short_path_mpc.hpp"
 
 using drake::symbolic::Expression;
 namespace py = pybind11;
@@ -486,4 +487,24 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_times", &AdmmShortPathMPC::view_times, py::return_value_policy::reference_internal)
 		.def("view_obstacles", &AdmmShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
 		.def("get_last_solve_time", &AdmmShortPathMPC::get_last_solve_time);
+
+	py::class_<SqpShortPathMPC>(goc_mpc, "SqpShortPathMPC")
+		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
+		     const ObstacleSet&, double, int, double, double, double, double>(),
+		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
+		     py::arg("time_per_step"), py::arg("obstacles"), py::arg("penalty_weight") = 1.0e3,
+		     py::arg("max_iterations") = 30, py::arg("initial_trust_radius") = 0.5,
+		     py::arg("max_trust_radius") = 5.0, py::arg("min_trust_radius") = 1.0e-6,
+		     py::arg("grad_tol") = 1.0e-6,
+		     // Same lifetime discipline as GraphShortPathMPC/AdmmShortPathMPC's
+		     // bindings above.
+		     py::keep_alive<1, 2>(), py::keep_alive<1, 7>())
+		.def("solve", &SqpShortPathMPC::solve)
+		.def("view_points", &SqpShortPathMPC::view_points, py::return_value_policy::reference_internal)
+		.def("view_vels", &SqpShortPathMPC::view_vels, py::return_value_policy::reference_internal)
+		.def("view_times", &SqpShortPathMPC::view_times, py::return_value_policy::reference_internal)
+		.def("view_obstacles", &SqpShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
+		.def("get_last_solve_time", &SqpShortPathMPC::get_last_solve_time)
+		.def("get_last_iterations", &SqpShortPathMPC::get_last_iterations)
+		.def("get_last_trust_radius", &SqpShortPathMPC::get_last_trust_radius);
 }
