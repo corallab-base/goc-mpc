@@ -72,12 +72,12 @@ def _make_merit_batched(problem, wp_shape):
         total = F
         if eq_fns:
             h = jnp.concatenate(
-                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0)
                  for fn in eq_fns], axis=1)
             total = total + jnp.sum(mu * h, axis=1) + 0.5 * rho * jnp.sum(h * h, axis=1)
         if ineq_fns:
             g = jnp.concatenate(
-                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0)
                  for fn in ineq_fns], axis=1)
             z = jnp.maximum(0.0, lam + rho[:, None] * g)
             total = total + (jnp.sum(z * z, axis=1) - jnp.sum(lam * lam, axis=1)) / (2.0 * rho)
@@ -92,12 +92,12 @@ def _make_merit_batched(problem, wp_shape):
     return merit_and_grad
 
 
-def _eval_residuals_batched(fns, assign, cond_binary, t, wp_frozen, wp_live, node_active):
+def _eval_residuals_batched(fns, assign, cond_binary, t, wp_frozen, wp_live, node_active, x0):
     pop = wp_frozen.shape[0]
     if not fns:
         return jnp.zeros((pop, 0))
     return jnp.concatenate(
-        [fn(assign, cond_binary, t, wp_frozen, wp_live, node_active) for fn in fns], axis=1)
+        [fn(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0) for fn in fns], axis=1)
 
 
 def _violation_batched(h, g):
@@ -224,9 +224,9 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             assign_eff, wp_eff0_frozen, wp_eff0_live = apply_anchor(
                 problem, assign, wp_flat.reshape(pop, n_nodes, state_dim), anchor, x0)
             h0 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff0_frozen, wp_eff0_live,
-                                          anchor.node_active)
+                                          anchor.node_active, x0)
             g0 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff0_frozen, wp_eff0_live,
-                                          anchor.node_active)
+                                          anchor.node_active, x0)
             v0 = _violation_batched(h0, g0)
 
             wp_flat = _lbfgs_solve(merit_and_grad_fixed, wp_flat, lbfgs_history, inner_maxiter, ls_max_trials)
@@ -235,9 +235,9 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             wp = wp_flat.reshape(pop, n_nodes, state_dim)
             assign_eff, wp_eff1_frozen, wp_eff1_live = apply_anchor(problem, assign, wp, anchor, x0)
             h1 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff1_frozen, wp_eff1_live,
-                                          anchor.node_active)
+                                          anchor.node_active, x0)
             g1 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff1_frozen, wp_eff1_live,
-                                          anchor.node_active)
+                                          anchor.node_active, x0)
             v1 = _violation_batched(h1, g1)
 
             if eq_fns:
@@ -454,11 +454,11 @@ def _evaluate_population_jax(problem, X, x0, anchor):
     F, _G_kernel = problem._batched(assign_eff, cond_binary, t, wp_eff_frozen, agent_depot(problem, x0),
                                      anchor.node_active)
     G = (jnp.concatenate(
-            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0)
              for fn in problem._ineq_constraints], axis=1)
          if problem._ineq_constraints else None)
     H = (jnp.concatenate(
-            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active)
+            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0)
              for fn in problem._eq_constraints], axis=1)
          if problem._eq_constraints else None)
     CV = _calc_cv_jax(pop, G, H)

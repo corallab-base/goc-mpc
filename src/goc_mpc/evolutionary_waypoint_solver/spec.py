@@ -295,14 +295,15 @@ def _batch_symbolic_constraint_fn(fn, node_locals, mode="frozen"):
     one this particular constraint reads for ALL of its rows. Each entry of
     `node_locals` is a node index (this constraint's node, or (u, v)
     for an edge constraint) -- NOT a routing-instance id (see module
-    docstring). `cond_binary`/`node_active` are accepted only to match the
-    uniform 6-arg contract every eq/ineq constraint closure shares (see
+    docstring). `cond_binary`/`node_active`/`x0` are accepted only to match
+    the uniform 7-arg contract every eq/ineq constraint closure shares (see
     _batch_along_edge_interior_fn/_batch_relational_interior_fn/
-    _batch_stationary_edge_fn for closures that actually need them, via
-    decode_node_rank)."""
+    _batch_stationary_edge_fn for closures that actually need node_active,
+    via decode_node_rank, and _batch_depot_stationary_fn for the one that
+    actually needs x0)."""
     vmapped = jax.vmap(fn)
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0,
                 node_locals=node_locals, vmapped=vmapped, mode=mode):
         wp = wp_live if mode == "live" else wp_frozen
         rows = [wp[:, nl, :] for nl in node_locals]
@@ -340,7 +341,7 @@ def _batch_along_edge_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
     applied uniformly to every other between-node's row too."""
     vmapped_pop = jax.vmap(fn)
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, u=u, v=v,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, u=u, v=v,
                 kind=kind, vmapped_pop=vmapped_pop, mode=mode, decode_node_rank=decode_node_rank):
         wp = wp_live if mode == "live" else wp_frozen
         owner_variable = jnp.argmax(assign, axis=-1)
@@ -390,7 +391,7 @@ def _batch_relational_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
     trading exact per-node multipliers for a single shared one."""
     vmapped_pop = jax.vmap(fn)
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, u=u, v=v,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, u=u, v=v,
                 kind=kind, vmapped_pop=vmapped_pop, mode=mode, decode_node_rank=decode_node_rank):
         wp = wp_live if mode == "live" else wp_frozen
         owner_variable = jnp.argmax(assign, axis=-1)
@@ -452,7 +453,7 @@ def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank
     for the same reasoning applied to hold rigidity): once u has passed, an
     untouched object's real current position (x0) is the ground truth going
     forward, not whatever was merely planned there."""
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, u=u, v=v, seg_slice=seg_slice,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, u=u, v=v, seg_slice=seg_slice,
                 hold_node_pairs=hold_node_pairs, decode_node_rank=decode_node_rank, mode=mode):
         wp = wp_live if mode == "live" else wp_frozen
         residual = wp[:, u, seg_slice] - wp[:, v, seg_slice]
@@ -461,6 +462,47 @@ def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank
         rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
         edge_lo = jnp.minimum(rank[:, u], rank[:, v])
         edge_hi = jnp.maximum(rank[:, u], rank[:, v])
+        overlap_any = jnp.zeros(rank.shape[0], dtype=bool)
+        for hu, hv in hold_node_pairs:
+            hold_lo = jnp.minimum(rank[:, hu], rank[:, hv])
+            hold_hi = jnp.maximum(rank[:, hu], rank[:, hv])
+            overlap_any = overlap_any | ((edge_lo < hold_hi) & (hold_lo < edge_hi))
+
+        gate = jnp.where(overlap_any, 0.0, 1.0)[:, None]  # (pop, 1)
+        return viol * gate  # feasible at <=0: forces exact equality unless gated off
+    return batched
+
+
+def _batch_depot_stationary_fn(v, seg_slice, hold_node_pairs, decode_node_rank, mode="live"):
+    """Depot analogue of _batch_stationary_edge_fn: ties a graph SOURCE
+    node's (no incoming hard edge) object segment directly to the object's
+    REAL depot value -- the runtime `x0` GraphOfConstraintsMPC.step() passes
+    each cycle, not another node's solved row. This is the JAX side of
+    MILP's Constraint 14b depot loop (milp_waypoint_mpc.cpp: `for (v14b :
+    subgraph.structure.sources())`), needed because _resolve_stationary_
+    objects' regular edge-to-edge chaining alone has nothing to anchor a
+    source node to: an object with no explicit node/hold constraint
+    anywhere is otherwise only tied to ITSELF across edges (internally
+    consistent at some arbitrary GA-found value), never to where it's
+    actually sitting.
+
+    The depot plays the role of "the previous waypoint" for a node with no
+    real structural predecessor: same residual/gating shape as
+    _batch_stationary_edge_fn, just with x0 substituted for wp[u] and the
+    depot's own decoded rank fixed at -1 -- strictly before every real
+    node's rank (always >= 0, see kernel.build_decode_node_rank) -- so the
+    interval-overlap gate against each hold's own [rank_hu, rank_hv] span
+    still correctly turns this off wherever a hold reaches v before the
+    depot's (definitionally always-earliest) claim would apply."""
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, v=v, seg_slice=seg_slice,
+                hold_node_pairs=hold_node_pairs, decode_node_rank=decode_node_rank, mode=mode):
+        wp = wp_live if mode == "live" else wp_frozen
+        residual = x0[None, seg_slice] - wp[:, v, seg_slice]
+        viol = jnp.sum(residual ** 2, axis=-1, keepdims=True)  # (pop, 1)
+
+        rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
+        edge_lo = -jnp.ones_like(rank[:, v])
+        edge_hi = rank[:, v]
         overlap_any = jnp.zeros(rank.shape[0], dtype=bool)
         for hu, hv in hold_node_pairs:
             hold_lo = jnp.minimum(rank[:, hu], rank[:, hv])
@@ -482,14 +524,14 @@ def _batch_python_constraint_fn(fn, node, kind, val, dim, n_variables):
     has no live/frozen choice -- it's a single-node, single-instance escape
     hatch, not a u_/v_-prefixed relational edge formula, so there's no
     "which side is passed" question for it to answer); wp_live/cond_binary/
-    node_active are accepted only to match the uniform 6-arg contract every
-    eq/ineq constraint closure shares."""
+    node_active/x0 are accepted only to match the uniform 7-arg contract
+    every eq/ineq constraint closure shares."""
     vmapped = jax.vmap(fn)
     is_var = (kind == "var")
     fixed_agent = val if kind == "fixed" else 0
     var_slot = val if kind == "var" else 0
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, node=node, is_var=is_var,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, node=node, is_var=is_var,
                 fixed_agent=fixed_agent, var_slot=var_slot, dim=dim, n_variables=n_variables, vmapped=vmapped):
         node_row = wp_frozen[:, node, :]
         if n_variables > 0 and is_var:
@@ -765,7 +807,20 @@ class GraphOrderingSpec:
         Registered mode="live" (see _resolve_holds' docstring for the same
         reasoning applied to hold rigidity): once u has passed, an untouched
         object's real current position (x0) is the ground truth going
-        forward, not whatever was merely planned there."""
+        forward, not whatever was merely planned there.
+
+        Edge-to-edge chaining alone has nothing to anchor a graph SOURCE
+        node (no incoming hard edge) to: with no real predecessor, it's only
+        ever tied to itself via the equality above, so its value is free to
+        drift to whatever the GA/AL search finds convenient rather than the
+        object's actual position. MILP's own Constraint 14b covers this with
+        a second loop over `subgraph.structure.sources()`, feeding the real
+        depot `x0` in as each source's "previous waypoint"
+        (milp_waypoint_mpc.cpp: `for (v14b : subgraph.structure.sources())`)
+        -- mirrored below via _batch_depot_stationary_fn, one source node at
+        a time, gated by the same hold-overlap logic (see that function's
+        docstring for how the depot's own always-earliest rank makes the
+        existing gate math work unmodified)."""
         agents_width = self.graph.num_agents * self.graph.dim
         non_robot_dim = self.graph.non_robot_dim
 
@@ -773,6 +828,11 @@ class GraphOrderingSpec:
         for hold in self.graph.hold_ops.values():
             for oid in hold.held_point_ids:
                 holds_by_object.setdefault(oid, []).append((hold.u_node, hold.v_node))
+
+        # Source nodes: no incoming hard edge -- the only ones with no real
+        # structural predecessor for the depot loop below to anchor.
+        edge_targets = {v for _u, v in self._hard_edges}
+        source_nodes = [n for n in self._node_list if n not in edge_targets]
 
         for oid in range(self.graph.num_objects):
             seg_slice = slice(agents_width + oid * non_robot_dim,
@@ -782,6 +842,10 @@ class GraphOrderingSpec:
                 batched = _batch_stationary_edge_fn(
                     u, v, seg_slice, hold_node_pairs, self._decode_node_rank, mode="live")
                 self._stationary_constraints.append((batched, f"stationary_obj_{oid}_{u}_{v}"))
+            for v in source_nodes:
+                depot_batched = _batch_depot_stationary_fn(
+                    v, seg_slice, hold_node_pairs, self._decode_node_rank, mode="live")
+                self._stationary_constraints.append((depot_batched, f"stationary_obj_{oid}_depot_{v}"))
 
     def _resolve_holds(self):
         """Auto-derives rigid-carry (translation-only) constraints from the

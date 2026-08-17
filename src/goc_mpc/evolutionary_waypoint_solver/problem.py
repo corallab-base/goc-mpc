@@ -150,8 +150,9 @@ def _infer_constraint_size(fn, n_variables, n_agents, n_nodes, state_dim, n_cond
     dummy_t = np.zeros((1, n_nodes))
     dummy_wp = np.zeros((1, n_nodes, state_dim))
     dummy_node_active = np.ones((n_nodes,), dtype=bool)
+    dummy_x0 = np.zeros((state_dim,))
     return np.asarray(fn(dummy_assign, dummy_cond_binary, dummy_t, dummy_wp, dummy_wp,
-                          dummy_node_active)).shape[1]
+                          dummy_node_active, dummy_x0)).shape[1]
 
 
 class GraphOrderingRelaxed:
