@@ -80,6 +80,27 @@ inline Eigen::VectorXd project_out(const Eigen::VectorXd& p, const Candidate& c)
 	}
 }
 
+// A trajectory's own bounding sphere in workspace coordinates -- centered
+// on its mean position, radius covering every sample point exactly.
+// Shared by gather_candidates' point-cloud query below and
+// SqpShortPathMPC's distance-based obstacle/inter-agent-pair QP-row
+// pruning (sqp_short_path_layout.hpp's PruneObstaclesByDistance/
+// PruneAgentPairsByDistance) -- same "one bounding sphere per agent per
+// solve() call" shape, factored out so both can never silently diverge.
+struct BoundingSphere {
+	Eigen::VectorXd center;
+	double radius;
+};
+
+inline BoundingSphere TrajectoryBoundingSphere(const Eigen::MatrixXd& ref_points_workspace) {
+	const Eigen::VectorXd center = ref_points_workspace.colwise().mean().transpose();
+	double max_dist = 0.0;
+	for (int i = 0; i < ref_points_workspace.rows(); ++i) {
+		max_dist = std::max(max_dist, (ref_points_workspace.row(i).transpose() - center).norm());
+	}
+	return BoundingSphere{center, max_dist};
+}
+
 // Every registered sphere/box (unconditionally -- cheap, small counts) plus,
 // if a point cloud is registered, every cloud point within ONE
 // bounding-sphere query covering the agent's WHOLE reference trajectory (not
@@ -105,13 +126,9 @@ inline std::vector<Candidate> gather_candidates(const ObstacleSet& obstacles,
 	}
 
 	if (obstacles.has_point_cloud()) {
-		const Eigen::VectorXd center = ref_points_workspace.colwise().mean().transpose();
-		double max_dist = 0.0;
-		for (int i = 0; i < ref_points_workspace.rows(); ++i) {
-			max_dist = std::max(
-				max_dist, (ref_points_workspace.row(i).transpose() - center).norm());
-		}
-		const double query_radius = max_dist + query_margin;
+		const BoundingSphere traj_sphere = TrajectoryBoundingSphere(ref_points_workspace);
+		const Eigen::VectorXd& center = traj_sphere.center;
+		const double query_radius = traj_sphere.radius + query_margin;
 		std::vector<int> indices = obstacles.query_point_cloud_radius(center, query_radius);
 		// Defensive cap: per-candidate work (RHS assembly + projection) is
 		// O(num_candidates) per step per iteration, so a pathological query

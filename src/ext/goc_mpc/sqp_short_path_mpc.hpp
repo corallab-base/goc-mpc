@@ -92,6 +92,16 @@ struct SqpShortPathMPC {
 	double _penalty_weight;
 	int _max_iterations;
 	double _initial_trust_radius, _max_trust_radius, _min_trust_radius, _grad_tol;
+	// Distance-based QP-row pruning margin (sqp_short_path_layout.hpp's
+	// PruneObstaclesByDistance/PruneAgentPairsByDistance) -- an obstacle/
+	// agent-pair whose reference-trajectory bounding spheres can't come
+	// within this extra margin of touching gets no QP row at all this
+	// solve() call. Purely a speed lever: ApplySafetyProjection/
+	// ApplyAgentPairSafetyProjection (the final hard-feasibility passes)
+	// check every registered obstacle/pair regardless, so this never
+	// affects correctness, only how much the SQP loop itself gets to
+	// smoothly plan around vs. leaving to that closed-form fallback.
+	double _constraint_prune_margin;
 
 	// Fixed for this instance's whole lifetime (depend only on `graph`/
 	// `dim`/`time_per_step`, never on a particular solve() call's
@@ -159,6 +169,15 @@ struct SqpShortPathMPC {
 	// make reference-tracking more competitive with smoothness -- e.g. to
 	// stop a short-horizon obstacle detour from drifting off the reference
 	// for the rest of the horizon instead of returning to it.
+	// constraint_prune_margin: see `_constraint_prune_margin`'s own comment
+	// above. Default (1.0) matches ApplySafetyProjection's own
+	// long-standing hardcoded query margin for the same "how far past the
+	// reference trajectory's own bounding sphere could this plausibly
+	// matter" question -- same conservative choice, now made tunable
+	// because unlike that closed-form pass (fixed cost regardless), this
+	// margin trades QP row count (and hence solve time) directly against
+	// how far from the reference an obstacle/agent-pair the SQP loop is
+	// still willing to plan around.
 	SqpShortPathMPC(const GraphOfConstraints& graph,
 			 unsigned int num_steps,
 			 unsigned int num_agents,
@@ -174,7 +193,8 @@ struct SqpShortPathMPC {
 			 double initial_trust_radius = 0.5,
 			 double max_trust_radius = 5.0,
 			 double min_trust_radius = 1.0e-6,
-			 double grad_tol = 1.0e-6);
+			 double grad_tol = 1.0e-6,
+			 double constraint_prune_margin = 1.0);
 
 	// Explicit (not defaulted inline) for the same reason as
 	// GraphTimingMPC's: QpState is only complete in the .cpp, and pybind's

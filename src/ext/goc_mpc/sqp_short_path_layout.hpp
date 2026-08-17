@@ -6,6 +6,7 @@
 #include <Eigen/Dense>
 
 #include "graph_of_constraints.hpp"
+#include "obstacle_projection.hpp"
 #include "obstacle_set.hpp"
 #include "../configuration_spline.hpp"
 
@@ -196,11 +197,54 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 			   const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
 			   const Eigen::MatrixXd& ref_points_agent, const Eigen::MatrixXd& ref_velocities_agent);
 
+// Per-agent obstacle pointers "close enough to plausibly matter" over this
+// solve() call's horizon: agent ag's own REFERENCE-trajectory bounding
+// sphere (obstacle_projection.hpp's TrajectoryBoundingSphere) vs each
+// registered obstacle's own extent (sphere: radius+margin; box: half-
+// extents' norm+margin, a conservative circumscribing-sphere proxy) --
+// included if the two spheres could plausibly come within `prune_margin`
+// of touching. Computed ONCE per solve() call (SqpShortPathMPC::solve(),
+// alongside `ref_points`), reused for the whole call -- same "row COUNT
+// fixed for the whole solve() call" discipline design decision 6 already
+// established for the unpruned case (row COEFFICIENTS still get
+// relinearized every outer iteration; which rows EXIST does not, and
+// pruning is exactly one more thing computed once and held fixed).
+//
+// PURELY a speed optimization on the SQP's own optimization path --
+// pointers into `obstacles`, valid only for the caller's own solve() call
+// (ObstacleSet isn't mutated mid-call). SqpShortPathMPC's own
+// ApplySafetyProjection final hard-feasibility pass (sqp_short_path_mpc.cpp)
+// checks EVERY registered obstacle for every agent regardless of this
+// pruning, so an obstacle wrongly excluded here degrades solution
+// SMOOTHNESS around it (handled by that pass's less-smooth closed-form
+// fallback instead of the SQP loop optimizing around it), never
+// correctness/feasibility -- see that function's own comment for why this
+// asymmetry is safe to lean on.
+std::vector<std::vector<const Obstacle*>> PruneObstaclesByDistance(
+	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
+	const ObstacleSet& obstacles, double prune_margin);
+
+// Same idea for inter-agent pairs: (ag_a, ag_b) survives if their own
+// reference-trajectory bounding spheres could plausibly bring them within
+// `agent_radii(ag_a) + agent_radii(ag_b) + prune_margin` of each other.
+// ApplyAgentPairSafetyProjection's final pass checks EVERY pair
+// regardless -- same non-issue-for-correctness property as above. This is
+// the more consequential of the two prunings in practice: unpruned pair
+// count grows as `num_agents*(num_agents-1)/2`, quadratic in agent count,
+// while unpruned obstacle rows only grow linearly in obstacle count.
+std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
+	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
+	const Eigen::VectorXd& agent_radii, double prune_margin);
+
 // Total obstacle-constraint violation (Sum of max(0, -c(q)) over every
-// (step, agent, obstacle)) at the given absolute `points` -- the merit
-// function's penalty term, evaluated with the TRUE (non-linearized)
-// sphere/box signed distance, not LinearizeObstacleConstraints' local
-// model.
+// (step, agent, obstacle) SURVIVING PruneObstaclesByDistance) at the given
+// absolute `points` -- the merit function's penalty term, evaluated with
+// the TRUE (non-linearized) sphere/box signed distance, not
+// LinearizeObstacleConstraints' local model. Deliberately scoped to the
+// SAME pruned set LinearizeObstacleConstraints' rows come from (not the
+// full unpruned obstacle list) -- the merit function must score exactly
+// what the QP can act on, or the trust-region ratio test (predicted vs.
+// actual reduction) becomes meaningless for whatever it silently omitted.
 // `ambient_dim`: per-agent AMBIENT stride used to slice `points`
 // (points.row(i).segment(ag*ambient_dim, workspace_dim) is agent ag's
 // world position at step i) -- NOT the tangent/decision-space stride
@@ -209,51 +253,55 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 // Stage 4). Uniform across agents (same assumption GraphShortPathMPC's own
 // a_dim/t_dim split already makes).
 double EvaluateObstacleViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
-				  const Eigen::MatrixXd& points, const ObstacleSet& obstacles);
+				  const Eigen::MatrixXd& points,
+				  const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles);
 
-// Every (step, agent, obstacle) row in `obstacles.obstacles()` (spheres and
-// boxes; point-cloud obstacles are a later stage, not read here),
-// linearized at the current iterate `points`. Fast path only: assumes
-// `fk(q) = q[:workspace_dim]` (points.row(i).segment(ag*ambient_dim,
-// workspace_dim) IS the agent's world position, so the constraint's
-// Jacobian w.r.t. the step is a constant 0/1 selection onto that agent's
-// leading `workspace_dim` axes at that step -- no chain rule beyond the
-// slice). `agent_axis_offsets` is still TANGENT-space (see
-// AccumulateSO3QuatBlock's own comment) -- it's what the resulting row's
-// Jacobian columns are indexed into, since the decision variables (and
-// hence the QP) live in tangent space regardless of `ambient_dim`.
+// Every (step, agent, obstacle) row for `per_agent_obstacles[ag]` (see
+// PruneObstaclesByDistance's own comment), linearized at the current
+// iterate `points`. Fast path only: assumes `fk(q) = q[:workspace_dim]`
+// (points.row(i).segment(ag*ambient_dim, workspace_dim) IS the agent's
+// world position, so the constraint's Jacobian w.r.t. the step is a
+// constant 0/1 selection onto that agent's leading `workspace_dim` axes at
+// that step -- no chain rule beyond the slice). `agent_axis_offsets` is
+// still TANGENT-space (see AccumulateSO3QuatBlock's own comment) -- it's
+// what the resulting row's Jacobian columns are indexed into, since the
+// decision variables (and hence the QP) live in tangent space regardless
+// of `ambient_dim`.
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
-	int workspace_dim, const Eigen::MatrixXd& points, const ObstacleSet& obstacles);
+	int workspace_dim, const Eigen::MatrixXd& points,
+	const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles);
 
-// Inter-agent avoidance: every (step, agent-pair) is treated as a sphere
-// constraint on the PAIR's separation (same sdf-style shape as
-// LinearizeObstacleConstraints's sphere case), except now BOTH endpoints
-// are decision variables (agent b's position is agent a's "obstacle center"
-// and vice versa), so the linearized row has nonzero coefficients on both
-// agents' position steps. Deliberately position-based, not velocity-based
-// (ORCA/velocity-obstacle was tried and rejected for this solver -- see the
-// project plan's Stage 2 notes: this solver already plans full-horizon
-// POSITIONS jointly for every agent, which already gives per-step
-// anticipation and rules out the reciprocal-double-counting concern
-// velocity-obstacle constructions solve for, so there was no offsetting
-// benefit to pay for the indirect, weight-dependent, and non-guaranteed
-// velocity-to-position coupling a velocity-space constraint would have
-// needed). `agent_radii` is one entry per agent (index-aligned with
-// `agent_axis_offsets`); a pair's combined avoidance radius is
-// `agent_radii(ag_i) + agent_radii(ag_j)` (0 is a valid default -- agents
-// are still treated as points that must not occupy the same position at
-// the same step, exactly like every other point-agent assumption already
-// made in this fast-path solver).
+// Inter-agent avoidance: every (step, agent-pair) SURVIVING
+// PruneAgentPairsByDistance is treated as a sphere constraint on the
+// PAIR's separation (same sdf-style shape as LinearizeObstacleConstraints's
+// sphere case), except now BOTH endpoints are decision variables (agent
+// b's position is agent a's "obstacle center" and vice versa), so the
+// linearized row has nonzero coefficients on both agents' position steps.
+// Deliberately position-based, not velocity-based (ORCA/velocity-obstacle
+// was tried and rejected for this solver -- see the project plan's Stage 2
+// notes: this solver already plans full-horizon POSITIONS jointly for
+// every agent, which already gives per-step anticipation and rules out the
+// reciprocal-double-counting concern velocity-obstacle constructions solve
+// for, so there was no offsetting benefit to pay for the indirect,
+// weight-dependent, and non-guaranteed velocity-to-position coupling a
+// velocity-space constraint would have needed). `agent_radii` is one entry
+// per agent (index-aligned with `agent_axis_offsets`); a pair's combined
+// avoidance radius is `agent_radii(ag_i) + agent_radii(ag_j)` (0 is a
+// valid default -- agents are still treated as points that must not
+// occupy the same position at the same step, exactly like every other
+// point-agent assumption already made in this fast-path solver).
 //
 // Fast path only (same assumption as LinearizeObstacleConstraints): agent
 // positions are read directly from the leading `workspace_dim` ambient
 // columns, no fk chain rule.
-double EvaluateAgentPairViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
-				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii);
+double EvaluateAgentPairViolation(int num_steps, int ambient_dim, int workspace_dim,
+				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
+				   const std::vector<std::pair<int, int>>& active_pairs);
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
-	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii);
+	const std::vector<int>& agent_axis_offsets, int num_steps, int ambient_dim, int workspace_dim,
+	const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
+	const std::vector<std::pair<int, int>>& active_pairs);
 
 }  // namespace sqp_short_path

@@ -42,7 +42,8 @@ SqpShortPathMPC::SqpShortPathMPC(const GraphOfConstraints& graph,
 				  double initial_trust_radius,
 				  double max_trust_radius,
 				  double min_trust_radius,
-				  double grad_tol)
+				  double grad_tol,
+				  double constraint_prune_margin)
 	: _graph(&graph),
 	  _num_steps(num_steps),
 	  _num_agents(num_agents),
@@ -56,7 +57,8 @@ SqpShortPathMPC::SqpShortPathMPC(const GraphOfConstraints& graph,
 	  _initial_trust_radius(initial_trust_radius),
 	  _max_trust_radius(max_trust_radius),
 	  _min_trust_radius(min_trust_radius),
-	  _grad_tol(grad_tol) {
+	  _grad_tol(grad_tol),
+	  _constraint_prune_margin(constraint_prune_margin) {
 
 	if (_agent_radii.size() != static_cast<int>(num_agents)) {
 		throw std::runtime_error(
@@ -342,7 +344,10 @@ SqpResult RunTrustRegionSqp(
 		int num_steps, int num_agents, int dim, int ambient_dim, int workspace_dim, double tau,
 		const Eigen::VectorXd& x0, const Eigen::VectorXd& v0,
 		const Eigen::MatrixXd& ref_points, const Eigen::MatrixXd& ref_velocities,
-		const ObstacleSet& obstacles, const Eigen::VectorXd& agent_radii,
+		const ObstacleSet& obstacles,
+		const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles,
+		const std::vector<std::pair<int, int>>& active_pairs,
+		const Eigen::VectorXd& agent_radii,
 		double penalty_weight, int max_iterations,
 		double initial_trust_radius, double max_trust_radius, double min_trust_radius, double grad_tol,
 		Eigen::MatrixXd points, Eigen::MatrixXd vels,
@@ -350,14 +355,19 @@ SqpResult RunTrustRegionSqp(
 
 	const int per_axis = 2 * num_steps;
 	const int n_smooth = static_cast<int>(axes.size()) * per_axis;
-	// Fixed for the whole solve() call (design decision 6): obstacle count
-	// (and now agent-pair count) times step count never changes mid-call,
-	// only each row's coefficients/value do (re-linearized every outer
-	// iteration) -- so qpOASES::SQProblem can be reused (init once,
-	// hotstart thereafter) across every outer iteration, and across MPC
-	// cycles at a stable size.
-	const int num_pairs = num_agents * (num_agents - 1) / 2;
-	const int m = num_steps * (num_agents * static_cast<int>(obstacles.obstacles().size()) + num_pairs);
+	// Fixed for the whole solve() call (design decision 6): row COUNT
+	// never changes mid-call, only each row's coefficients/value do
+	// (re-linearized every outer iteration) -- so qpOASES::SQProblem can
+	// be reused (init once, hotstart thereafter) across every outer
+	// iteration, and across MPC cycles at a stable size. `m` now counts
+	// only the SURVIVING (distance-pruned, see PruneObstaclesByDistance/
+	// PruneAgentPairsByDistance) obstacle/pair rows -- pruning happens
+	// once, before this function runs (SqpShortPathMPC::solve()), same
+	// "computed once per solve() call" discipline as everything else this
+	// comment already covers.
+	int obstacle_rows = 0;
+	for (const auto& v : per_agent_obstacles) obstacle_rows += static_cast<int>(v.size());
+	const int m = num_steps * (obstacle_rows + static_cast<int>(active_pairs.size()));
 	const int m_eff = std::max(m, 1);
 	const int n = n_smooth + m_eff;
 
@@ -369,8 +379,8 @@ SqpResult RunTrustRegionSqp(
 	double f_current = TotalSmoothCost(agent_shapes, num_steps, tau, smooth_cost_weights, dim, ambient_dim,
 					    x0, v0, points, vels, ref_points, ref_velocities);
 	double violation_current =
-		EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, points, obstacles) +
-		EvaluateAgentPairViolation(num_steps, num_agents, ambient_dim, workspace_dim, points, agent_radii);
+		EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, points, per_agent_obstacles) +
+		EvaluateAgentPairViolation(num_steps, ambient_dim, workspace_dim, points, agent_radii, active_pairs);
 	double phi_current = f_current + penalty_weight * violation_current;
 
 	double trust_radius = initial_trust_radius;
@@ -442,9 +452,11 @@ SqpResult RunTrustRegionSqp(
 		for (int i = 0; i < n; ++i) H_qp(i, i) += qpOASES::real_t(1e-10);
 
 		std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
-			agent_axis_offsets, num_steps, num_agents, ambient_dim, workspace_dim, points, obstacles);
+			agent_axis_offsets, num_steps, num_agents, ambient_dim, workspace_dim, points,
+			per_agent_obstacles);
 		std::vector<ConstraintRow> pair_rows = LinearizeAgentPairConstraints(
-			agent_axis_offsets, num_steps, num_agents, ambient_dim, workspace_dim, points, agent_radii);
+			agent_axis_offsets, num_steps, ambient_dim, workspace_dim, points, agent_radii,
+			active_pairs);
 		rows.insert(rows.end(), std::make_move_iterator(pair_rows.begin()),
 			    std::make_move_iterator(pair_rows.end()));
 
@@ -473,7 +485,23 @@ SqpResult RunTrustRegionSqp(
 		}
 		for (int r = 0; r < m; ++r) dx_lb(n_smooth + r) = qpOASES::real_t(0.0);
 
-		qpOASES::int_t nWSR = 200;
+		// qpOASES's active-set homotopy needs roughly O(n) working-set
+		// recalculations for an n-variable dense QP even in the EASY case
+		// (a small budget like the previous 200 is fine for a single-agent
+		// problem but silently exhausts, returning RET_MAX_NWSR_REACHED,
+		// well before genuine infeasibility/nonconvexity as num_agents
+		// grows -- discovered via a multi-agent scaling investigation:
+		// a purely block-diagonal, exactly-quadratic, ZERO-constraint-row
+		// smooth-only QP (should solve in exactly one Newton step, rho=1)
+		// was instead failing on EVERY outer iteration at n~240 (4 R^3
+		// agents), each failure wrongly interpreted as "trust region too
+		// large" and burning a full trust-region shrink cycle for nothing
+		// -- not a convergence problem, a starved solver budget. 5000
+		// verified sufficient up to 8 agents (n~480) with room to spare;
+		// still cheap relative to the solve itself when NOT needed (a
+		// converged/already-optimal QP returns long before exhausting
+		// whatever budget it's given).
+		qpOASES::int_t nWSR = 5000;
 		qpOASES::returnValue status;
 		if (!(*qp_state)->initialized) {
 			status = qp.init(H_qp.data(), g_qp.data(), A_qp.data(),
@@ -513,8 +541,10 @@ SqpResult RunTrustRegionSqp(
 						      ambient_dim, x0, v0, candidate_points, candidate_vels,
 						      ref_points, ref_velocities);
 		const double violation_new =
-			EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, candidate_points, obstacles) +
-			EvaluateAgentPairViolation(num_steps, num_agents, ambient_dim, workspace_dim, candidate_points, agent_radii);
+			EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, candidate_points,
+						   per_agent_obstacles) +
+			EvaluateAgentPairViolation(num_steps, ambient_dim, workspace_dim, candidate_points, agent_radii,
+						    active_pairs);
 		const double phi_new = f_new + penalty_weight * violation_new;
 
 		// Uses H_smooth_total (THIS iteration's smooth Hessian, including
@@ -600,11 +630,25 @@ bool SqpShortPathMPC::solve(const Eigen::VectorXd& x0,
 			vels = _vels;
 		}
 
+		// Distance-based row pruning (design decision 6: computed ONCE per
+		// solve() call, from the REFERENCE trajectory, held fixed for the
+		// whole call -- see PruneObstaclesByDistance/PruneAgentPairsByDistance's
+		// own comments). Purely a speed lever, not a feasibility one:
+		// ApplySafetyProjection/ApplyAgentPairSafetyProjection (inside
+		// RunTrustRegionSqp) still check every registered obstacle/pair
+		// regardless of what got pruned out here.
+		const std::vector<std::vector<const Obstacle*>> per_agent_obstacles =
+			PruneObstaclesByDistance(ref_points, num_agents, ambient_dim, workspace_dim,
+						  *_obstacles, _constraint_prune_margin);
+		const std::vector<std::pair<int, int>> active_pairs =
+			PruneAgentPairsByDistance(ref_points, num_agents, ambient_dim, workspace_dim,
+						   _agent_radii, _constraint_prune_margin);
+
 		SqpResult result = RunTrustRegionSqp(
 			_agent_shapes, _axes, _agent_axis_offsets, _smooth_hessian_normal, _smooth_cost_weights,
 			H, num_agents, dim, ambient_dim, workspace_dim, _time_per_step,
-			x0, v0, ref_points, ref_velocities, *_obstacles, _agent_radii,
-			_penalty_weight, _max_iterations,
+			x0, v0, ref_points, ref_velocities, *_obstacles, per_agent_obstacles, active_pairs,
+			_agent_radii, _penalty_weight, _max_iterations,
 			_initial_trust_radius, _max_trust_radius, _min_trust_radius, _grad_tol,
 			points, vels, &_qp_state);
 
