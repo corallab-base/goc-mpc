@@ -100,18 +100,6 @@ def _eval_residuals_batched(fns, assign, cond_binary, t, wp_frozen, wp_live, nod
         [fn(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0) for fn in fns], axis=1)
 
 
-def _violation_batched(h, g):
-    pop = h.shape[0]
-    parts = []
-    if h.shape[1] > 0:
-        parts.append(jnp.max(jnp.abs(h), axis=1))
-    if g.shape[1] > 0:
-        parts.append(jnp.max(jnp.maximum(0.0, g), axis=1))
-    if not parts:
-        return jnp.zeros(pop)
-    return jnp.max(jnp.stack(parts, axis=1), axis=1)
-
-
 # ---------------------------------------------------------------------------
 # Batched L-BFGS: two-loop recursion + Armijo backtracking
 # ---------------------------------------------------------------------------
@@ -213,7 +201,23 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
     lo = jnp.asarray(problem.xl[problem.wp_offset:])
     hi = jnp.asarray(problem.xu[problem.wp_offset:])
 
-    def batched_local_refine(wp0, assign, cond_binary, t, mu, lam, rho, x0, anchor):
+    def batched_local_refine(wp0, assign, cond_binary, t, mu, lam, rho, x0, anchor, cv_tol):
+        """`cv_tol` (per-generation-annealed, from _score_schedule/
+        _calibrate_score_scale -- the SAME absolute yardstick the GA's own
+        selection score already penalizes violation against) is what grows
+        `rho` here, not a per-call relative "did this outer iteration's own
+        refinement shrink violation enough" comparison: that self-relative
+        version compares each iteration's post-refinement violation against
+        wherever THAT SAME iteration started, which -- fed a warm-started wp
+        that's already a little better each call -- can keep clearing its
+        own bar indefinitely while the absolute gap barely moves, so `rho`
+        never grows and the AL penalty never actually ramps up enough to
+        close a genuinely infeasible point. Comparing against `cv_tol`
+        instead means growth is judged against a fixed target, not a moving
+        one that resets every call. Uses _calc_cv_jax (the same summed
+        violation _evaluate_population_jax computes CV0/cv_tol's own
+        calibration from), not a max-norm, so the comparison is scale-
+        consistent with what `cv_tol` was actually calibrated against."""
         pop = wp0.shape[0]
         wp_flat = wp0.reshape(pop, -1)
 
@@ -221,30 +225,22 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             return merit_and_grad(w, assign, cond_binary, t, mu, lam, rho, x0, anchor)
 
         for _ in range(outer_iters):
-            assign_eff, wp_eff0_frozen, wp_eff0_live = apply_anchor(
-                problem, assign, wp_flat.reshape(pop, n_nodes, state_dim), anchor, x0)
-            h0 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff0_frozen, wp_eff0_live,
-                                          anchor.node_active, x0)
-            g0 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff0_frozen, wp_eff0_live,
-                                          anchor.node_active, x0)
-            v0 = _violation_batched(h0, g0)
-
             wp_flat = _lbfgs_solve(merit_and_grad_fixed, wp_flat, lbfgs_history, inner_maxiter, ls_max_trials)
             wp_flat = jnp.clip(wp_flat, lo, hi)
 
             wp = wp_flat.reshape(pop, n_nodes, state_dim)
-            assign_eff, wp_eff1_frozen, wp_eff1_live = apply_anchor(problem, assign, wp, anchor, x0)
-            h1 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff1_frozen, wp_eff1_live,
+            assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
+            h1 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
                                           anchor.node_active, x0)
-            g1 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff1_frozen, wp_eff1_live,
+            g1 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
                                           anchor.node_active, x0)
-            v1 = _violation_batched(h1, g1)
+            v1 = _calc_cv_jax(pop, g1, h1)
 
             if eq_fns:
                 mu = mu + rho[:, None] * h1
             if ineq_fns:
                 lam = jnp.maximum(0.0, lam + rho[:, None] * g1)
-            rho = jnp.where(v1 <= 0.25 * v0, rho, jnp.minimum(rho * rho_growth, rho_max))
+            rho = jnp.where(v1 <= cv_tol, rho, jnp.minimum(rho * rho_growth, rho_max))
 
             def merit_and_grad_fixed(w, assign=assign, cond_binary=cond_binary, t=t, mu=mu, lam=lam, rho=rho,
                                       x0=x0, anchor=anchor):
@@ -547,7 +543,8 @@ def _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob
 
         child_assign, child_cond_binary, child_t, child_wp0 = problem._extract_batch(child_X)
         child_wp_star, off_mu, off_lam, off_rho = local_refine(
-            child_wp0, child_assign, child_cond_binary, child_t, child_mu, child_lam, child_rho, x0, anchor)
+            child_wp0, child_assign, child_cond_binary, child_t, child_mu, child_lam, child_rho, x0, anchor,
+            cv_tol)
         off_X = _write_wp_batch_jax(problem, child_X, child_wp_star)
 
         off_assign, off_cond_binary, off_t, off_wp = problem._extract_batch(off_X)
