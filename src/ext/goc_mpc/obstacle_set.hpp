@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -40,6 +41,38 @@ enum class ObstacleKind {
 struct Obstacle {
 	ObstacleKind kind;
 	Eigen::VectorXd params;
+	double margin = 0.0;
+};
+
+// Caller-supplied signed-distance FIELD for one agent's own local vicinity
+// (Stage 3's point-cloud replacement for SqpShortPathMPC -- see the project
+// plan's "backend-agnostic external SDF-grid/TSDF obstacle plan"). A grid
+// VERTEX (i_0, ..., i_{d-1}) sits at world position `origin +
+// [i_0*resolution(0), ..., i_{d-1}*resolution(d-1)]`; querying an arbitrary
+// point in between multilinearly interpolates (bilinear for d=2, trilinear
+// for d=3) the surrounding 2^d vertices -- see sqp_short_path_layout.hpp's
+// QueryAgentSdfGrid, the only place this struct's buffers are actually read.
+// `margin` is subtracted from the raw interpolated value exactly like
+// Obstacle::margin is for spheres/boxes (SphereSdf/BoxSdf,
+// sqp_short_path_layout.cpp) -- `values` is assumed to already be a genuine
+// signed distance to the nearest obstacle SURFACE (negative inside), with
+// no clearance baked in; `margin` adds that clearance uniformly.
+//
+// `gradient` is OPTIONAL. Empty (default) means "derive the gradient by
+// differentiating the SAME multilinear interpolant `values` is queried
+// through" -- guarantees value/gradient consistency, which this solver's
+// trust-region ratio test depends on (an independently-supplied gradient
+// that doesn't match the interpolated value's actual local slope is a
+// subtle bug magnet there). Non-empty means the caller is instead handing
+// over its own (e.g. cheaper, or backend-native) per-vertex gradient field,
+// interpolated the same multilinear way as `values` -- the caller's own
+// responsibility to keep consistent with `values`.
+struct AgentSdfGrid {
+	Eigen::VectorXd origin;      // workspace_dim
+	Eigen::VectorXd resolution;  // workspace_dim, cell size per axis, > 0
+	Eigen::VectorXi shape;       // workspace_dim, >= 2 per axis
+	Eigen::VectorXd values;      // flat row-major, length prod(shape)
+	Eigen::VectorXd gradient;    // flat row-major workspace_dim-vectors, length prod(shape)*d, or empty
 	double margin = 0.0;
 };
 
@@ -141,6 +174,47 @@ public:
 
 	const std::vector<Obstacle>& obstacles() const { return _obstacles; }
 
+	// Registers/replaces agent `agent`'s own local signed-distance grid
+	// wholesale (same per-cycle-refresh contract as set_point_cloud: no
+	// incremental update, a fresh crop each call is the expected caller
+	// pattern) -- keyed by agent index, unlike every other obstacle kind
+	// above, which is shared/global and matched to agents only via
+	// distance pruning. A grid is registered PER AGENT instead because the
+	// robots this library controls may be far enough apart that one shared
+	// crop can't cover all of them; each agent gets its own independently
+	// caller-built local map. Deliberately backend-agnostic (no
+	// skfmm/nvblox/etc. anywhere in this repo's C++) -- the caller builds
+	// `values` (and, optionally, `gradient`) however it wants and hands
+	// over the raw buffer; see AgentSdfGrid's own doc comment for the
+	// buffer layout and the value/gradient consistency tradeoff.
+	//
+	// `origin`/`resolution`/`shape` must all be the same size, 2 or 3
+	// (matching the graph's workspace_dim this grid is meant for -- not
+	// validated against workspace_dim here, same "caller's responsibility"
+	// stance set_point_cloud already takes on its own `d`). `resolution`
+	// entries must be positive; `shape` entries must be >= 2 (need at
+	// least one cell per axis to interpolate at all). `values` must be
+	// flat, row-major (last axis fastest, i.e. the same C-order a NumPy
+	// array of shape `shape` flattens to), length `prod(shape)`.
+	// `gradient` is optional (default empty, meaning "derive from
+	// `values`" -- see AgentSdfGrid's own comment): if given, must be flat
+	// workspace_dim-vectors in the SAME per-vertex order as `values`,
+	// length `prod(shape) * d`.
+	void set_agent_sdf_grid(int agent, const Eigen::VectorXd& origin, const Eigen::VectorXd& resolution,
+				 const Eigen::VectorXi& shape, const Eigen::VectorXd& values,
+				 const Eigen::VectorXd& gradient = Eigen::VectorXd(), double margin = 0.0);
+
+	// Drops agent `agent`'s registered grid, if any. No-op if none
+	// registered (mirrors clear()'s "drop everything" for the shared
+	// obstacle list, scoped to just this one agent's grid instead).
+	void clear_agent_sdf_grid(int agent) { _agent_sdf_grids.erase(agent); }
+
+	// nullptr if agent `agent` has no registered grid.
+	const AgentSdfGrid* agent_sdf_grid(int agent) const {
+		const auto it = _agent_sdf_grids.find(agent);
+		return it == _agent_sdf_grids.end() ? nullptr : &it->second;
+	}
+
 private:
 	std::vector<Obstacle> _obstacles;
 
@@ -152,4 +226,9 @@ private:
 	Eigen::MatrixXd _point_cloud;
 	double _point_cloud_margin = 0.0;
 	std::unique_ptr<PointCloudKdTreeBase> _kdtree;
+
+	// Sparse (most agents may have none) -- see set_agent_sdf_grid's own
+	// comment for why this is keyed by agent index instead of being one
+	// more entry in `_obstacles`.
+	std::unordered_map<int, AgentSdfGrid> _agent_sdf_grids;
 };

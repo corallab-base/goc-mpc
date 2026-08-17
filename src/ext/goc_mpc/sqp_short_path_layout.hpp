@@ -304,4 +304,65 @@ std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 	const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
 	const std::vector<std::pair<int, int>>& active_pairs);
 
+// Value + gradient of one AgentSdfGrid, multilinearly interpolated
+// (bilinear for workspace_dim=2, trilinear for workspace_dim=3) at world
+// point `p`. `value` already has `grid.margin` subtracted (same convention
+// as SphereSdf/BoxSdf's own `sdf.value - obstacle.margin`, see
+// sqp_short_path_layout.cpp). `p` outside the grid's own extent is CLAMPED
+// to the nearest boundary vertex before interpolating (constant/
+// zero-order-hold extrapolation) rather than extrapolated -- a caller-built
+// local crop is expected to already cover whatever region the reference
+// trajectory (plus prune margin) needs; querying past its edge only
+// happens when that margin wasn't quite enough, and clamping is the
+// conservative choice (an out-of-crop query never silently reports a large
+// spurious clearance, nor extrapolates an unbounded one). Gradient comes
+// from `grid.gradient` if the caller supplied one (interpolated the SAME
+// multilinear way as `value`), otherwise from differentiating the SAME
+// interpolant `value` was computed from (see AgentSdfGrid's own doc
+// comment in obstacle_set.hpp for why this is the default). Used both by
+// this file's own EvaluateAgentSdfGridViolation/
+// LinearizeAgentSdfGridConstraints and by sqp_short_path_mpc.cpp's final
+// safety-projection pass -- both must query the SAME interpolant, hence
+// public/shared rather than a local anonymous-namespace helper.
+struct SdfSample {
+	double value;
+	Eigen::VectorXd grad;  // d(value)/d(p), workspace_dim
+};
+SdfSample QueryAgentSdfGrid(const AgentSdfGrid& grid, const Eigen::VectorXd& p, int workspace_dim);
+
+// Per-agent registered grid "close enough to plausibly matter" over this
+// solve() call's horizon, same distance-pruning idea as
+// PruneObstaclesByDistance but singular per agent (a grid is registered
+// PER AGENT already, not shared/matched-by-proximity like spheres/boxes --
+// see AgentSdfGrid's own comment) and compared against the grid's own
+// AABB instead of a sphere/box's radius/half-extents. Returned vector is
+// `num_agents` long; entry `ag` is `nullptr` if agent `ag` has no
+// registered grid OR its grid's AABB can't plausibly come within
+// `prune_margin` of the agent's own reference-trajectory bounding sphere.
+// Same "purely a speed lever, computed once per solve() call, never
+// affects correctness" property as PruneObstaclesByDistance -- the final
+// safety-projection pass (sqp_short_path_mpc.cpp) checks every agent's
+// registered grid regardless of this pruning.
+std::vector<const AgentSdfGrid*> PruneAgentSdfGridsByDistance(
+	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
+	const ObstacleSet& obstacles, double prune_margin);
+
+// Total grid-constraint violation (sum of max(0, -value) over every (step,
+// agent) with a non-null `active_grids[ag]`) at the given absolute
+// `points` -- the merit function's penalty term, same role as
+// EvaluateObstacleViolation but for grid obstacles.
+double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
+				      const Eigen::MatrixXd& points,
+				      const std::vector<const AgentSdfGrid*>& active_grids);
+
+// One (step, agent) row per non-null `active_grids[ag]`, linearized at the
+// current iterate `points` -- same fk fast-path shape as
+// LinearizeObstacleConstraints (constant 0/1 selection Jacobian), row
+// count `O(steps*agents)` regardless of grid resolution (the whole point
+// of a field representation over Stage 3's reverted one-row-per-point
+// approach -- see the project plan).
+std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
+	int workspace_dim, const Eigen::MatrixXd& points, const std::vector<const AgentSdfGrid*>& active_grids);
+
 }  // namespace sqp_short_path

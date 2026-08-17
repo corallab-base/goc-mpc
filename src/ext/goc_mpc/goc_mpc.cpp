@@ -435,6 +435,20 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("params", &Obstacle::params)
 		.def_readonly("margin", &Obstacle::margin);
 
+	// Caller-supplied, backend-agnostic signed-distance grid for one
+	// agent's own local vicinity -- see AgentSdfGrid's own doc comment
+	// (obstacle_set.hpp) for the buffer layout/convention. Read-only from
+	// Python: built via ObstacleSet.set_agent_sdf_grid below, this
+	// binding only exists so a caller can read back what's registered
+	// (mirrors Obstacle's own read-only binding just above).
+	py::class_<AgentSdfGrid>(goc_mpc, "AgentSdfGrid")
+		.def_readonly("origin", &AgentSdfGrid::origin)
+		.def_readonly("resolution", &AgentSdfGrid::resolution)
+		.def_readonly("shape", &AgentSdfGrid::shape)
+		.def_readonly("values", &AgentSdfGrid::values)
+		.def_readonly("gradient", &AgentSdfGrid::gradient)
+		.def_readonly("margin", &AgentSdfGrid::margin);
+
 	py::class_<ObstacleSet>(goc_mpc, "ObstacleSet")
 		.def(py::init<>())
 		.def("add_sphere", &ObstacleSet::add_sphere,
@@ -449,7 +463,20 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("point_cloud", &ObstacleSet::point_cloud, py::return_value_policy::reference_internal)
 		.def("point_cloud_margin", &ObstacleSet::point_cloud_margin)
 		.def("has_point_cloud", &ObstacleSet::has_point_cloud)
-		.def("obstacles", &ObstacleSet::obstacles, py::return_value_policy::reference_internal);
+		.def("obstacles", &ObstacleSet::obstacles, py::return_value_policy::reference_internal)
+		// SqpShortPathMPC's Stage-3 replacement: one local SDF grid PER
+		// AGENT (not shared like every obstacle kind above), wholesale-
+		// replaced each call like set_point_cloud -- see
+		// ObstacleSet::set_agent_sdf_grid's own doc comment. `gradient`
+		// defaults to empty (derive from `values`, the consistency-first
+		// default); pass a non-empty array to hand over a backend-native
+		// gradient field instead.
+		.def("set_agent_sdf_grid", &ObstacleSet::set_agent_sdf_grid,
+		     py::arg("agent"), py::arg("origin"), py::arg("resolution"), py::arg("shape"),
+		     py::arg("values"), py::arg("gradient") = Eigen::VectorXd(), py::arg("margin") = 0.0)
+		.def("clear_agent_sdf_grid", &ObstacleSet::clear_agent_sdf_grid, py::arg("agent"))
+		.def("agent_sdf_grid", &ObstacleSet::agent_sdf_grid, py::arg("agent"),
+		     py::return_value_policy::reference_internal);
 
         py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
                 .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,

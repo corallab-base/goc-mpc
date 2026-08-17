@@ -557,4 +557,174 @@ std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 	return rows;
 }
 
+namespace {
+
+// Row-major flat index into an AgentSdfGrid's `values`/`gradient` buffers
+// (last axis fastest -- see AgentSdfGrid's own doc comment), generalized
+// over `idx.size()` axes so the same helper serves both workspace_dim=2
+// and workspace_dim=3 without separate bilinear/trilinear special cases.
+long GridFlatIndex(const Eigen::VectorXi& shape, const std::vector<int>& idx) {
+	long flat = 0;
+	for (int k = 0; k < static_cast<int>(idx.size()); ++k) {
+		flat = flat * shape(k) + idx[k];
+	}
+	return flat;
+}
+
+}  // namespace
+
+SdfSample QueryAgentSdfGrid(const AgentSdfGrid& grid, const Eigen::VectorXd& p, int workspace_dim) {
+	const int d = workspace_dim;
+	// Continuous cell coordinates, clamped into the grid's own extent
+	// (constant/zero-order-hold extrapolation past the boundary -- see
+	// this function's own doc comment) -- `i0[k]` is clamped to
+	// `shape(k)-2` so `i0[k]+1` is always a valid vertex index.
+	std::vector<int> i0(d);
+	Eigen::VectorXd t(d);
+	for (int k = 0; k < d; ++k) {
+		double u = (p(k) - grid.origin(k)) / grid.resolution(k);
+		u = std::clamp(u, 0.0, static_cast<double>(grid.shape(k) - 1));
+		i0[k] = std::min(static_cast<int>(std::floor(u)), grid.shape(k) - 2);
+		t(k) = u - i0[k];
+	}
+
+	const int num_corners = 1 << d;
+	std::vector<int> idx(d);
+	auto corner_value = [&](int bits) -> double {
+		for (int k = 0; k < d; ++k) idx[k] = i0[k] + ((bits >> k) & 1);
+		return grid.values(GridFlatIndex(grid.shape, idx));
+	};
+	auto corner_weight = [&](int bits, int skip_axis) -> double {
+		double w = 1.0;
+		for (int k = 0; k < d; ++k) {
+			if (k == skip_axis) continue;
+			w *= ((bits >> k) & 1) ? t(k) : (1.0 - t(k));
+		}
+		return w;
+	};
+
+	double value = 0.0;
+	for (int bits = 0; bits < num_corners; ++bits) {
+		value += corner_weight(bits, /*skip_axis=*/-1) * corner_value(bits);
+	}
+
+	Eigen::VectorXd grad(d);
+	if (grid.gradient.size() > 0) {
+		// Interpolate the caller-supplied per-vertex gradient field the
+		// SAME multilinear way as `value` (see AgentSdfGrid's own
+		// comment for why this is the caller's own consistency
+		// responsibility, unlike the derive-by-default path below).
+		grad.setZero();
+		for (int bits = 0; bits < num_corners; ++bits) {
+			for (int k = 0; k < d; ++k) idx[k] = i0[k] + ((bits >> k) & 1);
+			const long flat = GridFlatIndex(grid.shape, idx);
+			grad += corner_weight(bits, /*skip_axis=*/-1) * grid.gradient.segment(flat * d, d);
+		}
+	} else {
+		// Derive by differentiating the SAME multilinear interpolant
+		// `value` was just computed from: d(value)/d(u_j), at fixed
+		// other axes, is the (d-1)-linear interpolation (over every
+		// OTHER axis only) of the forward difference along axis j --
+		// then the chain rule (u_j = (p_j - origin_j)/resolution_j)
+		// converts to d(value)/d(p_j).
+		for (int j = 0; j < d; ++j) {
+			double dvalue_duj = 0.0;
+			for (int bits = 0; bits < num_corners; ++bits) {
+				if ((bits >> j) & 1) continue;  // iterate the bit_j=0 half only
+				const double w = corner_weight(bits, /*skip_axis=*/j);
+				dvalue_duj += w * (corner_value(bits | (1 << j)) - corner_value(bits));
+			}
+			grad(j) = dvalue_duj / grid.resolution(j);
+		}
+	}
+
+	return SdfSample{value - grid.margin, grad};
+}
+
+namespace {
+// A grid's own AABB (workspace coordinates) for the pruning distance test
+// below -- `margin` deliberately NOT included here (unlike ObstacleExtent's
+// sphere/box radius+margin): a grid's `margin` shrinks its FEASIBLE region
+// inward (see QueryAgentSdfGrid's `value - grid.margin`), it doesn't grow
+// the region a query might plausibly matter over, which is what this AABB
+// is for.
+struct Aabb {
+	Eigen::VectorXd lo, hi;
+};
+Aabb GridAabb(const AgentSdfGrid& grid) {
+	const Eigen::VectorXd extent =
+		(grid.shape.cast<double>().array() - 1.0).matrix().cwiseProduct(grid.resolution);
+	return Aabb{grid.origin, grid.origin + extent};
+}
+// Conservative sphere-vs-AABB overlap test: distance from `center` to the
+// AABB's nearest point, compared against `radius` -- 0 if `center` is
+// already inside the box.
+bool SphereOverlapsAabb(const Eigen::VectorXd& center, double radius, const Aabb& box) {
+	double dist_sq = 0.0;
+	for (int k = 0; k < center.size(); ++k) {
+		const double c = std::clamp(center(k), box.lo(k), box.hi(k));
+		const double diff = center(k) - c;
+		dist_sq += diff * diff;
+	}
+	return dist_sq <= radius * radius;
+}
+}  // namespace
+
+std::vector<const AgentSdfGrid*> PruneAgentSdfGridsByDistance(
+	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
+	const ObstacleSet& obstacles, double prune_margin) {
+	std::vector<const AgentSdfGrid*> active_grids(num_agents, nullptr);
+	for (int ag = 0; ag < num_agents; ++ag) {
+		const AgentSdfGrid* grid = obstacles.agent_sdf_grid(ag);
+		if (!grid) continue;
+		const Eigen::MatrixXd traj = ref_points.block(0, ag * ambient_dim, ref_points.rows(), workspace_dim);
+		const BoundingSphere sphere = TrajectoryBoundingSphere(traj);
+		if (SphereOverlapsAabb(sphere.center, sphere.radius + prune_margin, GridAabb(*grid))) {
+			active_grids[ag] = grid;
+		}
+	}
+	return active_grids;
+}
+
+double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
+				      const Eigen::MatrixXd& points,
+				      const std::vector<const AgentSdfGrid*>& active_grids) {
+	double violation = 0.0;
+	for (int ag = 0; ag < num_agents; ++ag) {
+		const AgentSdfGrid* grid = active_grids[ag];
+		if (!grid) continue;
+		for (int i = 0; i < num_steps; ++i) {
+			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+			violation += std::max(0.0, -QueryAgentSdfGrid(*grid, p, workspace_dim).value);
+		}
+	}
+	return violation;
+}
+
+std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
+	int workspace_dim, const Eigen::MatrixXd& points, const std::vector<const AgentSdfGrid*>& active_grids) {
+	std::vector<ConstraintRow> rows;
+	for (int i = 0; i < num_steps; ++i) {
+		for (int ag = 0; ag < num_agents; ++ag) {
+			const AgentSdfGrid* grid = active_grids[ag];
+			if (!grid) continue;
+			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+			const SdfSample sdf = QueryAgentSdfGrid(*grid, p, workspace_dim);
+
+			ConstraintRow row;
+			row.value = sdf.value;
+			row.coeffs.reserve(workspace_dim);
+			for (int k = 0; k < workspace_dim; ++k) {
+				// Same fk fast-path column-equals-axis identification as
+				// LinearizeObstacleConstraints.
+				const int axis = agent_axis_offsets[ag] + k;
+				row.coeffs.emplace_back(IdxP(axis, i, num_steps), sdf.grad(k));
+			}
+			rows.push_back(std::move(row));
+		}
+	}
+	return rows;
+}
+
 }  // namespace sqp_short_path

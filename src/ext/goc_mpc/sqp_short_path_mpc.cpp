@@ -239,23 +239,52 @@ Eigen::VectorXd EscapeAlongAxis(const Eigen::VectorXd& p, const std::vector<Cand
 // worry). Fast-path-only, like everything below -- see
 // ApplyAgentPairSafetyProjection's own comment for why, and for the
 // intended future toggle once that stops being universally true.
+// Closed-form-ish projection of `p` outside an AgentSdfGrid's own feasible
+// region (`value >= 0`, i.e. already past `grid.margin`'s clearance) --
+// mirrors project_out's role for sphere/box candidates, but there's no
+// literal closed form for an arbitrary field, so this takes ONE Newton-style
+// step along the (already unit-normalized-by-construction, see
+// QueryAgentSdfGrid) ascending-value direction: `p + (-value) * grad_hat`,
+// same "push exactly to the zero-level-set along the local gradient" idea
+// SphereSdf's own closed-form projection reduces to near a sphere. Not
+// exact for a genuinely curved field in one step (unlike a sphere), which
+// is why this runs inside the SAME repeated-rounds loop as the sphere/box
+// candidates below, not just once.
+Eigen::VectorXd ProjectOutOfGrid(const Eigen::VectorXd& p, const AgentSdfGrid& grid, int workspace_dim) {
+	const sqp_short_path::SdfSample sdf = sqp_short_path::QueryAgentSdfGrid(grid, p, workspace_dim);
+	if (sdf.value >= 0.0) {
+		return p;
+	}
+	const double norm = sdf.grad.norm();
+	if (norm < 1.0e-9) {
+		// Degenerate (flat/zero gradient, e.g. deep inside a saturated
+		// region) -- same arbitrary-fixed-axis fallback as project_out's
+		// own degenerate case.
+		Eigen::VectorXd dir = Eigen::VectorXd::Zero(workspace_dim);
+		dir(0) = 1.0;
+		return p - sdf.value * dir;
+	}
+	return p - sdf.value * (sdf.grad / norm);
+}
+
 void ApplySafetyProjection(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
 			    const ObstacleSet& obstacles, Eigen::MatrixXd* points) {
-	if (obstacles.obstacles().empty() && !obstacles.has_point_cloud()) {
-		return;
-	}
 	constexpr int kSafetyPassRounds = 10;
 	for (int ag = 0; ag < num_agents; ++ag) {
+		const AgentSdfGrid* grid = obstacles.agent_sdf_grid(ag);
 		const Eigen::MatrixXd agent_workspace_traj =
 			points->block(0, ag * ambient_dim, num_steps, workspace_dim);
 		const std::vector<Candidate> candidates =
 			gather_candidates(obstacles, agent_workspace_traj, workspace_dim, /*query_margin=*/1.0);
-		if (candidates.empty()) continue;
+		if (candidates.empty() && !grid) continue;
 		for (int round = 0; round < kSafetyPassRounds; ++round) {
 			for (int i = 0; i < num_steps; ++i) {
 				Eigen::VectorXd p = points->row(i).segment(ag * ambient_dim, workspace_dim).transpose();
 				for (const Candidate& c : candidates) {
 					p = project_out(p, c);
+				}
+				if (grid) {
+					p = ProjectOutOfGrid(p, *grid, workspace_dim);
 				}
 				points->row(i).segment(ag * ambient_dim, workspace_dim) = p.transpose();
 			}
@@ -267,6 +296,21 @@ void ApplySafetyProjection(int num_steps, int num_agents, int ambient_dim, int w
 			if (any_violated) {
 				points->row(i).segment(ag * ambient_dim, workspace_dim) =
 					EscapeAlongAxis(p, candidates, workspace_dim).transpose();
+			}
+			// Grid violations left after the rounds above aren't covered
+			// by EscapeAlongAxis (built for closed-form box/sphere
+			// per-axis extents, no equivalent for an arbitrary field --
+			// see this function's own header comment) -- a few more
+			// direct grid-only pushes instead, cheap and a no-op in the
+			// common (already-feasible) case.
+			if (grid) {
+				Eigen::VectorXd pg = points->row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+				for (int extra = 0; extra < kSafetyPassRounds &&
+					     sqp_short_path::QueryAgentSdfGrid(*grid, pg, workspace_dim).value < 0.0;
+				     ++extra) {
+					pg = ProjectOutOfGrid(pg, *grid, workspace_dim);
+				}
+				points->row(i).segment(ag * ambient_dim, workspace_dim) = pg.transpose();
 			}
 		}
 	}
@@ -347,6 +391,7 @@ SqpResult RunTrustRegionSqp(
 		const ObstacleSet& obstacles,
 		const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles,
 		const std::vector<std::pair<int, int>>& active_pairs,
+		const std::vector<const AgentSdfGrid*>& active_grids,
 		const Eigen::VectorXd& agent_radii,
 		double penalty_weight, int max_iterations,
 		double initial_trust_radius, double max_trust_radius, double min_trust_radius, double grad_tol,
@@ -367,7 +412,9 @@ SqpResult RunTrustRegionSqp(
 	// comment already covers.
 	int obstacle_rows = 0;
 	for (const auto& v : per_agent_obstacles) obstacle_rows += static_cast<int>(v.size());
-	const int m = num_steps * (obstacle_rows + static_cast<int>(active_pairs.size()));
+	const int grid_rows = static_cast<int>(std::count_if(
+		active_grids.begin(), active_grids.end(), [](const AgentSdfGrid* g) { return g != nullptr; }));
+	const int m = num_steps * (obstacle_rows + static_cast<int>(active_pairs.size()) + grid_rows);
 	const int m_eff = std::max(m, 1);
 	const int n = n_smooth + m_eff;
 
@@ -380,7 +427,8 @@ SqpResult RunTrustRegionSqp(
 					    x0, v0, points, vels, ref_points, ref_velocities);
 	double violation_current =
 		EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, points, per_agent_obstacles) +
-		EvaluateAgentPairViolation(num_steps, ambient_dim, workspace_dim, points, agent_radii, active_pairs);
+		EvaluateAgentPairViolation(num_steps, ambient_dim, workspace_dim, points, agent_radii, active_pairs) +
+		EvaluateAgentSdfGridViolation(num_steps, num_agents, ambient_dim, workspace_dim, points, active_grids);
 	double phi_current = f_current + penalty_weight * violation_current;
 
 	double trust_radius = initial_trust_radius;
@@ -459,6 +507,10 @@ SqpResult RunTrustRegionSqp(
 			active_pairs);
 		rows.insert(rows.end(), std::make_move_iterator(pair_rows.begin()),
 			    std::make_move_iterator(pair_rows.end()));
+		std::vector<ConstraintRow> grid_row_list = LinearizeAgentSdfGridConstraints(
+			agent_axis_offsets, num_steps, num_agents, ambient_dim, workspace_dim, points, active_grids);
+		rows.insert(rows.end(), std::make_move_iterator(grid_row_list.begin()),
+			    std::make_move_iterator(grid_row_list.end()));
 
 		if (m == 0 && grad_smooth.norm() < grad_tol) break;
 
@@ -544,7 +596,9 @@ SqpResult RunTrustRegionSqp(
 			EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, candidate_points,
 						   per_agent_obstacles) +
 			EvaluateAgentPairViolation(num_steps, ambient_dim, workspace_dim, candidate_points, agent_radii,
-						    active_pairs);
+						    active_pairs) +
+			EvaluateAgentSdfGridViolation(num_steps, num_agents, ambient_dim, workspace_dim, candidate_points,
+						       active_grids);
 		const double phi_new = f_new + penalty_weight * violation_new;
 
 		// Uses H_smooth_total (THIS iteration's smooth Hessian, including
@@ -643,12 +697,15 @@ bool SqpShortPathMPC::solve(const Eigen::VectorXd& x0,
 		const std::vector<std::pair<int, int>> active_pairs =
 			PruneAgentPairsByDistance(ref_points, num_agents, ambient_dim, workspace_dim,
 						   _agent_radii, _constraint_prune_margin);
+		const std::vector<const AgentSdfGrid*> active_grids =
+			PruneAgentSdfGridsByDistance(ref_points, num_agents, ambient_dim, workspace_dim,
+						      *_obstacles, _constraint_prune_margin);
 
 		SqpResult result = RunTrustRegionSqp(
 			_agent_shapes, _axes, _agent_axis_offsets, _smooth_hessian_normal, _smooth_cost_weights,
 			H, num_agents, dim, ambient_dim, workspace_dim, _time_per_step,
 			x0, v0, ref_points, ref_velocities, *_obstacles, per_agent_obstacles, active_pairs,
-			_agent_radii, _penalty_weight, _max_iterations,
+			active_grids, _agent_radii, _penalty_weight, _max_iterations,
 			_initial_trust_radius, _max_trust_radius, _min_trust_radius, _grad_tol,
 			points, vels, &_qp_state);
 

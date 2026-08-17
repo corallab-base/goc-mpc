@@ -35,3 +35,41 @@ std::vector<int> ObstacleSet::query_point_cloud_radius(const Eigen::VectorXd& ce
 	}
 	return _kdtree->radius_search(center, radius);
 }
+
+void ObstacleSet::set_agent_sdf_grid(int agent, const Eigen::VectorXd& origin, const Eigen::VectorXd& resolution,
+				      const Eigen::VectorXi& shape, const Eigen::VectorXd& values,
+				      const Eigen::VectorXd& gradient, double margin) {
+	const int d = static_cast<int>(origin.size());
+	if (d != 2 && d != 3) {
+		throw std::runtime_error("ObstacleSet::set_agent_sdf_grid: origin must be 2- or 3-dimensional.");
+	}
+	if (resolution.size() != d || shape.size() != d) {
+		throw std::runtime_error(
+			"ObstacleSet::set_agent_sdf_grid: origin/resolution/shape must all be the same size.");
+	}
+	if ((resolution.array() <= 0.0).any()) {
+		throw std::runtime_error("ObstacleSet::set_agent_sdf_grid: resolution entries must be positive.");
+	}
+	if ((shape.array() < 2).any()) {
+		throw std::runtime_error(
+			"ObstacleSet::set_agent_sdf_grid: shape entries must be >= 2 (need at least one cell "
+			"per axis).");
+	}
+	const long num_vertices = shape.cast<long>().prod();
+	if (values.size() != num_vertices) {
+		throw std::runtime_error("ObstacleSet::set_agent_sdf_grid: values must have prod(shape) entries.");
+	}
+	if (gradient.size() != 0 && gradient.size() != num_vertices * d) {
+		throw std::runtime_error(
+			"ObstacleSet::set_agent_sdf_grid: gradient must be empty (derive from values) or have "
+			"prod(shape)*d entries.");
+	}
+	AgentSdfGrid grid;
+	grid.origin = origin;
+	grid.resolution = resolution;
+	grid.shape = shape;
+	grid.values = values;
+	grid.gradient = gradient;
+	grid.margin = margin;
+	_agent_sdf_grids[agent] = std::move(grid);
+}
