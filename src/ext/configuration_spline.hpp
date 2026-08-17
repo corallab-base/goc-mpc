@@ -151,8 +151,17 @@ namespace so3 {
 		}
 		const T half = T(0.5)*theta;
 		const T cot_half = std::cos(half)/std::sin(half);
-		// J^{-1} = I - 0.5 S + (1 - theta*cot(theta/2)) / theta^2 * S^2
-		const T C = (T(1) - theta * cot_half) / (theta*theta);
+		// J^{-1} = I - 0.5 S + (1/theta^2 - cot(theta/2)/(2*theta)) * S^2
+		// (equivalently 1/theta^2 - (1+cos theta)/(2*theta*sin theta), via the
+		// half-angle identity cot(theta/2) = (1+cos theta)/sin theta) --
+		// verified against the true numerical inverse of left_jacobian to
+		// machine precision. The PREVIOUS formula here, C = (1 - theta*cot_
+		// half)/theta^2, was missing a factor of 1/2 on the cot_half term and
+		// was NOT actually the inverse of left_jacobian (off by up to ~90% of
+		// a matrix entry, confirmed numerically) -- caught while deriving
+		// SqpShortPathMPC's Stage 4 SO3Quat residual-Jacobian, which wraps
+		// this function directly.
+		const T C = T(1) / (theta*theta) - cot_half / (T(2)*theta);
 		return I - T(0.5)*S + C * (S*S);
 	}
 
@@ -759,6 +768,52 @@ public:
 		}
 	}
 
+	// BlockPositionDelta's SO3Quat residual bundled with its Jacobian w.r.t.
+	// a small RIGHT (body-frame) tangent perturbation of either endpoint --
+	// i.e. d(value)/d(eps) where value = Log(qJm1^{-1} qJ) and qJ' = qJ ⊗
+	// Exp(eps_J), qJm1' = qJm1 ⊗ Exp(eps_Jm1). This is exactly
+	// BlockRetract's own SO3Quat perturbation convention, so the Jacobians
+	// here are what a caller linearizing a step applied via Retract needs
+	// (SqpShortPathMPC's Stage 4 per-outer-iteration SO3Quat Hessian/RHS
+	// block, see the project plan).
+	//
+	// Derivation (standard SO(3) BCH/adjoint identity, expressed via the
+	// already-existing so3::left_jacobian_inv):
+	//   qJm1'^{-1} qJ' = Exp(-eps_Jm1) Exp(value) Exp(eps_J)
+	//   => d(value)/d(eps_J)   =  left_jacobian_inv(-value)
+	//      d(value)/d(eps_Jm1) = -left_jacobian_inv( value)
+	// Verified numerically against central finite differences (~1e-7
+	// agreement, 500 randomized trials including a near-pi/branch-cut-
+	// adjacent case) -- see project_sqp_short_path_mpc memory for the
+	// derivation walkthrough. This check is also what caught
+	// so3::left_jacobian_inv's own pre-existing coefficient bug (fixed
+	// above, in left_jacobian_inv itself) -- this helper would otherwise
+	// have silently inherited it.
+	//
+	// double-only (not templated on T like BlockPositionDelta/BlockRetract):
+	// SqpShortPathMPC is deliberately a no-C++-autodiff, hand-differentiated
+	// solver (matches its existing sphere/box SDF gradients), and this is
+	// its only intended caller. `off.type` must be SO3Quat (throws
+	// otherwise) -- unlike BlockPositionDelta, every OTHER block type's
+	// perturbation Jacobian is just +-Identity (ambient==tangent, additive),
+	// not worth a shared helper.
+	struct SO3QuatResidual {
+		Eigen::Vector3d value;          // Log(qJm1^{-1} qJ), == BlockPositionDelta's own return
+		Eigen::Matrix3d d_value_d_J;    // d(value) / d(qJ's own tangent step)
+		Eigen::Matrix3d d_value_d_Jm1;  // d(value) / d(qJm1's own tangent step)
+	};
+
+	static SO3QuatResidual ComputeSO3QuatResidual(
+		const BlockOffset& off, const Eigen::VectorXd& xJ, const Eigen::VectorXd& xJm1) {
+		if (off.type != Block::Type::SO3Quat) {
+			throw std::runtime_error(
+				"CubicConfigurationSpline::ComputeSO3QuatResidual: off.type must be SO3Quat");
+		}
+		const Eigen::Vector3d value = BlockPositionDelta<double>(off, xJ, xJm1);
+		return SO3QuatResidual{value, so3::left_jacobian_inv(Eigen::Vector3d(-value)),
+					Eigen::Matrix3d(-so3::left_jacobian_inv(value))};
+	}
+
 	// Whole-vector counterpart to BlockPositionDelta: assembles every
 	// block's own wrap-aware residual into one tangent-space vector, for a
 	// caller that wants a genuine positional distance between two ambient
@@ -790,10 +845,18 @@ public:
 	// off.tangent_offset/tangent_size -- callers applying a per-block step
 	// pass the whole-vector Retract below instead of calling this per block.
 	//
-	// SO3Quat/SO3Mat throw for now: SO3Quat's retraction (q ⊗ Exp(delta)) is
-	// deferred to the stage that also adds its residual-Jacobian helper (see
-	// BlockPositionDelta's own SO3Quat case for the forward/delta half, which
-	// already works); SO3Mat is unsupported everywhere in this file.
+	// SO3Mat throws (unsupported everywhere in this file, matches
+	// BlockPositionDelta's own SO3Mat throw). SO3Quat retracts via the
+	// group product q_new = q_old ⊗ Exp(delta) -- a RIGHT (body-frame)
+	// perturbation, chosen to be the exact inverse of BlockPositionDelta's
+	// own SO3Quat residual `Log(qJm1^{-1} qJ)`: BlockPositionDelta(off,
+	// BlockRetract(off, qJm1, d), qJm1) recovers `d` exactly for small d
+	// (same round-trip guarantee R/Torus already have, mod the branch cut
+	// far from d=0 -- see BlockRetract's own top-level doc comment).
+	// ComputeSO3QuatResidual (below) gives the matching Jacobian of that
+	// same residual w.r.t. this exact perturbation, for callers (Stage 4 of
+	// SqpShortPathMPC's project plan) building a linear model of a step
+	// applied via THIS retraction.
 	template <typename T>
 	static VecX<T> BlockRetract(
 		const BlockOffset& off, const VecX<T>& xJm1, const VecX<T>& delta) {
@@ -814,20 +877,31 @@ public:
 			}
 			return out;
 		}
-		case Block::Type::SO3Quat:
+		case Block::Type::SO3Quat: {
+			DRAKE_DEMAND(aN == 4 && tN == 3);
+			const Eigen::Matrix<T,4,1> qjm1_vec = xJm1.segment(a0, 4);
+			const Eigen::Matrix<T,3,1> dphi = delta.segment(t0, 3);
+			const Eigen::Quaternion<T> dq = so3::quat::Exp<T>(dphi);
+			Eigen::Matrix<T,4,1> dq_vec;
+			dq_vec << dq.w(), dq.x(), dq.y(), dq.z();
+			const Eigen::Matrix<T,4,1> qnew_vec = drake::math::quatProduct(qjm1_vec, dq_vec);
+			VecX<T> out(4);
+			out << qnew_vec(0), qnew_vec(1), qnew_vec(2), qnew_vec(3);
+			return out;
+		}
 		case Block::Type::SO3Mat:
 		default:
 			throw std::runtime_error(
-				"CubicConfigurationSpline::BlockRetract: SO3Quat/SO3Mat are "
-				"not supported yet");
+				"CubicConfigurationSpline::BlockRetract: SO3Mat is not "
+				"supported yet");
 		}
 	}
 
 	// Whole-vector counterpart to BlockRetract, inverse of PositionDelta:
 	// BlockPositionDelta<T>(off, Retract(xJm1, delta), xJm1) recovers `delta`
-	// exactly for R, and for Torus as long as `delta` doesn't cross the
-	// (-pi, pi] branch cut (see BlockPositionDelta's own doc comment on
-	// wraparound). Throws for SO3Quat/SO3Mat (via BlockRetract).
+	// exactly for R and SO3Quat, and for Torus as long as `delta` doesn't
+	// cross the (-pi, pi] branch cut (see BlockPositionDelta's own doc
+	// comment on wraparound). Throws for SO3Mat (via BlockRetract).
 	template <typename T>
 	VecX<T> Retract(const VecX<T>& xJm1, const VecX<T>& delta) const {
 		VecX<T> out(ambient_dim_);

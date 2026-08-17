@@ -66,6 +66,17 @@ namespace py = pybind11;
 struct SqpShortPathMPC {
 	const GraphOfConstraints* _graph;
 	unsigned int _num_steps, _num_agents, _dim;
+	// AMBIENT per-agent stride, derived (not caller-supplied) from
+	// `_agent_shapes` in the constructor -- equals `_dim` (== tangent_dim)
+	// for R/Torus-only agents (ambient_dim==tangent_dim always holds for
+	// those), differs once an agent has an SO3Quat block (ambient 4 vs
+	// tangent 3 per block). `_dim` stays the TANGENT/decision-space stride
+	// throughout this file (what IdxP/IdxV, vels, v0, agent_radii use);
+	// `_ambient_dim` is only for x0/points/ref_points (AMBIENT
+	// configuration) slicing. Uniform across agents (same simplifying
+	// assumption GraphShortPathMPC's own a_dim/t_dim split already makes),
+	// validated in the constructor.
+	unsigned int _ambient_dim;
 	double _time_per_step;
 	Eigen::VectorXd _times;
 
@@ -89,13 +100,19 @@ struct SqpShortPathMPC {
 	std::vector<sqp_short_path::AxisLayout> _axes;
 	std::vector<int> _agent_axis_offsets;
 	// The smooth (tracking + velocity-tracking + acceleration-smoothing)
-	// cost's normal-equations Hessian, block-diagonal across axes --
-	// PROVABLY constant across every outer SQP iteration AND every solve()
-	// call for this instance's lifetime (an honest quadratic form in the
-	// step, independent of the current iterate -- see
-	// sqp_short_path_layout.hpp's own doc comment), so it's built exactly
-	// once here rather than per-call like AdmmShortPathMPC's analogous
-	// (but per-call-only) build_hessian.
+	// cost's normal-equations Hessian FOR EVERY R/TORUS AXIS -- block-
+	// diagonal across those axes, PROVABLY constant across every outer SQP
+	// iteration AND every solve() call for this instance's lifetime (an
+	// honest quadratic form in the step, independent of the current
+	// iterate -- see sqp_short_path_layout.hpp's own doc comment), so it's
+	// built exactly once here rather than per-call like AdmmShortPathMPC's
+	// analogous (but per-call-only) build_hessian. Any SO3Quat block's own
+	// rows/cols are left ZERO here (see AssembleSmoothHessian's own
+	// comment) -- their real, COUPLED, iteration-DEPENDENT contribution is
+	// computed fresh every outer iteration instead
+	// (sqp_short_path_mpc.cpp's RunTrustRegionSqp, via
+	// AccumulateSO3QuatBlock), on top of a per-iteration COPY of this
+	// matrix, not this cached member itself.
 	Eigen::MatrixXd _smooth_hessian_normal;
 
 	Eigen::MatrixXd _points;
@@ -117,6 +134,16 @@ struct SqpShortPathMPC {
 	// No default value for `obstacles` -- same lifetime discipline as
 	// GraphShortPathMPC/AdmmShortPathMPC (storing a pointer to a
 	// default-constructed temporary would dangle immediately).
+	// dim: every agent's TANGENT width (== ambient width for R/Torus-only
+	// agents, the only case before Stage 4 -- so this is a fully
+	// backward-compatible reinterpretation, not a behavior change for
+	// existing callers). x0/points/ref_points are AMBIENT-width instead
+	// (`_ambient_dim`, derived from `graph`/`agent_shapes` internally, see
+	// that member's own comment) -- for an agent with an SO3Quat block,
+	// `dim` must be its tangent_dim (3 per quat block), NOT its ambient_dim
+	// (4 per quat block); x0 must be sized with the agent's AMBIENT width
+	// accordingly (a quaternion needs 4 numbers to specify, even though its
+	// own step lives in a 3-dim tangent space).
 	// agent_radii: one entry per agent, default EMPTY meaning "every agent
 	// has radius 0" (point agents that still must not occupy the same
 	// position at the same step -- see LinearizeAgentPairConstraints's own

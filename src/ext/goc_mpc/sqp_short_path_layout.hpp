@@ -14,11 +14,18 @@
 // this file has no qpOASES/trust-region-loop code, only the Hessian/RHS/
 // constraint-row math the solver assembles into a QP every outer iteration.
 //
-// v1 scope: Block::R and Block::Torus only (BuildAgentShapes throws on
-// SO3Quat/SO3Mat -- see the project plan's Stage 4 for why quaternion
-// blocks need a structurally different, coupled-matrix layout instead of
-// this flat per-axis one) and fk(q) = q[:workspace_dim] (a constant 0/1
-// selection Jacobian -- see LinearizeObstacleConstraints).
+// Scope: Block::R, Block::Torus, and (Stage 4) Block::SO3Quat
+// (BuildAgentShapes still throws on SO3Mat -- out of scope permanently,
+// matches CubicConfigurationSpline's own SO3Mat throw everywhere else) and
+// fk(q) = q[:workspace_dim] (a constant 0/1 selection Jacobian -- see
+// LinearizeObstacleConstraints). R/Torus tangent columns are independent
+// scalars with an ITERATION-CONSTANT Hessian (BuildAxisHessianBlock/
+// BuildAxisRhs, built once per solve() call, see AssembleSmoothHessian's
+// own comment); an SO3Quat block's 3 tangent columns are COUPLED (SO(3)
+// has real curvature) and its Hessian genuinely depends on the current
+// iterate, so it gets separate, per-outer-iteration treatment
+// (AccumulateSO3QuatBlock) instead -- see the project plan's Stage 4
+// section for the full rationale.
 namespace sqp_short_path {
 
 // One scalar decision axis: a single tangent-space component of one
@@ -26,6 +33,9 @@ namespace sqp_short_path {
 // `tangent_col` is this axis's column within that agent's OWN (H x
 // agent_tangent_dim) step matrix -- exactly the column
 // BlockPositionDelta/BlockRetract's per-block outputs are sliced from.
+// Used for R/Torus axes only -- an SO3Quat block's 3 tangent columns are
+// identified via CubicConfigurationSpline::BlockOffset instead (see
+// AccumulateSO3QuatBlock), since they can't be treated independently.
 struct AxisLayout {
 	int agent;
 	int tangent_col;
@@ -34,7 +44,7 @@ struct AxisLayout {
 // Per-agent shape (block layout + ambient/tangent dims), one entry per
 // agent, built once from graph._robot_specs and reused for every
 // BlockPositionDelta/BlockRetract call this solver makes. Throws if any
-// agent has a Block::SO3Quat/SO3Mat component.
+// agent has a Block::SO3Mat component (SO3Quat is supported, Stage 4).
 std::vector<CubicConfigurationSpline> BuildAgentShapes(const GraphOfConstraints& graph, int num_agents);
 
 // Flat axis list across every agent, agent-major / tangent_col-minor (so
@@ -77,12 +87,19 @@ struct SmoothCostWeights {
 // independent of the current iterate.
 Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau, const SmoothCostWeights& weights);
 
-// Assembles the full block-diagonal (n x n) smooth-cost Hessian, `n =
-// axes.size() * 2 * num_steps`, by placing BuildAxisHessianBlock's block
-// once per axis. Call once per solve() call, reuse across every outer
-// iteration.
-Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int num_steps, double tau,
-				       const SmoothCostWeights& weights);
+// Assembles the full (n x n) smooth-cost Hessian, `n = axes.size() * 2 *
+// num_steps` (axes.size() summed over every agent's FULL tangent_dim,
+// R/Torus and SO3Quat columns alike -- see BuildAxisList), by placing
+// BuildAxisHessianBlock's block once per R/Torus axis. SO3Quat axes are
+// deliberately left ZERO here: their real (coupled, iterate-dependent)
+// contribution is added separately, every outer iteration, by
+// AccumulateSO3QuatBlock -- this function only ever needs calling ONCE per
+// solve() call regardless (its own R/Torus content is genuinely constant,
+// same as before Stage 4; it just no longer claims to be the WHOLE smooth
+// Hessian when SO3Quat blocks are present).
+Eigen::MatrixXd AssembleSmoothHessian(const std::vector<CubicConfigurationSpline>& agent_shapes,
+				       const std::vector<int>& agent_axis_offsets,
+				       int num_steps, double tau, const SmoothCostWeights& weights);
 
 // Per-axis RHS/target vector (length 2*num_steps) for the smooth cost,
 // evaluated AT THE CURRENT ITERATE (`points_agent`/`vels_agent`, H x
@@ -104,6 +121,52 @@ Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 			      const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
 			      const Eigen::MatrixXd& ref_points_agent,
 			      const Eigen::MatrixXd& ref_velocities_agent);
+
+// Identifies one SO3Quat block within one agent for AccumulateSO3QuatBlock
+// below: `offset` is the block's own BlockOffset (giving its
+// ambient_offset/tangent_offset WITHIN the agent's own ambient/tangent
+// vectors -- e.g. points_agent.row(i).segment(offset.ambient_offset, 4) is
+// this block's own quaternion at step i), `axis_offset` is where its 3
+// tangent columns start in the FLAT (agent-major, tangent-col-minor) axis
+// indexing IdxP/IdxV use (== agent_axis_offsets[agent] +
+// offset.tangent_offset) -- its 3 columns occupy 3 CONSECUTIVE flat axis
+// indices, same layout 3 independent R/Torus axes would get; this struct
+// just marks them for AccumulateSO3QuatBlock's separate, coupled,
+// per-outer-iteration treatment instead of BuildAxisHessianBlock/
+// BuildAxisRhs's per-axis-scalar, iteration-constant one.
+struct SO3QuatBlock {
+	int agent;
+	CubicConfigurationSpline::BlockOffset offset;
+	int axis_offset;
+};
+
+// Accumulates ONE SO3Quat block's tracking + velocity-tracking +
+// acceleration smooth-cost contribution into the FULL (n_smooth x
+// n_smooth) Hessian `H` and (n_smooth) RHS `g` -- ADDED (+=) at this
+// block's own scattered (IdxP/IdxV-indexed) rows/cols, not overwritten, so
+// callers place the constant R/Torus contribution first
+// (AssembleSmoothHessian/BuildAxisRhs) then call this once per SO3Quat
+// block on top; every OTHER row/col (R/Torus axes, other SO3Quat blocks)
+// is left untouched. UNLIKE AssembleSmoothHessian, this must be called
+// EVERY outer iteration, not built once and reused: the coupled 3x3
+// Jacobian (CubicConfigurationSpline::ComputeSO3QuatResidual) genuinely
+// depends on the CURRENT iterate's residual value, not just its target --
+// see the project plan's Stage 4 design decision for why R/Torus don't
+// have this problem and SO3Quat does.
+//
+// Same normal-equations convention (`H_n s = g_n`) as
+// BuildAxisHessianBlock/BuildAxisRhs -- the caller applies the identical
+// qpOASES 2x/-2x conversion uniformly across the whole assembled matrix,
+// not per block. Derivation (tracking and acceleration each linearized via
+// ComputeSO3QuatResidual's Jacobians, velocity-tracking flat/diagonal same
+// as R/Torus): see the .cpp and project_sqp_short_path_mpc memory.
+void AccumulateSO3QuatBlock(const SO3QuatBlock& block, const CubicConfigurationSpline& agent_shape,
+			     int num_steps, double tau, const SmoothCostWeights& weights,
+			     const Eigen::VectorXd& x0_agent, const Eigen::VectorXd& v0_agent,
+			     const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
+			     const Eigen::MatrixXd& ref_points_agent,
+			     const Eigen::MatrixXd& ref_velocities_agent,
+			     Eigen::MatrixXd* H, Eigen::VectorXd* g);
 
 // One linearized inequality constraint row `c(x) + a^T (dx) >= 0` (before
 // slack relaxation, which the solver -- not this file -- owns): `coeffs`
@@ -138,18 +201,29 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 // function's penalty term, evaluated with the TRUE (non-linearized)
 // sphere/box signed distance, not LinearizeObstacleConstraints' local
 // model.
-double EvaluateObstacleViolation(int num_steps, int num_agents, int dim, int workspace_dim,
+// `ambient_dim`: per-agent AMBIENT stride used to slice `points`
+// (points.row(i).segment(ag*ambient_dim, workspace_dim) is agent ag's
+// world position at step i) -- NOT the tangent/decision-space stride
+// `agent_axis_offsets` is built from; the two differ once an agent has an
+// SO3Quat block (ambient 4 vs tangent 3 per block, see the project plan's
+// Stage 4). Uniform across agents (same assumption GraphShortPathMPC's own
+// a_dim/t_dim split already makes).
+double EvaluateObstacleViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
 				  const Eigen::MatrixXd& points, const ObstacleSet& obstacles);
 
 // Every (step, agent, obstacle) row in `obstacles.obstacles()` (spheres and
 // boxes; point-cloud obstacles are a later stage, not read here),
 // linearized at the current iterate `points`. Fast path only: assumes
-// `fk(q) = q[:workspace_dim]` (points.row(i).segment(ag*dim, workspace_dim)
-// IS the agent's world position, so the constraint's Jacobian w.r.t. the
-// step is a constant 0/1 selection onto that agent's leading
-// `workspace_dim` axes at that step -- no chain rule beyond the slice).
+// `fk(q) = q[:workspace_dim]` (points.row(i).segment(ag*ambient_dim,
+// workspace_dim) IS the agent's world position, so the constraint's
+// Jacobian w.r.t. the step is a constant 0/1 selection onto that agent's
+// leading `workspace_dim` axes at that step -- no chain rule beyond the
+// slice). `agent_axis_offsets` is still TANGENT-space (see
+// AccumulateSO3QuatBlock's own comment) -- it's what the resulting row's
+// Jacobian columns are indexed into, since the decision variables (and
+// hence the QP) live in tangent space regardless of `ambient_dim`.
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int dim,
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
 	int workspace_dim, const Eigen::MatrixXd& points, const ObstacleSet& obstacles);
 
 // Inter-agent avoidance: every (step, agent-pair) is treated as a sphere
@@ -175,11 +249,11 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 // Fast path only (same assumption as LinearizeObstacleConstraints): agent
 // positions are read directly from the leading `workspace_dim` ambient
 // columns, no fk chain rule.
-double EvaluateAgentPairViolation(int num_steps, int num_agents, int dim, int workspace_dim,
+double EvaluateAgentPairViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii);
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int dim,
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
 	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii);
 
 }  // namespace sqp_short_path

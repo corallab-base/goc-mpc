@@ -1,7 +1,9 @@
 #include "sqp_short_path_layout.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 
@@ -16,11 +18,11 @@ std::vector<CubicConfigurationSpline> BuildAgentShapes(const GraphOfConstraints&
 	shapes.reserve(num_agents);
 	for (int ag = 0; ag < num_agents; ++ag) {
 		for (const Block& b : graph._robot_specs.at(ag)) {
-			if (b.type != Block::Type::R && b.type != Block::Type::Torus) {
+			if (b.type != Block::Type::R && b.type != Block::Type::Torus &&
+			    b.type != Block::Type::SO3Quat) {
 				throw std::runtime_error(
-					"SqpShortPathMPC: only Block::R/Block::Torus are supported "
-					"(agent " + std::to_string(ag) + " has an SO3Quat/SO3Mat "
-					"block -- see the project plan's Stage 4)");
+					"SqpShortPathMPC: Block::SO3Mat is not supported (agent " +
+					std::to_string(ag) + ") -- R/Torus/SO3Quat only.");
 			}
 		}
 		shapes.emplace_back(graph._robot_specs.at(ag));
@@ -86,14 +88,28 @@ Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau, const SmoothCos
 	return H;
 }
 
-Eigen::MatrixXd AssembleSmoothHessian(const std::vector<AxisLayout>& axes, int num_steps, double tau,
-				       const SmoothCostWeights& weights) {
+Eigen::MatrixXd AssembleSmoothHessian(const std::vector<CubicConfigurationSpline>& agent_shapes,
+				       const std::vector<int>& agent_axis_offsets,
+				       int num_steps, double tau, const SmoothCostWeights& weights) {
 	const Eigen::MatrixXd block = BuildAxisHessianBlock(num_steps, tau, weights);
 	const int per_axis = 2 * num_steps;
-	const int n = static_cast<int>(axes.size()) * per_axis;
+	int n_axes = 0;
+	for (const auto& shape : agent_shapes) n_axes += shape.tangent_dim();
+	const int n = n_axes * per_axis;
 	Eigen::MatrixXd H = Eigen::MatrixXd::Zero(n, n);
-	for (int a = 0; a < static_cast<int>(axes.size()); ++a) {
-		H.block(a * per_axis, a * per_axis, per_axis, per_axis) = block;
+	// Place BuildAxisHessianBlock's (iteration-constant) block at every
+	// R/Torus tangent column; SO3Quat columns are left zero here -- their
+	// real (coupled, iterate-dependent) contribution is added separately,
+	// every outer iteration, by AccumulateSO3QuatBlock.
+	for (int ag = 0; ag < static_cast<int>(agent_shapes.size()); ++ag) {
+		const int off = agent_axis_offsets[ag];
+		for (const auto& boff : agent_shapes[ag].block_offsets_) {
+			if (boff.type == Block::Type::SO3Quat) continue;
+			for (int k = 0; k < boff.tangent_size; ++k) {
+				const int a = off + boff.tangent_offset + k;
+				H.block(a * per_axis, a * per_axis, per_axis, per_axis) = block;
+			}
+		}
 	}
 	return H;
 }
@@ -164,6 +180,112 @@ Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 		}
 	}
 	return g;
+}
+
+namespace {
+
+// One coupled 3-vector term of a residual `sum(term.A * delta_term) + b`
+// (see AddVec3ResidualNormalEquations) -- the SO3Quat generalization of
+// BuildAxisRhs's `{index, scalar coefficient}` Entry pattern to `{index
+// triple, 3x3 coefficient}`, needed because an SO3Quat block's 3 tangent
+// components are coupled (SO(3) has real curvature -- see
+// ComputeSO3QuatResidual), not independently separable the way an R/Torus
+// axis's single scalar component is.
+struct Vec3Term {
+	std::array<int, 3> idx;  // flat decision-vector index (IdxP/IdxV) per tangent component
+	Eigen::Matrix3d A;       // this term's contribution to the residual is A * delta_term
+};
+
+// Normal-equations accumulation for a vector residual `residual(delta) =
+// sum_i(terms[i].A * delta_term_i) + b`, cost = weight*||residual||^2 --
+// standard weighted least squares: H += weight*A_a^T A_b for every term
+// PAIR (including a==b), g -= weight*A_a^T*b for every term. Generalizes
+// BuildAxisHessianBlock/BuildAxisRhs's scalar add_h/add_g to matrix-valued
+// coefficients; see this class's own doc comment.
+void AddVec3ResidualNormalEquations(Eigen::MatrixXd* H, Eigen::VectorXd* g,
+				     const std::vector<Vec3Term>& terms,
+				     const Eigen::Vector3d& b, double weight) {
+	for (const auto& ta : terms) {
+		const Eigen::Vector3d gb = weight * (ta.A.transpose() * b);
+		for (int c = 0; c < 3; ++c) (*g)(ta.idx[c]) -= gb(c);
+		for (const auto& tb : terms) {
+			const Eigen::Matrix3d hb = weight * (ta.A.transpose() * tb.A);
+			for (int c = 0; c < 3; ++c) {
+				for (int cp = 0; cp < 3; ++cp) {
+					(*H)(ta.idx[c], tb.idx[cp]) += hb(c, cp);
+				}
+			}
+		}
+	}
+}
+
+}  // namespace
+
+void AccumulateSO3QuatBlock(const SO3QuatBlock& block, const CubicConfigurationSpline& agent_shape,
+			     int num_steps, double tau, const SmoothCostWeights& weights,
+			     const Eigen::VectorXd& x0_agent, const Eigen::VectorXd& v0_agent,
+			     const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
+			     const Eigen::MatrixXd& ref_points_agent,
+			     const Eigen::MatrixXd& ref_velocities_agent,
+			     Eigen::MatrixXd* H, Eigen::VectorXd* g) {
+	const auto& off = block.offset;
+	const double tau2 = tau * tau;
+	const int t0 = off.tangent_offset;
+	auto idx3 = [&](std::function<int(int, int, int)> IdxFn, int i) {
+		return std::array<int, 3>{IdxFn(block.axis_offset + 0, i, num_steps),
+					   IdxFn(block.axis_offset + 1, i, num_steps),
+					   IdxFn(block.axis_offset + 2, i, num_steps)};
+	};
+
+	for (int i = 0; i < num_steps; ++i) {
+		// --- Tracking: weight * ||Log(q_new(i)^{-1} q_ref(i))||^2, linearized
+		// around the CURRENT q(i) via its own right-perturbation Jacobian
+		// (xJ=ref fixed, xJm1=q_current(i) is the decision variable).
+		const auto res_track = CubicConfigurationSpline::ComputeSO3QuatResidual(
+			off, ref_points_agent.row(i).transpose(), points_agent.row(i).transpose());
+		AddVec3ResidualNormalEquations(
+			H, g, {Vec3Term{idx3(IdxP, i), res_track.d_value_d_Jm1}}, res_track.value,
+			weights.tracking);
+
+		// --- Velocity tracking: flat tangent space, no manifold curvature --
+		// residual(delta_v) = (v_current+delta_v) - ref = delta_v + (v_current-ref).
+		const Eigen::Vector3d vtrack_b =
+			vels_agent.row(i).segment(t0, 3).transpose() -
+			ref_velocities_agent.row(i).segment(t0, 3).transpose();
+		AddVec3ResidualNormalEquations(
+			H, g, {Vec3Term{idx3(IdxV, i), Eigen::Matrix3d::Identity()}}, vtrack_b,
+			weights.velocity_tracking);
+
+		// --- Acceleration (coast-corrected), coupling step i (and i-1, or
+		// x0/v0 at i==0) -- same coefficient pattern as BuildAxisRhs's own
+		// acceleration branch, generalized to 3x3 blocks via
+		// ComputeSO3QuatResidual's Jacobians in place of the scalar +-1.
+		std::vector<Vec3Term> accel_terms;
+		Eigen::Vector3d disp0, v_km1;
+		if (i == 0) {
+			const auto res_acc = CubicConfigurationSpline::ComputeSO3QuatResidual(
+				off, points_agent.row(0).transpose(), x0_agent);
+			disp0 = res_acc.value;
+			v_km1 = v0_agent.segment(t0, 3);
+			accel_terms.push_back(Vec3Term{idx3(IdxP, 0), -(6.0 / tau2) * res_acc.d_value_d_J});
+		} else {
+			const auto res_acc = CubicConfigurationSpline::ComputeSO3QuatResidual(
+				off, points_agent.row(i).transpose(), points_agent.row(i - 1).transpose());
+			disp0 = res_acc.value;
+			v_km1 = vels_agent.row(i - 1).segment(t0, 3).transpose();
+			accel_terms.push_back(Vec3Term{idx3(IdxP, i), -(6.0 / tau2) * res_acc.d_value_d_J});
+			accel_terms.push_back(
+				Vec3Term{idx3(IdxP, i - 1), -(6.0 / tau2) * res_acc.d_value_d_Jm1});
+		}
+		const Eigen::Vector3d v_k = vels_agent.row(i).segment(t0, 3).transpose();
+		const Eigen::Vector3d accel0 = -(6.0 / tau2) * disp0 + (2.0 / tau) * (2.0 * v_k + v_km1);
+		accel_terms.push_back(Vec3Term{idx3(IdxV, i), (4.0 / tau) * Eigen::Matrix3d::Identity()});
+		if (i > 0) {
+			accel_terms.push_back(
+				Vec3Term{idx3(IdxV, i - 1), (2.0 / tau) * Eigen::Matrix3d::Identity()});
+		}
+		AddVec3ResidualNormalEquations(H, g, accel_terms, accel0, weights.acceleration);
+	}
 }
 
 double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_steps, double tau,
@@ -272,7 +394,7 @@ SdfResult BoxSdf(const Eigen::VectorXd& p, const Obstacle& obstacle, int workspa
 
 }  // namespace
 
-double EvaluateObstacleViolation(int num_steps, int num_agents, int dim, int workspace_dim,
+double EvaluateObstacleViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
 				  const Eigen::MatrixXd& points, const ObstacleSet& obstacles) {
 	if (obstacles.obstacles().empty()) {
 		return 0.0;
@@ -280,7 +402,7 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, int dim, int wor
 	double violation = 0.0;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
-			const Eigen::VectorXd p = points.row(i).segment(ag * dim, workspace_dim).transpose();
+			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
 			for (const Obstacle& obstacle : obstacles.obstacles()) {
 				const double value = (obstacle.kind == ObstacleKind::kSphere)
 					? SphereSdf(p, obstacle, workspace_dim).value
@@ -293,7 +415,7 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, int dim, int wor
 }
 
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int dim,
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
 	int workspace_dim, const Eigen::MatrixXd& points, const ObstacleSet& obstacles) {
 	std::vector<ConstraintRow> rows;
 	if (obstacles.obstacles().empty()) {
@@ -301,7 +423,7 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	}
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
-			const Eigen::VectorXd p = points.row(i).segment(ag * dim, workspace_dim).transpose();
+			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
 			for (const Obstacle& obstacle : obstacles.obstacles()) {
 				const SdfResult sdf = (obstacle.kind == ObstacleKind::kSphere)
 					? SphereSdf(p, obstacle, workspace_dim)
@@ -326,7 +448,7 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	return rows;
 }
 
-double EvaluateAgentPairViolation(int num_steps, int num_agents, int dim, int workspace_dim,
+double EvaluateAgentPairViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii) {
 	if (num_agents < 2) {
 		return 0.0;
@@ -334,9 +456,9 @@ double EvaluateAgentPairViolation(int num_steps, int num_agents, int dim, int wo
 	double violation = 0.0;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
-			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * dim, workspace_dim).transpose();
+			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * ambient_dim, workspace_dim).transpose();
 			for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
-				const Eigen::VectorXd p_b = points.row(i).segment(ag_b * dim, workspace_dim).transpose();
+				const Eigen::VectorXd p_b = points.row(i).segment(ag_b * ambient_dim, workspace_dim).transpose();
 				const double R = agent_radii(ag_a) + agent_radii(ag_b);
 				const double value = SphereSdfCore(p_b, p_a, R).value;
 				violation += std::max(0.0, -value);
@@ -347,7 +469,7 @@ double EvaluateAgentPairViolation(int num_steps, int num_agents, int dim, int wo
 }
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int dim,
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
 	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii) {
 	std::vector<ConstraintRow> rows;
 	if (num_agents < 2) {
@@ -355,9 +477,9 @@ std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 	}
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
-			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * dim, workspace_dim).transpose();
+			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * ambient_dim, workspace_dim).transpose();
 			for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
-				const Eigen::VectorXd p_b = points.row(i).segment(ag_b * dim, workspace_dim).transpose();
+				const Eigen::VectorXd p_b = points.row(i).segment(ag_b * ambient_dim, workspace_dim).transpose();
 				const double R = agent_radii(ag_a) + agent_radii(ag_b);
 
 				// Treat agent b's own position as agent a's "obstacle
