@@ -13,10 +13,15 @@ Output buffer shapes/conventions match GraphWaypointMPC's exactly:
                      GraphWaypointMPC's contract, which callers already slice
                      down to the agent columns themselves -- see goc_mpc.py's
                      step()); view_object_waypoints() returns the object-
-                     column slice as a convenience view. An (node, object)
-                     entry no constraint ever referenced is left as NaN (not
-                     a plausible-looking-but-meaningless value) -- see
-                     GraphOrderingSpec._node_objects.
+                     column slice as a convenience view. A node not yet
+                     covered by any solve() call (still at construction-time
+                     init) reads as NaN; every node in remaining_vertices as
+                     of the last solve() call carries that solve's real,
+                     GA-solved value, whether or not any constraint
+                     referenced it there (e.g. an un-held object's value at
+                     a node tied to it only via the auto-generated "stay
+                     stationary" invariant, GraphOrderingSpec._resolve_
+                     stationary_objects, not a NaN sentinel).
   _assignments:     (num_phis,)
   _var_assignments: (num_variables,)
   _t_by_node_id:    (num_graph_nodes,)
@@ -313,7 +318,6 @@ class EvolutionaryWaypointSolver:
     def solve(self, remaining_vertices, x0) -> bool:
         start = time.perf_counter()
         graph = self._graph
-        dim = graph.dim
         x0_flat = self._agent_depot(x0)
         was_already_built = self._spec is not None
         self._ensure_built(x0_flat)
@@ -358,37 +362,22 @@ class EvolutionaryWaypointSolver:
         owner_variable = (np.argmax(np.asarray(assign), axis=-1) if spec.n_variables > 0
                           else np.zeros(0, dtype=int))
 
-        # spec._node_objects/_var_id_to_slot are graph-global (see spec.py's
-        # class docstring) -- restrict every write-back below to
-        # remaining_vertices (or non-committed variable slots) so an
-        # already-passed node/committed variable's frozen anchor is never
-        # overwritten with this solve's (masked-out / inert) GA output. A
-        # node id is directly its own row index into wp/t (spec.py
-        # gives every graph node a row, matching MILP), so no node-id ->
-        # row-index conversion is needed anywhere below.
-        #
-        # Agent columns: the GA already solves a full per-node configuration
-        # row -- constrained wherever any formula (a node constraint OR an
-        # edge constraint, e.g. a rigid-transport equality tying a release
-        # node's agent position back to a grasp node's) touches them, its
-        # own AL-driven values elsewhere -- so copy the whole solved row
-        # through unconditionally here, exactly like MILPWaypointMPC.
-        # view_waypoints() (which likewise always returns its whole solved W
-        # row, not filtered by which agent "owns" each node). Downstream
-        # readers (GraphTimingMPC/TracedTimingMPC) only ever index a node's
-        # row for an agent that graph.get_agent_paths actually routes
-        # through that node, so an agent's column at a node it never visits
-        # is simply never read, whatever it holds. A per-instance write-back
-        # used to gate this on spec._instance_list/_instance_sources (a node
-        # gets an "instance" only from its OWN phis referencing agent_q --
-        # see GraphOrderingSpec._resolve_phi_agent_source, which never scans
-        # edge formulas), silently leaving any node reachable only via an
-        # edge formula stuck at this reset's x0 baseline forever instead of
-        # the GA's actual solved value.
-        agents_width = graph.num_agents * dim
+        # Copy the whole solved row through unconditionally for every
+        # remaining node -- agent AND object columns alike, exactly like
+        # MILPWaypointMPC.view_waypoints() (which likewise always returns
+        # its whole solved W row, not filtered by which agent/object "owns"
+        # each node). Downstream readers only ever index a node's row for an
+        # agent/object a constraint or graph.get_agent_paths actually routes
+        # through, so a column at a node that never references it is simply
+        # never read, whatever it holds. Restricted to remaining_vertices
+        # (spec._var_id_to_slot's write-back below is too, for the same
+        # reason) so an already-passed node's frozen anchor is never
+        # overwritten with this solve's masked-out/inert GA output. A node
+        # id is directly its own row index into wp/t (spec.py gives every
+        # graph node a row, matching MILP), so no node-id -> row-index
+        # conversion is needed anywhere below.
         for node in remaining_set:
-            self._waypoints[node, :agents_width] = wp[node, :agents_width]
-            self._waypoints[node, agents_width:] = np.nan
+            self._waypoints[node, :] = wp[node, :]
 
         # Report the DECODED visiting-order rank, not the raw priority `t`:
         # `t` only carries a meaningful order after kernel.py's topological
@@ -403,16 +392,6 @@ class EvolutionaryWaypointSolver:
             owner_variable, np.asarray(_cond_binary), t, np.asarray(anchor.node_active)))
         for node in remaining_set:
             self._t_by_node_id[node] = float(node_rank[node])
-
-        non_robot_dim = graph.non_robot_dim
-        for node, object_ids in spec._node_objects.items():
-            if node not in remaining_set:
-                continue
-            row = wp[node]
-            for oid in object_ids:
-                col_start = agents_width + oid * non_robot_dim
-                self._waypoints[node, col_start:col_start + non_robot_dim] = \
-                    row[col_start:col_start + non_robot_dim]
 
         for var_id, slot in spec._var_id_to_slot.items():
             if var_committed_np[slot]:
@@ -440,8 +419,10 @@ class EvolutionaryWaypointSolver:
     def view_object_waypoints(self):
         """(num_nodes, num_objects * non_robot_dim) solved object positions --
         a view onto _waypoints' object-column slice (see view_waypoints()),
-        matching its node-indexed convention. NaN for any (node, object) pair
-        no constraint ever referenced this solve."""
+        matching its node-indexed convention. NaN for any node not yet
+        covered by any solve() call; every node in the last solve()'s
+        remaining_vertices carries a real, GA-solved value regardless of
+        whether any constraint referenced it there."""
         agents_width = self._graph.num_agents * self._graph.dim
         return self._waypoints[:, agents_width:]
 

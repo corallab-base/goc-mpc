@@ -153,18 +153,6 @@ def _make_link_rot_map(graph):
     return out
 
 
-def _object_ids_referenced(formula, graph, placeholder_fn):
-    """Which object ids (0..graph.num_objects-1) `formula` references via
-    `placeholder_fn` (graph.object_q or graph.v_object_q) -- used only for
-    write-back bookkeeping (mpc.py's view_object_waypoints()), never for
-    constraint compilation itself (see _make_row_resolver: object columns
-    are always addressable regardless of which formula, if any, references
-    them at a given node)."""
-    free_var_ids = {v.get_id() for v in formula.GetFreeVariables()}
-    return [oid for oid in range(graph.num_objects)
-            if not _placeholder_id_map(placeholder_fn(oid)).keys().isdisjoint(free_var_ids)]
-
-
 def _make_row_resolver(graph, var_id_to_slot):
     """Builds resolve(var, n_row_slots) -> Callable[*rows, owner_variable]
     for the unified symbolic constraint API, over the per-node row layout
@@ -712,7 +700,6 @@ class GraphOrderingSpec:
         self._decode_node_rank = build_decode_node_rank(self._ordering_edges, self.n_nodes)
 
         self._resolver = _make_row_resolver(self.graph, var_id_to_slot)
-        self._node_objects = {}  # node -> {object_id, ...} referenced there (write-back bookkeeping only)
         self._resolve_symbolic_constraints()
         self._resolve_holds()
         self._resolve_stationary_objects()
@@ -883,8 +870,6 @@ class GraphOrderingSpec:
                 interior_batched = _batch_relational_interior_fn(
                     fn, kind, u, v, self._decode_node_rank, mode=mode)
                 self._interior_constraints.append((interior_batched, f"{name}_interior"))
-                self._node_objects.setdefault(u, set()).add(oid)
-                self._node_objects.setdefault(v, set()).add(oid)
 
     def _resolve_symbolic_constraints(self):
         """Auto-derives eq/ineq residual constraints from the graph's unified
@@ -920,8 +905,6 @@ class GraphOrderingSpec:
                 fn, kind = compile_relational_formula(formula, resolver)
                 self._symbolic_constraints.append(
                     ((node,), fn, kind, mode, f"phi_{phi_id}"))
-                for oid in _object_ids_referenced(formula, self.graph, self.graph.object_q):
-                    self._node_objects.setdefault(node, set()).add(oid)
 
         edge_formulas = self.graph.edge_phi_to_formula_map
         edge_along_edge = self.graph.edge_phi_to_along_edge_map
@@ -952,19 +935,12 @@ class GraphOrderingSpec:
                         fn, kind, u, v, self._decode_node_rank, mode=mode)
                     self._interior_constraints.append(
                         (interior_batched, f"edge_phi_{phi_id}_interior"))
-                    for oid in _object_ids_referenced(formula, self.graph, self.graph.object_q):
-                        self._node_objects.setdefault(u, set()).add(oid)
-                        self._node_objects.setdefault(v, set()).add(oid)
                     continue
 
                 resolver = lambda var, self=self: self._resolver(var, 2)
                 fn, kind = compile_relational_formula(formula, resolver)
                 self._symbolic_constraints.append(
                     ((u, v), fn, kind, mode, f"edge_phi_{phi_id}"))
-                for oid in _object_ids_referenced(formula, self.graph, self.graph.u_object_q):
-                    self._node_objects.setdefault(u, set()).add(oid)
-                for oid in _object_ids_referenced(formula, self.graph, self.graph.v_object_q):
-                    self._node_objects.setdefault(v, set()).add(oid)
 
     # -- constraints -------------------------------------------------------
 
