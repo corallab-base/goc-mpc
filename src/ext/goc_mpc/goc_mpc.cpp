@@ -241,6 +241,17 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
 		.def("agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
 		.def("var_agent_q", &GraphOfConstraints::var_agent_q, py::arg("var"))
+		// Runtime-editable scalar parameters -- see GraphOfConstraints::_param's
+		// doc comment. add_param declares one (returning its id); param(id)
+		// is the placeholder Expression to reference inside a Formula;
+		// set_param overwrites its value in place, cheap on both solvers
+		// (no Formula re-authoring, no jax retrace on the evolutionary side).
+		.def("add_param", &GraphOfConstraints::add_param, py::arg("initial_value") = 0.0)
+		.def("param", &GraphOfConstraints::param, py::arg("id"))
+		.def("set_param", &GraphOfConstraints::set_param, py::arg("id"), py::arg("value"))
+		.def("view_param_values", &GraphOfConstraints::view_param_values,
+		     py::return_value_policy::reference_internal)
+		.def("num_params", &GraphOfConstraints::num_params)
 		.def("agent_link_pos", &GraphOfConstraints::agent_link_pos,
 		     py::arg("agent_id"), py::arg("link_name"))
 		.def("agent_link_rot", &GraphOfConstraints::agent_link_rot,
@@ -349,7 +360,7 @@ void init_submodule_goc_mpc(py::module_& m) {
                                   py::object max_vel, py::object max_acc, py::object max_jerk,
                                   int max_iterations, double initial_trust_radius,
                                   double max_trust_radius, double min_trust_radius,
-                                  double grad_tol) {
+                                  double grad_tol, double interaction_penalty_weight) {
                         // max_vel/max_acc/max_jerk: a bare float broadcasts to every block in
                         // splines[0]'s spec (back-compat with every existing caller, including
                         // goc-mpc's own raw examples that construct this with plain floats); a
@@ -387,7 +398,7 @@ void init_submodule_goc_mpc(py::module_& m) {
                                 broadcast_bound(max_acc, "max_acc"),
                                 broadcast_bound(max_jerk, "max_jerk"),
                                 max_iterations, initial_trust_radius, max_trust_radius,
-                                min_trust_radius, grad_tol);
+                                min_trust_radius, grad_tol, interaction_penalty_weight);
                      }), py::keep_alive<1, 3>(),
                      py::arg("graph"), py::arg("splines"),
                      py::arg("time_cost") = 1e0, py::arg("time_cost2") = 0e0,
@@ -399,7 +410,8 @@ void init_submodule_goc_mpc(py::module_& m) {
                      py::arg("initial_trust_radius") = 1.0,
                      py::arg("max_trust_radius") = 50.0,
                      py::arg("min_trust_radius") = 1e-6,
-                     py::arg("grad_tol") = 1e-6)
+                     py::arg("grad_tol") = 1e-6,
+                     py::arg("interaction_penalty_weight") = 1.0e3)
 		.def("solve", &GraphTimingMPC::solve,
 		     py::arg("x0"), py::arg("v0"), py::arg("remaining_vertices"),
 		     py::arg("waypoints"), py::arg("assignments"),

@@ -461,6 +461,23 @@ struct GraphOfConstraints {
 	PlaceholderVarFamily<int> _object_q;
 	PlaceholderVarFamily<int> _var_agent_q;
 
+	// _param: runtime-editable scalar placeholders (width 1, one Variable
+	// per declared id) -- what param(id) returns, and what set_param(id, .)
+	// updates. Unlike agent_q/object_q/var_agent_q (which stand for a
+	// decision variable a solve() call optimizes over), a param is a
+	// caller-supplied CONSTANT: both compilers substitute it with the
+	// current entry of _param_values at solve/evaluate time, the same way
+	// they already substitute x0 into a depot/stationarity row, so a
+	// generator can reference a value it doesn't know yet at add_constraint
+	// time (e.g. derived from live sensor/env state) and correct it later
+	// via set_param without re-authoring the constraint's Formula. See
+	// add_param/param/set_param below, and formula_compiler.py's/spec.py's
+	// param_map (evolutionary side: threaded as a genuine jax runtime
+	// argument, not a value baked into the compiled/jitted closure, so
+	// set_param never forces a retrace).
+	PlaceholderVarFamily<int> _param;
+	Eigen::VectorXd _param_values;
+
 	// _agent_link_pos: world-position placeholder (workspace_dim-wide) for
 	// a registered (agent_id, link_name)'s forward kinematics -- see
 	// agent_link_pos() and set_robot_fk/link_pose above.
@@ -962,6 +979,27 @@ struct GraphOfConstraints {
 	// eq(graph.agent_link_rot(agent_id, link_name), R.flatten()) -- numpy's
 	// default flatten() order matches this placeholder's layout exactly.
 	drake::VectorX<drake::symbolic::Expression> agent_link_rot(int agent_id, const std::string& link_name);
+
+	// Declares a new runtime-editable scalar parameter, initialized to
+	// `initial_value`, and returns its id (0, 1, 2, ... in declaration
+	// order). Use param(id) to reference it inside a Formula passed to
+	// add_constraint/add_edge_constraint; use set_param(id, .) later (any
+	// time before the next solve/evaluate_phi call that needs the new
+	// value) to update it in place -- see _param's doc comment for why this
+	// is cheap on both solvers.
+	int add_param(double initial_value = 0.0);
+	// Scalar placeholder Expression for parameter `id` -- usable anywhere
+	// agent_q/object_q are (add_constraint, or an "along the edge"
+	// add_edge_constraint).
+	drake::symbolic::Expression param(int id) const;
+	// Overwrites parameter `id`'s current value. Does NOT touch the
+	// Formula(s) that reference it -- those were fixed at add_constraint
+	// time -- only the value both compilers substitute in for it going
+	// forward.
+	void set_param(int id, double value);
+	const Eigen::VectorXd& view_param_values() const { return _param_values; }
+	int num_params() const { return static_cast<int>(_param_values.size()); }
+
 	int add_constraint(int node, const drake::symbolic::Formula& f);
 	int add_assignable_constraint(int node, int var, const drake::symbolic::Formula& f);
 

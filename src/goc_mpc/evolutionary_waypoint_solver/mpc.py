@@ -300,6 +300,7 @@ class EvolutionaryWaypointSolver:
         x0_flat = self._agent_depot(x0)
         self._ensure_built(x0_flat)
         x0_arr = jnp.asarray(self._full_x0(x0))
+        params_arr = jnp.asarray(self._graph.view_param_values())
         anchor = self._compute_anchor(remaining_vertices)
 
         init_fn = build_initial_carry_fn(
@@ -307,7 +308,7 @@ class EvolutionaryWaypointSolver:
 
         start = time.perf_counter()
         carry_in = init_fn(jax.random.PRNGKey(self._seed))
-        carry_out = self._ga_fn(carry_in, x0_arr, anchor)
+        carry_out = self._ga_fn(carry_in, x0_arr, params_arr, anchor)
         jax.block_until_ready(carry_out)
         compile_time = time.perf_counter() - start
 
@@ -323,6 +324,7 @@ class EvolutionaryWaypointSolver:
         self._ensure_built(x0_flat)
         spec, problem, ga_fn = self._spec, self._problem, self._ga_fn
         x0_arr = jnp.asarray(self._full_x0(x0))
+        params_arr = jnp.asarray(self._graph.view_param_values())
         remaining_set = set(remaining_vertices)
 
         anchor = self._compute_anchor(remaining_vertices)
@@ -344,7 +346,8 @@ class EvolutionaryWaypointSolver:
             prev_X, prev_mu, prev_lam, prev_rho, prev_key = (
                 self._carry[0], self._carry[1], self._carry[2], self._carry[3], self._carry[6])
             init_carry = carry_from_population(
-                problem, prev_X, x0_arr, prev_key, anchor, mu=prev_mu, lam=prev_lam, rho=prev_rho,
+                problem, prev_X, x0_arr, prev_key, anchor, params=params_arr,
+                mu=prev_mu, lam=prev_lam, rho=prev_rho,
                 pop_size=self._pop_size, **self._carry_kwargs_for("rho0"))
             self._last_population_reused = True
         else:
@@ -353,7 +356,8 @@ class EvolutionaryWaypointSolver:
 
         result = run_lamarckian_al(problem, anchor, pop_size=self._pop_size, n_gen=self._n_gen,
                                     seed=self._seed, _ga_fn=ga_fn, _init_carry=init_carry,
-                                    x0=x0_arr, **self._lamarckian_kwargs, **self._carry_kwargs)
+                                    x0=x0_arr, params=params_arr,
+                                    **self._lamarckian_kwargs, **self._carry_kwargs)
 
         self._carry = result.pop
 

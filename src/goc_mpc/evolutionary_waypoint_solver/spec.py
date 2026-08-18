@@ -101,7 +101,7 @@ def _unsupported_placeholder(var):
     raise ValueError(
         f"Symbolic constraint references placeholder variable {var!r} that "
         "isn't representable here -- expected one of agent_q(k)/object_q(k)/"
-        "var_agent_q(var)/agent_link_pos(agent_id, link_name)/"
+        "var_agent_q(var)/param(id)/agent_link_pos(agent_id, link_name)/"
         "agent_link_rot(agent_id, link_name) (node constraints, or an edge "
         "constraint's \"along the edge\" form) or "
         "u_agent_q(k)/u_object_q(k) (an edge constraint's u side) or "
@@ -154,9 +154,9 @@ def _make_link_rot_map(graph):
 
 
 def _make_row_resolver(graph, var_id_to_slot):
-    """Builds resolve(var, n_row_slots) -> Callable[*rows, owner_variable]
-    for the unified symbolic constraint API, over the per-node row layout
-    described in this module's docstring.
+    """Builds resolve(var, n_row_slots) -> Callable[*rows, owner_variable,
+    params] for the unified symbolic constraint API, over the per-node row
+    layout described in this module's docstring.
 
     agent_q(k)/object_q(k) (side 0 -- a node constraint's own row, or an
     "along the edge" edge constraint's row, applied once per endpoint by the
@@ -167,13 +167,14 @@ def _make_row_resolver(graph, var_id_to_slot):
     constraint's v row) are all STATIC column offsets, known at spec-build
     time. var_agent_q(var) is the only DYNAMIC case: which agent's column it
     reads depends on the GA-searched assignment (`owner_variable`, threaded
-    as the trailing argument after every row by _batch_symbolic_constraint_
-    fn), resolved via a differentiable jax.lax.dynamic_slice so gradient-
-    based local refinement of wp still works through it. It only ever binds
-    side 0 (mirrors add_edge_constraint's C++ substitution, which never
-    binds var_agent_q on the v side of a relational edge constraint, and an
-    "along the edge" constraint has no v side to bind at all -- it's just a
-    single node-scoped placeholder set, applied once per endpoint).
+    as the second-to-last argument after every row by
+    _batch_symbolic_constraint_fn), resolved via a differentiable
+    jax.lax.dynamic_slice so gradient-based local refinement of wp still
+    works through it. It only ever binds side 0 (mirrors add_edge_constraint's
+    C++ substitution, which never binds var_agent_q on the v side of a
+    relational edge constraint, and an "along the edge" constraint has no v
+    side to bind at all -- it's just a single node-scoped placeholder set,
+    applied once per endpoint).
 
     agent_link_pos(agent_id, link_name)/agent_link_rot(agent_id, link_name)
     are a third, distinct case: a STATIC side-0 column slice (agent_id is
@@ -183,6 +184,12 @@ def _make_row_resolver(graph, var_id_to_slot):
     directly, in Python (see _make_link_pos_map/_make_link_rot_map), on that
     agent's dim-wide slice, tracing cleanly under jax.jit/vmap as long as
     fk_fn is written in jax.numpy (see set_robot_fk's doc comment).
+
+    param(id) is a fourth case: a runtime-editable scalar constant
+    (GraphOfConstraints.add_param/set_param), resolved by reading the
+    trailing `params` argument (always LAST, after owner_variable) -- a
+    genuine jax runtime array threaded the same way x0 already is, so
+    set_param never forces a retrace (see this module's param_map).
 
     n_row_slots: 1 for a node constraint or an "along the edge" edge
     constraint (only side 0 valid -- u_/v_agent_q / u_/v_object_q correctly
@@ -233,6 +240,18 @@ def _make_row_resolver(graph, var_id_to_slot):
     link_pos_map = _make_link_pos_map(graph)  # var_id -> (agent_id, link_name, fk_fn, j)
     link_rot_map = _make_link_rot_map(graph)  # var_id -> (agent_id, link_name, fk_fn, flat_j)
 
+    # param(id) -- runtime-editable scalar placeholders (GraphOfConstraints.
+    # add_param/param/set_param). Every compiled residual fn is called as
+    # fn(*rows, owner_variable, params) (see _batch_symbolic_constraint_fn et
+    # al.) -- params is therefore always the LAST positional argument, a
+    # genuine jax runtime array (not baked into the compiled closure), so
+    # set_param never forces a retrace.
+    param_map = {}  # var_id -> component index into params
+    for i in range(graph.num_params()):
+        v = as_variable(graph.param(i))
+        if v is not None:
+            param_map[v.get_id()] = i
+
     def resolve(var, n_row_slots):
         vid = var.get_id()
         if vid in static_map:
@@ -244,10 +263,13 @@ def _make_row_resolver(graph, var_id_to_slot):
             slot, j = var_map[vid]
 
             def fn(*args, slot=slot, j=j, dim=dim):
-                owner_variable = args[-1]
+                owner_variable = args[-2]
                 agent = owner_variable[slot]
                 return jax.lax.dynamic_slice_in_dim(args[0], agent * dim + j, 1)[0]
             return fn
+        if vid in param_map:
+            idx = param_map[vid]
+            return lambda *args, idx=idx: args[-1][idx]
         if vid in link_pos_map:
             agent_id, _link_name, fk_fn, j = link_pos_map[vid]
             col0 = agent_id * dim
@@ -284,31 +306,35 @@ def _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active):
 
 
 def _batch_symbolic_constraint_fn(fn, node_locals, mode="frozen"):
-    """Wraps a compiled symbolic-constraint residual fn(*rows, owner_variable)
-    -> (k,) into the batched (assign, cond_binary, t, wp_frozen, wp_live,
-    node_active) -> (pop, k) contract solver.py expects, via jax.vmap over
-    the population. `wp_frozen`/`wp_live` are both the per-node tensor (pop,
-    n_nodes, state_dim) -- identical wherever a row's node is still active,
-    and differing only for an already-passed node's row (problem.
-    apply_anchor); `mode` (a plain Python str, closed over at spec-build time
-    via GraphOrderingSpec's live_phi_ids, never a traced value) picks which
-    one this particular constraint reads for ALL of its rows. Each entry of
-    `node_locals` is a node index (this constraint's node, or (u, v)
-    for an edge constraint) -- NOT a routing-instance id (see module
-    docstring). `cond_binary`/`node_active`/`x0` are accepted only to match
-    the uniform 7-arg contract every eq/ineq constraint closure shares (see
-    _batch_along_edge_interior_fn/_batch_relational_interior_fn/
+    """Wraps a compiled symbolic-constraint residual fn(*rows, owner_variable,
+    params) -> (k,) into the batched (assign, cond_binary, t, wp_frozen,
+    wp_live, node_active, x0, params) -> (pop, k) contract solver.py expects,
+    via jax.vmap over the population. `wp_frozen`/`wp_live` are both the
+    per-node tensor (pop, n_nodes, state_dim) -- identical wherever a row's
+    node is still active, and differing only for an already-passed node's row
+    (problem.apply_anchor); `mode` (a plain Python str, closed over at
+    spec-build time via GraphOrderingSpec's live_phi_ids, never a traced
+    value) picks which one this particular constraint reads for ALL of its
+    rows. Each entry of `node_locals` is a node index (this constraint's
+    node, or (u, v) for an edge constraint) -- NOT a routing-instance id (see
+    module docstring). `cond_binary`/`node_active`/`x0` are accepted only to
+    match the uniform 8-arg contract every eq/ineq constraint closure shares
+    (see _batch_along_edge_interior_fn/_batch_relational_interior_fn/
     _batch_stationary_edge_fn for closures that actually need node_active,
     via decode_node_rank, and _batch_depot_stationary_fn for the one that
-    actually needs x0)."""
-    vmapped = jax.vmap(fn)
+    actually needs x0). `params` (GraphOfConstraints.add_param/set_param) IS
+    read here, by any compiled residual referencing a param(id) placeholder
+    -- population-invariant (in_axes=None, unlike every row/owner_variable
+    arg above it), so set_param between solve() calls never forces a
+    retrace, only changes what this same jitted vmapped(...) reads."""
+    vmapped = jax.vmap(fn, in_axes=(0,) * len(node_locals) + (0, None))
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params,
                 node_locals=node_locals, vmapped=vmapped, mode=mode):
         wp = wp_live if mode == "live" else wp_frozen
         rows = [wp[:, nl, :] for nl in node_locals]
         owner_variable = jnp.argmax(assign, axis=-1)
-        return vmapped(*rows, owner_variable)
+        return vmapped(*rows, owner_variable, params)
     return batched
 
 
@@ -339,15 +365,15 @@ def _batch_along_edge_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
     docstring) -- the same choice made for this formula's exact u/v
     registrations (both come from the same phi's live_phi_ids membership),
     applied uniformly to every other between-node's row too."""
-    vmapped_pop = jax.vmap(fn)
+    vmapped_pop = jax.vmap(fn, in_axes=(0, 0, None))
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, u=u, v=v,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, u=u, v=v,
                 kind=kind, vmapped_pop=vmapped_pop, mode=mode, decode_node_rank=decode_node_rank):
         wp = wp_live if mode == "live" else wp_frozen
         owner_variable = jnp.argmax(assign, axis=-1)
 
         def per_node(node_rows):  # node_rows: (pop, state_dim) -- wp[:, nd, :]
-            return vmapped_pop(node_rows, owner_variable)  # (pop, k)
+            return vmapped_pop(node_rows, owner_variable, params)  # (pop, k)
 
         # vmap over wp's node axis (1) -- (pop, n_nodes, state_dim)
         # -> (n_nodes, pop, k).
@@ -389,16 +415,16 @@ def _batch_relational_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
     "total interior violation" (masked relu(residual) for an ineq formula,
     residual**2 for an eq one) and registered as one ineq-style constraint,
     trading exact per-node multipliers for a single shared one."""
-    vmapped_pop = jax.vmap(fn)
+    vmapped_pop = jax.vmap(fn, in_axes=(0, 0, 0, None))
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, u=u, v=v,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, u=u, v=v,
                 kind=kind, vmapped_pop=vmapped_pop, mode=mode, decode_node_rank=decode_node_rank):
         wp = wp_live if mode == "live" else wp_frozen
         owner_variable = jnp.argmax(assign, axis=-1)
         row_u = wp[:, u, :]
 
         def per_node(node_rows):  # node_rows: (pop, state_dim) -- wp[:, nd, :]
-            return vmapped_pop(row_u, node_rows, owner_variable)  # (pop, k)
+            return vmapped_pop(row_u, node_rows, owner_variable, params)  # (pop, k)
 
         # vmap over wp's node axis (1) -- (pop, n_nodes, state_dim)
         # -> (n_nodes, pop, k).
@@ -453,7 +479,7 @@ def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank
     for the same reasoning applied to hold rigidity): once u has passed, an
     untouched object's real current position (x0) is the ground truth going
     forward, not whatever was merely planned there."""
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, u=u, v=v, seg_slice=seg_slice,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, u=u, v=v, seg_slice=seg_slice,
                 hold_node_pairs=hold_node_pairs, decode_node_rank=decode_node_rank, mode=mode):
         wp = wp_live if mode == "live" else wp_frozen
         residual = wp[:, u, seg_slice] - wp[:, v, seg_slice]
@@ -494,7 +520,7 @@ def _batch_depot_stationary_fn(v, seg_slice, hold_node_pairs, decode_node_rank, 
     interval-overlap gate against each hold's own [rank_hu, rank_hv] span
     still correctly turns this off wherever a hold reaches v before the
     depot's (definitionally always-earliest) claim would apply."""
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, v=v, seg_slice=seg_slice,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, v=v, seg_slice=seg_slice,
                 hold_node_pairs=hold_node_pairs, decode_node_rank=decode_node_rank, mode=mode):
         wp = wp_live if mode == "live" else wp_frozen
         residual = x0[None, seg_slice] - wp[:, v, seg_slice]
@@ -524,14 +550,14 @@ def _batch_python_constraint_fn(fn, node, kind, val, dim, n_variables):
     has no live/frozen choice -- it's a single-node, single-instance escape
     hatch, not a u_/v_-prefixed relational edge formula, so there's no
     "which side is passed" question for it to answer); wp_live/cond_binary/
-    node_active/x0 are accepted only to match the uniform 7-arg contract
-    every eq/ineq constraint closure shares."""
+    node_active/x0/params are accepted only to match the uniform 8-arg
+    contract every eq/ineq constraint closure shares."""
     vmapped = jax.vmap(fn)
     is_var = (kind == "var")
     fixed_agent = val if kind == "fixed" else 0
     var_slot = val if kind == "var" else 0
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, node=node, is_var=is_var,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node=node, is_var=is_var,
                 fixed_agent=fixed_agent, var_slot=var_slot, dim=dim, n_variables=n_variables, vmapped=vmapped):
         node_row = wp_frozen[:, node, :]
         if n_variables > 0 and is_var:
@@ -918,10 +944,10 @@ class GraphOrderingSpec:
             for oid in hold.held_point_ids:
                 obj_col0 = agents_width + oid * non_robot_dim
 
-                def fn(row_u, row_v, owner_variable, fk_fn=fk_fn,
+                def fn(row_u, row_v, owner_variable, params, fk_fn=fk_fn,
                        agent_col0=agent_col0, dim=dim, obj_col0=obj_col0,
                        workspace_dim=workspace_dim):
-                    del owner_variable  # robot_ag is static, not GA-searched
+                    del owner_variable, params  # robot_ag is static, not GA-searched; no param(id) here
                     u_pos, _u_rot = fk_fn(row_u[agent_col0:agent_col0 + dim])
                     v_pos, _v_rot = fk_fn(row_v[agent_col0:agent_col0 + dim])
                     obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
@@ -1056,4 +1082,12 @@ class GraphOrderingSpec:
             edge_cost_fn=self.edge_cost_fn,
             eq_constraints=eq_constraints,
             ineq_constraints=ineq_constraints,
+            # Structural shape only (n_params) -- fixes the jitted GA's
+            # `params` argument width for this problem's whole lifetime,
+            # same as x0 fixes n_agents/dim. The actual VALUES a live solve()
+            # reads come fresh from graph.view_param_values() each call
+            # (mpc.py), same as x0 -- this initial snapshot only matters for
+            # params-less structural call sites (build_initial_carry_fn's
+            # cold start, run_lamarckian_al/warmup_lamarckian_al's default).
+            params=np.asarray(self.graph.view_param_values()),
         )

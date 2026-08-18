@@ -100,6 +100,7 @@ GraphOfConstraints::GraphOfConstraints(
 	_agent_q = PlaceholderVarFamily<int>(dim, [](const int& i) { return fmt::format("agent_{}_q", i); });
 	_object_q = PlaceholderVarFamily<int>(non_robot_dim, [](const int& o) { return fmt::format("object_{}_q", o); });
 	_var_agent_q = PlaceholderVarFamily<int>(dim, [](const int& v) { return fmt::format("var_{}_agent_q", v); });
+	_param = PlaceholderVarFamily<int>(1, [](const int& p) { return fmt::format("param_{}", p); });
 	_agent_link_pos = PlaceholderVarFamily<std::pair<int, std::string>>(
 		workspace_dim, [](const std::pair<int, std::string>& k) {
 			return fmt::format("agent_{}_link_{}_pos", k.first, k.second);
@@ -2621,6 +2622,24 @@ drake::VectorX<drake::symbolic::Expression>
 GraphOfConstraints::object_q(int object_id) const {
 	DRAKE_DEMAND(object_id >= 0 && object_id < num_objects);
 	return _object_q.Get(object_id);
+}
+
+int GraphOfConstraints::add_param(double initial_value) {
+	const int id = static_cast<int>(_param_values.size());
+	_param_values.conservativeResize(id + 1);
+	_param_values(id) = initial_value;
+	_param.Vars(id);  // eager creation -- mirrors add_binary_cond_var
+	return id;
+}
+
+drake::symbolic::Expression GraphOfConstraints::param(int id) const {
+	DRAKE_DEMAND(id >= 0 && id < _param_values.size());
+	return _param.Get(id)[0];
+}
+
+void GraphOfConstraints::set_param(int id, double value) {
+	DRAKE_DEMAND(id >= 0 && id < _param_values.size());
+	_param_values(id) = value;
 }
 
 // For unified edge constraint API (relational form)

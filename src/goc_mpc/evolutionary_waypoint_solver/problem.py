@@ -144,27 +144,37 @@ def full_active_anchor(problem):
     )
 
 
-def _infer_constraint_size(fn, n_variables, n_agents, n_nodes, state_dim, n_cond_vars):
+def _infer_constraint_size(fn, n_variables, n_agents, n_nodes, state_dim, n_cond_vars, n_params):
     dummy_assign = np.zeros((1, n_variables, n_agents))
     dummy_cond_binary = np.zeros((1, n_cond_vars))
     dummy_t = np.zeros((1, n_nodes))
     dummy_wp = np.zeros((1, n_nodes, state_dim))
     dummy_node_active = np.ones((n_nodes,), dtype=bool)
     dummy_x0 = np.zeros((state_dim,))
+    dummy_params = np.zeros((n_params,))
     return np.asarray(fn(dummy_assign, dummy_cond_binary, dummy_t, dummy_wp, dummy_wp,
-                          dummy_node_active, dummy_x0)).shape[1]
+                          dummy_node_active, dummy_x0, dummy_params)).shape[1]
 
 
 class GraphOrderingRelaxed:
     def __init__(self, instance_sources, n_variables, ordering_edges, x0, wp_bounds,
                  instance_node, n_nodes, state_dim,
                  n_cond_vars=0, objective="avg", edge_cost_fn=None,
-                 eq_constraints=(), ineq_constraints=()):
+                 eq_constraints=(), ineq_constraints=(), params=None):
         self.instance_sources = list(instance_sources)
         self.n_variables = n_variables
         self.n_agents = x0.shape[0]
         self.dim = x0.shape[1]
         self.x0 = x0
+        # Structural default for GraphOrderingRelaxed's own params-less
+        # call sites (build_initial_carry_fn's cold start, run_lamarckian_al/
+        # warmup_lamarckian_al's params=None default) -- mirrors problem.x0's
+        # own role exactly; a live caller (EvolutionaryWaypointSolver.solve/
+        # warmup, mpc.py) always supplies the graph's CURRENT
+        # view_param_values() instead, the same way it always supplies a
+        # live x0 rather than relying on this default.
+        self.params = np.zeros(0) if params is None else np.asarray(params)
+        self.n_params = self.params.shape[0]
         self.objective = objective
         self.n_cond_vars = n_cond_vars
 
@@ -188,7 +198,8 @@ class GraphOrderingRelaxed:
         self._eq_constraints = list(eq_constraints)
         self._ineq_constraints = list(ineq_constraints)
         sizes = lambda fns: sum(_infer_constraint_size(fn, self.n_variables, self.n_agents,
-                                                         self.n_nodes, self.state_dim, self.n_cond_vars)
+                                                         self.n_nodes, self.state_dim, self.n_cond_vars,
+                                                         self.n_params)
                                  for fn in fns)
         self.n_eq_extra = sizes(self._eq_constraints)
         self.n_ineq_extra = sizes(self._ineq_constraints)

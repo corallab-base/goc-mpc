@@ -273,6 +273,8 @@ void CompileSymbolicNodeConstraint(
 				return Expression(W(sg_node, ag * graph.dim + j)); });
 			graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
 				return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+			graph._param.SubstituteRange(&sub, graph.num_params(), [&](int p, int) {
+				return Expression(graph.view_param_values()(p)); });
 			RequireFullySubstituted(rec.formula, sub);
 			drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 			if (first) { f_or = f_sub; first = false; }
@@ -300,6 +302,8 @@ void CompileSymbolicNodeConstraint(
 				return Expression(W(sg_node, kk * graph.dim + j)); });
 			graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
 				return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+			graph._param.SubstituteRange(&sub, graph.num_params(), [&](int p, int) {
+				return Expression(graph.view_param_values()(p)); });
 			RequireFullySubstituted(rec.formula, sub);
 			drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 			Expression s = Assignments(variable_k, i);
@@ -322,6 +326,8 @@ void CompileSymbolicNodeConstraint(
 		return Expression(W(sg_node, i * graph.dim + j)); });
 	graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
 		return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+	graph._param.SubstituteRange(&sub, graph.num_params(), [&](int p, int) {
+		return Expression(graph.view_param_values()(p)); });
 	RequireFullySubstituted(rec.formula, sub);
 	prog.AddConstraint(rec.formula.Substitute(sub));
 }
@@ -355,6 +361,8 @@ void CompileAlongEdgeConstraintAtNode(
 				return Expression(W(sg_node, kk * graph.dim + j)); });
 			graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
 				return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+			graph._param.SubstituteRange(&sub, graph.num_params(), [&](int p, int) {
+				return Expression(graph.view_param_values()(p)); });
 			RequireFullySubstituted(rec.formula, sub);
 			drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 			std::vector<Expression> gates = {Assignments(variable_k, i)};
@@ -370,6 +378,8 @@ void CompileAlongEdgeConstraintAtNode(
 		return Expression(W(sg_node, i * graph.dim + j)); });
 	graph._object_q.SubstituteRange(&sub, n_objects, [&](int o, int j) {
 		return Expression(W(sg_node, n_agents * graph.dim + o * graph.non_robot_dim + j)); });
+	graph._param.SubstituteRange(&sub, graph.num_params(), [&](int p, int) {
+		return Expression(graph.view_param_values()(p)); });
 	RequireFullySubstituted(rec.formula, sub);
 	drake::symbolic::Formula f_sub = rec.formula.Substitute(sub);
 
@@ -428,6 +438,8 @@ void CompileSymbolicEdgeConstraint(
 		return row_expr(sg_u_node, rec.u_node, n_agents * graph.dim + o * graph.non_robot_dim + j); });
 	graph._object_q_v.SubstituteRange(&sub, n_objects, [&](int o, int j) {
 		return row_expr(sg_v_node, rec.v_node, n_agents * graph.dim + o * graph.non_robot_dim + j); });
+	graph._param.SubstituteRange(&sub, graph.num_params(), [&](int p, int) {
+		return Expression(graph.view_param_values()(p)); });
 	RequireFullySubstituted(rec.formula, sub);
 	prog.AddConstraint(rec.formula.Substitute(sub));
 }
@@ -455,6 +467,7 @@ double EvaluateSymbolicNodeConstraint(
 	graph._agent_q.InsertRange(&env, n_agents, [&](int i, int j) { return x[i * graph.dim + j]; });
 	graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
 		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
+	graph._param.InsertRange(&env, graph.num_params(), [&](int p, int) { return graph.view_param_values()(p); });
 	InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
 	return ComputeViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 }
@@ -484,6 +497,7 @@ double EvaluateSymbolicEdgeConstraint(
 		graph._agent_q.InsertRange(&env, n_agents, [&](int i, int j) { return x[i * graph.dim + j]; });
 		graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
 			return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
+		graph._param.InsertRange(&env, graph.num_params(), [&](int p, int) { return graph.view_param_values()(p); });
 		InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
 		return ComputeSignedViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 	}
@@ -504,5 +518,6 @@ double EvaluateSymbolicEdgeConstraint(
 		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
 	graph._object_q_v.InsertRange(&env, n_objects, [&](int o, int j) {
 		return x[n_agents * graph.dim + o * graph.non_robot_dim + j]; });
+	graph._param.InsertRange(&env, graph.num_params(), [&](int p, int) { return graph.view_param_values()(p); });
 	return ComputeSignedViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 }
