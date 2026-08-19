@@ -838,11 +838,11 @@ class GraphOrderingSpec:
         reinforcement alike).
 
         Uses EVERY hold in the registry for gating (both static AND
-        assignable, unlike _resolve_holds' rigid-carry relation, which only
-        handles static holds -- see its docstring) -- the gate only needs to
-        know WHEN a hold's own node interval falls, not which agent resolves
-        it, so an assignable hold's span is real, usable gating information
-        here even though its own rigid-carry formula is still deferred.
+        assignable -- _resolve_holds' rigid-carry relation handles both too,
+        see its docstring) -- the gate only needs to know WHEN a hold's own
+        node interval falls, not which agent resolves it, so an assignable
+        hold's span is real, usable gating information regardless of how
+        its own rigid-carry formula resolves the agent.
 
         Registered mode="live" (see _resolve_holds' docstring for the same
         reasoning applied to hold rigidity): once u has passed, an untouched
