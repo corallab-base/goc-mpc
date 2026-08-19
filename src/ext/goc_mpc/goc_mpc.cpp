@@ -190,28 +190,6 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("var"))
 		.def("get_commit_trigger_var", &GraphOfConstraints::get_commit_trigger_var,
 		     py::arg("node"))
-		.def("add_robot_to_point_displacement_cost", &GraphOfConstraints::add_robot_to_point_displacement_cost)
-		.def("add_robot_to_point_alignment_cost", &GraphOfConstraints::add_robot_to_point_alignment_cost,
-		     py::arg("k"),
-		     py::arg("robot_id"),
-		     py::arg("point_id"),
-		     py::arg("ee_ray_body"),
-		     py::arg("u_body_opt") = std::nullopt,
-		     py::arg("roll_ref_world") = std::nullopt,
-		     py::arg("roll_ref_flat") = false,
-		     py::arg("require_positive_pointing") = true,
-		     py::arg("w_point") = 1.0,
-		     py::arg("w_roll") = 0.1,
-		     py::arg("w_flat") = 0.05,
-		     py::arg("w_guard") = 0.0,
-		     py::arg("w_u_stab") = 0.01,
-		     py::arg("eps") = 1e-10,
-		     py::arg("eps_d") = 1e-3)
-		.def("add_point_to_point_displacement_cost", &GraphOfConstraints::add_point_to_point_displacement_cost,
-		     py::arg("k"),
-		     py::arg("point_a"),
-		     py::arg("point_b"),
-		     py::arg("disp"))
 		// HOLD DECLARATIONS  //////////////////////////////////////////
 		// Canonical way to declare that held_point_ids are rigidly held by
 		// a robot over edge (u -> v) -- see HoldDeclaration/hold_ops above.

@@ -819,11 +819,6 @@ struct GraphOfConstraints {
 						       int point_id,
 						       const Eigen::VectorXd& disp,
 						       double tol = 0.0);
-	int add_robot_to_point_displacement_cost(int k,
-						 int robot_id,
-						 int point_id,
-						 Eigen::Vector3d& disp);
-
 	int add_robot_to_point_alignment_constraint(int k,
 						    int robot_id,
 						    int point_id,
@@ -835,29 +830,11 @@ struct GraphOfConstraints {
 						    bool require_positive_pointing = true,
 						    double eps_d = 0.05, double tau_tperp = 0.05);
 
-	int add_robot_to_point_alignment_cost(int k, int robot_id, int point_id,
-					      const Eigen::Vector3d& ee_ray_body,
-					      std::optional<Eigen::Vector3d> u_body_opt,
-					      std::optional<Eigen::Vector3d> roll_ref_world,
-					      bool roll_ref_flat,
-					      bool require_positive_pointing,
-					      double w_point=1.0,
-					      double w_roll=0.1,
-					      double w_flat=0.05,
-					      double w_guard=0.0,
-					      double w_u_stab=0.01,
-					      double eps=1e-10,
-					      double eps_d=1e-3);
-
 	int add_point_to_point_displacement_constraint(int k,
 						       int point_a,
 						       int point_b,
 						       Eigen::Vector3d& disp,
 						       double tol = 0.05);
-	int add_point_to_point_displacement_cost(int k,
-						 int point_a,
-						 int point_b,
-						 Eigen::Vector3d& disp);
 
 	int add_point_to_point_alignment_constraint(int k,
 						    int point_a,
