@@ -289,10 +289,10 @@ std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
 // looked up in the node-indexed `assignments` vector `PhiOwningAgents`
 // takes -- an assignable edge constraint (edge_phi_to_variable_map) would
 // need its own resolved-assignment vector, which get_agent_paths doesn't
-// currently receive. No current constraint generator gives a node ITS
-// ONLY ownership through an assignable edge constraint, so that priority
-// tier is left unresolved here (falls through to {}) rather than guessing
-// -- a real gap if that ever changes, not a silent miscompute today.
+// currently receive. This only covers constraints actually routed through
+// `_add_edge_op` (add_edge_constraint and friends); the canonical hold
+// registry (add_hold/add_assignable_hold) bypasses that machinery entirely
+// -- see HoldOwningAgents below for its ownership resolution.
 std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_id) {
 	if (graph._edge_phi_to_static_assignment_map.contains(edge_phi_id)) {
 		return {graph._edge_phi_to_static_assignment_map.at(edge_phi_id)};
@@ -314,6 +314,41 @@ std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_
 		return owners;
 	}
 	return {};
+}
+
+// Hold-registry counterpart of EdgePhiOwningAgents: resolves a node's
+// ownership through a rigid-carry hold (add_hold/add_assignable_hold)
+// along the (u, v) edge, the ONLY ownership evidence a node like Place has
+// by design -- its own node constraint pins just the held object (see
+// pyrobosim_gymnasium's _place_add), leaving the robot's position there to
+// come entirely from the transport edge back to Pick (_place_edge_add).
+// HoldDeclaration is pure bookkeeping (hold_ops), never routed through
+// _add_edge_op, so it has no phi_id and EdgePhiOwningAgents never sees it
+// -- checked here as a separate tier instead.
+//
+// A statically-assigned hold (add_hold, robot_ag set) resolves
+// immediately. An assignable hold (add_assignable_hold, var_id set)
+// resolves once `committed_assignments` has an entry for that var --
+// populated the instant its u_node (Pick, the hold's own commit trigger --
+// see add_variable_commit) completes (GraphOfConstraintsMPC._maybe_commit)
+// -- which is always before a downstream node's ownership is asked for
+// here: a v_node only re-enters get_agent_paths' traversal once its u_node
+// predecessor is done. Returns {} for a still-uncommitted assignable hold
+// (no opinion yet, same contract as EdgePhiOwningAgents/PhiOwningAgents),
+// not the committed agent guessed early.
+std::set<int> HoldOwningAgents(const GraphOfConstraints& graph, int u, int v) {
+	std::set<int> owners;
+	for (const auto& [hold_id, hold] : graph.hold_ops) {
+		if (hold.u_node != u || hold.v_node != v) continue;
+		if (hold.robot_ag.has_value()) {
+			owners.insert(*hold.robot_ag);
+			continue;
+		}
+		if (!hold.var_id.has_value()) continue;  // defensive; HoldDeclaration always sets one
+		const auto it = graph.committed_assignments.find(*hold.var_id);
+		if (it != graph.committed_assignments.end()) owners.insert(it->second);
+	}
+	return owners;
 }
 
 // Flattens `f`'s top-level And-conjunction into its non-And leaf atoms
@@ -563,6 +598,8 @@ std::tuple<std::vector<std::optional<int>>,
 			// well-scaled remaining-path costs to another agent's
 			// already-arrived, near-zero ones in the same shared QP).
 			for (const auto& e : full_sg.neighbors(node)) {
+				const std::set<int> hold_owners = HoldOwningAgents(*this, node, e.to);
+				owners.insert(hold_owners.begin(), hold_owners.end());
 				const auto phis_it = edge_to_phis_map.find({node, e.to});
 				if (phis_it == edge_to_phis_map.end()) continue;
 				for (int edge_phi_id : phis_it->second) {
@@ -571,6 +608,8 @@ std::tuple<std::vector<std::optional<int>>,
 				}
 			}
 			for (const auto& in : full_sg.incoming_neighbors(node)) {
+				const std::set<int> hold_owners = HoldOwningAgents(*this, in.from, node);
+				owners.insert(hold_owners.begin(), hold_owners.end());
 				const auto phis_it = edge_to_phis_map.find({in.from, node});
 				if (phis_it == edge_to_phis_map.end()) continue;
 				for (int edge_phi_id : phis_it->second) {
