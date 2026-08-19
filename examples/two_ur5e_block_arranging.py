@@ -139,7 +139,6 @@ def build_goc_mpc(graph: GraphOfConstraints):
         time_delta_cutoff=0.3,
         short_path_time_per_step=0.1,
         phi_tolerance=0.05,
-        max_acc=1.5,
         linear_interpolation=True,
     )
 

@@ -108,9 +108,9 @@ def pointmass_example_setup(use_evolutionary: bool = False, warm_start: bool = T
                                     time_delta_cutoff = 0.3,
                                     short_path_time_per_step = 0.1,
                                     phi_tolerance = 0.05,
-                                    # max_vel = 0.05,  # maximum velocity for every joint
-                                    max_acc = 1.00,  # maximum acceleration for every joint
-                                    # max_jerk = 0.05 # maximum jerk for every joint
+                                    # max_vel/max_acc/max_jerk hard bounds are not supported by
+                                    # GraphTimingMPC's current (trust-region SQP) implementation --
+                                    # see graph_timing_mpc.hpp's own doc comment.
                                     linear_interpolation = True)
 
     # goc_mpc.reset()
