@@ -22,8 +22,12 @@ Every graph node gets a configuration row, unconditionally (whether or not
 any phi references it -- matching MILP's own `W`, one row per node in its
 subgraph regardless of constraint presence) -- `[agent_0 | agent_1 | ... |
 agent_{n_agents-1} | object_0 | ... | object_{n_objects-1}]`, `state_dim =
-num_agents*dim + num_objects*non_robot_dim` wide -- mirroring MILP's
+num_agents*slot_width + num_objects*non_robot_dim` wide -- mirroring MILP's
 per-node joint configuration `W` (graph_of_constraints.cpp:79's `total_dim`).
+Each agent's own slot is `slot_width` wide (see _slot_width's docstring) --
+today always == graph.dim, since GraphOfConstraints still requires every
+agent to share one width, but derived here from each agent's own declared
+config (_agent_widths) rather than assumed from that shared scalar.
 A node id is therefore directly its own row index into wp/t/node_active --
 no separate local/compacted node numbering anywhere in this solver. So a
 node/edge constraint can reference ANY agent's or
@@ -97,6 +101,44 @@ def _placeholder_id_map(vec):
     return out
 
 
+def _agent_widths(graph):
+    """Per-agent ambient config width, one entry per graph.num_agents,
+    derived from graph._robot_specs (the actual declared Block sizes) rather
+    than trusted from the graph's single shared `dim` scalar. graph.dim is
+    real ground truth today ONLY because GraphOfConstraints's constructor
+    (graph_of_constraints.cpp) throws if any robot_spec's width differs from
+    the first agent's, and every placeholder family (agent_q, var_agent_q,
+    ...) is itself built at one shared width -- both still true, unrelaxed,
+    as of this writing. This function exists so this module's OWN row-layout
+    math (wp's per-agent slot placement below) derives its width the same
+    way a genuinely per-agent-width graph would require, instead of taking
+    graph.dim as a shortcut -- see _slot_width's docstring for the row
+    layout this feeds into."""
+    return [sum(b.size for b in spec) for spec in graph._robot_specs]
+
+
+def _slot_width(agent_widths):
+    """The per-agent PADDED-SLOT width this module's wp row layout uses:
+    every agent gets an equal-width column slot (max over agent_widths),
+    with its real config occupying only the slot's first agent_widths[k]
+    columns -- exactly the zero-fill convention mpc.py's/problem.py's own
+    x0 padding already uses elsewhere, just applied to the row layout
+    itself instead of to x0. This keeps every per-agent column offset a
+    plain `k * slot_width` (or, for a GA-searched dynamic agent, `agent *
+    slot_width`) -- a single static stride valid for every agent -- rather
+    than a packed cumulative offset that would depend on which agents
+    precede k, which a GA-searched dynamic selection can't index without
+    itself becoming per-candidate-width-aware. A static, agent-known
+    reference (agent_q(k), agent_link_pos(k, ...), a hold's static
+    robot_ag) instead slices its own agent_widths[k] columns out of that
+    slot, never the padded remainder -- see _make_row_resolver/
+    _resolve_holds. Today agent_widths are always identical (graph.dim
+    enforces it -- see _agent_widths), so slot_width == graph.dim and no
+    padding columns actually exist; this is prep for whenever that stops
+    being true, not yet exercised by any real heterogeneous-width graph."""
+    return max(agent_widths) if agent_widths else 0
+
+
 def _unsupported_placeholder(var):
     raise ValueError(
         f"Symbolic constraint references placeholder variable {var!r} that "
@@ -153,7 +195,7 @@ def _make_link_rot_map(graph):
     return out
 
 
-def _make_row_resolver(graph, var_id_to_slot):
+def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width):
     """Builds resolve(var, n_row_slots) -> Callable[*rows, owner_variable,
     params] for the unified symbolic constraint API, over the per-node row
     layout described in this module's docstring.
@@ -195,21 +237,26 @@ def _make_row_resolver(graph, var_id_to_slot):
     constraint (only side 0 valid -- u_/v_agent_q / u_/v_object_q correctly
     raise via _unsupported_placeholder), 2 for a relational edge constraint
     (side 0 = u, side 1 = v).
+
+    agent_widths/slot_width: this module's per-agent padded-slot row layout
+    (see _slot_width's docstring) -- agent k's slot starts at `k *
+    slot_width` regardless of its own real width, so every static offset
+    below is `k * slot_width + j`, never a packed cumulative offset.
     """
-    dim, num_agents = graph.dim, graph.num_agents
+    num_agents = graph.num_agents
     num_objects, non_robot_dim = graph.num_objects, graph.non_robot_dim
-    agents_width = num_agents * dim
+    agents_width = num_agents * slot_width
 
     static_map = {}  # var_id -> (side, col)
     for k in range(num_agents):
         for j, expr in enumerate(graph.agent_q(k)):
             v = as_variable(expr)
             if v is not None:
-                static_map[v.get_id()] = (0, k * dim + j)
+                static_map[v.get_id()] = (0, k * slot_width + j)
         for j, expr in enumerate(graph.u_agent_q(k)):
             v = as_variable(expr)
             if v is not None:
-                static_map[v.get_id()] = (0, k * dim + j)
+                static_map[v.get_id()] = (0, k * slot_width + j)
     for k in range(num_objects):
         for j, expr in enumerate(graph.object_q(k)):
             v = as_variable(expr)
@@ -223,7 +270,7 @@ def _make_row_resolver(graph, var_id_to_slot):
         for j, expr in enumerate(graph.v_agent_q(k)):
             v = as_variable(expr)
             if v is not None:
-                static_map[v.get_id()] = (1, k * dim + j)
+                static_map[v.get_id()] = (1, k * slot_width + j)
     for k in range(num_objects):
         for j, expr in enumerate(graph.v_object_q(k)):
             v = as_variable(expr)
@@ -262,29 +309,38 @@ def _make_row_resolver(graph, var_id_to_slot):
         if vid in var_map:
             slot, j = var_map[vid]
 
-            def fn(*args, slot=slot, j=j, dim=dim):
+            # `agent` is GA-searched (traced, one per population member), so
+            # this offset must be a single static stride valid for whichever
+            # agent gets selected -- slot_width (see _slot_width's
+            # docstring), not that agent's own (potentially narrower) real
+            # width. var_agent_q's own placeholder family is fixed-width in
+            # C++ today (uniformly slot_width, since graph.dim still is), so
+            # j never exceeds any candidate's real width regardless.
+            def fn(*args, slot=slot, j=j, slot_width=slot_width):
                 owner_variable = args[-2]
                 agent = owner_variable[slot]
-                return jax.lax.dynamic_slice_in_dim(args[0], agent * dim + j, 1)[0]
+                return jax.lax.dynamic_slice_in_dim(args[0], agent * slot_width + j, 1)[0]
             return fn
         if vid in param_map:
             idx = param_map[vid]
             return lambda *args, idx=idx: args[-1][idx]
         if vid in link_pos_map:
             agent_id, _link_name, fk_fn, j = link_pos_map[vid]
-            col0 = agent_id * dim
+            col0 = agent_id * slot_width
+            w = agent_widths[agent_id]
 
-            def fn(*args, col0=col0, dim=dim, fk_fn=fk_fn, j=j):
-                q = args[0][col0:col0 + dim]
+            def fn(*args, col0=col0, w=w, fk_fn=fk_fn, j=j):
+                q = args[0][col0:col0 + w]
                 pos, _rot = fk_fn(q)
                 return pos[j]
             return fn
         if vid in link_rot_map:
             agent_id, _link_name, fk_fn, j = link_rot_map[vid]
-            col0 = agent_id * dim
+            col0 = agent_id * slot_width
+            w = agent_widths[agent_id]
 
-            def fn(*args, col0=col0, dim=dim, fk_fn=fk_fn, j=j):
-                q = args[0][col0:col0 + dim]
+            def fn(*args, col0=col0, w=w, fk_fn=fk_fn, j=j):
+                q = args[0][col0:col0 + w]
                 _pos, rot = fk_fn(q)
                 return jnp.reshape(rot, (-1,))[j]
             return fn
@@ -540,33 +596,45 @@ def _batch_depot_stationary_fn(v, seg_slice, hold_node_pairs, decode_node_rank, 
     return batched
 
 
-def _batch_python_constraint_fn(fn, node, kind, val, dim, n_variables):
+def _batch_python_constraint_fn(fn, node, kind, val, agent_widths, slot_width, n_variables):
     """Wraps a single-instance add_python_constraint fn(wp_row) -> (k,) (see
     target_eq_constraint) into the batched (assign, cond_binary, t,
     wp_frozen, wp_live, node_active) -> (pop, k) contract, gathering that
-    instance's own dim-wide agent slice out of its node's row -- the same
-    kind of gather kernel.py's routing performs for every instance at once,
-    just for this one instance. Always reads wp_frozen (add_python_constraint
-    has no live/frozen choice -- it's a single-node, single-instance escape
-    hatch, not a u_/v_-prefixed relational edge formula, so there's no
-    "which side is passed" question for it to answer); wp_live/cond_binary/
-    node_active/x0/params are accepted only to match the uniform 8-arg
-    contract every eq/ineq constraint closure shares."""
+    instance's own agent slice out of its node's row -- the same kind of
+    gather kernel.py's routing performs for every instance at once, just for
+    this one instance. Always reads wp_frozen (add_python_constraint has no
+    live/frozen choice -- it's a single-node, single-instance escape hatch,
+    not a u_/v_-prefixed relational edge formula, so there's no "which side
+    is passed" question for it to answer); wp_live/cond_binary/node_active/
+    x0/params are accepted only to match the uniform 8-arg contract every
+    eq/ineq constraint closure shares.
+
+    The gathered slice's width differs by `kind`: a "fixed" instance's agent
+    is known at spec-build time, so it gets exactly that agent's own real
+    width (agent_widths[fixed_agent], no padding). A "var" instance's agent
+    is GA-searched (one value per population member), so the gather can only
+    use one static width valid for every candidate -- slot_width, the padded
+    per-agent slot (see _slot_width's docstring) -- meaning fn may see
+    trailing zero padding past a narrower candidate's real width. The column
+    OFFSET is always `agent * slot_width` either way (every agent's slot
+    starts at the same static stride, real width or not)."""
     vmapped = jax.vmap(fn)
     is_var = (kind == "var")
     fixed_agent = val if kind == "fixed" else 0
     var_slot = val if kind == "var" else 0
+    width = slot_width if is_var else agent_widths[fixed_agent]
 
     def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node=node, is_var=is_var,
-                fixed_agent=fixed_agent, var_slot=var_slot, dim=dim, n_variables=n_variables, vmapped=vmapped):
+                fixed_agent=fixed_agent, var_slot=var_slot, slot_width=slot_width, width=width,
+                n_variables=n_variables, vmapped=vmapped):
         node_row = wp_frozen[:, node, :]
         if n_variables > 0 and is_var:
             owner_variable = jnp.argmax(assign, axis=-1)
             agent = owner_variable[:, var_slot]
         else:
             agent = jnp.full((wp_frozen.shape[0],), fixed_agent, dtype=jnp.int32)
-        col = agent * dim
-        idx = col[:, None] + jnp.arange(dim)[None, :]
+        col = agent * slot_width
+        idx = col[:, None] + jnp.arange(width)[None, :]
         row = jnp.take_along_axis(node_row, idx, axis=1)
         return vmapped(row)
     return batched
@@ -670,7 +738,13 @@ class GraphOrderingSpec:
         # node_active/anchor_wp -- no separate local/compacted numbering.
         self._node_list = list(range(self.graph.structure.num_nodes))
         self.n_nodes = len(self._node_list)
-        self.state_dim = self.graph.num_agents * self.graph.dim + self.graph.num_objects * self.graph.non_robot_dim
+        # Per-agent padded-slot row layout -- see _slot_width's docstring.
+        # Computed once here and reused by _make_row_resolver/_resolve_holds/
+        # _resolve_stationary_objects/build_problem below, all of which used
+        # to reach for self.graph.dim directly.
+        self._agent_widths = _agent_widths(self.graph)
+        self._slot_width = _slot_width(self._agent_widths)
+        self.state_dim = self.graph.num_agents * self._slot_width + self.graph.num_objects * self.graph.non_robot_dim
 
         # Routing instances: (node, resolved agent source) pairs -- purely a
         # routing/ordering concept (which real agent visits this node, and
@@ -781,7 +855,8 @@ class GraphOrderingSpec:
         self._ordering_edges = [(u, v, None) for u, v in self._hard_edges] + list(cond_edges)
         self._decode_node_rank = build_decode_node_rank(self._ordering_edges, self.n_nodes)
 
-        self._resolver = _make_row_resolver(self.graph, var_id_to_slot)
+        self._resolver = _make_row_resolver(
+            self.graph, var_id_to_slot, self._agent_widths, self._slot_width)
         self._resolve_symbolic_constraints()
         self._resolve_holds()
         self._resolve_stationary_objects()
@@ -861,7 +936,7 @@ class GraphOrderingSpec:
         a time, gated by the same hold-overlap logic (see that function's
         docstring for how the depot's own always-earliest rank makes the
         existing gate math work unmodified)."""
-        agents_width = self.graph.num_agents * self.graph.dim
+        agents_width = self.graph.num_agents * self._slot_width
         non_robot_dim = self.graph.non_robot_dim
 
         holds_by_object = {}
@@ -959,8 +1034,8 @@ class GraphOrderingSpec:
         own interior-reinforcement loop -- since another agent's route might
         otherwise schedule a node in between that leaves the held object's
         value there completely unconstrained."""
-        dim = self.graph.dim
-        agents_width = self.graph.num_agents * dim
+        agent_widths, slot_width = self._agent_widths, self._slot_width
+        agents_width = self.graph.num_agents * slot_width
         non_robot_dim = self.graph.non_robot_dim
         workspace_dim = self.graph.workspace_dim
 
@@ -973,32 +1048,38 @@ class GraphOrderingSpec:
 
                 if hold.robot_ag is not None:
                     fk_fn = resolve_link_fk(self.graph, hold.robot_ag)
-                    agent_col0 = hold.robot_ag * dim
+                    agent_col0 = hold.robot_ag * slot_width
+                    agent_w = agent_widths[hold.robot_ag]
 
                     def fn(row_u, row_v, owner_variable, params, fk_fn=fk_fn,
-                           agent_col0=agent_col0, dim=dim, obj_col0=obj_col0,
+                           agent_col0=agent_col0, agent_w=agent_w, obj_col0=obj_col0,
                            workspace_dim=workspace_dim):
                         del owner_variable, params  # robot_ag is static, not GA-searched; no param(id) here
-                        u_pos, _u_rot = fk_fn(row_u[agent_col0:agent_col0 + dim])
-                        v_pos, _v_rot = fk_fn(row_v[agent_col0:agent_col0 + dim])
+                        u_pos, _u_rot = fk_fn(row_u[agent_col0:agent_col0 + agent_w])
+                        v_pos, _v_rot = fk_fn(row_v[agent_col0:agent_col0 + agent_w])
                         obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
                         obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
                         return (obj_v - obj_u) - (v_pos - u_pos)
                 else:
                     slot = self._var_id_to_slot[hold.var_id]
-                    # One (agent_col0, fk_fn) pair per candidate agent,
-                    # Python-time (fk_fn may genuinely differ per agent --
-                    # heterogeneous configuration kinds -- so this can't be
-                    # a single traced closure the way agent_col0 alone could
-                    # be); which branch actually applies is resolved at
-                    # trace time below via owner_variable[slot].
-                    branch_cols = [k * dim for k in range(self.graph.num_agents)]
+                    # One (agent_col0, agent_w, fk_fn) triple per candidate
+                    # agent, Python-time (fk_fn may genuinely differ per
+                    # agent -- heterogeneous configuration kinds -- so this
+                    # can't be a single traced closure the way agent_col0
+                    # alone could be); which branch actually applies is
+                    # resolved at trace time below via owner_variable[slot].
+                    # Each branch slices its own candidate's real width
+                    # (agent_w), not the shared slot_width stride -- fk_fn
+                    # expects that agent's genuine config, no padding.
+                    branch_cols = [k * slot_width for k in range(self.graph.num_agents)]
+                    branch_widths = [agent_widths[k] for k in range(self.graph.num_agents)]
                     branch_fks = [resolve_link_fk(self.graph, k)
                                   for k in range(self.graph.num_agents)]
 
                     def fn(row_u, row_v, owner_variable, params,
-                           branch_cols=branch_cols, branch_fks=branch_fks, slot=slot,
-                           dim=dim, obj_col0=obj_col0, workspace_dim=workspace_dim):
+                           branch_cols=branch_cols, branch_widths=branch_widths,
+                           branch_fks=branch_fks, slot=slot,
+                           obj_col0=obj_col0, workspace_dim=workspace_dim):
                         del params  # no param(id) placeholder in this residual
                         # Every candidate's (v_pos - u_pos), stacked -- same
                         # per-candidate enumeration MILP does explicitly via
@@ -1007,8 +1088,8 @@ class GraphOrderingSpec:
                         # always small, so this is a handful of extra fk
                         # evaluations, not a real cost.
                         deltas = jnp.stack([
-                            fk(row_v[col:col + dim])[0] - fk(row_u[col:col + dim])[0]
-                            for col, fk in zip(branch_cols, branch_fks)
+                            fk(row_v[col:col + w])[0] - fk(row_u[col:col + w])[0]
+                            for col, w, fk in zip(branch_cols, branch_widths, branch_fks)
                         ])  # (num_agents, workspace_dim)
                         agent = owner_variable[slot]
                         # Hard select, same convention _make_row_resolver's
@@ -1126,7 +1207,8 @@ class GraphOrderingSpec:
         for instance_local, fn, kind, _name in self._python_constraints:
             node, source = self._instance_list[instance_local]
             src_kind, val = source
-            batched = _batch_python_constraint_fn(fn, node, src_kind, val, self.graph.dim, self.n_variables)
+            batched = _batch_python_constraint_fn(
+                fn, node, src_kind, val, self._agent_widths, self._slot_width, self.n_variables)
             (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
         for node_locals, fn, kind, mode, _name in self._symbolic_constraints:
             batched = _batch_symbolic_constraint_fn(fn, node_locals, mode=mode)

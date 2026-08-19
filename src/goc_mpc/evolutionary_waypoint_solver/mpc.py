@@ -182,59 +182,27 @@ class EvolutionaryWaypointSolver:
                 "python constraints before the first solve()/warmup() call")
         self._python_constraints.append((node, fn, kind, name))
 
-    def _agent_depot(self, x0):
-        """Slices `x0` down to the agent-only depot prefix (num_agents*dim)
-        this solver's kernel/routing machinery expects. `x0` may already be
-        exactly that size (e.g. goc-mpc/examples/test_evolutionary_object_
-        constraints.py's direct solver.solve() calls) or may be the full
-        graph.total_dim state -- agents followed by objects -- that
-        GraphOfConstraintsMPC.step() always passes (it asserts x.size ==
-        graph.total_dim before calling waypoint_mpc.solve()/warmup()).
-        Object positions are never a depot concept for this solver: they're
-        determined purely by symbolic node/edge constraints (see spec.py),
-        so any trailing object-state in `x0` is simply not needed here."""
-        graph = self._graph
-        return np.asarray(x0)[: graph.num_agents * graph.dim]
-
-    def _object_depot(self, x0):
-        """Slices `x0` down to the object-state suffix (num_objects *
-        non_robot_dim) when `x0` is the full graph.total_dim vector
-        GraphOfConstraintsMPC.step() passes (agents then objects -- see
-        _agent_depot). Returns None when `x0` is only agent-depot-sized
-        (e.g. a direct low-level solve()/warmup() caller with no object
-        state to give), since there's then no real object state to report."""
-        graph = self._graph
+    def _check_x0(self, x0):
+        """`x0` is always the single full-configuration state vector
+        (graph.total_dim,) -- agent columns then object columns, exactly
+        what GraphOfConstraintsMPC.step() passes and what problem.
+        apply_anchor's wp_eff_live substitution reads as one global joint
+        state. There is no separate agent-only depot convention: a caller
+        with no real object state to report (e.g. a fresh solve before
+        anything's been grasped) zero-fills those columns itself."""
         x0 = np.asarray(x0)
-        agents_width = graph.num_agents * graph.dim
-        objects_width = graph.num_objects * graph.non_robot_dim
-        if objects_width > 0 and x0.size == agents_width + objects_width:
-            return x0[agents_width:agents_width + objects_width]
-        return None
-
-    def _full_x0(self, x0):
-        """Builds the full-configuration runtime x0 (graph.total_dim,) this
-        solver threads through solver.py/problem.py (agent_depot, apply_anchor):
-        the agent depot always, plus the object depot when the caller
-        supplied one (see _object_depot). Zero-filled -- never NaN, to keep
-        the JAX-traced path free of NaNs that could otherwise poison
-        autodiff even through masked-out branches -- for any object column
-        no x0 this solver has ever seen covers (e.g. a direct low-level
-        caller that only ever passes an agent-depot-sized x0, see
-        examples/test_evolutionary_object_constraints.py)."""
         graph = self._graph
-        agents_width = graph.num_agents * graph.dim
-        row = np.zeros(graph.total_dim)
-        row[:agents_width] = self._agent_depot(x0)
-        obj_flat = self._object_depot(x0)
-        if obj_flat is not None:
-            row[agents_width:] = obj_flat
-        return row
+        assert x0.size == graph.total_dim, (
+            f"x0.size ({x0.size}) != graph.total_dim ({graph.total_dim}) -- "
+            "x0 must be the full agent+object configuration vector")
+        return x0
 
-    def _ensure_built(self, x0_flat):
+    def _ensure_built(self, x0):
         if self._spec is not None:
             return
         graph = self._graph
-        x0_per_agent = np.asarray(x0_flat).reshape(graph.num_agents, graph.dim)
+        agents_width = graph.num_agents * graph.dim
+        x0_per_agent = x0[:agents_width].reshape(graph.num_agents, graph.dim)
 
         spec = GraphOrderingSpec.from_graph_of_constraints(
             graph, x0_per_agent, self._wp_bounds,
@@ -297,9 +265,9 @@ class EvolutionaryWaypointSolver:
         population, so this cost is paid once up front instead of on the
         first timed solve() -- which then also starts from a genuinely warm
         population rather than a random one. Returns the compile time."""
-        x0_flat = self._agent_depot(x0)
-        self._ensure_built(x0_flat)
-        x0_arr = jnp.asarray(self._full_x0(x0))
+        x0 = self._check_x0(x0)
+        self._ensure_built(x0)
+        x0_arr = jnp.asarray(x0)
         params_arr = jnp.asarray(self._graph.view_param_values())
         anchor = self._compute_anchor(remaining_vertices)
 
@@ -319,11 +287,11 @@ class EvolutionaryWaypointSolver:
     def solve(self, remaining_vertices, x0) -> bool:
         start = time.perf_counter()
         graph = self._graph
-        x0_flat = self._agent_depot(x0)
+        x0 = self._check_x0(x0)
         was_already_built = self._spec is not None
-        self._ensure_built(x0_flat)
+        self._ensure_built(x0)
         spec, problem, ga_fn = self._spec, self._problem, self._ga_fn
-        x0_arr = jnp.asarray(self._full_x0(x0))
+        x0_arr = jnp.asarray(x0)
         params_arr = jnp.asarray(self._graph.view_param_values())
         remaining_set = set(remaining_vertices)
 
