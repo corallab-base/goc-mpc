@@ -709,7 +709,21 @@ class GraphOrderingSpec:
         # here; statically-fixed instances consume no slot at all (their
         # real agent id is already known, no GA search needed) -- this can
         # legitimately leave n_variables at 0.
-        var_ids = sorted({src[1] for _, src in instance_list if src[0] == "var"})
+        #
+        # Also folds in every assignable hold's var_id (hold.var_id, see
+        # _resolve_holds below) even though a hold contributes no routing
+        # instance of its own (add_assignable_hold's edge carries no node
+        # phi -- see get_agent_paths' HoldOwningAgents, goc-mpc's C++ side,
+        # for the ownership-resolution counterpart of this same gap). In
+        # every current experiment a hold's var_id is ALSO referenced by its
+        # u_node's own Pick-style constraint (e.g. pyrobosim_gymnasium's
+        # _pick_add pins agent_q via the same var_agent_q(var_id)), so this
+        # is redundant there -- but nothing enforces that pairing, and
+        # without it a hold whose variable is referenced nowhere else would
+        # KeyError in _resolve_holds instead of getting a GA slot.
+        var_ids = sorted({src[1] for _, src in instance_list if src[0] == "var"}
+                         | {hold.var_id for hold in self.graph.hold_ops.values()
+                            if hold.var_id is not None})
         var_id_to_slot = {v: i for i, v in enumerate(var_ids)}
         self._var_id_to_slot = var_id_to_slot
         self.n_variables = len(var_ids)
@@ -877,12 +891,7 @@ class GraphOrderingSpec:
         """Auto-derives rigid-carry (translation-only) constraints from the
         graph's canonical hold registry (graph.hold_ops -- add_hold/
         add_assignable_hold) -- the JAX analogue of MILP's Constraint 14a
-        (milp_waypoint_mpc.cpp). Static holds (hold.robot_ag set) only for
-        now: an assignable hold (hold.var_id set) needs the SAME GA-searched
-        agent resolved consistently on BOTH sides of a relational formula,
-        which the generic var_agent_q resolver can't express (it only ever
-        binds side 0 -- see _make_row_resolver's docstring) and would need a
-        bespoke resolver; deferred until that's written.
+        (milp_waypoint_mpc.cpp).
 
         For each held point, enforces that the object's held position moves
         exactly as the holding robot's end-effector (its "ee" link, or
@@ -906,6 +915,27 @@ class GraphOrderingSpec:
         Raises (via default_fk_for) if robot_ag's configuration space is
         articulated and has no registered fk_fn -- there's no default for
         that case, a real fk_fn is required.
+
+        Static holds (hold.robot_ag set) pin `agent_col0`/`fk_fn` to a plain
+        Python int/closure at spec-build time -- robot_ag is already known,
+        no search needed. Assignable holds (hold.var_id set) instead need
+        the SAME GA-searched agent resolved consistently on BOTH row_u and
+        row_v -- which side of a relational formula var_agent_q(var) binds
+        is fixed per placeholder in the generic resolver (_make_row_
+        resolver: "it only ever binds side 0"), so that path can't express
+        this. Handled here instead, mirroring MILP's own resolution
+        (milp_waypoint_mpc.cpp: "For each possible agent k, construct the
+        same residual as static-HoldSpec(robot_ag=k)"): build one static
+        branch per candidate agent k (exactly the static-hold computation
+        above, just not yet selected), stack their (v_pos - u_pos) results,
+        and gather the one at `owner_variable[slot]` via
+        jax.lax.dynamic_index_in_dim -- the same hard-select-then-
+        dynamic-slice convention _make_row_resolver's var_map branch
+        already uses for a single placeholder, just applied to two rows and
+        gathering a precomputed delta instead of a raw column. `slot` comes
+        from `self._var_id_to_slot`, which folds in every hold's var_id
+        even when (as here) nothing else references it -- see
+        _resolve_structure's own comment on that.
 
         Since fk_fn is called directly here rather than substituted through
         the unified symbolic placeholder API (agent_link_pos has no u_/v_
@@ -935,24 +965,62 @@ class GraphOrderingSpec:
         workspace_dim = self.graph.workspace_dim
 
         for hold_id, hold in self.graph.hold_ops.items():
-            if hold.robot_ag is None:
-                continue  # assignable hold -- deferred, see docstring above
-            u, v, robot_ag = hold.u_node, hold.v_node, hold.robot_ag
+            u, v = hold.u_node, hold.v_node
             mode = "live"
-            fk_fn = resolve_link_fk(self.graph, robot_ag)
-            agent_col0 = robot_ag * dim
+
             for oid in hold.held_point_ids:
                 obj_col0 = agents_width + oid * non_robot_dim
 
-                def fn(row_u, row_v, owner_variable, params, fk_fn=fk_fn,
-                       agent_col0=agent_col0, dim=dim, obj_col0=obj_col0,
-                       workspace_dim=workspace_dim):
-                    del owner_variable, params  # robot_ag is static, not GA-searched; no param(id) here
-                    u_pos, _u_rot = fk_fn(row_u[agent_col0:agent_col0 + dim])
-                    v_pos, _v_rot = fk_fn(row_v[agent_col0:agent_col0 + dim])
-                    obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
-                    obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
-                    return (obj_v - obj_u) - (v_pos - u_pos)
+                if hold.robot_ag is not None:
+                    fk_fn = resolve_link_fk(self.graph, hold.robot_ag)
+                    agent_col0 = hold.robot_ag * dim
+
+                    def fn(row_u, row_v, owner_variable, params, fk_fn=fk_fn,
+                           agent_col0=agent_col0, dim=dim, obj_col0=obj_col0,
+                           workspace_dim=workspace_dim):
+                        del owner_variable, params  # robot_ag is static, not GA-searched; no param(id) here
+                        u_pos, _u_rot = fk_fn(row_u[agent_col0:agent_col0 + dim])
+                        v_pos, _v_rot = fk_fn(row_v[agent_col0:agent_col0 + dim])
+                        obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
+                        obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
+                        return (obj_v - obj_u) - (v_pos - u_pos)
+                else:
+                    slot = self._var_id_to_slot[hold.var_id]
+                    # One (agent_col0, fk_fn) pair per candidate agent,
+                    # Python-time (fk_fn may genuinely differ per agent --
+                    # heterogeneous configuration kinds -- so this can't be
+                    # a single traced closure the way agent_col0 alone could
+                    # be); which branch actually applies is resolved at
+                    # trace time below via owner_variable[slot].
+                    branch_cols = [k * dim for k in range(self.graph.num_agents)]
+                    branch_fks = [resolve_link_fk(self.graph, k)
+                                  for k in range(self.graph.num_agents)]
+
+                    def fn(row_u, row_v, owner_variable, params,
+                           branch_cols=branch_cols, branch_fks=branch_fks, slot=slot,
+                           dim=dim, obj_col0=obj_col0, workspace_dim=workspace_dim):
+                        del params  # no param(id) placeholder in this residual
+                        # Every candidate's (v_pos - u_pos), stacked -- same
+                        # per-candidate enumeration MILP does explicitly via
+                        # binary indicators (milp_waypoint_mpc.cpp), here
+                        # just gathered instead of gated. num_agents is
+                        # always small, so this is a handful of extra fk
+                        # evaluations, not a real cost.
+                        deltas = jnp.stack([
+                            fk(row_v[col:col + dim])[0] - fk(row_u[col:col + dim])[0]
+                            for col, fk in zip(branch_cols, branch_fks)
+                        ])  # (num_agents, workspace_dim)
+                        agent = owner_variable[slot]
+                        # Hard select, same convention _make_row_resolver's
+                        # var_map branch uses (argmax + dynamic_slice):
+                        # differentiable w.r.t. wp (row_u/row_v feed the
+                        # stacked deltas), not w.r.t. which agent -- that's
+                        # already true of every other assignable-var
+                        # resolution in this file, not a new tradeoff.
+                        delta = jax.lax.dynamic_index_in_dim(deltas, agent, axis=0, keepdims=False)
+                        obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
+                        obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
+                        return (obj_v - obj_u) - delta
 
                 kind = "eq"
                 name = f"hold_{hold_id}_obj_{oid}"
