@@ -133,7 +133,7 @@ std::pair<double, double> InteractionGiGj(const Eigen::VectorXd& x, const Intera
 // (0 if already satisfied); EQUAL contributes the absolute cross-agent
 // timing mismatch. Used by the merit function below (actual, not
 // predicted, violation at a candidate point) -- mirrors
-// sqp_short_path_mpc.cpp's EvaluateObstacleViolation/
+// graph_short_path_mpc.cpp's EvaluateObstacleViolation/
 // EvaluateAgentPairViolation's own role there.
 double TotalInteractionViolation(const Eigen::VectorXd& x, const ProblemLayout& layout) {
 	double violation = 0.0;
@@ -180,7 +180,7 @@ SqpResult RunTrustRegionSqp(
 
 	// n_smooth: the tau/v decision-vector width alone -- what
 	// AssembleObjective's f/grad/Hessian, and `x` itself, are sized to
-	// throughout this function (matches SqpShortPathMPC's own n_smooth/n
+	// throughout this function (matches GraphShortPathMPC's own n_smooth/n
 	// split). Interaction-row slack columns (see below) are appended after
 	// these, purely a QP-assembly artifact the smooth cost model never
 	// sees.
@@ -197,7 +197,7 @@ SqpResult RunTrustRegionSqp(
 	// reformulation of an equality). Computed once here since it depends
 	// only on `layout.interactions`' TYPES, not the current iterate --
 	// same "row count/shape fixed for the whole call" discipline
-	// sqp_short_path_mpc.cpp's pruning uses.
+	// graph_short_path_mpc.cpp's pruning uses.
 	std::vector<int> slack_offset(m);
 	int n_slack = 0;
 	for (int r = 0; r < m; ++r) {
@@ -378,7 +378,7 @@ SqpResult RunTrustRegionSqp(
 		// the QP optimum (interaction_penalty_weight > 0 drives every
 		// slack to its tight lower bound given the row's RHS), so this is
 		// the model's own prediction of the post-step violation -- same
-		// "predicted reduction" role sqp_short_path_mpc.cpp's
+		// "predicted reduction" role graph_short_path_mpc.cpp's
 		// predicted_violation_reduction plays.
 		const double predicted_violation_reduction = violation_current - predicted_slack_sum;
 		const double predicted_reduction =

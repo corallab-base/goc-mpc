@@ -8,13 +8,9 @@
 #include "obstacle_set.hpp"
 
 // Closed-form "project a workspace point outside an obstacle, by at least
-// its margin" primitive, shared by AdmmShortPathMPC (its ADMM z-update) and
-// SqpShortPathMPC (its fast-path safety-projection final pass) -- pulled out
-// of AdmmShortPathMPC's own anonymous namespace into a header with external
-// linkage so both consumers use one implementation, not two copies that can
-// silently diverge. See project_out's own doc comment for the actual
-// sphere/box math; this file adds no new behavior over what
-// admm_short_path_mpc.cpp already had.
+// its margin" primitive, used by GraphShortPathMPC's fast-path safety-
+// projection final pass. See project_out's own doc comment for the actual
+// sphere/box math.
 
 // One obstacle candidate in workspace-dim coordinates, dimension-agnostic
 // (2 or 3), unified across ObstacleSet's spheres/boxes AND pruned
@@ -83,7 +79,7 @@ inline Eigen::VectorXd project_out(const Eigen::VectorXd& p, const Candidate& c)
 // A trajectory's own bounding sphere in workspace coordinates -- centered
 // on its mean position, radius covering every sample point exactly.
 // Shared by gather_candidates' point-cloud query below and
-// SqpShortPathMPC's distance-based obstacle/inter-agent-pair QP-row
+// GraphShortPathMPC's distance-based obstacle/inter-agent-pair QP-row
 // pruning (sqp_short_path_layout.hpp's PruneObstaclesByDistance/
 // PruneAgentPairsByDistance) -- same "one bounding sphere per agent per
 // solve() call" shape, factored out so both can never silently diverge.

@@ -1,511 +1,717 @@
 #include "graph_short_path_mpc.hpp"
 
+#include <algorithm>
+#include <iostream>
 #include <limits>
+#include <stdexcept>
 
-using Eigen::VectorX;
-using drake::symbolic::Expression;
-using drake::symbolic::Variable;
-using drake::solvers::MathematicalProgramResult;
+#include <qpOASES.hpp>
 
-using namespace pybind11::literals;
-namespace py = pybind11;
+#include "obstacle_projection.hpp"
 
-ShortPathProblem build_short_path_problem(
-	const GraphOfConstraints* graph,
-	const ObstacleSet* obstacles,
-	double obstacle_repulsion_weight,
-	bool use_hard_constraints,
-	const Eigen::MatrixXd& ref_points,
-	const Eigen::MatrixXd& ref_velocities,
-	const Eigen::MatrixXd& initial_guess_points,
-	const Eigen::MatrixXd& initial_guess_velocities,
-	const Eigen::VectorXd& x0,
-	const Eigen::VectorXd& v0,
-	const Eigen::VectorXi& var_assignments,
-	const std::vector<int> remaining_vertices,
-	double tau) {
+using namespace sqp_short_path;
 
-	using namespace drake::solvers;
+namespace {
+using RealMat = Eigen::Matrix<qpOASES::real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using RealVec = Eigen::Matrix<qpOASES::real_t, Eigen::Dynamic, 1>;
+constexpr double kInf = 1.0e19;
+}  // namespace
 
-	const int num_steps = ref_points.rows();
-	const int ambient_dim = ref_points.cols();
-	const int tangent_dim = ref_velocities.cols();
+struct GraphShortPathMPC::QpState {
+	qpOASES::SQProblem qp;
+	int n = 0, m_eff = 0;
+	bool initialized = false;
 
-	// Create program
-	ShortPathProblem problem;
-
-	MatrixXDecisionVariable Xi = problem.prog->NewContinuousVariables(num_steps, ambient_dim, "xi");
-	problem.Xi = Xi;
-
-	MatrixXDecisionVariable V = problem.prog->NewContinuousVariables(num_steps, tangent_dim, "v");
-	problem.V = V;
-
-	// Set initial guess. `initial_guess_points`/`initial_guess_velocities`
-	// are DELIBERATELY separate arguments from `ref_points`/`ref_velocities`
-	// (used below for the tracking costs) -- see GraphShortPathMPC::solve's
-	// own comment: they're the previous cycle's converged solution when one
-	// exists (warm start) and/or, in the obstacle-avoidance path, carry a
-	// small symmetry-breaking nudge away from any obstacle center a
-	// reference point happens to coincide with (a zero-gradient degenerate
-	// point for the constraint below) -- while the tracking costs
-	// themselves must still pull toward the real, un-nudged reference.
-	problem.prog->SetInitialGuess(Xi, initial_guess_points);
-	problem.prog->SetInitialGuess(V, initial_guess_velocities);
-
-	/*
-	 * OBJECTIVE FUNCTION
-	 */
-
-	// 1. Tracking error objective
-	for (int i = 0; i < num_steps; ++i) {
-		VectorX<Expression> diff = Xi.row(i) - ref_points.row(i);
-		Expression dist = diff.squaredNorm();
-		problem.prog->AddQuadraticCost(dist);
+	QpState(int n_, int m_eff_) : qp(n_, m_eff_), n(n_), m_eff(m_eff_) {
+		qp.setPrintLevel(qpOASES::PL_NONE);
 	}
-
-	// 1b. Velocity tracking error objective -- `ref_velocities` was
-	// previously only used for `SetInitialGuess(V, ...)` above, which seeds
-	// the solver's starting point but applies no cost, so nothing in the
-	// objective anchored V to it: the QP was free to drift V arbitrarily
-	// far from what `references` (the timing MPC's own spline) actually
-	// prescribed, constrained only indirectly via the acceleration
-	// objective's coupling to Xi. Diagnosed by comparing `spline.eval(0.1)`
-	// against the state PyRoboGym actually executed under `position_velocity`
-	// mode each cycle (po_goc_mpc.experiments.basic_fmm_experiment): position
-	// matched almost exactly (it has this same tracking cost below), but
-	// velocity was found to inflate ~1.7-1.8x per cycle and compound, since
-	// nothing here penalized it drifting from ref_velocities.
-	for (int i = 0; i < num_steps; ++i) {
-		VectorX<Expression> vdiff = V.row(i) - ref_velocities.row(i);
-		Expression vdist = vdiff.squaredNorm();
-		problem.prog->AddQuadraticCost(vdist);
-	}
-
-	double tau2 = tau * tau;
-	double tau3 = tau * tau2;
-
-	// 2. Scaled acceleration objective
-	for (int i = 0; i < num_steps; ++i) {
-		if (i == 0) {
-			// only take elements for agent positions
-			const Eigen::VectorXd xKm1 = x0.segment(0, ambient_dim);
-			const Eigen::VectorX<Variable> xK = Xi.row(i);
-			const Eigen::VectorXd vKm1 = v0.segment(0, tangent_dim);
-			const Eigen::VectorX<Variable> vK = V.row(i);
-
-			const Eigen::VectorX<Expression> a6_tau = 6.0 / tau2 * (-2.0 * (xK - xKm1) + tau * (vK + vKm1));
-			const Eigen::VectorX<Expression> b2 = 2.0 / tau2 * (3.0 * (xK - xKm1) - tau * (vK + 2.0 * vKm1));
-			const Expression acc_norm = (a6_tau + b2).squaredNorm();
-			problem.prog->AddQuadraticCost(acc_norm);
-		} else {
-			const Eigen::VectorX<Variable> xKm1 = Xi.row(i-1);
-			const Eigen::VectorX<Variable> xK = Xi.row(i);
-			const Eigen::VectorX<Variable> vKm1 = V.row(i-1);
-			const Eigen::VectorX<Variable> vK = V.row(i);
-
-			const Eigen::VectorX<Expression> a6_tau = 6.0 / tau2 * (-2.0 * (xK - xKm1) + tau * (vK + vKm1));
-			const Eigen::VectorX<Expression> b2 = 2.0 / tau2 * (3.0 * (xK - xKm1) - tau * (vK + 2.0 * vKm1));
-			const Expression acc_norm = (a6_tau + b2).squaredNorm();
-			problem.prog->AddQuadraticCost(acc_norm);
-		}
-	}
-
-	// 3. Inter-agent collision cost -- still disabled (non-convex squared-
-	// distance lower bound, can't live in the plain QP path this class
-	// used exclusively before stage 2). Stage 3 (ORCA-style reciprocal
-	// avoidance) will replace this, following the same pattern stage 2 uses
-	// below for environment obstacles: a real inequality constraint, routed
-	// through NloptSolver (NOT IpoptSolver -- see item 4's comment below for
-	// why) instead of the QP-only dispatcher. Left disabled rather than
-	// activated here since it's out of this stage's scope.
-	const int num_agents = graph->num_agents;
-	const int dim = graph->dim;
-	const int workspace_dim_scaffold = graph->workspace_dim;
-	for (int i = 0; i < num_steps; ++i) {
-		for (int ag_i = 0; ag_i < num_agents; ++ag_i) {
-			const Eigen::VectorX<Variable> p_WE_i = Xi.row(i).segment(ag_i * dim, workspace_dim_scaffold);
-			for (int ag_j = ag_i + 1; ag_j < num_agents; ++ag_j) {
-				const Eigen::VectorX<Variable> p_WE_j = Xi.row(i).segment(ag_j * dim, workspace_dim_scaffold);
-
-				const Expression d_ij = (p_WE_j - p_WE_i).squaredNorm();
-
-				// problem.prog->AddQuadraticConstraint(d_ij,
-				// 				     0.0144,
-				// 				     10.0);
-			}
-		}
-	}
-
-	// 4. Environment-obstacle avoidance (stage 2) -- spheres and axis-aligned
-	// boxes, see ObstacleSet's doc comment (obstacle_set.hpp). For every
-	// (step, agent, obstacle): optionally (use_hard_constraints) a hard
-	// inequality constraint keeps the agent outside the shape + margin,
-	// applied at EVERY step in the horizon, not just step 0 -- otherwise the
-	// solver could route straight through the obstacle at an interior step
-	// while leaving the endpoints clear -- plus, always, a soft Lorentzian
-	// repulsion cost (graceful, visible deflection well before the hard
-	// boundary -- reuses the Lorentzian SHAPE validated in an earlier,
-	// since-superseded hand-rolled-gradient-descent prototype).
-	//
-	// use_hard_constraints selects what gets added (both cases route through
-	// NloptSolver/LD_SLSQP -- see GraphShortPathMPC::solve):
-	//   true (default): the hard constraint is non-convex (same shape of
-	//     problem as the disabled inter-agent scaffold above) -- a real
-	//     safety guarantee when it converges, but SLSQP is a local SQP
-	//     method and its QP subproblem can report the whole NLP infeasible
-	//     once several such constraints are simultaneously active
-	//     (confirmed empirically: 35-53% failure rate with 2 agents x 2 box
-	//     obstacles, in both isolated tests and a real multi-robot
-	//     pick-and-place scenario -- not fixable by tuning).
-	//   false: no hard constraint at all, only the smooth repulsion cost --
-	//     SLSQP's QP subproblem then has nothing to report infeasible about
-	//     (there's no explicit inequality to violate), so it reduces to
-	//     ordinary local quasi-Newton minimization of a smooth function --
-	//     structurally can't fail the same way, at the cost of no hard
-	//     safety guarantee (the agent CAN end up inside an obstacle if the
-	//     tracking/acceleration cost pulls hard enough against a bounded
-	//     penalty -- see the penalty's own doc comment below for why it's
-	//     built to grow unboundedly rather than saturate).
-	// NOT IpoptSolver for the true case: a first attempt routed the hard
-	// constraint through IpoptSolver and was EMPIRICALLY ABANDONED -- even
-	// this class's own pre-existing cross-step acceleration-smoothing cost
-	// above (item 2), with NO obstacle constraint involved at all, failed to
-	// converge under Drake's IpoptSolver in this environment (confirmed via
-	// a from-scratch test harness: IPOPT reported zero nonzeros in the
-	// Lagrangian Hessian throughout and stalled regardless of max_iter,
-	// while the identical cost solves instantly through the normal QP
-	// solver).
-	//
-	// Uses workspace_dim (not a hardcoded 3, unlike the disabled
-	// inter-agent block above) to slice each agent's position out of Xi --
-	// see stage 1's plan notes on why hardcoding 3 silently breaks a
-	// workspace_dim=2 planar agent.
-	const int workspace_dim = graph->workspace_dim;
-	for (int i = 0; i < num_steps; ++i) {
-		for (int ag = 0; ag < num_agents; ++ag) {
-			const auto p = Xi.row(i).segment(ag * dim, workspace_dim);
-			for (const Obstacle& obstacle : obstacles->obstacles()) {
-				const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
-				// p is a ROW (Xi.row(i).segment(...)); center is a COLUMN
-				// (Eigen::VectorXd) -- .transpose() p first. Getting this
-				// wrong doesn't fail loudly: in a RelWithDebInfo build with
-				// Eigen assertions compiled out, a row-minus-column shape
-				// mismatch silently produces a garbage/truncated
-				// expression instead of throwing (confirmed: without this
-				// transpose, the resulting constraint printed as just
-				// `pow(xi(0,0), 2)` -- the y/z terms had vanished).
-				const Eigen::VectorX<Expression> diff = p.transpose() - center;
-
-				if (obstacle.kind == ObstacleKind::kSphere) {
-					const double R = obstacle.params(workspace_dim) + obstacle.margin;
-					const double R2 = R * R;
-					const Expression d2 = diff.squaredNorm();
-
-					if (use_hard_constraints) {
-						problem.prog->AddConstraint(d2, R2, std::numeric_limits<double>::infinity());
-					}
-					problem.prog->AddCost(obstacle_repulsion_weight * R2 / (d2 + R2));
-				} else if (obstacle.kind == ObstacleKind::kBox) {
-					// Signed distance to an axis-aligned box (negative
-					// inside, per-axis excess distance outside), the
-					// standard box-SDF construction: q = |diff| - half_extents;
-					// sdf = ||max(q, 0)|| + min(max(q), 0). AddConstraint on
-					// the exact sdf (not a squared surrogate, unlike the
-					// sphere case above) since the squared-distance-to-surface
-					// formula alone is 0 both ON the surface AND anywhere
-					// INSIDE the box, and can't tell those apart -- sdf can.
-					const Eigen::VectorXd half_extents = obstacle.params.segment(workspace_dim, workspace_dim);
-					const double margin = obstacle.margin;
-
-					Expression outside_sq = 0.0;
-					Expression max_q;
-					for (int k = 0; k < workspace_dim; ++k) {
-						const Expression q_k = drake::symbolic::abs(diff(k)) - half_extents(k);
-						const Expression clamped = drake::symbolic::max(q_k, 0.0);
-						outside_sq += clamped * clamped;
-						max_q = (k == 0) ? q_k : drake::symbolic::max(max_q, q_k);
-					}
-					// sqrt(outside_sq) alone has an INFINITE gradient at
-					// outside_sq == 0 -- which is the box's entire interior,
-					// not just its boundary (d/dx[sqrt(u)] = 1/(2*sqrt(u)) ->
-					// infinity as u -> 0). Any point inside the box during
-					// optimization hits that singularity, corrupting autodiff
-					// and throwing (confirmed empirically: NLopt/LD_MMA raised
-					// SolverSpecificError as soon as the soft cost below was
-					// changed to depend on `sdf` instead of `outside_sq`
-					// alone). A tiny smoothing epsilon inside the sqrt fixes
-					// the gradient everywhere at a negligible (~1e-4) bias to
-					// sdf's value.
-					const double kSqrtEps2 = 1.0e-8;
-					const Expression sdf =
-						drake::symbolic::sqrt(outside_sq + kSqrtEps2) + drake::symbolic::min(max_q, 0.0);
-
-					if (use_hard_constraints) {
-						problem.prog->AddConstraint(sdf, margin, std::numeric_limits<double>::infinity());
-					}
-					// Soft repulsion cost: a squared-hinge PENALTY on
-					// `margin - sdf` (same shape already used for this
-					// project's other soft inequality constraints), not a
-					// barrier and not the bounded Lorentzian/sigmoid bump
-					// tried earlier. Two failure modes it avoids:
-					//   - A bump built from `outside_sq` alone is flat (zero
-					//     gradient) throughout the box's entire interior --
-					//     `outside_sq` only measures excess distance outside
-					//     each face, so it's identically 0 anywhere inside.
-					//     Confirmed empirically: with use_hard_constraints=
-					//     false (no hard boundary to stop tunneling), a path
-					//     pulled inside the box by the tracking cost stayed
-					//     there regardless of weight, up to 40x the default.
-					//   - A true barrier (e.g. 1/(sdf-margin)) is only valid
-					//     in the strictly-feasible region and requires a
-					//     solver that guarantees the iterate never crosses
-					//     it (that guarantee is exactly what dropping the
-					//     hard constraint gives up) -- cross to the
-					//     infeasible side and it flips sign, rewarding
-					//     further penetration instead of resisting it.
-					// The hinge penalty is 0 (no gradient) whenever
-					// sdf >= margin -- doesn't fight the tracking cost when
-					// there's nothing to avoid -- and grows quadratically
-					// (gradient growing linearly) in penetration depth once
-					// sdf < margin, including arbitrarily deep inside, with
-					// no saturation ceiling: unlike a bounded bump, a deep
-					// enough violation eventually outweighs any finite
-					// spring stiffness from the acceleration cost (item 2
-					// above, whose effective stiffness scales as ~1/tau^4).
-					// Continuous first derivative at sdf == margin (the
-					// hinge's kink itself is smooth: d/dx[max(x,0)^2] -> 0 as
-					// x -> 0 from either side), so no new numerical kink at
-					// the boundary.
-					const Expression violation = drake::symbolic::max(margin - sdf, 0.0);
-					problem.prog->AddCost(obstacle_repulsion_weight * violation * violation);
-				}
-			}
-		}
-	}
-	if (!obstacles->obstacles().empty()) {
-		// Xi/V otherwise have NO other bounds anywhere in this problem --
-		// harmless extra insurance for the NLP solver's numerics; doesn't
-		// change the feasible region for any realistic trajectory.
-		const double kGenericBound = 1.0e3;
-		problem.prog->AddBoundingBoxConstraint(
-			Eigen::MatrixXd::Constant(num_steps, ambient_dim, -kGenericBound),
-			Eigen::MatrixXd::Constant(num_steps, ambient_dim, kGenericBound),
-			Xi);
-		problem.prog->AddBoundingBoxConstraint(
-			Eigen::MatrixXd::Constant(num_steps, tangent_dim, -kGenericBound),
-			Eigen::MatrixXd::Constant(num_steps, tangent_dim, kGenericBound),
-			V);
-	}
-
-
-	// TODO: Add path constraint
-	// for (const auto& [edge_phi_id, edge_op] : graph->get_next_edge_ops(remaining_vertices)) {
-	// 	edge_op.short_path_builder(*(problem.prog), edge_phi_id, var_assignments, Xi);
-	// }
-
-	return std::move(problem);
-}
-
-
-/*
- * Short Path MPC
- */
+};
 
 GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
-				     unsigned int num_steps,
-				     unsigned int num_agents,
-				     unsigned int dim,
-				     double time_per_step,
-				     const ObstacleSet& obstacles,
-				     double obstacle_repulsion_weight,
-				     bool use_hard_constraints)
+				  unsigned int num_steps,
+				  unsigned int num_agents,
+				  unsigned int dim,
+				  double time_per_step,
+				  const ObstacleSet& obstacles,
+				  Eigen::VectorXd agent_radii,
+				  double tracking_weight,
+				  double velocity_tracking_weight,
+				  double acceleration_weight,
+				  double penalty_weight,
+				  int max_iterations,
+				  double initial_trust_radius,
+				  double max_trust_radius,
+				  double min_trust_radius,
+				  double grad_tol,
+				  double constraint_prune_margin)
 	: _graph(&graph),
 	  _num_steps(num_steps),
 	  _num_agents(num_agents),
 	  _dim(dim),
 	  _time_per_step(time_per_step),
 	  _obstacles(&obstacles),
-	  _obstacle_repulsion_weight(obstacle_repulsion_weight),
-	  _use_hard_constraints(use_hard_constraints) {
+	  _agent_radii(agent_radii.size() == 0 ? Eigen::VectorXd::Zero(num_agents) : std::move(agent_radii)),
+	  _smooth_cost_weights{tracking_weight, velocity_tracking_weight, acceleration_weight},
+	  _penalty_weight(penalty_weight),
+	  _max_iterations(max_iterations),
+	  _initial_trust_radius(initial_trust_radius),
+	  _max_trust_radius(max_trust_radius),
+	  _min_trust_radius(min_trust_radius),
+	  _grad_tol(grad_tol),
+	  _constraint_prune_margin(constraint_prune_margin) {
 
-        /* short path times */
-	// Xi.row(i) is offset by one tau from x0/v0's own time -- the
-	// acceleration cost's i==0 branch already treats Xi.row(0) as the
-	// state ONE tau after x0 (x0/v0 stand in as "xKm1"/"vKm1" for it).
-	// _times must agree, so ref_points/ref_velocities (used by the
-	// tracking cost) are sampled at the SAME offset times -- otherwise
-	// the tracking cost pulls Xi.row(0) toward the reference at t=0
-	// (which fill_cubic_splines sets to literally BE x0) while the
-	// acceleration cost simultaneously treats it as t=tau, fighting each
-	// other at every step 0 of every cycle.
-	_times = Eigen::VectorXd(_num_steps);
-	for (int i = 0; i < _num_steps; ++i) {
-		_times(i) = (i + 1) * _time_per_step;
+	if (_agent_radii.size() != static_cast<int>(num_agents)) {
+		throw std::runtime_error(
+			"GraphShortPathMPC: agent_radii must be empty (defaults every agent to "
+			"radius 0) or have exactly num_agents entries.");
 	}
 
-	/* short path points */
-	_points = Eigen::MatrixXd(_num_steps, _dim);
-	for (int i = 0; i < _num_steps; ++i) {
-		for (int j = 0; j < _dim; ++j) {
-			_points(i, j) = 0.0;
+	_agent_shapes = BuildAgentShapes(graph, static_cast<int>(num_agents));
+	_ambient_dim = _agent_shapes.empty() ? 0 : static_cast<unsigned int>(_agent_shapes[0].ambient_dim());
+	for (unsigned int ag = 0; ag < num_agents; ++ag) {
+		// `dim` is what every caller's TANGENT-space arrays (v0/vels) slice
+		// agent columns with; `_ambient_dim` (derived just above, from
+		// agent 0, required uniform across agents -- a simplifying
+		// assumption) is what AMBIENT arrays (x0/points/ref_points) slice with.
+		// If either doesn't match this agent's own actual width, every
+		// later `.segment(ag*dim, dim)`/`.segment(ag*_ambient_dim,
+		// _ambient_dim)` in this file reads the wrong columns (a silent
+		// corruption, not a crash: this project's RelWithDebInfo build
+		// compiles out eigen_assert, see feedback_eigen_row_col_no_assert
+		// in project memory), so this is checked loudly here instead.
+		if (_agent_shapes[ag].tangent_dim() != static_cast<int>(dim)) {
+			throw std::runtime_error(
+				"GraphShortPathMPC: agent " + std::to_string(ag) + "'s tangent "
+				"width doesn't match `dim` -- indicates a real spec/dim "
+				"mismatch, not just a scope gap.");
+		}
+		if (_agent_shapes[ag].ambient_dim() != static_cast<int>(_ambient_dim)) {
+			throw std::runtime_error(
+				"GraphShortPathMPC: agent " + std::to_string(ag) + "'s ambient "
+				"width doesn't match agent 0's -- every agent must share the "
+				"same ambient width.");
 		}
 	}
+	_axes = BuildAxisList(_agent_shapes);
+	_agent_axis_offsets = BuildAgentAxisOffsets(_agent_shapes);
+	_smooth_hessian_normal = AssembleSmoothHessian(_agent_shapes, _agent_axis_offsets,
+							static_cast<int>(num_steps), time_per_step,
+							_smooth_cost_weights);
 
-	/* short path vels */
-	_vels = Eigen::MatrixXd(_num_steps, _dim);
-	for (int i = 0; i < _num_steps; ++i) {
-		for (int j = 0; j < _dim; ++j) {
-			_vels(i, j) = 0.0;
+	// Xi.row(i) is offset by one tau from x0/v0's own time: Xi.row(0) is
+	// treated as the state ONE tau after x0/v0 by the acceleration term
+	// throughout this file, so the tracking reference must be sampled at
+	// the same offset.
+	_times = Eigen::VectorXd(_num_steps);
+	for (unsigned int i = 0; i < _num_steps; ++i) {
+		_times(i) = (i + 1) * _time_per_step;
+	}
+	_points = Eigen::MatrixXd::Zero(_num_steps, _num_agents * _ambient_dim);
+	_vels = Eigen::MatrixXd::Zero(_num_steps, _num_agents * _dim);
+}
+
+GraphShortPathMPC::~GraphShortPathMPC() = default;
+GraphShortPathMPC::GraphShortPathMPC(GraphShortPathMPC&&) noexcept = default;
+GraphShortPathMPC& GraphShortPathMPC::operator=(GraphShortPathMPC&&) noexcept = default;
+
+namespace {
+
+// Retracts every agent's every step by the smooth-cost step vector
+// `dx_smooth` (length axes.size()*2*num_steps, same convention as
+// sqp_short_path::IdxP/IdxV) -- positions via each agent's own
+// CubicConfigurationSpline::Retract (R: plain add, Torus: wrap_pi(x+d)),
+// velocities via plain addition (they live in a flat tangent space
+// already, no manifold to respect).
+void ApplyStep(const std::vector<CubicConfigurationSpline>& agent_shapes,
+		const std::vector<int>& agent_axis_offsets, int num_steps, int dim, int ambient_dim,
+		const Eigen::MatrixXd& points, const Eigen::MatrixXd& vels,
+		const Eigen::VectorXd& dx_smooth,
+		Eigen::MatrixXd* new_points, Eigen::MatrixXd* new_vels) {
+	*new_points = points;
+	*new_vels = vels;
+	for (int ag = 0; ag < static_cast<int>(agent_shapes.size()); ++ag) {
+		const int off = agent_axis_offsets[ag];
+		for (int i = 0; i < num_steps; ++i) {
+			Eigen::VectorXd dp(dim), dv(dim);
+			for (int k = 0; k < dim; ++k) {
+				dp(k) = dx_smooth(IdxP(off + k, i, num_steps));
+				dv(k) = dx_smooth(IdxV(off + k, i, num_steps));
+			}
+			const Eigen::VectorXd p_old = points.row(i).segment(ag * ambient_dim, ambient_dim).transpose();
+			const Eigen::VectorXd p_new = agent_shapes[ag].Retract<double>(p_old, dp);
+			new_points->row(i).segment(ag * ambient_dim, ambient_dim) = p_new.transpose();
+			new_vels->row(i).segment(ag * dim, dim) += dv.transpose();
 		}
 	}
 }
 
-bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
-			      const Eigen::VectorXd& v0,
-			      const Eigen::VectorXi& var_assignments,
-			      const std::vector<int>& remaining_vertices,
-			      const std::vector<CubicConfigurationSpline>& references) {
-
-	_timer.Start();
-
-	int a_dim = references.at(0).ambient_dim();
-	int t_dim = references.at(0).tangent_dim();
-
-	Eigen::MatrixXd ref_points(_num_steps, _num_agents * a_dim);
-	Eigen::MatrixXd ref_velocities(_num_steps, _num_agents * t_dim);
-
-	for (int ag = 0; ag < _num_agents; ++ag) {
-		const auto& [q_ag, qdot_ag] = references[ag].eval_multiple(_times);
-		ref_points.block(0, ag * a_dim, _num_steps, a_dim) = q_ag;
-		ref_velocities.block(0, ag * t_dim, _num_steps, t_dim) = qdot_ag;
+double TotalSmoothCost(const std::vector<CubicConfigurationSpline>& agent_shapes, int num_steps, double tau,
+			const SmoothCostWeights& weights,
+			int dim, int ambient_dim, const Eigen::VectorXd& x0, const Eigen::VectorXd& v0,
+			const Eigen::MatrixXd& points, const Eigen::MatrixXd& vels,
+			const Eigen::MatrixXd& ref_points, const Eigen::MatrixXd& ref_velocities) {
+	double f = 0.0;
+	for (int ag = 0; ag < static_cast<int>(agent_shapes.size()); ++ag) {
+		f += EvaluateSmoothCost(
+			agent_shapes[ag], num_steps, tau, weights,
+			x0.segment(ag * ambient_dim, ambient_dim), v0.segment(ag * dim, dim),
+			points.block(0, ag * ambient_dim, num_steps, ambient_dim),
+			vels.block(0, ag * dim, num_steps, dim),
+			ref_points.block(0, ag * ambient_dim, num_steps, ambient_dim),
+			ref_velocities.block(0, ag * dim, num_steps, dim));
 	}
-	// Initial guess for the solver -- distinct from `ref_points`/
-	// `ref_velocities` (used for the tracking costs, see
-	// build_short_path_problem). Fast path (empty obstacles): identical to
-	// ref_points/ref_velocities, exactly as before stage 2 -- byte-identical
-	// default behavior. Obstacle path: warm-start from the PREVIOUS cycle's
-	// converged trajectory (`_points`/`_vels`) when its shape matches
-	// (steady-state cycles then need very little solver work, since
-	// consecutive ~50ms cycles -- or, in an interactive demo, consecutive
-	// drag events -- rarely change much), falling back to ref_points/
-	// ref_velocities on the first cycle or after a shape change. Then
-	// symmetry-break (positions only): if any per-agent-per-step guess point is CLOSE to a
-	// registered sphere's center (not just exactly coincident -- the
-	// constraint's gradient there, 2*(p-center), is small in proportion to
-	// how close p is to center, and empirically even a near-degenerate
-	// (not just exactly zero) starting gradient reliably turned a fast,
-	// correct solve into an immediate solver error: confirmed via a real
-	// end-to-end GraphOfConstraintsMPC.step() reference spline that placed
-	// a point just ~0.001 away from an R=0.2 sphere's center -- far outside
-	// a naive exact-equality check, but still degenerate enough to break
-	// NLopt/SLSQP) -- nudge it off-axis whenever it's within a proportional
-	// fraction of the sphere's own radius, mirroring the small perturbation
-	// technique already used for exactly this failure mode in this
-	// project's own history.
-	Eigen::MatrixXd initial_guess_points = ref_points;
-	Eigen::MatrixXd initial_guess_velocities = ref_velocities;
-	if (!_obstacles->obstacles().empty()) {
-		if (_has_solved && _points.rows() == static_cast<int>(_num_steps) && _points.cols() == ref_points.cols()) {
-			initial_guess_points = _points;
+	return f;
+}
+
+// project_out's own "needs projecting" test (box: inside the
+// margin-expanded axis-aligned box; sphere: within radius+margin) --
+// duplicated here (not exposed by obstacle_projection.hpp) so
+// EscapeAlongAxis below can check "did this actually clear the obstacle"
+// with the exact same feasibility definition project_out itself uses.
+bool IsInsideCandidate(const Eigen::VectorXd& p, const Candidate& c) {
+	if (c.is_box) {
+		const Eigen::VectorXd he = c.half_extents.array() + c.margin;
+		return (p.array() >= (c.center - he).array()).all() &&
+		       (p.array() <= (c.center + he).array()).all();
+	}
+	return (p - c.center).norm() < c.radius + c.margin;
+}
+
+// Last-resort escape for a point the alternating-projection rounds below
+// leave oscillating between two (or more) candidates -- confirmed via a
+// from-scratch reproduction (not a project_out bug) that this genuinely
+// happens: two candidates whose "least-penetrated axis" (project_out's own
+// per-candidate escape direction) is the SAME axis but in OPPOSITE signs
+// walk a point back and forth between them forever, since project_out only
+// ever looks at ONE candidate at a time. This tries every world axis/sign
+// directly (not just each candidate's own preferred axis), computing the
+// minimum push along that one axis that clears EVERY candidate
+// simultaneously (valid because clearing a box/sphere via a single
+// coordinate moving far enough past its projected extent is always
+// sufficient, never just necessary -- see the per-candidate `required`
+// derivation below), and takes whichever axis/sign needs the smallest such
+// push. Runs ONLY on points still violated after the standard rounds, so
+// it's zero-cost in the common (already-feasible) case.
+Eigen::VectorXd EscapeAlongAxis(const Eigen::VectorXd& p, const std::vector<Candidate>& candidates,
+				 int workspace_dim) {
+	double best_delta = std::numeric_limits<double>::infinity();
+	int best_axis = -1;
+	double best_sign = 1.0;
+	for (int k = 0; k < workspace_dim; ++k) {
+		for (double sign : {1.0, -1.0}) {
+			double delta = 0.0;
+			for (const Candidate& c : candidates) {
+				const double extent = c.is_box ? (c.half_extents(k) + c.margin) : (c.radius + c.margin);
+				const double target_k = c.center(k) + sign * extent;
+				delta = std::max(delta, std::max(0.0, sign * (target_k - p(k))));
+			}
+			if (delta < best_delta) {
+				best_delta = delta;
+				best_axis = k;
+				best_sign = sign;
+			}
 		}
-		if (_has_solved && _vels.rows() == static_cast<int>(_num_steps) && _vels.cols() == ref_velocities.cols()) {
-			initial_guess_velocities = _vels;
+	}
+	Eigen::VectorXd result = p;
+	if (best_axis >= 0) {
+		result(best_axis) += best_sign * best_delta;
+	}
+	return result;
+}
+
+// Final hard-feasibility safety net, using obstacle_projection.hpp's
+// closed-form projection -- guarantees the RETURNED trajectory clears every
+// registered obstacle regardless of whether the SQP loop above fully
+// converged within `max_iterations` (design decision 7 in the project
+// plan). This is the actual feasibility guarantee; the SQP loop's job is
+// only to make this pass's corrections small. A single sweep isn't
+// enough once obstacles are close enough to interact (confirmed
+// empirically by stress testing), hence several repeated sweeps
+// (Dykstra-style alternating
+// projection) followed by EscapeAlongAxis for anything that's STILL
+// violated (the two-obstacle oscillation case above -- confirmed to
+// actually occur via a real stress-test trial, not just a theoretical
+// worry). Fast-path-only, like everything below -- see
+// ApplyAgentPairSafetyProjection's own comment for why, and for the
+// intended future toggle once that stops being universally true.
+// Closed-form-ish projection of `p` outside an AgentSdfGrid's own feasible
+// region (`value >= 0`, i.e. already past `grid.margin`'s clearance) --
+// mirrors project_out's role for sphere/box candidates, but there's no
+// literal closed form for an arbitrary field, so this takes ONE Newton-style
+// step along the (already unit-normalized-by-construction, see
+// QueryAgentSdfGrid) ascending-value direction: `p + (-value) * grad_hat`,
+// same "push exactly to the zero-level-set along the local gradient" idea
+// SphereSdf's own closed-form projection reduces to near a sphere. Not
+// exact for a genuinely curved field in one step (unlike a sphere), which
+// is why this runs inside the SAME repeated-rounds loop as the sphere/box
+// candidates below, not just once.
+Eigen::VectorXd ProjectOutOfGrid(const Eigen::VectorXd& p, const AgentSdfGrid& grid, int workspace_dim) {
+	const sqp_short_path::SdfSample sdf = sqp_short_path::QueryAgentSdfGrid(grid, p, workspace_dim);
+	if (sdf.value >= 0.0) {
+		return p;
+	}
+	const double norm = sdf.grad.norm();
+	if (norm < 1.0e-9) {
+		// Degenerate (flat/zero gradient, e.g. deep inside a saturated
+		// region) -- same arbitrary-fixed-axis fallback as project_out's
+		// own degenerate case.
+		Eigen::VectorXd dir = Eigen::VectorXd::Zero(workspace_dim);
+		dir(0) = 1.0;
+		return p - sdf.value * dir;
+	}
+	return p - sdf.value * (sdf.grad / norm);
+}
+
+void ApplySafetyProjection(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
+			    const ObstacleSet& obstacles, Eigen::MatrixXd* points) {
+	constexpr int kSafetyPassRounds = 10;
+	for (int ag = 0; ag < num_agents; ++ag) {
+		const AgentSdfGrid* grid = obstacles.agent_sdf_grid(ag);
+		const Eigen::MatrixXd agent_workspace_traj =
+			points->block(0, ag * ambient_dim, num_steps, workspace_dim);
+		const std::vector<Candidate> candidates =
+			gather_candidates(obstacles, agent_workspace_traj, workspace_dim, /*query_margin=*/1.0);
+		if (candidates.empty() && !grid) continue;
+		for (int round = 0; round < kSafetyPassRounds; ++round) {
+			for (int i = 0; i < num_steps; ++i) {
+				Eigen::VectorXd p = points->row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+				for (const Candidate& c : candidates) {
+					p = project_out(p, c);
+				}
+				if (grid) {
+					p = ProjectOutOfGrid(p, *grid, workspace_dim);
+				}
+				points->row(i).segment(ag * ambient_dim, workspace_dim) = p.transpose();
+			}
 		}
-		const int workspace_dim = _graph->workspace_dim;
-		for (int i = 0; i < static_cast<int>(_num_steps); ++i) {
-			for (int ag = 0; ag < static_cast<int>(_num_agents); ++ag) {
-				auto p = initial_guess_points.row(i).segment(ag * _dim, workspace_dim);
-				for (const Obstacle& obstacle : _obstacles->obstacles()) {
-					const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
-					if (obstacle.kind == ObstacleKind::kSphere) {
-						const double R = obstacle.params(workspace_dim) + obstacle.margin;
-						const double kNudgeThreshold = std::max(0.05 * R, 1.0e-3);
-						if ((p.transpose() - center).norm() < kNudgeThreshold) {
-							p(0) += kNudgeThreshold;
-						}
-					} else if (obstacle.kind == ObstacleKind::kBox) {
-						// Same failure mode as the sphere case (near-zero
-						// constraint gradient breaks NLopt/SLSQP), but the
-						// degenerate region is the box's WHOLE interior, not
-						// a single point -- several consecutive reference
-						// steps can land inside at once (confirmed: a 0.1s
-						// step spacing against a 0.2-wide box put 3 of 10
-						// reference points inside it simultaneously). A tiny
-						// epsilon nudge isn't enough to clear that for all
-						// of them; push all the way past the box's x extent
-						// + margin instead.
-						const Eigen::VectorXd half_extents = obstacle.params.segment(workspace_dim, workspace_dim);
-						const double margin = obstacle.margin;
-						const double kNudgeThreshold = std::max(0.05 * half_extents.minCoeff(), 1.0e-3);
-						const Eigen::VectorXd q = (p.transpose() - center).cwiseAbs() - half_extents;
-						const double outside_dist = q.cwiseMax(0.0).norm();
-						if (outside_dist < kNudgeThreshold) {
-							p(0) = center(0) + half_extents(0) + margin + kNudgeThreshold;
-						}
+		for (int i = 0; i < num_steps; ++i) {
+			Eigen::VectorXd p = points->row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+			bool any_violated = false;
+			for (const Candidate& c : candidates) any_violated |= IsInsideCandidate(p, c);
+			if (any_violated) {
+				points->row(i).segment(ag * ambient_dim, workspace_dim) =
+					EscapeAlongAxis(p, candidates, workspace_dim).transpose();
+			}
+			// Grid violations left after the rounds above aren't covered
+			// by EscapeAlongAxis (built for closed-form box/sphere
+			// per-axis extents, no equivalent for an arbitrary field --
+			// see this function's own header comment) -- a few more
+			// direct grid-only pushes instead, cheap and a no-op in the
+			// common (already-feasible) case.
+			if (grid) {
+				Eigen::VectorXd pg = points->row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+				for (int extra = 0; extra < kSafetyPassRounds &&
+					     sqp_short_path::QueryAgentSdfGrid(*grid, pg, workspace_dim).value < 0.0;
+				     ++extra) {
+					pg = ProjectOutOfGrid(pg, *grid, workspace_dim);
+				}
+				points->row(i).segment(ag * ambient_dim, workspace_dim) = pg.transpose();
+			}
+		}
+	}
+}
+
+// Final hard-feasibility safety net for INTER-AGENT separation, mirroring
+// ApplySafetyProjection above but BILATERAL: a violated pair is pushed
+// apart symmetrically (each agent moves half the required separation)
+// rather than one point being projected against a fixed obstacle. Same
+// repeated-rounds rationale (a single sweep isn't enough once several
+// pairs interact at once -- see ApplySafetyProjection's own comment).
+//
+// Fast-path-only, same as ApplySafetyProjection: both write directly into
+// ambient position columns, which is only valid while fk(q)=q[:workspace_
+// dim]. Neither is gated on that today because every agent IS fast-path
+// today -- there's nothing yet to gate against. Once a general (non-
+// selection) fk exists for some agent (out of scope for this solver, see
+// the project plan), this closed-form projection has no equivalent for
+// that agent (no closed form for "solve fk(q)=target_point", an IK
+// problem) -- calling it would be wrong, not just imprecise. The intended
+// fix at that point is a per-agent "is this agent's fk trivial" check
+// (which the constraint-linearization code will ALSO need by then, to
+// decide whether to chain through a real Jacobian -- see that discussion
+// in the project plan) gating which agents these two passes touch, rather
+// than a separate flag a caller has to keep in sync with which agents
+// have a registered FK.
+void ApplyAgentPairSafetyProjection(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
+				     const Eigen::VectorXd& agent_radii, Eigen::MatrixXd* points) {
+	if (num_agents < 2) {
+		return;
+	}
+	constexpr int kSafetyPassRounds = 10;
+	for (int round = 0; round < kSafetyPassRounds; ++round) {
+		for (int i = 0; i < num_steps; ++i) {
+			for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
+				for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
+					Eigen::VectorXd p_a = points->row(i).segment(ag_a * ambient_dim, workspace_dim).transpose();
+					Eigen::VectorXd p_b = points->row(i).segment(ag_b * ambient_dim, workspace_dim).transpose();
+					const double R = agent_radii(ag_a) + agent_radii(ag_b);
+					const Eigen::VectorXd diff = p_b - p_a;
+					const double d = diff.norm();
+					if (d >= R) {
+						continue;
 					}
+					Eigen::VectorXd dir;
+					if (d < 1.0e-9) {
+						dir = Eigen::VectorXd::Zero(workspace_dim);
+						dir(0) = 1.0;
+					} else {
+						dir = diff / d;
+					}
+					const double push = 0.5 * (R - d);
+					p_a -= push * dir;
+					p_b += push * dir;
+					points->row(i).segment(ag_a * ambient_dim, workspace_dim) = p_a.transpose();
+					points->row(i).segment(ag_b * ambient_dim, workspace_dim) = p_b.transpose();
 				}
 			}
 		}
 	}
+}
 
-	std::unique_ptr<ShortPathProblem> problem;
-	try {
-		problem = std::make_unique<ShortPathProblem>(
-			build_short_path_problem(_graph,
-						 _obstacles,
-						 _obstacle_repulsion_weight,
-						 _use_hard_constraints,
-						 ref_points,
-						 ref_velocities,
-						 initial_guess_points,
-						 initial_guess_velocities,
-						 x0, v0,
-						 var_assignments,
-						 remaining_vertices,
-						 _time_per_step));
-	} catch (const std::exception& e) {
-		std::cout << "Caught exception in short path problem construction" << std::endl;
-		return false;
+struct SqpResult {
+	Eigen::MatrixXd points, vels;
+	int iterations = 0;
+	double trust_radius = 0.0;
+};
+
+SqpResult RunTrustRegionSqp(
+		const std::vector<CubicConfigurationSpline>& agent_shapes,
+		const std::vector<AxisLayout>& axes,
+		const std::vector<int>& agent_axis_offsets,
+		const Eigen::MatrixXd& smooth_hessian_normal,
+		const SmoothCostWeights& smooth_cost_weights,
+		int num_steps, int num_agents, int dim, int ambient_dim, int workspace_dim, double tau,
+		const Eigen::VectorXd& x0, const Eigen::VectorXd& v0,
+		const Eigen::MatrixXd& ref_points, const Eigen::MatrixXd& ref_velocities,
+		const ObstacleSet& obstacles,
+		const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles,
+		const std::vector<std::pair<int, int>>& active_pairs,
+		const std::vector<const AgentSdfGrid*>& active_grids,
+		const Eigen::VectorXd& agent_radii,
+		double penalty_weight, int max_iterations,
+		double initial_trust_radius, double max_trust_radius, double min_trust_radius, double grad_tol,
+		Eigen::MatrixXd points, Eigen::MatrixXd vels,
+		std::unique_ptr<GraphShortPathMPC::QpState>* qp_state) {
+
+	const int per_axis = 2 * num_steps;
+	const int n_smooth = static_cast<int>(axes.size()) * per_axis;
+	// Fixed for the whole solve() call (design decision 6): row COUNT
+	// never changes mid-call, only each row's coefficients/value do
+	// (re-linearized every outer iteration) -- so qpOASES::SQProblem can
+	// be reused (init once, hotstart thereafter) across every outer
+	// iteration, and across MPC cycles at a stable size. `m` now counts
+	// only the SURVIVING (distance-pruned, see PruneObstaclesByDistance/
+	// PruneAgentPairsByDistance) obstacle/pair rows -- pruning happens
+	// once, before this function runs (GraphShortPathMPC::solve()), same
+	// "computed once per solve() call" discipline as everything else this
+	// comment already covers.
+	int obstacle_rows = 0;
+	for (const auto& v : per_agent_obstacles) obstacle_rows += static_cast<int>(v.size());
+	const int grid_rows = static_cast<int>(std::count_if(
+		active_grids.begin(), active_grids.end(), [](const AgentSdfGrid* g) { return g != nullptr; }));
+	const int m = num_steps * (obstacle_rows + static_cast<int>(active_pairs.size()) + grid_rows);
+	const int m_eff = std::max(m, 1);
+	const int n = n_smooth + m_eff;
+
+	if (!*qp_state || (*qp_state)->n != n || (*qp_state)->m_eff != m_eff) {
+		*qp_state = std::make_unique<GraphShortPathMPC::QpState>(n, m_eff);
 	}
+	qpOASES::SQProblem& qp = (*qp_state)->qp;
 
+	double f_current = TotalSmoothCost(agent_shapes, num_steps, tau, smooth_cost_weights, dim, ambient_dim,
+					    x0, v0, points, vels, ref_points, ref_velocities);
+	double violation_current =
+		EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, points, per_agent_obstacles) +
+		EvaluateAgentPairViolation(num_steps, ambient_dim, workspace_dim, points, agent_radii, active_pairs) +
+		EvaluateAgentSdfGridViolation(num_steps, num_agents, ambient_dim, workspace_dim, points, active_grids);
+	double phi_current = f_current + penalty_weight * violation_current;
 
+	double trust_radius = initial_trust_radius;
+	int iter = 0;
 
-	// Solve. Fast path (unchanged from before stage 2): no obstacles
-	// registered means no non-convex constraint was added, so the original
-	// QP-only dispatcher is byte-identical to today's behavior. Otherwise
-	// route through NloptSolver/LD_SLSQP regardless of _use_hard_constraints
-	// -- SLSQP's documented failure mode (see build_short_path_problem's own
-	// comment) comes specifically from the HARD inequality constraints
-	// (multiple simultaneously-active non-convex AddConstraint calls can
-	// make an SQP subproblem locally infeasible), not from being SLSQP.
-	// When use_hard_constraints is false, build_short_path_problem adds no
-	// AddConstraint at all -- only the smooth penalty cost -- so there's
-	// nothing for SLSQP to report infeasible about; it's just local
-	// quasi-Newton minimization of a smooth function, exactly what SLSQP is
-	// built for. (NOT IpoptSolver: see build_short_path_problem's own
-	// comment for that dead end.)
-	MathematicalProgramResult result;
-	try {
-		if (_obstacles->obstacles().empty()) {
-			result = drake::solvers::Solve(*problem->prog);
-		} else {
-			drake::solvers::NloptSolver solver;
-			problem->prog->SetSolverOption(drake::solvers::NloptSolver::id(), "algorithm", "LD_SLSQP");
-			result = solver.Solve(*problem->prog);
+	for (; iter < max_iterations; ++iter) {
+		if (iter > 0 && trust_radius <= min_trust_radius) break;
+
+		// H_smooth_total/g_smooth: the smooth-cost Hessian/RHS evaluated at
+		// the CURRENT (points, vels). Starts from `smooth_hessian_normal`
+		// (a COPY -- R/Torus's iteration-CONSTANT contribution, see
+		// AssembleSmoothHessian's own comment) and adds each SO3Quat
+		// block's own coupled, iteration-DEPENDENT contribution on top
+		// (AccumulateSO3QuatBlock) -- R/Torus-only agents pay only the cost
+		// of that one copy (H_smooth_total == smooth_hessian_normal
+		// unchanged), not a behavior change from before Stage 4.
+		Eigen::MatrixXd H_smooth_total = smooth_hessian_normal;
+		Eigen::VectorXd g_smooth = Eigen::VectorXd::Zero(n_smooth);
+		for (int ag = 0; ag < num_agents; ++ag) {
+			const int off = agent_axis_offsets[ag];
+			const Eigen::VectorXd x0_agent = x0.segment(ag * ambient_dim, ambient_dim);
+			const Eigen::VectorXd v0_agent = v0.segment(ag * dim, dim);
+			const Eigen::MatrixXd points_agent = points.block(0, ag * ambient_dim, num_steps, ambient_dim);
+			const Eigen::MatrixXd vels_agent = vels.block(0, ag * dim, num_steps, dim);
+			const Eigen::MatrixXd ref_points_agent =
+				ref_points.block(0, ag * ambient_dim, num_steps, ambient_dim);
+			const Eigen::MatrixXd ref_velocities_agent =
+				ref_velocities.block(0, ag * dim, num_steps, dim);
+			// R/Torus tangent columns keep the existing per-axis-scalar
+			// treatment (BuildAxisRhs, iterate-dependent RHS only -- H
+			// already placed by AssembleSmoothHessian, unchanged);
+			// SO3Quat blocks get the coupled treatment on top of the same
+			// H_smooth_total/g_smooth (AccumulateSO3QuatBlock) -- see
+			// sqp_short_path_layout.hpp's own doc comment for why these two
+			// need to differ.
+			for (const auto& boff : agent_shapes[ag].block_offsets_) {
+				if (boff.type == CubicConfigurationSpline::Block::Type::SO3Quat) {
+					AccumulateSO3QuatBlock(
+						SO3QuatBlock{ag, boff, off + boff.tangent_offset},
+						agent_shapes[ag], num_steps, tau, smooth_cost_weights,
+						x0_agent, v0_agent, points_agent, vels_agent,
+						ref_points_agent, ref_velocities_agent,
+						&H_smooth_total, &g_smooth);
+					continue;
+				}
+				for (int k = boff.tangent_offset; k < boff.tangent_offset + boff.tangent_size; ++k) {
+					const Eigen::VectorXd g_axis = BuildAxisRhs(
+						AxisLayout{ag, k}, agent_shapes[ag], num_steps, tau, smooth_cost_weights,
+						x0_agent, v0_agent, points_agent, vels_agent,
+						ref_points_agent, ref_velocities_agent);
+					g_smooth.segment((off + k) * per_axis, per_axis) = g_axis;
+				}
+			}
 		}
-	} catch (const std::exception& e) {
-		std::cout << "Caught exception in short path solver: " << e.what() << std::endl;
-		return false;
+		const Eigen::VectorXd grad_smooth = -2.0 * g_smooth;
+
+		// H_qp: the smooth block is `2 * H_smooth_total` (the factor of 2
+		// converts BuildAxisRhs/AssembleSmoothHessian/AccumulateSO3QuatBlock's
+		// shared normal-equations convention, `H_n s = g_n`, to qpOASES'
+		// `0.5 z'Hz + g'z` convention -- see this file's own top comment),
+		// the slack block is a pure Tikhonov floor (slack only ever appears
+		// LINEARLY in the true cost, `penalty_weight * s`). Rebuilt every
+		// outer iteration (unlike pre-Stage-4, when the whole smooth block
+		// was iteration-constant) since H_smooth_total now can be -- R/Torus
+		// -only agents pay only a cheap matrix copy for this, see
+		// H_smooth_total's own comment above.
+		RealMat H_qp = RealMat::Zero(n, n);
+		H_qp.topLeftCorner(n_smooth, n_smooth) = (2.0 * H_smooth_total).cast<qpOASES::real_t>();
+		for (int i = 0; i < n; ++i) H_qp(i, i) += qpOASES::real_t(1e-10);
+
+		std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
+			agent_axis_offsets, num_steps, num_agents, ambient_dim, workspace_dim, points,
+			per_agent_obstacles);
+		std::vector<ConstraintRow> pair_rows = LinearizeAgentPairConstraints(
+			agent_axis_offsets, num_steps, ambient_dim, workspace_dim, points, agent_radii,
+			active_pairs);
+		rows.insert(rows.end(), std::make_move_iterator(pair_rows.begin()),
+			    std::make_move_iterator(pair_rows.end()));
+		std::vector<ConstraintRow> grid_row_list = LinearizeAgentSdfGridConstraints(
+			agent_axis_offsets, num_steps, num_agents, ambient_dim, workspace_dim, points, active_grids);
+		rows.insert(rows.end(), std::make_move_iterator(grid_row_list.begin()),
+			    std::make_move_iterator(grid_row_list.end()));
+
+		if (m == 0 && grad_smooth.norm() < grad_tol) break;
+
+		RealVec g_qp = RealVec::Zero(n);
+		g_qp.head(n_smooth) = grad_smooth.cast<qpOASES::real_t>();
+		for (int r = 0; r < m; ++r) g_qp(n_smooth + r) = qpOASES::real_t(penalty_weight);
+
+		RealMat A_qp = RealMat::Zero(m_eff, n);
+		RealVec lbA = RealVec::Constant(m_eff, qpOASES::real_t(-kInf));
+		RealVec ubA = RealVec::Constant(m_eff, qpOASES::real_t(kInf));
+		for (int r = 0; r < m; ++r) {
+			for (const auto& [idx, coeff] : rows[r].coeffs) {
+				A_qp(r, idx) += static_cast<qpOASES::real_t>(coeff);
+			}
+			A_qp(r, n_smooth + r) = qpOASES::real_t(1.0);
+			lbA(r) = static_cast<qpOASES::real_t>(-rows[r].value);
+		}
+
+		RealVec dx_lb = RealVec::Constant(n, qpOASES::real_t(-kInf));
+		RealVec dx_ub = RealVec::Constant(n, qpOASES::real_t(kInf));
+		for (int i = 0; i < n_smooth; ++i) {
+			dx_lb(i) = qpOASES::real_t(-trust_radius);
+			dx_ub(i) = qpOASES::real_t(trust_radius);
+		}
+		for (int r = 0; r < m; ++r) dx_lb(n_smooth + r) = qpOASES::real_t(0.0);
+
+		// qpOASES's active-set homotopy needs roughly O(n) working-set
+		// recalculations for an n-variable dense QP even in the EASY case
+		// (a small budget like the previous 200 is fine for a single-agent
+		// problem but silently exhausts, returning RET_MAX_NWSR_REACHED,
+		// well before genuine infeasibility/nonconvexity as num_agents
+		// grows -- discovered via a multi-agent scaling investigation:
+		// a purely block-diagonal, exactly-quadratic, ZERO-constraint-row
+		// smooth-only QP (should solve in exactly one Newton step, rho=1)
+		// was instead failing on EVERY outer iteration at n~240 (4 R^3
+		// agents), each failure wrongly interpreted as "trust region too
+		// large" and burning a full trust-region shrink cycle for nothing
+		// -- not a convergence problem, a starved solver budget. 5000
+		// verified sufficient up to 8 agents (n~480) with room to spare;
+		// still cheap relative to the solve itself when NOT needed (a
+		// converged/already-optimal QP returns long before exhausting
+		// whatever budget it's given).
+		qpOASES::int_t nWSR = 5000;
+		qpOASES::returnValue status;
+		if (!(*qp_state)->initialized) {
+			status = qp.init(H_qp.data(), g_qp.data(), A_qp.data(),
+					  dx_lb.data(), dx_ub.data(), lbA.data(), ubA.data(), nWSR);
+			(*qp_state)->initialized = (status == qpOASES::SUCCESSFUL_RETURN);
+		} else {
+			status = qp.hotstart(H_qp.data(), g_qp.data(), A_qp.data(),
+					      dx_lb.data(), dx_ub.data(), lbA.data(), ubA.data(), nWSR);
+		}
+
+		if (status != qpOASES::SUCCESSFUL_RETURN) {
+			// Unlike GraphTimingMPC's comment for this same branch: here
+			// the QP subproblem being unsolvable really can only be a
+			// numerical/active-set-homotopy hiccup, not a structural
+			// impossibility -- it's LITERALLY always feasible by
+			// construction (dz=0, s=max(0,-value) satisfies every row --
+			// see this class's own header comment) regardless of how
+			// pathological the obstacle geometry is.
+			trust_radius *= 0.25;
+			(*qp_state)->initialized = false;
+			continue;
+		}
+
+		RealVec z_q(n);
+		qp.getPrimalSolution(z_q.data());
+		const Eigen::VectorXd z = z_q.cast<double>();
+		const Eigen::VectorXd dx_smooth = z.head(n_smooth);
+		const double predicted_slack_sum = m > 0 ? z.tail(m).sum() : 0.0;
+
+		if (dx_smooth.norm() < 1e-9) break;
+
+		Eigen::MatrixXd candidate_points, candidate_vels;
+		ApplyStep(agent_shapes, agent_axis_offsets, num_steps, dim, ambient_dim, points, vels, dx_smooth,
+			  &candidate_points, &candidate_vels);
+
+		const double f_new = TotalSmoothCost(agent_shapes, num_steps, tau, smooth_cost_weights, dim,
+						      ambient_dim, x0, v0, candidate_points, candidate_vels,
+						      ref_points, ref_velocities);
+		const double violation_new =
+			EvaluateObstacleViolation(num_steps, num_agents, ambient_dim, workspace_dim, candidate_points,
+						   per_agent_obstacles) +
+			EvaluateAgentPairViolation(num_steps, ambient_dim, workspace_dim, candidate_points, agent_radii,
+						    active_pairs) +
+			EvaluateAgentSdfGridViolation(num_steps, num_agents, ambient_dim, workspace_dim, candidate_points,
+						       active_grids);
+		const double phi_new = f_new + penalty_weight * violation_new;
+
+		// Uses H_smooth_total (THIS iteration's smooth Hessian, including
+		// any SO3Quat contribution), not the raw constant
+		// smooth_hessian_normal -- the merit function's predicted-reduction
+		// model must match what the QP was actually built from, or rho
+		// becomes meaningless for exactly the SO3Quat rows/cols (matches
+		// this file's own top comment's point 1 about the merit function
+		// needing to track the true QP model).
+		const Eigen::MatrixXd H_smooth_d = (2.0 * H_smooth_total);
+		const double predicted_smooth_reduction =
+			-(grad_smooth.dot(dx_smooth) + 0.5 * dx_smooth.dot(H_smooth_d * dx_smooth));
+		// The QP's own slack values ARE exactly max(0, -(value + a.dx)) at
+		// the QP optimum (penalty_weight > 0 drives every slack to its
+		// tight lower bound given the row's RHS), so this is the model's
+		// own prediction of the post-step violation -- an honest "predicted
+		// reduction" in the SAME sense GraphTimingMPC's does for the
+		// smooth-only case, just extended to the penalty term.
+		const double predicted_violation_reduction = violation_current - predicted_slack_sum;
+		const double predicted_reduction =
+			predicted_smooth_reduction + penalty_weight * predicted_violation_reduction;
+		const double actual_reduction = phi_current - phi_new;
+		const double rho = (predicted_reduction > 1e-14) ? actual_reduction / predicted_reduction : 1.0;
+
+		const double step_inf_norm = dx_smooth.lpNorm<Eigen::Infinity>();
+		if (rho < 0.25) {
+			trust_radius = std::max(0.25 * trust_radius, min_trust_radius);
+		} else if (rho > 0.75 && step_inf_norm > 0.9 * trust_radius) {
+			trust_radius = std::min(2.0 * trust_radius, max_trust_radius);
+		}
+
+		if (rho > 1e-8) {
+			points = candidate_points;
+			vels = candidate_vels;
+			f_current = f_new;
+			violation_current = violation_new;
+			phi_current = phi_new;
+		}
+		// else: reject -- points/vels/f_current/violation_current/
+		// phi_current stay at the previous (still fully valid) iterate;
+		// only trust_radius moved.
 	}
 
-	if (result.is_success()) {
-		_last_solve_time = _timer.Tick();
+	ApplySafetyProjection(num_steps, num_agents, ambient_dim, workspace_dim, obstacles, &points);
+	ApplyAgentPairSafetyProjection(num_steps, num_agents, ambient_dim, workspace_dim, agent_radii, &points);
 
-		_points = result.GetSolution(problem->Xi);
-		_vels = result.GetSolution(problem->V);
+	return SqpResult{points, vels, iter, trust_radius};
+}
+
+}  // namespace
+
+bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
+			     const Eigen::VectorXd& v0,
+			     const Eigen::VectorXi& /*var_assignments*/,
+			     const std::vector<int>& /*remaining_vertices*/,
+			     const std::vector<CubicConfigurationSpline>& references) {
+	_timer.Start();
+	try {
+		const int H = static_cast<int>(_num_steps);
+		const int num_agents = static_cast<int>(_num_agents);
+		const int dim = static_cast<int>(_dim);
+		const int ambient_dim = static_cast<int>(_ambient_dim);
+		const int workspace_dim = _graph->workspace_dim;
+
+		Eigen::MatrixXd ref_points(H, num_agents * ambient_dim);
+		Eigen::MatrixXd ref_velocities(H, num_agents * dim);
+		for (int ag = 0; ag < num_agents; ++ag) {
+			const auto& [q_ag, qdot_ag] = references.at(ag).eval_multiple(_times);
+			ref_points.block(0, ag * ambient_dim, H, ambient_dim) = q_ag;
+			ref_velocities.block(0, ag * dim, H, dim) = qdot_ag;
+		}
+
+		// Warm start: previous cycle's converged trajectory when its shape
+		// matches, falling back to the reference itself on the first cycle
+		// or after a shape change.
+		Eigen::MatrixXd points = ref_points;
+		Eigen::MatrixXd vels = ref_velocities;
+		if (_has_solved && _points.rows() == H && _points.cols() == ref_points.cols()) {
+			points = _points;
+		}
+		if (_has_solved && _vels.rows() == H && _vels.cols() == ref_velocities.cols()) {
+			vels = _vels;
+		}
+
+		// Distance-based row pruning (design decision 6: computed ONCE per
+		// solve() call, from the REFERENCE trajectory, held fixed for the
+		// whole call -- see PruneObstaclesByDistance/PruneAgentPairsByDistance's
+		// own comments). Purely a speed lever, not a feasibility one:
+		// ApplySafetyProjection/ApplyAgentPairSafetyProjection (inside
+		// RunTrustRegionSqp) still check every registered obstacle/pair
+		// regardless of what got pruned out here.
+		const std::vector<std::vector<const Obstacle*>> per_agent_obstacles =
+			PruneObstaclesByDistance(ref_points, num_agents, ambient_dim, workspace_dim,
+						  *_obstacles, _constraint_prune_margin);
+		const std::vector<std::pair<int, int>> active_pairs =
+			PruneAgentPairsByDistance(ref_points, num_agents, ambient_dim, workspace_dim,
+						   _agent_radii, _constraint_prune_margin);
+		const std::vector<const AgentSdfGrid*> active_grids =
+			PruneAgentSdfGridsByDistance(ref_points, num_agents, ambient_dim, workspace_dim,
+						      *_obstacles, _constraint_prune_margin);
+
+		SqpResult result = RunTrustRegionSqp(
+			_agent_shapes, _axes, _agent_axis_offsets, _smooth_hessian_normal, _smooth_cost_weights,
+			H, num_agents, dim, ambient_dim, workspace_dim, _time_per_step,
+			x0, v0, ref_points, ref_velocities, *_obstacles, per_agent_obstacles, active_pairs,
+			active_grids, _agent_radii, _penalty_weight, _max_iterations,
+			_initial_trust_radius, _max_trust_radius, _min_trust_radius, _grad_tol,
+			points, vels, &_qp_state);
+
+		_points = result.points;
+		_vels = result.vels;
+		_last_iterations = result.iterations;
+		_last_trust_radius = result.trust_radius;
 		_has_solved = true;
+		_last_solve_time = _timer.Tick();
 		return true;
-	} else {
+	} catch (const std::exception& e) {
+		std::cout << "Caught exception in SQP short path solver: " << e.what() << std::endl;
 		return false;
 	}
 }

@@ -1,5 +1,5 @@
 """
-Interactive demo for SqpShortPathMPC's Stage 4 (R^3 x SO(3) quaternion
+Interactive demo for GraphShortPathMPC's Stage 4 (R^3 x SO(3) quaternion
 manifold support) with a VARIABLE number of agents and obstacles, and a
 rigorous, reproducible comparison of its solve time against the SAME
 solver restricted to R^3 (position only) -- the config space it originally
@@ -17,7 +17,7 @@ gizmos keep whatever position you last dragged them to even while hidden,
 so growing/shrinking the counts doesn't lose your setup.
 
   - "Config space" ("Position only (R^3)" / "Position + orientation (R^3 x
-    SO3Quat)"): applies to every ACTIVE agent uniformly -- SqpShortPathMPC
+    SO3Quat)"): applies to every ACTIVE agent uniformly -- GraphShortPathMPC
     requires every agent to share the same ambient/tangent width (see its
     own constructor comment), so a per-agent mix isn't supported here
     either.
@@ -26,9 +26,9 @@ Two ways to get real numbers (not just eyeballing a single drag's solve
 time, which is noisy):
   - "Run timing benchmark": solves the CURRENT scene (however many agents/
     obstacles are active, at their current gizmo positions) `repeats`
-    times, COLD (fresh SqpShortPathMPC instance every call) and WARM (one
+    times, COLD (fresh GraphShortPathMPC instance every call) and WARM (one
     instance, repeated `.solve()` -- steady-state MPC operation, see
-    SqpShortPathMPC's own "warm start" comment), for both config spaces.
+    GraphShortPathMPC's own "warm start" comment), for both config spaces.
   - "Run scaling sweep": fixes the OTHER count at its current value and
     varies obstacle count 0..(current) and agent count 1..(current) one at
     a time, WARM only, for both config spaces -- directly shows how solve
@@ -52,7 +52,7 @@ import time
 import numpy as np
 import viser
 
-from goc_mpc import GraphOfConstraints, SqpShortPathMPC, ObstacleSet
+from goc_mpc import GraphOfConstraints, GraphShortPathMPC, ObstacleSet
 from goc_mpc._ext.configuration_spline import CubicConfigurationSpline, Block
 
 MAX_AGENTS = 6
@@ -208,10 +208,10 @@ def main():
     def agent_radii_for(n: int) -> np.ndarray:
         return np.full(n, agent_radius_slider.value) if n >= 2 else np.array([])
 
-    def build_mpc(num_agents: int, with_orientation: bool, obstacles: ObstacleSet) -> SqpShortPathMPC:
+    def build_mpc(num_agents: int, with_orientation: bool, obstacles: ObstacleSet) -> GraphShortPathMPC:
         graph = make_graph(num_agents, with_orientation)
         dim = 6 if with_orientation else 3
-        return SqpShortPathMPC(graph, NUM_STEPS, num_agents, dim, TIME_PER_STEP, obstacles,
+        return GraphShortPathMPC(graph, NUM_STEPS, num_agents, dim, TIME_PER_STEP, obstacles,
                                 agent_radii_for(num_agents), **current_weights())
 
     def build_obstacles(num_obstacles: int) -> ObstacleSet:
@@ -281,7 +281,7 @@ def main():
         update_visibility(num_agents, num_obstacles, with_orientation)
 
         # Obstacles may have been DRAGGED since rebuild_mpc() last ran --
-        # update the live ObstacleSet in place (SqpShortPathMPC stores a
+        # update the live ObstacleSet in place (GraphShortPathMPC stores a
         # POINTER to it, see its own doc comment, so this is picked up
         # without reconstructing the solver).
         obstacles_live.clear()

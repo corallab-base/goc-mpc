@@ -10,8 +10,6 @@
 #include "milp_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
-#include "admm_short_path_mpc.hpp"
-#include "sqp_short_path_mpc.hpp"
 
 using drake::symbolic::Expression;
 namespace py = pybind11;
@@ -454,7 +452,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("point_cloud_margin", &ObstacleSet::point_cloud_margin)
 		.def("has_point_cloud", &ObstacleSet::has_point_cloud)
 		.def("obstacles", &ObstacleSet::obstacles, py::return_value_policy::reference_internal)
-		// SqpShortPathMPC's Stage-3 replacement: one local SDF grid PER
+		// GraphShortPathMPC's Stage-3 replacement: one local SDF grid PER
 		// AGENT (not shared like every obstacle kind above), wholesale-
 		// replaced each call like set_point_cloud -- see
 		// ObstacleSet::set_agent_sdf_grid's own doc comment. `gradient`
@@ -468,12 +466,19 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("agent_sdf_grid", &ObstacleSet::agent_sdf_grid, py::arg("agent"),
 		     py::return_value_policy::reference_internal);
 
-        py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
-                .def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
-		     const ObstacleSet&, double, bool>(),
+	py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
+		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
+		     const ObstacleSet&, Eigen::VectorXd, double, double, double, double, int, double, double,
+		     double, double, double>(),
 		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
-		     py::arg("time_per_step"), py::arg("obstacles"), py::arg("obstacle_repulsion_weight") = 0.5,
-		     py::arg("use_hard_constraints") = true,
+		     py::arg("time_per_step"), py::arg("obstacles"),
+		     py::arg("agent_radii") = Eigen::VectorXd(),
+		     py::arg("tracking_weight") = 1.0, py::arg("velocity_tracking_weight") = 1.0,
+		     py::arg("acceleration_weight") = 1.0,
+		     py::arg("penalty_weight") = 1.0e3,
+		     py::arg("max_iterations") = 30, py::arg("initial_trust_radius") = 0.5,
+		     py::arg("max_trust_radius") = 5.0, py::arg("min_trust_radius") = 1.0e-6,
+		     py::arg("grad_tol") = 1.0e-6, py::arg("constraint_prune_margin") = 1.0,
 		     // `graph` and `obstacles` are both stored by the C++ side as raw
 		     // pointers (see GraphShortPathMPC::_graph/_obstacles) -- keep
 		     // both Python arguments alive at least as long as this
@@ -488,45 +493,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_vels", &GraphShortPathMPC::view_vels, py::return_value_policy::reference_internal)
 		.def("view_times", &GraphShortPathMPC::view_times, py::return_value_policy::reference_internal)
 		.def("view_obstacles", &GraphShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
-		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time);
-
-	py::class_<AdmmShortPathMPC>(goc_mpc, "AdmmShortPathMPC")
-		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
-		     const ObstacleSet&, double, unsigned int, double>(),
-		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
-		     py::arg("time_per_step"), py::arg("obstacles"), py::arg("rho") = 5.0,
-		     py::arg("num_iterations") = 8, py::arg("point_cloud_query_margin") = 1.0,
-		     // Same lifetime discipline as GraphShortPathMPC's binding above.
-		     py::keep_alive<1, 2>(), py::keep_alive<1, 7>())
-		.def("solve", &AdmmShortPathMPC::solve)
-		.def("view_points", &AdmmShortPathMPC::view_points, py::return_value_policy::reference_internal)
-		.def("view_vels", &AdmmShortPathMPC::view_vels, py::return_value_policy::reference_internal)
-		.def("view_times", &AdmmShortPathMPC::view_times, py::return_value_policy::reference_internal)
-		.def("view_obstacles", &AdmmShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
-		.def("get_last_solve_time", &AdmmShortPathMPC::get_last_solve_time);
-
-	py::class_<SqpShortPathMPC>(goc_mpc, "SqpShortPathMPC")
-		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
-		     const ObstacleSet&, Eigen::VectorXd, double, double, double, double, int, double, double,
-		     double, double, double>(),
-		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
-		     py::arg("time_per_step"), py::arg("obstacles"),
-		     py::arg("agent_radii") = Eigen::VectorXd(),
-		     py::arg("tracking_weight") = 1.0, py::arg("velocity_tracking_weight") = 1.0,
-		     py::arg("acceleration_weight") = 1.0,
-		     py::arg("penalty_weight") = 1.0e3,
-		     py::arg("max_iterations") = 30, py::arg("initial_trust_radius") = 0.5,
-		     py::arg("max_trust_radius") = 5.0, py::arg("min_trust_radius") = 1.0e-6,
-		     py::arg("grad_tol") = 1.0e-6, py::arg("constraint_prune_margin") = 1.0,
-		     // Same lifetime discipline as GraphShortPathMPC/AdmmShortPathMPC's
-		     // bindings above.
-		     py::keep_alive<1, 2>(), py::keep_alive<1, 7>())
-		.def("solve", &SqpShortPathMPC::solve)
-		.def("view_points", &SqpShortPathMPC::view_points, py::return_value_policy::reference_internal)
-		.def("view_vels", &SqpShortPathMPC::view_vels, py::return_value_policy::reference_internal)
-		.def("view_times", &SqpShortPathMPC::view_times, py::return_value_policy::reference_internal)
-		.def("view_obstacles", &SqpShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
-		.def("get_last_solve_time", &SqpShortPathMPC::get_last_solve_time)
-		.def("get_last_iterations", &SqpShortPathMPC::get_last_iterations)
-		.def("get_last_trust_radius", &SqpShortPathMPC::get_last_trust_radius);
+		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time)
+		.def("get_last_iterations", &GraphShortPathMPC::get_last_iterations)
+		.def("get_last_trust_radius", &GraphShortPathMPC::get_last_trust_radius);
 }

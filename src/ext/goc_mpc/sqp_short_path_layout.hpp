@@ -10,7 +10,7 @@
 #include "obstacle_set.hpp"
 #include "../configuration_spline.hpp"
 
-// Problem-layout/assembly math for SqpShortPathMPC (sqp_short_path_mpc.hpp),
+// Problem-layout/assembly math for GraphShortPathMPC (graph_short_path_mpc.hpp),
 // mirroring timing_gn_layout.{hpp,cpp}'s split from graph_timing_mpc.cpp:
 // this file has no qpOASES/trust-region-loop code, only the Hessian/RHS/
 // constraint-row math the solver assembles into a QP every outer iteration.
@@ -203,7 +203,7 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 // registered obstacle's own extent (sphere: radius+margin; box: half-
 // extents' norm+margin, a conservative circumscribing-sphere proxy) --
 // included if the two spheres could plausibly come within `prune_margin`
-// of touching. Computed ONCE per solve() call (SqpShortPathMPC::solve(),
+// of touching. Computed ONCE per solve() call (GraphShortPathMPC::solve(),
 // alongside `ref_points`), reused for the whole call -- same "row COUNT
 // fixed for the whole solve() call" discipline design decision 6 already
 // established for the unpruned case (row COEFFICIENTS still get
@@ -212,8 +212,8 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 //
 // PURELY a speed optimization on the SQP's own optimization path --
 // pointers into `obstacles`, valid only for the caller's own solve() call
-// (ObstacleSet isn't mutated mid-call). SqpShortPathMPC's own
-// ApplySafetyProjection final hard-feasibility pass (sqp_short_path_mpc.cpp)
+// (ObstacleSet isn't mutated mid-call). GraphShortPathMPC's own
+// ApplySafetyProjection final hard-feasibility pass (graph_short_path_mpc.cpp)
 // checks EVERY registered obstacle for every agent regardless of this
 // pruning, so an obstacle wrongly excluded here degrades solution
 // SMOOTHNESS around it (handled by that pass's less-smooth closed-form
@@ -321,7 +321,7 @@ std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 // interpolant `value` was computed from (see AgentSdfGrid's own doc
 // comment in obstacle_set.hpp for why this is the default). Used both by
 // this file's own EvaluateAgentSdfGridViolation/
-// LinearizeAgentSdfGridConstraints and by sqp_short_path_mpc.cpp's final
+// LinearizeAgentSdfGridConstraints and by graph_short_path_mpc.cpp's final
 // safety-projection pass -- both must query the SAME interpolant, hence
 // public/shared rather than a local anonymous-namespace helper.
 struct SdfSample {
@@ -341,7 +341,7 @@ SdfSample QueryAgentSdfGrid(const AgentSdfGrid& grid, const Eigen::VectorXd& p, 
 // `prune_margin` of the agent's own reference-trajectory bounding sphere.
 // Same "purely a speed lever, computed once per solve() call, never
 // affects correctness" property as PruneObstaclesByDistance -- the final
-// safety-projection pass (sqp_short_path_mpc.cpp) checks every agent's
+// safety-projection pass (graph_short_path_mpc.cpp) checks every agent's
 // registered grid regardless of this pruning.
 std::vector<const AgentSdfGrid*> PruneAgentSdfGridsByDistance(
 	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,

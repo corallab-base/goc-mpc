@@ -45,7 +45,7 @@ struct Obstacle {
 };
 
 // Caller-supplied signed-distance FIELD for one agent's own local vicinity
-// (Stage 3's point-cloud replacement for SqpShortPathMPC -- see the project
+// (Stage 3's point-cloud replacement for GraphShortPathMPC -- see the project
 // plan's "backend-agnostic external SDF-grid/TSDF obstacle plan"). A grid
 // VERTEX (i_0, ..., i_{d-1}) sits at world position `origin +
 // [i_0*resolution(0), ..., i_{d-1}*resolution(d-1)]`; querying an arbitrary

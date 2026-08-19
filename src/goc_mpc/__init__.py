@@ -13,8 +13,6 @@ from .goc_mpc import (
     MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
-    AdmmShortPathMPC,
-    SqpShortPathMPC,
     ObstacleSet,
 )
 try:

@@ -71,7 +71,7 @@ namespace py = pybind11;
 // trajectory downstream, not just waste compute solving repeatedly.
 //
 // Fixed by slack-relaxing the interaction rows themselves -- the same
-// exact-l1-penalty Sl1QP pattern SqpShortPathMPC uses for its obstacle/
+// exact-l1-penalty Sl1QP pattern GraphShortPathMPC uses for its obstacle/
 // agent-pair rows (Nocedal & Wright Sec. 18.5, see that class's own doc
 // comment): a LESS_THAN row gets one nonnegative slack; an EQUAL row
 // (two-sided) gets a nonnegative plus/minus PAIR (`g_val = s_plus -
@@ -80,7 +80,7 @@ namespace py = pybind11;
 // row's slack(s))` added to the QP objective, and the trust-region loop's
 // accept/reject now runs on the merit function
 // `phi(x) = f(x) + _interaction_penalty_weight * violation(x)` (mirroring
-// SqpShortPathMPC's RunTrustRegionSqp) instead of the plain objective
+// GraphShortPathMPC's RunTrustRegionSqp) instead of the plain objective
 // ratio. This restores "every QP subproblem feasible by construction" as
 // an ACTUALLY true statement (dx=0, slack=|current violation| always
 // satisfies every row, independent of trust_radius) -- the tau/v box and
@@ -165,7 +165,7 @@ struct GraphTimingMPC {
 	// interaction row is active at the optimum, not knowable a priori);
 	// too small and a cross-agent LESS_THAN/EQUAL constraint can be
 	// smoothly traded away against tracking/acceleration cost instead of
-	// actually enforced. Default matches SqpShortPathMPC's own
+	// actually enforced. Default matches GraphShortPathMPC's own
 	// `penalty_weight` default -- no case-specific tuning done yet.
 	double _interaction_penalty_weight;
 

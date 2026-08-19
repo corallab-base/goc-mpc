@@ -159,7 +159,7 @@ namespace so3 {
 		// half)/theta^2, was missing a factor of 1/2 on the cot_half term and
 		// was NOT actually the inverse of left_jacobian (off by up to ~90% of
 		// a matrix entry, confirmed numerically) -- caught while deriving
-		// SqpShortPathMPC's Stage 4 SO3Quat residual-Jacobian, which wraps
+		// GraphShortPathMPC's Stage 4 SO3Quat residual-Jacobian, which wraps
 		// this function directly.
 		const T C = T(1) / (theta*theta) - cot_half / (T(2)*theta);
 		return I - T(0.5)*S + C * (S*S);
@@ -774,7 +774,7 @@ public:
 	// Exp(eps_J), qJm1' = qJm1 ⊗ Exp(eps_Jm1). This is exactly
 	// BlockRetract's own SO3Quat perturbation convention, so the Jacobians
 	// here are what a caller linearizing a step applied via Retract needs
-	// (SqpShortPathMPC's Stage 4 per-outer-iteration SO3Quat Hessian/RHS
+	// (GraphShortPathMPC's Stage 4 per-outer-iteration SO3Quat Hessian/RHS
 	// block, see the project plan).
 	//
 	// Derivation (standard SO(3) BCH/adjoint identity, expressed via the
@@ -791,7 +791,7 @@ public:
 	// have silently inherited it.
 	//
 	// double-only (not templated on T like BlockPositionDelta/BlockRetract):
-	// SqpShortPathMPC is deliberately a no-C++-autodiff, hand-differentiated
+	// GraphShortPathMPC is deliberately a no-C++-autodiff, hand-differentiated
 	// solver (matches its existing sphere/box SDF gradients), and this is
 	// its only intended caller. `off.type` must be SO3Quat (throws
 	// otherwise) -- unlike BlockPositionDelta, every OTHER block type's
@@ -855,7 +855,7 @@ public:
 	// far from d=0 -- see BlockRetract's own top-level doc comment).
 	// ComputeSO3QuatResidual (below) gives the matching Jacobian of that
 	// same residual w.r.t. this exact perturbation, for callers (Stage 4 of
-	// SqpShortPathMPC's project plan) building a linear model of a step
+	// GraphShortPathMPC's project plan) building a linear model of a step
 	// applied via THIS retraction.
 	template <typename T>
 	static VecX<T> BlockRetract(

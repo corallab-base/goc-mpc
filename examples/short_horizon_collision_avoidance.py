@@ -4,9 +4,9 @@ Interactive obstacle demo for the short-horizon MPC (stage 2 of 3).
 A single point-mass agent has a FIXED nominal reference path (straight line,
 start -> goal, drawn in gray). A draggable obstacle (sphere or box, pick via
 the GUI) sits in the browser (viser transform-controls gizmo). Every time you
-drag it -- or change a GUI control -- the selected solver's `.solve()` is
-re-run from scratch against the (unchanged) nominal reference, and the
-resulting short-horizon trajectory (blue line) is redrawn.
+drag it -- or change a GUI control -- GraphShortPathMPC.solve() is re-run
+from scratch against the (unchanged) nominal reference, and the resulting
+short-horizon trajectory (blue line) is redrawn.
 
 A second agent can be toggled on ("Enable second agent"). Its own nominal
 path is a fixed-length segment attached to a SECOND, draggable-AND-
@@ -15,44 +15,16 @@ so you can steer it to cross agent 1's fixed path. It defaults to crossing
 agent 1's path immediately (positioned at agent 1's own midpoint, identity
 rotation) so the interesting case is visible the moment you tick the box,
 before touching anything. Both agents' optimized short-horizon paths are
-drawn (agent 1 blue, agent 2 orange).
+drawn (agent 1 blue, agent 2 orange), and the "Agent radius" slider controls
+their inter-agent avoidance margin.
 
-Four solvers, picked live via the "Solver" dropdown:
-  - SLSQP (hard constraint): GraphShortPathMPC, use_hard_constraints=True.
-    A real clearance guarantee when it converges, but can report the whole
-    solve infeasible with several obstacles simultaneously active.
-  - SLSQP (soft penalty): GraphShortPathMPC, use_hard_constraints=False.
-    Structurally can't report infeasible -- SLSQP with no AddConstraint
-    calls just does local quasi-Newton minimization of a smooth function --
-    but clearance depends on the weight slider: too low and the tracking/
-    acceleration cost can pull the path inside the obstacle.
-  - ADMM: AdmmShortPathMPC. Also structurally can't report infeasible (a
-    closed-form projection can't fail), but gets there differently -- see
-    that class's own doc comment (admm_short_path_mpc.hpp): the smooth cost
-    is solved as a plain (unconstrained) per-axis linear system, factorized
-    once and reused, with obstacle avoidance handled entirely by cheap
-    closed-form projections outside the linear solve. Typically the fastest
-    of the three (microseconds to low-milliseconds even with a point cloud)
-    and, unlike the SLSQP-soft-penalty path, its "rho" doesn't trade away
-    speed for clearance the way that path's weight does.
-  - SQP: SqpShortPathMPC (see sqp_short_path_mpc.hpp) -- Riemannian
-    trust-region SQP over qpOASES. Every obstacle constraint is a
-    slack-relaxed exact-penalty row, so the QP subproblem is feasible by
-    construction at every outer iteration (fixing SLSQP's hard-constraint
-    infeasibility failure directly, not by tuning), plus a closed-form
-    safety-projection final pass gives the same hard clearance guarantee
-    ADMM has regardless of SQP convergence. The weight slider maps to its
-    penalty weight.
+GraphShortPathMPC (see graph_short_path_mpc.hpp) is a Riemannian trust-region
+SQP solver over qpOASES. Every obstacle constraint is a slack-relaxed
+exact-penalty row, so the QP subproblem is feasible by construction at every
+outer iteration, plus a closed-form safety-projection final pass gives a
+hard clearance guarantee regardless of SQP convergence.
 
-Inter-agent avoidance (the "Agent radius" slider) is SQP-ONLY --
-GraphShortPathMPC/AdmmShortPathMPC have no inter-agent term at all (see
-LinearizeAgentPairConstraints's own comment in sqp_short_path_layout.hpp for
-why this ended up position-based, not an ORCA/velocity-obstacle
-construction). With those two solvers and the second agent enabled, both
-agents will happily plan straight through each other -- that contrast is
-deliberate, not a bug, and the status line calls it out.
-
-This deliberately calls the solver classes directly (not the full
+This deliberately calls the solver class directly (not the full
 `GraphOfConstraintsMPC.step()` closed loop) and always resolves from the same
 fixed start state(s) -- that's what "a nominal spline that's fixed" means
 here, and it isolates the thing being demonstrated (does the short path
@@ -73,8 +45,7 @@ import time
 import numpy as np
 import viser
 
-from goc_mpc import (GraphOfConstraints, GraphShortPathMPC, AdmmShortPathMPC, SqpShortPathMPC,
-                      ObstacleSet)
+from goc_mpc import GraphOfConstraints, GraphShortPathMPC, ObstacleSet
 from goc_mpc._ext.configuration_spline import CubicConfigurationSpline, Block
 
 DIM = 3
@@ -99,8 +70,6 @@ OBSTACLE_INITIAL_CENTER = np.array([0.6, 0.5, 1.0])  # off to the side initially
 
 NUM_STEPS = 10
 TIME_PER_STEP = 0.1
-
-SOLVERS = ("ADMM", "SQP", "SLSQP (hard constraint)", "SLSQP (soft penalty)")
 
 
 def make_graph(num_agents: int) -> GraphOfConstraints:
@@ -136,22 +105,18 @@ def main():
 
     second_agent_checkbox = server.gui.add_checkbox("Enable second agent", initial_value=False)
     kind_dropdown = server.gui.add_dropdown("Obstacle kind", ("sphere", "box"), initial_value="box")
-    solver_dropdown = server.gui.add_dropdown("Solver", SOLVERS, initial_value="ADMM")
     weight_slider = server.gui.add_slider(
-        "Repulsion weight (SLSQP) / rho (ADMM) / penalty weight (SQP)",
-        min=0.1, max=2000.0, step=0.1, initial_value=5.0)
-    admm_iters_slider = server.gui.add_slider(
-        "ADMM iterations", min=1, max=50, step=1, initial_value=15)
-    # log10(acceleration_weight) -- SQP's smoothness term has a large BUILT-IN
+        "Penalty weight", min=0.1, max=2000.0, step=0.1, initial_value=5.0)
+    # log10(acceleration_weight) -- the smoothness term has a large BUILT-IN
     # stiffness relative to tracking (its own coefficients scale as
     # ~1/time_per_step^2, squared again in the Hessian), so a *linear* slider
     # can't usefully span the range where tracking becomes competitive; a
-    # slider over the exponent can. 0 (10^0=1.0) reproduces SqpShortPathMPC's
-    # default byte-for-byte.
-    sqp_accel_log_slider = server.gui.add_slider(
-        "SQP acceleration weight (log10)", min=-7.0, max=1.0, step=0.1, initial_value=0.0)
+    # slider over the exponent can. 0 (10^0=1.0) reproduces
+    # GraphShortPathMPC's default byte-for-byte.
+    accel_log_slider = server.gui.add_slider(
+        "Acceleration weight (log10)", min=-7.0, max=1.0, step=0.1, initial_value=0.0)
     agent_radius_slider = server.gui.add_slider(
-        "Agent radius (SQP inter-agent avoidance)", min=0.0, max=0.5, step=0.01, initial_value=0.1)
+        "Agent radius (inter-agent avoidance)", min=0.0, max=0.5, step=0.01, initial_value=0.1)
     status_text = server.gui.add_text("Status", initial_value="")
 
     # Agent 1: fixed nominal path + endpoint markers (unchanged from before
@@ -211,12 +176,12 @@ def main():
         dimensions=tuple(2.0 * (BOX_HALF_EXTENTS + OBSTACLE_MARGIN)),
         color=(220, 60, 60), opacity=0.15)
 
-    # Every solver class takes its tuning knobs (INCLUDING agent count, since
+    # GraphShortPathMPC takes its tuning knobs (INCLUDING agent count, since
     # that's baked into the graph too) at CONSTRUCTION time, not per-solve --
-    # so toggling the second agent, like changing solver/weight/iterations,
+    # so toggling the second agent, like changing weight/acceleration weight,
     # means rebuilding both the graph and the solver instance. Dragging a
     # gizmo does NOT rebuild -- it reuses the same instance and just calls
-    # .solve() again, which is what lets each class's own cross-cycle warm
+    # .solve() again, which is what lets the solver's own cross-cycle warm
     # start (previous _points/_vels seed the next solve's initial guess)
     # actually kick in as you drag, instead of starting cold on every frame.
     obstacles = ObstacleSet()
@@ -225,31 +190,16 @@ def main():
     def rebuild_mpc():
         num_agents = 2 if second_agent_checkbox.value else 1
         graph = make_graph(num_agents)
-        solver = solver_dropdown.value
-        is_admm = solver == "ADMM"
-        is_sqp = solver == "SQP"
-        admm_iters_slider.visible = is_admm
-        sqp_accel_log_slider.visible = is_sqp
-        agent_radius_slider.visible = is_sqp and num_agents == 2
-        if is_admm:
-            mpc_holder["mpc"] = AdmmShortPathMPC(
-                graph, NUM_STEPS, num_agents, DIM, TIME_PER_STEP, obstacles,
-                rho=weight_slider.value, num_iterations=int(admm_iters_slider.value))
-        elif is_sqp:
-            # Empty (not per-agent-filled) when there's only one agent --
-            # SqpShortPathMPC treats that identically to all-zero radii, and
-            # there's no pair to avoid anyway.
-            agent_radii = (np.full(num_agents, agent_radius_slider.value)
-                            if num_agents == 2 else np.array([]))
-            mpc_holder["mpc"] = SqpShortPathMPC(
-                graph, NUM_STEPS, num_agents, DIM, TIME_PER_STEP, obstacles, agent_radii,
-                acceleration_weight=10.0 ** sqp_accel_log_slider.value,
-                penalty_weight=weight_slider.value)
-        else:
-            use_hard = solver == "SLSQP (hard constraint)"
-            mpc_holder["mpc"] = GraphShortPathMPC(
-                graph, NUM_STEPS, num_agents, DIM, TIME_PER_STEP, obstacles,
-                weight_slider.value, use_hard)
+        agent_radius_slider.visible = num_agents == 2
+        # Empty (not per-agent-filled) when there's only one agent --
+        # GraphShortPathMPC treats that identically to all-zero radii, and
+        # there's no pair to avoid anyway.
+        agent_radii = (np.full(num_agents, agent_radius_slider.value)
+                        if num_agents == 2 else np.array([]))
+        mpc_holder["mpc"] = GraphShortPathMPC(
+            graph, NUM_STEPS, num_agents, DIM, TIME_PER_STEP, obstacles, agent_radii,
+            acceleration_weight=10.0 ** accel_log_slider.value,
+            penalty_weight=weight_slider.value)
         mpc_holder["num_agents"] = num_agents
 
     def agent2_start_goal():
@@ -311,9 +261,8 @@ def main():
         if two_agents:
             path_vis2.points = pts[:, DIM:2 * DIM]
             inter_dist = float(np.linalg.norm(pts[:, 0:DIM] - pts[:, DIM:2 * DIM], axis=1).min())
-            required = 2.0 * agent_radius_slider.value if solver_dropdown.value == "SQP" else 0.0
-            note = "" if solver_dropdown.value == "SQP" else "  [this solver has no inter-agent avoidance]"
-            msg += f"  |  min inter-agent distance={inter_dist:.3f} (required >= {required:.3f}){note}"
+            required = 2.0 * agent_radius_slider.value
+            msg += f"  |  min inter-agent distance={inter_dist:.3f} (required >= {required:.3f})"
         status_text.value = msg
 
     def rebuild_and_resolve():
@@ -336,19 +285,11 @@ def main():
     def _(_):
         rebuild_and_resolve()
 
-    @solver_dropdown.on_update
-    def _(_):
-        rebuild_and_resolve()
-
     @weight_slider.on_update
     def _(_):
         rebuild_and_resolve()
 
-    @admm_iters_slider.on_update
-    def _(_):
-        rebuild_and_resolve()
-
-    @sqp_accel_log_slider.on_update
+    @accel_log_slider.on_update
     def _(_):
         rebuild_and_resolve()
 

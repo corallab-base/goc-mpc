@@ -16,8 +16,6 @@ from ._ext.goc_mpc import (
     MILPWaypointMPC,
     GraphTimingMPC,
     GraphShortPathMPC,
-    AdmmShortPathMPC,
-    SqpShortPathMPC,
     ObstacleSet,
 )
 
@@ -90,43 +88,41 @@ class GraphOfConstraintsMPC():
             short_path_length: int = 10,
             short_path_time_per_step: float = 0.05,
             # Static (per-episode) obstacle geometry consumed by the short
-            # path MPC (stage 2: sphere obstacles only -- see
-            # ObstacleSet.add_sphere). Pass an ObstacleSet you've already
-            # called add_sphere(...) on, or leave unset for an empty one
-            # (byte-identical behavior to before obstacle avoidance existed
-            # -- an empty ObstacleSet keeps the short path MPC on its
-            # original QP-only fast path, no IPOPT involved).
+            # path MPC (sphere/box obstacles, point clouds, per-agent SDF
+            # grids -- see ObstacleSet's own doc comment, obstacle_set.hpp).
+            # Pass an ObstacleSet you've already registered geometry on, or
+            # leave unset for an empty one.
             # GraphShortPathMPC stores it BY POINTER, not by copy, so
-            # further add_sphere/clear calls on the SAME object after
-            # construction remain visible to every future solve() -- see
-            # `self.obstacles` below, which is what keeps it alive.
+            # further mutation of the SAME object after construction remains
+            # visible to every future solve() -- see `self.obstacles` below,
+            # which is what keeps it alive.
             obstacles: ObstacleSet | None = None,
-            # Weight on the soft Lorentzian obstacle-repulsion cost added
-            # alongside the hard per-obstacle clearance constraint (see
-            # graph_short_path_mpc.cpp's build_short_path_problem). Has no
-            # effect when `obstacles` is empty.
-            obstacle_repulsion_weight: float = 0.5,
-            # True (default): add the hard per-obstacle clearance constraint
-            # and solve with NloptSolver/LD_SLSQP -- a real safety guarantee
-            # when it converges, but can report the whole short-path NLP
-            # infeasible once several obstacle constraints are active at
-            # once (see GraphShortPathMPC::_use_hard_constraints's own
-            # comment). False drops the hard constraint, keeps only the
-            # soft repulsion cost -- still routed through NloptSolver/
-            # LD_SLSQP, but with nothing to report infeasible about, so it
-            # reduces to ordinary local quasi-Newton minimization of a
-            # smooth function -- structurally can't fail the same way, no
-            # hard safety guarantee.
-            use_hard_constraints: bool = True,
+            # Remaining short path mpc hyperparameters mirror
+            # GraphShortPathMPC's own constructor 1:1, same defaults -- see
+            # its doc comment (graph_short_path_mpc.hpp) for the full
+            # rationale behind each. agent_radii: one entry per agent,
+            # default EMPTY meaning every agent has radius 0 (point agents
+            # that still must not occupy the same position at the same
+            # step); a pair's combined inter-agent avoidance radius is the
+            # sum of both agents' own.
+            agent_radii: np.ndarray | None = None,
+            tracking_weight: float = 1.0,
+            velocity_tracking_weight: float = 1.0,
+            acceleration_weight: float = 1.0,
+            penalty_weight: float = 1.0e3,
+            max_iterations: int = 30,
+            initial_trust_radius: float = 0.5,
+            max_trust_radius: float = 5.0,
+            min_trust_radius: float = 1.0e-6,
+            grad_tol: float = 1.0e-6,
+            constraint_prune_margin: float = 1.0,
             # Caller-supplied short-path solver, bypassing the
             # GraphShortPathMPC auto-construction below entirely -- mirrors
-            # waypoint_mpc/timing_mpc's own override pattern. Lets a caller
-            # swap in AdmmShortPathMPC (see admm_short_path_mpc.hpp) instead
-            # of the default Drake-MathematicalProgram/NLopt-based
-            # GraphShortPathMPC; both classes expose an identical solve()
-            # signature (var_assignments/remaining_vertices are accepted but
-            # unused by either today) so this class's call site
-            # (_solve_for_short_path) works unmodified either way. As with
+            # waypoint_mpc/timing_mpc's own override pattern. The override
+            # need only expose the same solve()/view_points/view_vels/
+            # view_times/view_obstacles/get_last_solve_time surface (see
+            # GraphShortPathMPC's own doc comment) so this class's call site
+            # (_solve_for_short_path) works unmodified. As with
             # waypoint_mpc/timing_mpc, the caller is responsible for having
             # built it against the same graph/spline_spec/short_path_length,
             # and for keeping its own ObstacleSet alive (this class's
@@ -227,8 +223,13 @@ class GraphOfConstraintsMPC():
             self.obstacles = obstacles if obstacles is not None else ObstacleSet()
             self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
                                                     num_agents, dim, short_path_time_per_step,
-                                                    self.obstacles, obstacle_repulsion_weight,
-                                                    use_hard_constraints)
+                                                    self.obstacles,
+                                                    agent_radii if agent_radii is not None else np.array([]),
+                                                    tracking_weight, velocity_tracking_weight,
+                                                    acceleration_weight, penalty_weight,
+                                                    max_iterations, initial_trust_radius,
+                                                    max_trust_radius, min_trust_radius,
+                                                    grad_tol, constraint_prune_margin)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):

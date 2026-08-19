@@ -21,7 +21,7 @@ std::vector<CubicConfigurationSpline> BuildAgentShapes(const GraphOfConstraints&
 			if (b.type != Block::Type::R && b.type != Block::Type::Torus &&
 			    b.type != Block::Type::SO3Quat) {
 				throw std::runtime_error(
-					"SqpShortPathMPC: Block::SO3Mat is not supported (agent " +
+					"GraphShortPathMPC: Block::SO3Mat is not supported (agent " +
 					std::to_string(ag) + ") -- R/Torus/SO3Quat only.");
 			}
 		}
@@ -56,9 +56,8 @@ Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau, const SmoothCos
 	Eigen::MatrixXd H = Eigen::MatrixXd::Zero(n, n);
 	const double tau2 = tau * tau;
 
-	// Same coefficient pattern as AdmmShortPathMPC::build_hessian
-	// (admm_short_path_mpc.cpp) -- tracking, velocity-tracking, and the
-	// coast-corrected acceleration residual's linear-in-(p,v) coefficients,
+	// Tracking, velocity-tracking, and the coast-corrected acceleration
+	// residual's linear-in-(p,v) coefficients,
 	// none of which depend on the current iterate (only the RHS/target
 	// does, see BuildAxisRhs) -- so this block is reused unchanged across
 	// every outer SQP iteration within one solve() call. `weights` scales
@@ -156,13 +155,11 @@ Eigen::VectorXd BuildAxisRhs(const AxisLayout& axis,
 		add_g({{IdxV(0, i, num_steps), 1.0}}, vtrack_target, weights.velocity_tracking);
 
 		if (i == 0) {
-			// disp0 = p_current(0) - x0, wrap-aware -- the coefficient
-			// pattern is identical to AdmmShortPathMPC's i==0 branch
-			// (build_rhs), only the target changes (linearized around the
+			// disp0 = p_current(0) - x0, wrap-aware -- linearized around the
 			// current iterate instead of being an absolute-coordinate
 			// target against x0 directly -- see this file's own top
 			// comment / the project plan's design decision 3 for the
-			// derivation).
+			// derivation.
 			const Eigen::VectorXd disp0 =
 				agent_shape.PositionDelta<double>(points_agent.row(0).transpose(), x0_agent);
 			const double target0 =
