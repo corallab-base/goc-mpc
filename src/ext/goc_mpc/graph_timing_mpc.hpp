@@ -46,7 +46,51 @@ namespace py = pybind11;
 // box (D/V are LINEAR in v, so the Hessian's v-dependent blocks don't grow
 // with v's actual value), every QP subproblem is solvable by construction
 // -- so a failed step degrades to a smaller trust region (a detectable,
-// recoverable stall) rather than IPOPT's outright refusal. A stress test
+// recoverable stall) rather than IPOPT's outright refusal.
+//
+// CORRECTION (2026-08-17): the "solvable by construction" claim above held
+// for the tau box and the LESS_THAN/EQUAL cross-agent interaction rows only
+// in the sense that the GLOBAL (un-trust-regioned) feasible set is always
+// non-empty -- every row is exactly linear, never curved, so nothing here
+// needs re-linearizing. It did NOT account for the TRUST-REGION-CLAMPED
+// subproblem actually solved every iteration. An EQUAL row (two agents'
+// cumulative time-to-a-shared-node forced equal -- exactly what
+// `GraphOfConstraints::get_agent_paths`/`reindex_agent_interactions` emit
+// for any node two agents both touch, e.g. a handoff) can have a CURRENT
+// violation larger than any combination of moves within
+// `[-trust_radius, trust_radius]` on the involved tau's can close, making
+// that iteration's box-intersect-hyperplane genuinely empty -- qpOASES
+// then correctly (not spuriously) reports infeasibility. Worse, for an
+// EQUALITY row this trust-region shrink-and-retry loop's usual remedy
+// backfires: a smaller box is a STRICTER subset, never easier to satisfy,
+// so a stuck cycle burns every iteration down to min_trust_radius and
+// commits whatever half-stalled iterate it has as the cycle's plan --
+// confirmed, via a real 2-agent handoff scenario
+// (po_goc_mpc's object_handoff_experiment.py under
+// TracedTimingMPC/solve_dense), to visibly derail the commanded
+// trajectory downstream, not just waste compute solving repeatedly.
+//
+// Fixed by slack-relaxing the interaction rows themselves -- the same
+// exact-l1-penalty Sl1QP pattern SqpShortPathMPC uses for its obstacle/
+// agent-pair rows (Nocedal & Wright Sec. 18.5, see that class's own doc
+// comment): a LESS_THAN row gets one nonnegative slack; an EQUAL row
+// (two-sided) gets a nonnegative plus/minus PAIR (`g_val = s_plus -
+// s_minus`, the standard elastic-variable reformulation of an equality in
+// an exact-penalty method); `_interaction_penalty_weight * (sum of every
+// row's slack(s))` added to the QP objective, and the trust-region loop's
+// accept/reject now runs on the merit function
+// `phi(x) = f(x) + _interaction_penalty_weight * violation(x)` (mirroring
+// SqpShortPathMPC's RunTrustRegionSqp) instead of the plain objective
+// ratio. This restores "every QP subproblem feasible by construction" as
+// an ACTUALLY true statement (dx=0, slack=|current violation| always
+// satisfies every row, independent of trust_radius) -- the tau/v box and
+// the smooth Gauss-Newton Hessian are unaffected, so behavior only changes
+// in cycles where the interaction rows and the trust region would
+// otherwise have conflicted, and reproduces the unrelaxed optimum whenever
+// that's reachable within the trust region and
+// `_interaction_penalty_weight` exceeds the active rows' true Lagrange
+// multipliers (same caveat as any exact-penalty method -- see this
+// parameter's own comment below). A stress test
 // (25 randomized 3-agent scenarios with active cross-agent timing
 // constraints) found the old IPOPT-based implementation failing on 24/25
 // while this one succeeded on all 25, ~30x faster on average.
@@ -112,6 +156,19 @@ struct GraphTimingMPC {
 	double _time_cost2;
 	double _acceleration_cost;
 
+	// Weight on the interaction rows' slack relaxation (see this struct's
+	// own doc comment's CORRECTION paragraph) -- large enough and a
+	// relaxed-optimum solve reproduces the unrelaxed (hard-constrained)
+	// one exactly whenever that's reachable within the current trust
+	// region (standard exact-penalty behavior, Nocedal & Wright Sec. 18.5:
+	// the threshold is the true Lagrange multiplier magnitude of whichever
+	// interaction row is active at the optimum, not knowable a priori);
+	// too small and a cross-agent LESS_THAN/EQUAL constraint can be
+	// smoothly traded away against tracking/acceleration cost instead of
+	// actually enforced. Default matches SqpShortPathMPC's own
+	// `penalty_weight` default -- no case-specific tuning done yet.
+	double _interaction_penalty_weight;
+
 	// Trust-region outer loop tuning. Defaults are conservative (small
 	// initial radius, generous iteration budget) rather than tuned for
 	// speed -- see solve()'s own comment on why correctness of the
@@ -165,7 +222,8 @@ struct GraphTimingMPC {
 		       double initial_trust_radius = 1.0,
 		       double max_trust_radius = 50.0,
 		       double min_trust_radius = 1e-6,
-		       double grad_tol = 1e-6);
+		       double grad_tol = 1e-6,
+		       double interaction_penalty_weight = 1.0e3);
 	~GraphTimingMPC();
 
 	// Explicit, not implicit: declaring ~GraphTimingMPC() above (needed so
