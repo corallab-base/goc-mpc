@@ -446,10 +446,7 @@ class GraphOfConstraintsMPC():
         self.last_cycle_backtracked_phases = {}
 
         # BACKTRACKING: if the task has been finished
-        if len(self.remaining_phases) == 0:
-            # TODO: support final edge phis
-            pass
-        else:
+        if len(self.remaining_phases) > 0:
             remaining_phases_changed = True
 
             # otherwise,
