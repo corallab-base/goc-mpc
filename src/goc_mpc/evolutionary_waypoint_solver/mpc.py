@@ -93,11 +93,12 @@ change), passing a different `anchor` value on each call -- like `x0` -- adds
 no retracing, only a cheap-in-Python `_compute_anchor` call. Population reuse
 (`_carry`) is therefore unconditional after the first build too: `solve()`
 always resumes from the previous call's population/AL-state via
-`carry_from_population`, which re-evaluates F/CV/best fresh under the
-*current* x0 and anchor before continuing (a single cheap batched forward
-pass, not a full n_gen search). Call `warmup()` once up front to pay the
-first trace/compile outside of a timed run and seed `_carry` from that run's
-own result.
+`self._resume_fn` (built once per problem by `_ensure_built`, see
+solver.py's `build_resume_carry_fn`), which re-evaluates F/CV/best fresh
+under the *current* x0 and anchor before continuing (a single cheap, jitted
+batched forward pass, not a full n_gen search). Call `warmup()` once up
+front to pay the first trace/compile outside of a timed run and seed
+`_carry` from that run's own result.
 """
 
 import time
@@ -112,7 +113,7 @@ from .solver import (
     run_lamarckian_al,
     build_lamarckian_ga,
     build_initial_carry_fn,
-    carry_from_population,
+    build_resume_carry_fn,
 )
 
 # Params that only affect *building the initial carry* (a fresh random
@@ -211,6 +212,11 @@ class EvolutionaryWaypointSolver:
 
         self._problem = problem
         self._ga_fn = build_lamarckian_ga(problem, self._pop_size, self._n_gen, **self._lamarckian_kwargs)
+        # Compiled once per problem/pop_size, reused by every solve() call's
+        # warm-resume branch below (see build_resume_carry_fn's docstring for
+        # why the un-jitted, generic carry_from_population is the wrong
+        # thing to call there every cycle).
+        self._resume_fn = build_resume_carry_fn(problem, self._pop_size)
 
     def _compute_anchor(self, remaining_vertices):
         """Builds this solve()/warmup() call's AnchorState from
@@ -264,32 +270,23 @@ class EvolutionaryWaypointSolver:
         first timed solve() -- which then also starts from a genuinely warm
         population rather than a random one.
 
-        Also exercises two code paths solve() alone reaches but this cold-
-        start build above never does, so a real solve() call right after
-        this one doesn't still pay for either:
-          - `problem._decode_node_rank`: a separate jitted function from
-            `_ga_fn`, called only by solve()'s own write-back, to report
-            the visiting-order rank.
-          - `carry_from_population` (module-level, solver.py): the WARM-
-            resume path solve() takes on every call once `_carry` is
-            already set (i.e. every real call after the first). This is a
-            plain, un-jitted Python function -- unlike the cold-start path
-            above, which is `build_initial_carry_fn`'s `jax.jit(init)`, one
-            fused compiled program wrapping the *same* underlying
-            `_carry_from_population` logic. Tracing that fused program does
-            NOT populate the separate per-primitive compile cache each of
-            `carry_from_population`'s bare eager `jnp`/`problem._batched`
-            calls hits on ITS OWN first invocation -- CPU XLA compilation
-            has real fixed per-call latency, and this function dispatches
-            many small ops (one gather/concatenate per registered
-            constraint), so that first eager call is the dominant cost left
-            over even after the above -- confirmed empirically: extending
-            this method to trace `_decode_node_rank` alone barely moved the
-            first real solve() call's time, tracing `carry_from_population`
-            as well dropped it to steady-state. Without this, `solve()`'s
-            warm-resume branch (`self._carry is not None`, i.e. every call
-            after the very first) always pays this once, on its own first
-            invocation, warmed here or not.
+        Also exercises two jitted functions solve() alone reaches but this
+        cold-start build above never does, so a real solve() call right
+        after this one doesn't still pay their first-call compile:
+          - `problem._decode_node_rank`: called only by solve()'s own
+            write-back, to report the visiting-order rank.
+          - `self._resume_fn` (see `_ensure_built`/`build_resume_carry_fn`):
+            the WARM-resume path solve() takes on every call once `_carry`
+            is already set (i.e. every real call after the first). Unlike
+            the generic, un-jitted `carry_from_population` this used to
+            call (see build_resume_carry_fn's docstring for why that was
+            the actual dominant cost of solve() on a real problem -- NOT a
+            one-time compile artifact but genuine per-call eager-dispatched
+            constraint-evaluation compute, paid on every solve(), warmed
+            here or not, until `self._resume_fn` existed to actually
+            compile it), `self._resume_fn` IS a real jitted function, so
+            warming it here does eliminate its first-call compile the same
+            way as `_decode_node_rank`'s.
 
         Returns the compile time."""
         x0 = self._check_x0(x0)
@@ -316,10 +313,8 @@ class EvolutionaryWaypointSolver:
 
         prev_X, prev_mu, prev_lam, prev_rho, prev_key = (
             carry_out[0], carry_out[1], carry_out[2], carry_out[3], carry_out[6])
-        warm_carry = carry_from_population(
-            self._problem, prev_X, x0_arr, prev_key, anchor, params=params_arr,
-            mu=prev_mu, lam=prev_lam, rho=prev_rho,
-            pop_size=self._pop_size, **self._carry_kwargs_for("rho0"))
+        warm_carry = self._resume_fn(prev_X, x0_arr, prev_key, anchor, params_arr,
+                                      prev_mu, prev_lam, prev_rho)
         jax.block_until_ready(warm_carry)
 
         compile_time = time.perf_counter() - start
@@ -351,16 +346,16 @@ class EvolutionaryWaypointSolver:
             # Resume the previous solve's population *and* AL multiplier
             # state (mu/lam/rho) instead of cold-random-initializing and
             # resetting the constraint penalty from scratch -- see
-            # carry_from_population's docstring. F/CV/best are always
-            # freshly re-evaluated under the *current* x0/anchor, since the
-            # cached carry's own were scored under whatever was current on
-            # the call that produced them.
+            # build_resume_carry_fn's docstring for why this goes through
+            # the jitted `self._resume_fn` (compiled once in _ensure_built)
+            # rather than the generic, un-jitted `carry_from_population`.
+            # F/CV/best are always freshly re-evaluated under the *current*
+            # x0/anchor, since the cached carry's own were scored under
+            # whatever was current on the call that produced them.
             prev_X, prev_mu, prev_lam, prev_rho, prev_key = (
                 self._carry[0], self._carry[1], self._carry[2], self._carry[3], self._carry[6])
-            init_carry = carry_from_population(
-                problem, prev_X, x0_arr, prev_key, anchor, params=params_arr,
-                mu=prev_mu, lam=prev_lam, rho=prev_rho,
-                pop_size=self._pop_size, **self._carry_kwargs_for("rho0"))
+            init_carry = self._resume_fn(prev_X, x0_arr, prev_key, anchor, params_arr,
+                                          prev_mu, prev_lam, prev_rho)
             self._last_population_reused = True
         else:
             init_carry = None
@@ -426,9 +421,6 @@ class EvolutionaryWaypointSolver:
         self._last_solve_time = time.perf_counter() - start
         return True
 
-    def _carry_kwargs_for(self, *names):
-        return {k: self._carry_kwargs[k] for k in names if k in self._carry_kwargs}
-
     def view_waypoints(self):
         return self._waypoints
 
@@ -465,7 +457,7 @@ class EvolutionaryWaypointSolver:
     def was_last_population_reused(self):
         """True if the last solve() started from a previous carry's
         population (refreshed under the current x0/anchor via
-        carry_from_population) rather than a cold random one."""
+        self._resume_fn) rather than a cold random one."""
         return self._last_population_reused
 
     def get_last_compile_time(self):

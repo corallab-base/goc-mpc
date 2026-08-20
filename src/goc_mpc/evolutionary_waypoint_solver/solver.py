@@ -687,6 +687,42 @@ def carry_from_population(problem, X, x0, key, anchor, params=None, mu=None, lam
     return _carry_from_population(problem, key, X, pop_size, x0, params, anchor, mu=mu, lam=lam, rho=rho, rho0=rho0)
 
 
+def build_resume_carry_fn(problem, pop_size):
+    """Builds a jitted `resume(X, x0, key, anchor, params, mu, lam, rho) ->
+    carry`, compiled once per `problem` -- the same re-evaluate-under-
+    current-(x0, anchor)-and-keep-(mu, lam, rho) logic `carry_from_population`/
+    `_carry_from_population` implement (see their docstrings), but for
+    EvolutionaryWaypointSolver's own repeated warm-resume call (solve()'s
+    `self._carry is not None` branch, taken on every real call after the
+    first) instead of a one-off external caller.
+
+    `carry_from_population` stays a plain, un-jitted function deliberately
+    -- it accepts `problem` as an ordinary argument (not a valid JAX
+    tracer/pytree leaf) and tolerates `mu`/`lam`/`rho` being `None` (built
+    fresh from `pop_size`/`rho0` instead), which suits a convenient one-off
+    public entry point but means `_evaluate_population_jax`'s constraint
+    evaluations -- one un-fused eager op per registered constraint, not a
+    single cached compiled program -- are re-dispatched from scratch on
+    EVERY call. For a problem with real per-constraint compute (e.g.
+    forward-kinematics-heavy pick/place constraints), that eager-dispatch
+    cost is genuine repeated compute, not one-time overhead: measured on
+    one such problem, this was the actual dominant cost of `solve()` --
+    ~620ms EVERY call, dwarfing the GA/AL/L-BFGS computation itself
+    (~10ms) -- not a first-call-only compile artifact. Closing over
+    `problem`/`pop_size` here (mirroring `build_lamarckian_ga`/
+    `build_initial_carry_fn`'s own factory-returns-a-jitted-closure
+    pattern) and requiring `mu`/`lam`/`rho` as plain (non-`None`) arguments
+    -- always true for EvolutionaryWaypointSolver's own resume call, which
+    only ever takes this branch once a carry, and so real `mu`/`lam`/`rho`,
+    already exist -- makes this compilable, fixing that."""
+    def resume(X, x0, key, anchor, params, mu, lam, rho):
+        F0, CV0 = _evaluate_population_jax(problem, X, x0, params, anchor)
+        order0 = _rank_jax(F0 + 1e6 * jnp.maximum(0.0, CV0))
+        best_X0, best_F0, best_CV0 = X[order0[0]], F0[order0[0]], CV0[order0[0]]
+        return (X, mu, lam, rho, F0, CV0, key, best_X0, best_F0, best_CV0)
+    return jax.jit(resume)
+
+
 def build_initial_carry_fn(problem, pop_size, anchor, rho0=1.0,
                             n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05):
     """Returns a jitted `init(key) -> carry` building a fresh (cold) random
