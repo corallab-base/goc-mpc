@@ -262,7 +262,36 @@ class EvolutionaryWaypointSolver:
         and seeds `_carry` with the resulting (already optimized)
         population, so this cost is paid once up front instead of on the
         first timed solve() -- which then also starts from a genuinely warm
-        population rather than a random one. Returns the compile time."""
+        population rather than a random one.
+
+        Also exercises two code paths solve() alone reaches but this cold-
+        start build above never does, so a real solve() call right after
+        this one doesn't still pay for either:
+          - `problem._decode_node_rank`: a separate jitted function from
+            `_ga_fn`, called only by solve()'s own write-back, to report
+            the visiting-order rank.
+          - `carry_from_population` (module-level, solver.py): the WARM-
+            resume path solve() takes on every call once `_carry` is
+            already set (i.e. every real call after the first). This is a
+            plain, un-jitted Python function -- unlike the cold-start path
+            above, which is `build_initial_carry_fn`'s `jax.jit(init)`, one
+            fused compiled program wrapping the *same* underlying
+            `_carry_from_population` logic. Tracing that fused program does
+            NOT populate the separate per-primitive compile cache each of
+            `carry_from_population`'s bare eager `jnp`/`problem._batched`
+            calls hits on ITS OWN first invocation -- CPU XLA compilation
+            has real fixed per-call latency, and this function dispatches
+            many small ops (one gather/concatenate per registered
+            constraint), so that first eager call is the dominant cost left
+            over even after the above -- confirmed empirically: extending
+            this method to trace `_decode_node_rank` alone barely moved the
+            first real solve() call's time, tracing `carry_from_population`
+            as well dropped it to steady-state. Without this, `solve()`'s
+            warm-resume branch (`self._carry is not None`, i.e. every call
+            after the very first) always pays this once, on its own first
+            invocation, warmed here or not.
+
+        Returns the compile time."""
         x0 = self._check_x0(x0)
         self._ensure_built(x0)
         x0_arr = jnp.asarray(x0)
@@ -276,6 +305,23 @@ class EvolutionaryWaypointSolver:
         carry_in = init_fn(jax.random.PRNGKey(self._seed))
         carry_out = self._ga_fn(carry_in, x0_arr, params_arr, anchor)
         jax.block_until_ready(carry_out)
+
+        best_X = np.asarray(carry_out[-3])
+        assign, cond_binary, t, _wp = self._problem._extract_single(best_X)
+        owner_variable = (np.argmax(assign, axis=-1) if self._problem.n_variables > 0
+                          else np.zeros(0, dtype=int))
+        node_rank = self._problem._decode_node_rank(
+            owner_variable, np.asarray(cond_binary), t, np.asarray(anchor.node_active))
+        jax.block_until_ready(node_rank)
+
+        prev_X, prev_mu, prev_lam, prev_rho, prev_key = (
+            carry_out[0], carry_out[1], carry_out[2], carry_out[3], carry_out[6])
+        warm_carry = carry_from_population(
+            self._problem, prev_X, x0_arr, prev_key, anchor, params=params_arr,
+            mu=prev_mu, lam=prev_lam, rho=prev_rho,
+            pop_size=self._pop_size, **self._carry_kwargs_for("rho0"))
+        jax.block_until_ready(warm_carry)
+
         compile_time = time.perf_counter() - start
 
         self._carry = carry_out
