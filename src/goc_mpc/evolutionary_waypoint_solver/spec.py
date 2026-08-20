@@ -1,11 +1,11 @@
-"""GraphOrderingSpec: adapter that derives a GraphOrderingRelaxed problem
+"""build_graph_ordering_problem: derives a GraphOrderingRelaxed problem
 instance (see problem.py) from a real C++ GraphOfConstraints, so one graph
 definition can drive either the MILP (MILPWaypointMPC) or this JAX-native
 evolutionary solver.
 
 Built ONCE per GraphOfConstraints and reused for the solver's whole lifetime,
-spanning the WHOLE graph unconditionally (see GraphOrderingSpec's class
-docstring): remaining_vertices is a runtime AnchorState (mpc.py/problem.py)
+spanning the WHOLE graph unconditionally (see build_graph_ordering_
+problem's own docstring): remaining_vertices is a runtime AnchorState (mpc.py/problem.py)
 fed into the already-compiled GraphOrderingRelaxed at solve time, so a node
 dropping out of remaining_vertices never removes its wps row, routing
 instance, or any constraint touching it -- it only switches that node from a
@@ -373,7 +373,7 @@ def _batch_symbolic_constraint_fn(fn, node_locals, mode="frozen"):
     per-node tensor (pop, n_nodes, state_dim) -- identical wherever a row's
     node is still active, and differing only for an already-passed node's row
     (problem.apply_anchor); `mode` (a plain Python str, closed over at
-    spec-build time via GraphOrderingSpec's live_phi_ids, never a traced
+    spec-build time via build_graph_ordering_problem's live_phi_ids, never a traced
     value) picks which one this particular constraint reads for ALL of its
     rows. Each entry of `node_locals` is a node index (this constraint's
     node, or (u, v) for an edge constraint) -- NOT a routing-instance id (see
@@ -455,7 +455,7 @@ def _batch_along_edge_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
 def _batch_relational_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen"):
     """The *relational* (two-row) analogue of _batch_along_edge_interior_fn
     above -- used for hold-derived rigid-carry constraints (see
-    GraphOrderingSpec._resolve_holds), the JAX side of MILP's Constraint 14a
+    spec.py's _resolve_holds), the JAX side of MILP's Constraint 14a
     interior-reinforcement loop (milp_waypoint_mpc.cpp: AddHoldRigidity*Gated,
     gated by GetOrAddBetweennessIndicator). `fn(row_ref, row_other,
     owner_variable) -> (k,)` is the same compiled residual already registered
@@ -510,7 +510,7 @@ def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank
     Ties the object's segment at u and v together UNLESS the edge's own
     DECODED-rank interval [rank_u, rank_v] overlaps some declared hold's own
     interval [rank_hu, rank_hv] on this object (`hold_node_pairs`, from
-    GraphOrderingSpec._resolve_stationary_objects) -- via decode_node_rank
+    spec.py's _resolve_stationary_objects) -- via decode_node_rank
     (see _batch_along_edge_interior_fn's docstring for why the EXACT decoded
     rank is used here rather than raw `t`: unlike that function's bonus/
     best-effort reinforcement on top of an already-exact registration, this
@@ -535,7 +535,7 @@ def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank
     means overlap_any is vacuously always False -- collapses to an
     unconditional equality, exactly mirroring MILP's `any_gate` branch.
 
-    Registered mode="live" (see GraphOrderingSpec._resolve_holds' docstring
+    Registered mode="live" (see spec.py's _resolve_holds' docstring
     for the same reasoning applied to hold rigidity): once u has passed, an
     untouched object's real current position (x0) is the ground truth going
     forward, not whatever was merely planned there."""
@@ -626,70 +626,97 @@ def _batch_python_constraint_fn(fn, node):
     return batched
 
 
-class GraphOrderingSpec:
-    """Spans the WHOLE graph, independent of any receding-horizon
-    remaining_vertices set -- built once per GraphOfConstraints and reused
-    for every solve() (see EvolutionaryWaypointSolver in mpc.py, which feeds
-    remaining_vertices in as a runtime AnchorState instead: a node no longer
-    in remaining_vertices keeps its waypoint row and any routing instance, but
-    solver.py's apply_anchor() substitutes its last-committed value in place
-    of the free decision variable there, and kernel.py masks it out of
-    routing/ordering -- so a node/edge constraint anchored at an already-
-    passed node is never dropped, only its "passed" side becomes a known
-    constant instead of a free variable. For an edge constraint, that
-    constant is one of TWO choices, picked per constraint via `live_phi_ids`
-    (edge phi ids only -- see graph_of_constraints.hpp's live_edge_phis
-    comment for why a node constraint has no such choice to make) -- see
-    _resolve_symbolic_constraints and problem.apply_anchor's docstring)."""
+def build_graph_ordering_problem(graph, x0, wp_bounds,
+                                  objective="avg", edge_cost_fn=None,
+                                  python_constraints=()):
+    """Derives a GraphOrderingRelaxed problem instance (see problem.py)
+    from a real C++ GraphOfConstraints in one pass, so one graph
+    definition can drive either the MILP (MILPWaypointMPC) or this
+    JAX-native evolutionary solver. Called exactly once per
+    GraphOfConstraints, by EvolutionaryWaypointSolver._ensure_built
+    (mpc.py) -- the returned GraphOrderingRelaxed's shape is fixed for the
+    solver's whole lifetime, so there is no later point at which a change
+    here could take effect.
 
-    def __init__(self, graph, x0, wp_bounds,
-                 objective="avg", edge_cost_fn=None):
-        self.graph = graph
-        self.x0 = x0
-        self.wp_bounds = wp_bounds
-        self.objective = objective
-        self.edge_cost_fn = edge_cost_fn
-        # Edge phi ids (graph.edge_phi_to_formula_map keys, populated by
-        # GraphOfConstraints.add_edge_constraint(..., live=True)) whose
-        # u-side reads should track the current call's real x0 (wp_live)
-        # instead of the last-committed planned value (wp_frozen, the
-        # default for anything not listed here) -- see
-        # _resolve_symbolic_constraints and problem.apply_anchor's
-        # docstring. Read straight off `graph` (not a separate constructor
-        # argument): the live/frozen choice lives with the constraint that
-        # defines it (graph_of_constraints.hpp's live_edge_phis comment),
-        # not with whichever solver happens to run it, so there is nothing
-        # for a caller here to legitimately override. Node phi ids are
-        # never meaningful here (_resolve_symbolic_constraints hardcodes
-        # "frozen" for every node constraint), so any present would simply
-        # be inert.
-        self._live_phi_ids = frozenset(graph.live_edge_phis)
-        self._python_constraints = []  # (node, fn, kind, name)
-        self._symbolic_constraints = []  # (node_locals_tuple, fn, kind, mode, name)
-        self._interior_constraints = []  # (batched_fn, name) -- see _batch_along_edge_interior_fn
-        self._stationary_constraints = []  # (batched_fn, name) -- see _batch_stationary_edge_fn
+    Spans the WHOLE graph unconditionally, independent of any
+    receding-horizon remaining_vertices set (see module docstring above):
+    remaining_vertices is a runtime AnchorState (mpc.py/problem.py) fed
+    into the already-built GraphOrderingRelaxed at solve time, so a node
+    dropping out of remaining_vertices never removes its wp row, routing
+    instance, or any constraint touching it -- it only switches that node
+    from a free decision variable to a known constant (its last-committed
+    value), mirroring how MILP substitutes a passed node's frozen waypoint
+    into a boundary edge constraint rather than dropping it. For an edge
+    constraint, that constant is one of TWO choices, picked per constraint
+    via `live_phi_ids` (edge phi ids only -- see graph_of_constraints.hpp's
+    live_edge_phis comment for why a node constraint has no such choice to
+    make) -- see _resolve_symbolic_constraints and problem.apply_anchor's
+    docstring.
 
-    @classmethod
-    def from_graph_of_constraints(cls, graph, x0, wp_bounds,
-                                   objective="avg", edge_cost_fn=None):
-        spec = cls(graph, x0, wp_bounds, objective, edge_cost_fn)
-        spec._resolve_structure()
-        return spec
+    `python_constraints`: an iterable of (node, fn, kind, name) tuples --
+    see EvolutionaryWaypointSolver.add_python_constraint (mpc.py), the
+    single-node-whole-row Python escape hatch for anything outside this
+    module's symbolic scope entirely (e.g. a non-symbolic/black-box cost);
+    fn(wp_row, assign) -> (k,), kind="eq" feeds pymoo/AL's H (feasible at
+    0), kind="ineq" feeds G (feasible at <=0) -- see target_eq_constraint/
+    _batch_python_constraint_fn. Every node/edge constraint added via the
+    graph's unified symbolic API (add_constraint/add_assignable_constraint/
+    add_edge_constraint) is instead auto-derived below from graph.phi_to_
+    formula_map/edge_phi_to_formula_map and compiled via formula_compiler.
+    compile_relational_formula -- the same Formula that drives
+    MILPWaypointMPC also drives this solver, no manual duplication."""
+    # Edge phi ids (graph.edge_phi_to_formula_map keys, populated by
+    # GraphOfConstraints.add_edge_constraint(..., live=True)) whose u-side
+    # reads should track the current call's real x0 (wp_live) instead of
+    # the last-committed planned value (wp_frozen, the default for
+    # anything not listed here) -- see _resolve_symbolic_constraints and
+    # problem.apply_anchor's docstring. Read straight off `graph` (not a
+    # separate argument): the live/frozen choice lives with the constraint
+    # that defines it (graph_of_constraints.hpp's live_edge_phis comment),
+    # not with whichever solver happens to run it, so there is nothing for
+    # a caller here to legitimately override. Node phi ids are never
+    # meaningful here (_resolve_symbolic_constraints hardcodes "frozen"
+    # for every node constraint), so any present would simply be inert.
+    live_phi_ids = frozenset(graph.live_edge_phis)
+    symbolic_constraints = []  # (node_locals_tuple, fn, kind, mode, name)
+    interior_constraints = []  # (batched_fn, name) -- see _batch_along_edge_interior_fn
+    stationary_constraints = []  # (batched_fn, name) -- see _batch_stationary_edge_fn
 
-    # -- structure derivation -------------------------------------------
+    # -- structure derivation ---------------------------------------------
 
-    def _resolve_phi_agent_source(self, phi_id):
+    # Every graph node gets a row, unconditionally -- matching MILP, which
+    # gives every node in its (remaining_vertices-scoped) subgraph a W row
+    # regardless of whether any phi references it. This solver spans the
+    # whole graph rather than just remaining_vertices (see above), so
+    # "every node" here means every node in graph.structure, not just
+    # remaining_vertices. There is therefore exactly one node-numbering
+    # space in this solver: a real graph node id (from graph.structure) IS
+    # its own row index into wp/t/node_active/anchor_wp -- no separate
+    # local/compacted numbering.
+    node_list = list(range(graph.structure.num_nodes))
+    n_nodes = len(node_list)
+    # Per-agent padded-slot row layout -- see _slot_width's docstring.
+    # `agent_widths`/`slot_width` (no leading underscore) name the VALUES
+    # here, deliberately distinct from the _agent_widths/_slot_width
+    # module-level functions that compute them -- every reference to
+    # either name below (including inside the nested functions further
+    # down) means this same pair of values, never the function.
+    agent_widths = _agent_widths(graph)
+    slot_width = _slot_width(agent_widths)
+    state_dim = graph.num_agents * slot_width + graph.num_objects * graph.non_robot_dim
+
+    def _resolve_phi_agent_source(phi_id):
         """Resolves ONE phi/constraint's own agent source -- ("fixed",
         agent_id), ("var", var_id), or None if it doesn't establish a
         routing instance (e.g. an object-only formula) -- independently of
         any other phi on the same node, purely for ROUTING/ordering purposes
         (see module docstring; unrelated to whether the formula itself can
         be compiled, which the waypoint row layout always supports)."""
-        if phi_id in self.graph.phi_to_variable_map:
-            return ("var", self.graph.phi_to_variable_map[phi_id])
-        if phi_id in self.graph.phi_to_static_assignment_map:
-            return ("fixed", self.graph.phi_to_static_assignment_map[phi_id])
-        formula = self.graph.phi_to_formula_map.get(phi_id)
+        if phi_id in graph.phi_to_variable_map:
+            return ("var", graph.phi_to_variable_map[phi_id])
+        if phi_id in graph.phi_to_static_assignment_map:
+            return ("fixed", graph.phi_to_static_assignment_map[phi_id])
+        formula = graph.phi_to_formula_map.get(phi_id)
         if formula is None:
             return None
         # No entry in either map: either a plain literal-agent_q(k) node
@@ -701,8 +728,8 @@ class GraphOrderingSpec:
         # (references var_agent_q for >1 variable, matches nothing below,
         # correctly falls through to None).
         free_var_ids = {v.get_id() for v in formula.GetFreeVariables()}
-        matched = [k for k in range(self.graph.num_agents)
-                   if not _placeholder_id_map(self.graph.agent_q(k)).keys().isdisjoint(free_var_ids)]
+        matched = [k for k in range(graph.num_agents)
+                   if not _placeholder_id_map(graph.agent_q(k)).keys().isdisjoint(free_var_ids)]
         if len(matched) == 1:
             return ("fixed", matched[0])
         if len(matched) > 1:
@@ -712,243 +739,179 @@ class GraphOrderingSpec:
                 "as a single agent source for routing purposes")
         return None
 
-    def _resolve_structure(self):
-        # Every graph node gets a row, unconditionally -- matching MILP,
-        # which gives every node in its (remaining_vertices-scoped) subgraph
-        # a W row regardless of whether any phi references it. This solver
-        # spans the whole graph rather than just remaining_vertices (see
-        # class docstring), so "every node" here means every node in
-        # graph.structure, not just remaining_vertices. There is therefore
-        # exactly one node-numbering space in this solver: a real graph node
-        # id (from graph.structure) IS its own row index into wp/t/
-        # node_active/anchor_wp -- no separate local/compacted numbering.
-        self._node_list = list(range(self.graph.structure.num_nodes))
-        self.n_nodes = len(self._node_list)
-        # Per-agent padded-slot row layout -- see _slot_width's docstring.
-        # Computed once here and reused by _make_row_resolver/_resolve_holds/
-        # _resolve_stationary_objects/build_problem below, all of which used
-        # to reach for self.graph.dim directly.
-        self._agent_widths = _agent_widths(self.graph)
-        self._slot_width = _slot_width(self._agent_widths)
-        self.state_dim = self.graph.num_agents * self._slot_width + self.graph.num_objects * self.graph.non_robot_dim
+    # Routing instances: (node, resolved agent source) pairs -- purely a
+    # routing/ordering concept (which real agent visits this node, and in
+    # what order relative to its other nodes). A node may carry several
+    # (distinct agent targets); object references never contribute one
+    # (see _resolve_phi_agent_source). Discovered over every node with
+    # phis at all -- NOT restricted to Formula-based ones, since a routing
+    # instance can be established purely via phi_to_variable_map/phi_to_
+    # static_assignment_map (e.g. the older add_robot_linear_eq-style
+    # helpers, which register a static assignment but no drake::symbolic
+    # Formula at all -- see add_python_constraint/target_eq_constraint's
+    # use in examples/pointmass_example.py).
+    instance_list = []
+    instance_local_id = {}  # (node, src) -> local index, dedup only -- not read past this loop
+    for node in node_list:
+        for phi_id in graph.node_to_phis_map.get(node, []):
+            src = _resolve_phi_agent_source(phi_id)
+            if src is None:
+                continue
+            key = (node, src)
+            if key not in instance_local_id:
+                instance_local_id[key] = len(instance_list)
+                instance_list.append(key)
 
-        # Routing instances: (node, resolved agent source) pairs -- purely a
-        # routing/ordering concept (which real agent visits this node, and
-        # in what order relative to its other nodes). A node may carry
-        # several (distinct agent targets); object references never
-        # contribute one (see _resolve_phi_agent_source). Discovered over
-        # every node with phis at all -- NOT restricted to Formula-based
-        # ones, since a routing instance can be established purely via
-        # phi_to_variable_map/phi_to_static_assignment_map (e.g. the older
-        # add_robot_linear_eq-style helpers, which register a static
-        # assignment but no drake::symbolic Formula at all -- see
-        # add_python_constraint/target_eq_constraint's use in
-        # examples/pointmass_example.py).
-        instance_list = []
-        instance_local_id = {}
-        node_instances = {}
-        phi_instance = {}
-        for node in self._node_list:
-            for phi_id in self.graph.node_to_phis_map.get(node, []):
-                src = self._resolve_phi_agent_source(phi_id)
-                if src is None:
+    # One slot per distinct assignable variable id actually referenced
+    # here; statically-fixed instances consume no slot at all (their real
+    # agent id is already known, no GA search needed) -- this can
+    # legitimately leave n_variables at 0.
+    #
+    # Also folds in every assignable hold's var_id (hold.var_id, see
+    # _resolve_holds below) even though a hold contributes no routing
+    # instance of its own (add_assignable_hold's edge carries no node phi
+    # -- see get_agent_paths' HoldOwningAgents, goc-mpc's C++ side, for the
+    # ownership-resolution counterpart of this same gap). In every current
+    # experiment a hold's var_id is ALSO referenced by its u_node's own
+    # Pick-style constraint (e.g. pyrobosim_gymnasium's _pick_add pins
+    # agent_q via the same var_agent_q(var_id)), so this is redundant
+    # there -- but nothing enforces that pairing, and without it a hold
+    # whose variable is referenced nowhere else would KeyError in
+    # _resolve_holds instead of getting a GA slot.
+    var_ids = sorted({src[1] for _, src in instance_list if src[0] == "var"}
+                     | {hold.var_id for hold in graph.hold_ops.values()
+                        if hold.var_id is not None})
+    var_id_to_slot = {v: i for i, v in enumerate(var_ids)}
+    n_variables = len(var_ids)
+
+    instance_sources = [
+        (kind, var_id_to_slot[val] if kind == "var" else val)
+        for _, (kind, val) in instance_list
+    ]
+    instance_node = [node for node, _ in instance_list]
+
+    # Ordering edges are node pairs, not instance pairs: kernel.py's
+    # topological decoder (_topological_rank) computes a visiting-order
+    # rank for EVERY node unconditionally, regardless of whether that node
+    # carries a routing instance -- unlike the older arrival-time scheme
+    # this replaced (where node_arrival_time was only ever populated for
+    # nodes an agent's own route actually visited, via instance_node -- a
+    # node with no routing instance stayed stuck at its -inf init value,
+    # so an edge touching one was genuinely unconstrainable then). So an
+    # ordering edge no longer needs either endpoint to carry a routing
+    # instance: it's entirely normal, and common in this package's own
+    # experiments (e.g. a "release"/"place" node whose agent position is
+    # established purely by a transport EDGE constraint, not a node
+    # constraint -- see e.g. object_grasp_experiment.py's n_place), for a
+    # node that must still participate in precedence to have no routing
+    # instance of its own.
+
+    # Hard edges: conditional edges never enter `structure` (see
+    # add_conditional_edge_ordering's doc -- "invisible to BFS/routing"),
+    # so every structure edge is an unconditional precedence constraint.
+    hard_edges = []
+    for u in node_list:
+        for e in graph.structure.neighbors(u):
+            hard_edges.append((u, e.to))
+
+    # Conditional ordering edges: compile each Formula into a gate_fn
+    # closed over owner_variable/cond_binary index maps.
+    var_sym_ids = {graph.assignment_sym(v).get_id(): var_id_to_slot[v] for v in var_ids}
+    cond_binary_vars = graph.binary_cond_sym_vars
+    cond_sym_ids = {v.get_id(): i for i, v in enumerate(cond_binary_vars)}
+    n_cond_vars = len(cond_binary_vars)
+
+    cond_edges = []
+    for (u, v), formula in graph.conditional_ordering_map.items():
+        gate = compile_condition(formula, var_sym_ids, cond_sym_ids)
+        cond_edges.append((u, v, gate))
+
+    # Needed here (not just below, where symbolic/hold/stationary
+    # constraint resolution also uses it) since gated interior/stationary
+    # constraints (_batch_along_edge_interior_fn, _batch_relational_
+    # interior_fn, _batch_stationary_edge_fn) need the SAME decode_node_
+    # rank the routing kernel itself will use, to gate on an exact
+    # per-individual topologically valid order instead of raw t (see
+    # kernel.build_decode_node_rank's docstring).
+    ordering_edges = [(u, v, None) for u, v in hard_edges] + list(cond_edges)
+    decode_node_rank = build_decode_node_rank(ordering_edges, n_nodes)
+
+    row_resolver = _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width)
+
+    # -- symbolic constraints -----------------------------------------------
+
+    def _resolve_symbolic_constraints():
+        """Auto-derives eq/ineq residual constraints from the graph's unified
+        symbolic API (add_constraint / add_assignable_constraint /
+        add_edge_constraint), compiling each stored Formula the same way MILP
+        does structurally. Raises (via _make_row_resolver, through
+        _unsupported_placeholder) if a formula references a placeholder
+        genuinely outside that scope (e.g. a u-/ v-side placeholder inside a
+        node constraint). An edge constraint's stored formula compiles
+        differently depending on graph.edge_phi_to_along_edge_map: relationally
+        (once, over both endpoint rows) or "along the edge" (once, applied
+        independently to each endpoint's own row) -- see the branch below. Each
+        phi's `mode` ("live" if its id is in live_phi_ids, else "frozen")
+        threads through to build_graph_ordering_problem's _batch_symbolic_
+        constraint_fn/_batch_along_edge_interior_fn calls below -- see
+        problem.apply_anchor's docstring for what the two modes mean."""
+        node_formulas = graph.phi_to_formula_map
+        for node in node_list:
+            for phi_id in graph.node_to_phis_map.get(node, []):
+                if phi_id not in node_formulas:
+                    continue  # not a Formula-based (symbolic) constraint
+                formula = node_formulas[phi_id]
+                # Always frozen, never checked against live_phi_ids: a
+                # node constraint can only reference its own node's
+                # placeholders (see graph_of_constraints.hpp's live_edge_phis
+                # comment), so it has no live/frozen distinction to make --
+                # and node phi ids and edge phi ids are independent counters
+                # that can collide numerically, so checking a node phi_id
+                # against a set that only ever holds EDGE phi ids would risk
+                # spuriously matching an unrelated edge's id.
+                mode = "frozen"
+                resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 1)
+                fn, kind = compile_relational_formula(formula, resolver)
+                symbolic_constraints.append(
+                    ((node,), fn, kind, mode, f"phi_{phi_id}"))
+
+        edge_formulas = graph.edge_phi_to_formula_map
+        edge_along_edge = graph.edge_phi_to_along_edge_map
+        for (u, v), phi_ids in graph.edge_to_phis_map.items():
+            for phi_id in phi_ids:
+                if phi_id not in edge_formulas:
+                    continue  # not a Formula-based (symbolic) edge constraint
+                formula = edge_formulas[phi_id]
+                mode = "live" if phi_id in live_phi_ids else "frozen"
+
+                if edge_along_edge.get(phi_id, False):
+                    # "Along the edge" -- built from the plain agent_q/
+                    # object_q/var_agent_q placeholders (same as a node
+                    # constraint), so compile it ONCE against a single-slot
+                    # (node-scoped) resolver, then register the resulting fn
+                    # at each endpoint's own row (exact, its own persistent AL
+                    # multiplier each), PLUS a best-effort aggregate
+                    # re-application at any OTHER node whose `t` currently
+                    # falls between the endpoints' -- see
+                    # _batch_along_edge_interior_fn.
+                    resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 1)
+                    fn, kind = compile_relational_formula(formula, resolver)
+                    symbolic_constraints.append(
+                        ((u,), fn, kind, mode, f"edge_phi_{phi_id}_u"))
+                    symbolic_constraints.append(
+                        ((v,), fn, kind, mode, f"edge_phi_{phi_id}_v"))
+                    interior_batched = _batch_along_edge_interior_fn(
+                        fn, kind, u, v, decode_node_rank, mode=mode)
+                    interior_constraints.append(
+                        (interior_batched, f"edge_phi_{phi_id}_interior"))
                     continue
-                key = (node, src)
-                if key not in instance_local_id:
-                    instance_local_id[key] = len(instance_list)
-                    instance_list.append(key)
-                    node_instances.setdefault(node, []).append(instance_local_id[key])
-                phi_instance[phi_id] = instance_local_id[key]
 
-        self._instance_list = instance_list
-        self._instance_local_id = instance_local_id
-        self._node_instances = node_instances
-        self._phi_instance = phi_instance
+                resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 2)
+                fn, kind = compile_relational_formula(formula, resolver)
+                symbolic_constraints.append(
+                    ((u, v), fn, kind, mode, f"edge_phi_{phi_id}"))
 
-        # One slot per distinct assignable variable id actually referenced
-        # here; statically-fixed instances consume no slot at all (their
-        # real agent id is already known, no GA search needed) -- this can
-        # legitimately leave n_variables at 0.
-        #
-        # Also folds in every assignable hold's var_id (hold.var_id, see
-        # _resolve_holds below) even though a hold contributes no routing
-        # instance of its own (add_assignable_hold's edge carries no node
-        # phi -- see get_agent_paths' HoldOwningAgents, goc-mpc's C++ side,
-        # for the ownership-resolution counterpart of this same gap). In
-        # every current experiment a hold's var_id is ALSO referenced by its
-        # u_node's own Pick-style constraint (e.g. pyrobosim_gymnasium's
-        # _pick_add pins agent_q via the same var_agent_q(var_id)), so this
-        # is redundant there -- but nothing enforces that pairing, and
-        # without it a hold whose variable is referenced nowhere else would
-        # KeyError in _resolve_holds instead of getting a GA slot.
-        var_ids = sorted({src[1] for _, src in instance_list if src[0] == "var"}
-                         | {hold.var_id for hold in self.graph.hold_ops.values()
-                            if hold.var_id is not None})
-        var_id_to_slot = {v: i for i, v in enumerate(var_ids)}
-        self._var_id_to_slot = var_id_to_slot
-        self.n_variables = len(var_ids)
-
-        self._instance_sources = [
-            (kind, var_id_to_slot[val] if kind == "var" else val)
-            for _, (kind, val) in instance_list
-        ]
-        self._instance_node = [node for node, _ in instance_list]
-
-        # Ordering edges are node pairs, not instance pairs: kernel.py's
-        # topological decoder (_topological_rank) computes a visiting-order
-        # rank for EVERY node unconditionally, regardless of whether that
-        # node carries a routing instance -- unlike the older arrival-time
-        # scheme this replaced (where node_arrival_time was only ever
-        # populated for nodes an agent's own route actually visited, via
-        # instance_node -- a node with no routing instance stayed stuck at
-        # its -inf init value, so an edge touching one was genuinely
-        # unconstrainable then). So an ordering edge no longer needs either
-        # endpoint to carry a routing instance: it's entirely normal, and
-        # common in this package's own experiments (e.g. a "release"/"place"
-        # node whose agent position is established purely by a transport
-        # EDGE constraint, not a node constraint -- see e.g.
-        # object_grasp_experiment.py's n_place), for a node that must still
-        # participate in precedence to have no routing instance of its own.
-
-        # Hard edges: conditional edges never enter `structure` (see
-        # add_conditional_edge_ordering's doc -- "invisible to BFS/routing"),
-        # so every structure edge is an unconditional precedence constraint.
-        hard_edges = []
-        for u in self._node_list:
-            for e in self.graph.structure.neighbors(u):
-                hard_edges.append((u, e.to))
-        self._hard_edges = hard_edges
-
-        # Conditional ordering edges: compile each Formula into a gate_fn
-        # closed over owner_variable/cond_binary index maps.
-        var_sym_ids = {self.graph.assignment_sym(v).get_id(): var_id_to_slot[v] for v in var_ids}
-        cond_binary_vars = self.graph.binary_cond_sym_vars
-        cond_sym_ids = {v.get_id(): i for i, v in enumerate(cond_binary_vars)}
-        self.n_cond_vars = len(cond_binary_vars)
-
-        cond_edges = []
-        for (u, v), formula in self.graph.conditional_ordering_map.items():
-            gate = compile_condition(formula, var_sym_ids, cond_sym_ids)
-            cond_edges.append((u, v, gate))
-        self._cond_edges = cond_edges
-
-        # Built once here (not just inside build_problem, which also uses
-        # it) since gated interior/stationary constraints (_batch_along_edge_
-        # interior_fn, _batch_relational_interior_fn, _batch_stationary_edge_
-        # fn) need the SAME decode_node_rank the routing kernel itself will
-        # use, to gate on an exact per-individual topologically valid order
-        # instead of raw t (see kernel.build_decode_node_rank's docstring).
-        self._ordering_edges = [(u, v, None) for u, v in self._hard_edges] + list(cond_edges)
-        self._decode_node_rank = build_decode_node_rank(self._ordering_edges, self.n_nodes)
-
-        self._resolver = _make_row_resolver(
-            self.graph, var_id_to_slot, self._agent_widths, self._slot_width)
-        self._resolve_symbolic_constraints()
-        self._resolve_holds()
-        self._resolve_stationary_objects()
-
-    def _resolve_stationary_objects(self):
-        """Auto-derives the default "an object not currently being held must
-        not move" invariant -- the JAX analogue of MILP's Constraint 14b
-        (milp_waypoint_mpc.cpp), always enforced (unlike 14a/_resolve_holds,
-        which is translation-only-static-holds for now): 14b only ever
-        compares plain object segments with no rotation involved, so it has
-        no rotation-dependent case to defer the way 14a's rigid-carry
-        relation does.
-
-        Unlike every other constraint in this module, this one is never
-        authored by a graph builder -- there is no add_edge_constraint call
-        to discover via graph.edge_to_phis_map. It's a default applied to
-        EVERY (structural edge, object) pair unconditionally, mirroring
-        MILP's own unconditional `for (int obj = 0; ...) for (edge : ...)`
-        loop -- synthesized directly from self._hard_edges x
-        range(graph.num_objects), gated per pair via _batch_stationary_edge_fn
-        against every hold (self.graph.hold_ops) declared anywhere on that
-        object. An object with zero declared holds anywhere still gets the
-        (now always-on) equality -- matching MILP's `if (!any_gate)
-        AddLinearEqualityConstraint` branch, since the gate is vacuously
-        always-off with no hold_node_pairs to overlap against.
-
-        The gate is dynamic (per solved individual), via
-        GraphOrderingSpec._decode_node_rank -- an EXACT topologically valid
-        visiting-order rank (kernel.build_decode_node_rank), not raw `t` (see
-        that function's docstring, and _batch_stationary_edge_fn's, for why
-        raw t alone is unsafe here: it's a pure GA-searched sort key with no
-        pressure to stay magnitude-monotonic once decode fixes the true
-        order -- empirically confirmed to drift even on a trivial 3-node
-        chain). An EARLIER version of this method used a static,
-        t-independent structural-reachability exemption instead (an edge is
-        exempt iff it lies on some path from a hold's u to its v) -- correct
-        for the deterministic/nested case (verified against
-        test_interior_reinforcement, examples/test_hold_registry.py: hold
-        n0->n2 spanning structural n0->n1->n2 exempts both (n0,n1) and
-        (n1,n2) either way), but WRONG in general: whether a structural edge
-        genuinely overlaps a hold's span can depend on the solved schedule
-        itself when the two are structurally unordered (concurrent
-        branches, no DAG precedence either way) -- there, which interleaving
-        the GA settles on IS part of what's being searched over, so no
-        static, t-independent answer exists. Decoded rank resolves this
-        correctly in both cases: it's the exact, valid schedule that
-        particular individual represents, deterministic or concurrent alike,
-        so a betweenness/overlap test built on it is correct for that
-        individual specifically (this is exactly the same generalization
-        _batch_along_edge_interior_fn/_batch_relational_interior_fn now use
-        too -- one unified decode-rank-based gating mechanism for all of
-        this module's edge constraints, per-edge along-edge/relational
-        registration plus decode-rank-gated interior/stationary
-        reinforcement alike).
-
-        Uses EVERY hold in the registry for gating (both static AND
-        assignable -- _resolve_holds' rigid-carry relation handles both too,
-        see its docstring) -- the gate only needs to know WHEN a hold's own
-        node interval falls, not which agent resolves it, so an assignable
-        hold's span is real, usable gating information regardless of how
-        its own rigid-carry formula resolves the agent.
-
-        Registered mode="live" (see _resolve_holds' docstring for the same
-        reasoning applied to hold rigidity): once u has passed, an untouched
-        object's real current position (x0) is the ground truth going
-        forward, not whatever was merely planned there.
-
-        Edge-to-edge chaining alone has nothing to anchor a graph SOURCE
-        node (no incoming hard edge) to: with no real predecessor, it's only
-        ever tied to itself via the equality above, so its value is free to
-        drift to whatever the GA/AL search finds convenient rather than the
-        object's actual position. MILP's own Constraint 14b covers this with
-        a second loop over `subgraph.structure.sources()`, feeding the real
-        depot `x0` in as each source's "previous waypoint"
-        (milp_waypoint_mpc.cpp: `for (v14b : subgraph.structure.sources())`)
-        -- mirrored below via _batch_depot_stationary_fn, one source node at
-        a time, gated by the same hold-overlap logic (see that function's
-        docstring for how the depot's own always-earliest rank makes the
-        existing gate math work unmodified)."""
-        agents_width = self.graph.num_agents * self._slot_width
-        non_robot_dim = self.graph.non_robot_dim
-
-        holds_by_object = {}
-        for hold in self.graph.hold_ops.values():
-            for oid in hold.held_point_ids:
-                holds_by_object.setdefault(oid, []).append((hold.u_node, hold.v_node))
-
-        # Source nodes: no incoming hard edge -- the only ones with no real
-        # structural predecessor for the depot loop below to anchor.
-        edge_targets = {v for _u, v in self._hard_edges}
-        source_nodes = [n for n in self._node_list if n not in edge_targets]
-
-        for oid in range(self.graph.num_objects):
-            seg_slice = slice(agents_width + oid * non_robot_dim,
-                               agents_width + (oid + 1) * non_robot_dim)
-            hold_node_pairs = holds_by_object.get(oid, [])
-            for u, v in self._hard_edges:
-                batched = _batch_stationary_edge_fn(
-                    u, v, seg_slice, hold_node_pairs, self._decode_node_rank, mode="live")
-                self._stationary_constraints.append((batched, f"stationary_obj_{oid}_{u}_{v}"))
-            for v in source_nodes:
-                depot_batched = _batch_depot_stationary_fn(
-                    v, seg_slice, hold_node_pairs, self._decode_node_rank, mode="live")
-                self._stationary_constraints.append((depot_batched, f"stationary_obj_{oid}_depot_{v}"))
-
-    def _resolve_holds(self):
+    def _resolve_holds():
         """Auto-derives rigid-carry (translation-only) constraints from the
         graph's canonical hold registry (graph.hold_ops -- add_hold/
         add_assignable_hold) -- the JAX analogue of MILP's Constraint 14a
@@ -994,9 +957,9 @@ class GraphOrderingSpec:
         dynamic-slice convention _make_row_resolver's var_map branch
         already uses for a single placeholder, just applied to two rows and
         gathering a precomputed delta instead of a raw column. `slot` comes
-        from `self._var_id_to_slot`, which folds in every hold's var_id
-        even when (as here) nothing else references it -- see
-        _resolve_structure's own comment on that.
+        from `var_id_to_slot`, which folds in every hold's var_id even when
+        (as here) nothing else references it -- see the instance-discovery
+        comment above.
 
         Since fk_fn is called directly here rather than substituted through
         the unified symbolic placeholder API (agent_link_pos has no u_/v_
@@ -1020,12 +983,11 @@ class GraphOrderingSpec:
         own interior-reinforcement loop -- since another agent's route might
         otherwise schedule a node in between that leaves the held object's
         value there completely unconstrained."""
-        agent_widths, slot_width = self._agent_widths, self._slot_width
-        agents_width = self.graph.num_agents * slot_width
-        non_robot_dim = self.graph.non_robot_dim
-        workspace_dim = self.graph.workspace_dim
+        agents_width = graph.num_agents * slot_width
+        non_robot_dim = graph.non_robot_dim
+        workspace_dim = graph.workspace_dim
 
-        for hold_id, hold in self.graph.hold_ops.items():
+        for hold_id, hold in graph.hold_ops.items():
             u, v = hold.u_node, hold.v_node
             mode = "live"
 
@@ -1033,7 +995,7 @@ class GraphOrderingSpec:
                 obj_col0 = agents_width + oid * non_robot_dim
 
                 if hold.robot_ag is not None:
-                    fk_fn = resolve_link_fk(self.graph, hold.robot_ag)
+                    fk_fn = resolve_link_fk(graph, hold.robot_ag)
                     agent_col0 = hold.robot_ag * slot_width
                     agent_w = agent_widths[hold.robot_ag]
 
@@ -1047,7 +1009,7 @@ class GraphOrderingSpec:
                         obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
                         return (obj_v - obj_u) - (v_pos - u_pos)
                 else:
-                    slot = self._var_id_to_slot[hold.var_id]
+                    slot = var_id_to_slot[hold.var_id]
                     # One (agent_col0, agent_w, fk_fn) triple per candidate
                     # agent, Python-time (fk_fn may genuinely differ per
                     # agent -- heterogeneous configuration kinds -- so this
@@ -1057,10 +1019,10 @@ class GraphOrderingSpec:
                     # Each branch slices its own candidate's real width
                     # (agent_w), not the shared slot_width stride -- fk_fn
                     # expects that agent's genuine config, no padding.
-                    branch_cols = [k * slot_width for k in range(self.graph.num_agents)]
-                    branch_widths = [agent_widths[k] for k in range(self.graph.num_agents)]
-                    branch_fks = [resolve_link_fk(self.graph, k)
-                                  for k in range(self.graph.num_agents)]
+                    branch_cols = [k * slot_width for k in range(graph.num_agents)]
+                    branch_widths = [agent_widths[k] for k in range(graph.num_agents)]
+                    branch_fks = [resolve_link_fk(graph, k)
+                                  for k in range(graph.num_agents)]
 
                     def fn(row_u, row_v, owner_variable, params,
                            branch_cols=branch_cols, branch_widths=branch_widths,
@@ -1091,130 +1053,161 @@ class GraphOrderingSpec:
 
                 kind = "eq"
                 name = f"hold_{hold_id}_obj_{oid}"
-                self._symbolic_constraints.append(((u, v), fn, kind, mode, name))
+                symbolic_constraints.append(((u, v), fn, kind, mode, name))
                 interior_batched = _batch_relational_interior_fn(
-                    fn, kind, u, v, self._decode_node_rank, mode=mode)
-                self._interior_constraints.append((interior_batched, f"{name}_interior"))
+                    fn, kind, u, v, decode_node_rank, mode=mode)
+                interior_constraints.append((interior_batched, f"{name}_interior"))
 
-    def _resolve_symbolic_constraints(self):
-        """Auto-derives eq/ineq residual constraints from the graph's unified
-        symbolic API (add_constraint / add_assignable_constraint /
-        add_edge_constraint), compiling each stored Formula the same way MILP
-        does structurally. Raises (via _make_row_resolver, through
-        _unsupported_placeholder) if a formula references a placeholder
-        genuinely outside that scope (e.g. a u-/ v-side placeholder inside a
-        node constraint). An edge constraint's stored formula compiles
-        differently depending on graph.edge_phi_to_along_edge_map: relationally
-        (once, over both endpoint rows) or "along the edge" (once, applied
-        independently to each endpoint's own row) -- see the branch below. Each
-        phi's `mode` ("live" if its id is in self._live_phi_ids, else "frozen")
-        threads through to build_problem's _batch_symbolic_constraint_fn/
-        _batch_along_edge_interior_fn calls -- see problem.apply_anchor's
-        docstring for what the two modes mean."""
-        node_formulas = self.graph.phi_to_formula_map
-        for node in self._node_list:
-            for phi_id in self.graph.node_to_phis_map.get(node, []):
-                if phi_id not in node_formulas:
-                    continue  # not a Formula-based (symbolic) constraint
-                formula = node_formulas[phi_id]
-                # Always frozen, never checked against self._live_phi_ids: a
-                # node constraint can only reference its own node's
-                # placeholders (see graph_of_constraints.hpp's live_edge_phis
-                # comment), so it has no live/frozen distinction to make --
-                # and node phi ids and edge phi ids are independent counters
-                # that can collide numerically, so checking a node phi_id
-                # against a set that only ever holds EDGE phi ids would risk
-                # spuriously matching an unrelated edge's id.
-                mode = "frozen"
-                resolver = lambda var, self=self: self._resolver(var, 1)
-                fn, kind = compile_relational_formula(formula, resolver)
-                self._symbolic_constraints.append(
-                    ((node,), fn, kind, mode, f"phi_{phi_id}"))
+    def _resolve_stationary_objects():
+        """Auto-derives the default "an object not currently being held must
+        not move" invariant -- the JAX analogue of MILP's Constraint 14b
+        (milp_waypoint_mpc.cpp), always enforced (unlike 14a/_resolve_holds,
+        which is translation-only-static-holds for now): 14b only ever
+        compares plain object segments with no rotation involved, so it has
+        no rotation-dependent case to defer the way 14a's rigid-carry
+        relation does.
 
-        edge_formulas = self.graph.edge_phi_to_formula_map
-        edge_along_edge = self.graph.edge_phi_to_along_edge_map
-        for (u, v), phi_ids in self.graph.edge_to_phis_map.items():
-            for phi_id in phi_ids:
-                if phi_id not in edge_formulas:
-                    continue  # not a Formula-based (symbolic) edge constraint
-                formula = edge_formulas[phi_id]
-                mode = "live" if phi_id in self._live_phi_ids else "frozen"
+        Unlike every other constraint in this module, this one is never
+        authored by a graph builder -- there is no add_edge_constraint call
+        to discover via graph.edge_to_phis_map. It's a default applied to
+        EVERY (structural edge, object) pair unconditionally, mirroring
+        MILP's own unconditional `for (int obj = 0; ...) for (edge : ...)`
+        loop -- synthesized directly from hard_edges x
+        range(graph.num_objects), gated per pair via _batch_stationary_edge_fn
+        against every hold (graph.hold_ops) declared anywhere on that
+        object. An object with zero declared holds anywhere still gets the
+        (now always-on) equality -- matching MILP's `if (!any_gate)
+        AddLinearEqualityConstraint` branch, since the gate is vacuously
+        always-off with no hold_node_pairs to overlap against.
 
-                if edge_along_edge.get(phi_id, False):
-                    # "Along the edge" -- built from the plain agent_q/
-                    # object_q/var_agent_q placeholders (same as a node
-                    # constraint), so compile it ONCE against a single-slot
-                    # (node-scoped) resolver, then register the resulting fn
-                    # at each endpoint's own row (exact, its own persistent AL
-                    # multiplier each), PLUS a best-effort aggregate
-                    # re-application at any OTHER node whose `t` currently
-                    # falls between the endpoints' -- see
-                    # _batch_along_edge_interior_fn.
-                    resolver = lambda var, self=self: self._resolver(var, 1)
-                    fn, kind = compile_relational_formula(formula, resolver)
-                    self._symbolic_constraints.append(
-                        ((u,), fn, kind, mode, f"edge_phi_{phi_id}_u"))
-                    self._symbolic_constraints.append(
-                        ((v,), fn, kind, mode, f"edge_phi_{phi_id}_v"))
-                    interior_batched = _batch_along_edge_interior_fn(
-                        fn, kind, u, v, self._decode_node_rank, mode=mode)
-                    self._interior_constraints.append(
-                        (interior_batched, f"edge_phi_{phi_id}_interior"))
-                    continue
+        The gate is dynamic (per solved individual), via this function's
+        enclosing decode_node_rank -- an EXACT topologically valid
+        visiting-order rank (kernel.build_decode_node_rank), not raw `t` (see
+        that function's docstring, and _batch_stationary_edge_fn's, for why
+        raw t alone is unsafe here: it's a pure GA-searched sort key with no
+        pressure to stay magnitude-monotonic once decode fixes the true
+        order -- empirically confirmed to drift even on a trivial 3-node
+        chain). An EARLIER version of this function used a static,
+        t-independent structural-reachability exemption instead (an edge is
+        exempt iff it lies on some path from a hold's u to its v) -- correct
+        for the deterministic/nested case (verified against
+        test_interior_reinforcement, examples/test_hold_registry.py: hold
+        n0->n2 spanning structural n0->n1->n2 exempts both (n0,n1) and
+        (n1,n2) either way), but WRONG in general: whether a structural edge
+        genuinely overlaps a hold's span can depend on the solved schedule
+        itself when the two are structurally unordered (concurrent
+        branches, no DAG precedence either way) -- there, which interleaving
+        the GA settles on IS part of what's being searched over, so no
+        static, t-independent answer exists. Decoded rank resolves this
+        correctly in both cases: it's the exact, valid schedule that
+        particular individual represents, deterministic or concurrent alike,
+        so a betweenness/overlap test built on it is correct for that
+        individual specifically (this is exactly the same generalization
+        _batch_along_edge_interior_fn/_batch_relational_interior_fn now use
+        too -- one unified decode-rank-based gating mechanism for all of
+        this module's edge constraints, per-edge along-edge/relational
+        registration plus decode-rank-gated interior/stationary
+        reinforcement alike).
 
-                resolver = lambda var, self=self: self._resolver(var, 2)
-                fn, kind = compile_relational_formula(formula, resolver)
-                self._symbolic_constraints.append(
-                    ((u, v), fn, kind, mode, f"edge_phi_{phi_id}"))
+        Uses EVERY hold in the registry for gating (both static AND
+        assignable -- _resolve_holds' rigid-carry relation handles both too,
+        see its docstring) -- the gate only needs to know WHEN a hold's own
+        node interval falls, not which agent resolves it, so an assignable
+        hold's span is real, usable gating information regardless of how
+        its own rigid-carry formula resolves the agent.
 
-    # -- constraints -------------------------------------------------------
+        Registered mode="live" (see _resolve_holds' docstring for the same
+        reasoning applied to hold rigidity): once u has passed, an untouched
+        object's real current position (x0) is the ground truth going
+        forward, not whatever was merely planned there.
 
-    def add_python_constraint(self, node, fn, kind="eq", name=None):
-        """Registers a constraint fn(wp_row, assign) -> (k,) on `node`'s
-        WHOLE row (every agent's slot plus every object's column -- see
-        _batch_python_constraint_fn). kind="eq" feeds pymoo/AL's H (feasible
-        at 0), kind="ineq" feeds G (feasible at <=0). `node` needs no
-        routing instance of its own -- this is a plain per-node escape
-        hatch, independent of routing/ordering."""
+        Edge-to-edge chaining alone has nothing to anchor a graph SOURCE
+        node (no incoming hard edge) to: with no real predecessor, it's only
+        ever tied to itself via the equality above, so its value is free to
+        drift to whatever the GA/AL search finds convenient rather than the
+        object's actual position. MILP's own Constraint 14b covers this with
+        a second loop over `subgraph.structure.sources()`, feeding the real
+        depot `x0` in as each source's "previous waypoint"
+        (milp_waypoint_mpc.cpp: `for (v14b : subgraph.structure.sources())`)
+        -- mirrored below via _batch_depot_stationary_fn, one source node at
+        a time, gated by the same hold-overlap logic (see that function's
+        docstring for how the depot's own always-earliest rank makes the
+        existing gate math work unmodified)."""
+        agents_width = graph.num_agents * slot_width
+        non_robot_dim = graph.non_robot_dim
+
+        holds_by_object = {}
+        for hold in graph.hold_ops.values():
+            for oid in hold.held_point_ids:
+                holds_by_object.setdefault(oid, []).append((hold.u_node, hold.v_node))
+
+        # Source nodes: no incoming hard edge -- the only ones with no real
+        # structural predecessor for the depot loop below to anchor.
+        edge_targets = {v for _u, v in hard_edges}
+        source_nodes = [n for n in node_list if n not in edge_targets]
+
+        for oid in range(graph.num_objects):
+            seg_slice = slice(agents_width + oid * non_robot_dim,
+                               agents_width + (oid + 1) * non_robot_dim)
+            hold_node_pairs = holds_by_object.get(oid, [])
+            for u, v in hard_edges:
+                batched = _batch_stationary_edge_fn(
+                    u, v, seg_slice, hold_node_pairs, decode_node_rank, mode="live")
+                stationary_constraints.append((batched, f"stationary_obj_{oid}_{u}_{v}"))
+            for v in source_nodes:
+                depot_batched = _batch_depot_stationary_fn(
+                    v, seg_slice, hold_node_pairs, decode_node_rank, mode="live")
+                stationary_constraints.append((depot_batched, f"stationary_obj_{oid}_depot_{v}"))
+
+    _resolve_symbolic_constraints()
+    _resolve_holds()
+    _resolve_stationary_objects()
+
+    # -- python constraints + build -----------------------------------------
+
+    eq_constraints, ineq_constraints = [], []
+    for node, fn, kind, _name in python_constraints:
         if kind not in ("eq", "ineq"):
             raise ValueError(f"Unknown constraint kind {kind!r}, expected 'eq' or 'ineq'")
-        self._python_constraints.append((node, fn, kind, name))
+        batched = _batch_python_constraint_fn(fn, node)
+        (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
+    for node_locals, fn, kind, mode, _name in symbolic_constraints:
+        batched = _batch_symbolic_constraint_fn(fn, node_locals, mode=mode)
+        (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
+    for batched, _name in interior_constraints:
+        ineq_constraints.append(batched)
+    for batched, _name in stationary_constraints:
+        ineq_constraints.append(batched)
 
-    # -- build ---------------------------------------------------------
-
-    def build_problem(self):
-        eq_constraints, ineq_constraints = [], []
-        for node, fn, kind, _name in self._python_constraints:
-            batched = _batch_python_constraint_fn(fn, node)
-            (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
-        for node_locals, fn, kind, mode, _name in self._symbolic_constraints:
-            batched = _batch_symbolic_constraint_fn(fn, node_locals, mode=mode)
-            (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
-        for batched, _name in self._interior_constraints:
-            ineq_constraints.append(batched)
-        for batched, _name in self._stationary_constraints:
-            ineq_constraints.append(batched)
-
-        return GraphOrderingRelaxed(
-            instance_sources=self._instance_sources,
-            n_variables=self.n_variables,
-            ordering_edges=self._ordering_edges,
-            x0=np.asarray(self.x0),
-            wp_bounds=self.wp_bounds,
-            instance_node=self._instance_node,
-            n_nodes=self.n_nodes,
-            state_dim=self.state_dim,
-            n_cond_vars=self.n_cond_vars,
-            objective=self.objective,
-            edge_cost_fn=self.edge_cost_fn,
-            eq_constraints=eq_constraints,
-            ineq_constraints=ineq_constraints,
-            # Structural shape only (n_params) -- fixes the jitted GA's
-            # `params` argument width for this problem's whole lifetime,
-            # same as x0 fixes n_agents/dim. The actual VALUES a live solve()
-            # reads come fresh from graph.view_param_values() each call
-            # (mpc.py), same as x0 -- this initial snapshot only matters for
-            # params-less structural call sites (build_initial_carry_fn's
-            # cold start, run_lamarckian_al/warmup_lamarckian_al's default).
-            params=np.asarray(self.graph.view_param_values()),
-        )
+    return GraphOrderingRelaxed(
+        instance_sources=instance_sources,
+        n_variables=n_variables,
+        ordering_edges=ordering_edges,
+        x0=np.asarray(x0),
+        wp_bounds=wp_bounds,
+        instance_node=instance_node,
+        n_nodes=n_nodes,
+        state_dim=state_dim,
+        n_cond_vars=n_cond_vars,
+        objective=objective,
+        edge_cost_fn=edge_cost_fn,
+        eq_constraints=eq_constraints,
+        ineq_constraints=ineq_constraints,
+        # Structural shape only (n_params) -- fixes the jitted GA's
+        # `params` argument width for this problem's whole lifetime, same
+        # as x0 fixes n_agents/dim. The actual VALUES a live solve() reads
+        # come fresh from graph.view_param_values() each call (mpc.py),
+        # same as x0 -- this initial snapshot only matters for params-less
+        # structural call sites (build_initial_carry_fn's cold start,
+        # run_lamarckian_al/warmup_lamarckian_al's default).
+        params=np.asarray(graph.view_param_values()),
+        # Plain problem-instance data, stashed the same way instance_
+        # sources/instance_node/ordering_edges already are (see
+        # GraphOrderingRelaxed's own comment on that) so a caller with only
+        # `problem` in hand -- EvolutionaryWaypointSolver._compute_anchor,
+        # mpc.py -- can recover which nodes reference a given GA-searched
+        # variable, without this module needing to stay alive as a
+        # separate object past this call.
+        instance_list=instance_list,
+        var_id_to_slot=var_id_to_slot,
+    )

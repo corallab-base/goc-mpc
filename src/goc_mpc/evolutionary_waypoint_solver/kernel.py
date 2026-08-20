@@ -27,7 +27,7 @@ Routing instances
 A routing instance is a (node, resolved agent source) pair -- `("fixed",
 agent_id)` (a literal agent_q(k) constraint) or `("var", var_slot)` (an
 assignable var_agent_q(var) constraint), one entry per distinct agent source
-a node's phis establish (see spec.GraphOrderingSpec._resolve_structure). A
+a node's phis establish (see spec.build_graph_ordering_problem). A
 node can carry several instances when more than one agent is independently
 constrained there (e.g. a shared start/rendezvous node). Instances exist
 solely to partition nodes into "which agent must visit this node" for each

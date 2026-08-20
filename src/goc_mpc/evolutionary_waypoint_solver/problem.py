@@ -1,6 +1,6 @@
 """GraphOrderingRelaxed: the real-relaxed decision-variable layout and problem
 metadata the GA/L-BFGS solver (solver.py) optimizes over, built by
-GraphOrderingSpec.build_problem() (spec.py).
+spec.build_graph_ordering_problem() (spec.py).
 
 The decision vector `x` is four contiguous blocks:
   assign      (n_variables, n_agents)   -- one-hot/continuous-relaxed agent
@@ -38,7 +38,7 @@ from .kernel import make_graph_kernel
 
 
 # Bundles remaining_vertices' runtime effect on an otherwise-fixed-size
-# problem (see GraphOrderingSpec's module docstring) into one pytree,
+# problem (see spec.py's module docstring) into one pytree,
 # threaded alongside x0 through decode_and_cost/_batched/merit/local_refine/
 # _routing_local_search_batched/gen_step/step (solver.py, kernel.py) -- built
 # fresh each solve() call by EvolutionaryWaypointSolver._compute_anchor
@@ -101,11 +101,12 @@ def apply_anchor(problem, assign, wp, anchor, x0):
     state (wp_eff_live, the full-configuration `x0` argument -- state_dim
     wide, broadcast across every node since x0 is one global joint
     state, not a per-node history) instead of the free GA/L-BFGS value --
-    GraphOrderingSpec compiles each constraint to read from whichever of the
-    two it was registered against (live_phi_ids), so which one "wins" for a
-    given passed node is a per-constraint choice, not a per-node one (a
-    variable no longer in remaining_vertices has no such choice -- assign_eff
-    is always its committed one-hot). Callers should use assign_eff/
+    spec.py's build_graph_ordering_problem compiles each constraint to read
+    from whichever of the two it was registered against (live_phi_ids), so
+    which one "wins" for a given passed node is a per-constraint choice,
+    not a per-node one (a variable no longer in remaining_vertices has no
+    such choice -- assign_eff is always its committed one-hot). Callers
+    should use assign_eff/
     wp_eff_frozen/wp_eff_live everywhere a constraint or routing decision is
     made (never the raw assign/wp) -- this is the single substitution point
     that lets a node/edge constraint anchored at an already-passed node stay
@@ -160,8 +161,20 @@ class GraphOrderingRelaxed:
     def __init__(self, instance_sources, n_variables, ordering_edges, x0, wp_bounds,
                  instance_node, n_nodes, state_dim,
                  n_cond_vars=0, objective="avg", edge_cost_fn=None,
-                 eq_constraints=(), ineq_constraints=(), params=None):
+                 eq_constraints=(), ineq_constraints=(), params=None,
+                 instance_list=(), var_id_to_slot=None):
         self.instance_sources = list(instance_sources)
+        # Raw (node, (kind, val)) routing-instance pairs and the GA-slot
+        # assignment for each assignable variable id -- unlike
+        # instance_sources/instance_node above (already slot-translated,
+        # for kernel.py's consumption), these keep the graph's own node/
+        # var_id numbering, so a caller with only `problem` in hand
+        # (EvolutionaryWaypointSolver._compute_anchor, mpc.py) can recover
+        # which nodes reference a given assignable variable without
+        # build_graph_ordering_problem needing to stay alive as a separate
+        # object past this call (see that function's docstring).
+        self.instance_list = list(instance_list)
+        self.var_id_to_slot = {} if var_id_to_slot is None else dict(var_id_to_slot)
         self.n_variables = n_variables
         self.n_agents = x0.shape[0]
         self.dim = x0.shape[1]

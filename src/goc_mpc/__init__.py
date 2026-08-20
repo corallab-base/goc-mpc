@@ -16,6 +16,6 @@ from .goc_mpc import (
     ObstacleSet,
 )
 try:
-    from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, GraphOrderingSpec
+    from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, build_graph_ordering_problem
 except ModuleNotFoundError:
     print("Unable to import EvolutionaryWaypointSolver")

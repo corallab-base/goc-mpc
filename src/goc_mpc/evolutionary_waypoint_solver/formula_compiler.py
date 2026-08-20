@@ -24,7 +24,7 @@ pattern-matching. Two independent compilers live here, for two different jobs:
     a *relational* formula (u_agent_q/v_agent_q etc.), or once against a
     single-row resolver but registered twice (once per endpoint) for an
     "along the edge" formula (the plain agent_q/object_q/var_agent_q
-    placeholders) -- see GraphOrderingSpec._resolve_symbolic_constraints.
+    placeholders) -- see spec.py's _resolve_symbolic_constraints.
 """
 
 import jax.numpy as jnp

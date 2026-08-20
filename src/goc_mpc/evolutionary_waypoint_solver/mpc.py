@@ -1,5 +1,5 @@
 """EvolutionaryWaypointSolver: a GraphWaypointMPC-compatible (duck-typed)
-wrapper around GraphOrderingSpec + solver.run_lamarckian_al.
+wrapper around spec.build_graph_ordering_problem + solver.run_lamarckian_al.
 `GraphOfConstraintsMPC` (goc_mpc.py) accepts any object satisfying this
 protocol via its `waypoint_mpc=` constructor argument, with no isinstance
 check, so no changes are needed there.
@@ -20,8 +20,8 @@ Output buffer shapes/conventions match GraphWaypointMPC's exactly:
                      GA-solved value, whether or not any constraint
                      referenced it there (e.g. an un-held object's value at
                      a node tied to it only via the auto-generated "stay
-                     stationary" invariant, GraphOrderingSpec._resolve_
-                     stationary_objects, not a NaN sentinel).
+                     stationary" invariant, spec.py's
+                     _resolve_stationary_objects, not a NaN sentinel).
   _assignments:     (num_phis,)
   _var_assignments: (num_variables,)
   _t_by_node_id:    (num_graph_nodes,)
@@ -36,12 +36,13 @@ joint `W` carries, just solved via GA+AL instead of MILP.
 Build once, reuse forever, remaining_vertices as a runtime input
 ------------------------------------------------------------------
 Unlike MILPWaypointMPC (which rebuilds a SubgraphOfConstraints fresh every
-solve from remaining_vertices), GraphOrderingSpec/GraphOrderingRelaxed now
-span the WHOLE graph unconditionally (see spec.py's class docstring) --
-their shape (n_var, n_eq_constr, n_ieq_constr, ...) is fixed for the
-lifetime of a GraphOfConstraints, independent of remaining_vertices. So
-`_ensure_built` constructs `_spec`/`_problem`/`_ga_fn` exactly ONCE, on the
-first solve()/warmup() call, and every later call reuses them unconditionally
+solve from remaining_vertices), build_graph_ordering_problem/
+GraphOrderingRelaxed now span the WHOLE graph unconditionally (see spec.py's
+build_graph_ordering_problem docstring) -- their shape (n_var, n_eq_constr,
+n_ieq_constr, ...) is fixed for the lifetime of a GraphOfConstraints,
+independent of remaining_vertices. So `_ensure_built` constructs `_problem`/
+`_ga_fn` exactly ONCE, on the first solve()/warmup() call, and every later
+call reuses them unconditionally
 -- no cache-key/shape-key bookkeeping, since the shape can never mismatch
 again. `add_python_constraint` must be called before that first call (raises
 otherwise): constraints are baked into `_problem`'s fixed structure once,
@@ -70,12 +71,11 @@ solve()/warmup(), read straight off by problem.apply_anchor -- "the live
 position"). Which one a given EDGE constraint's `u`-side residual reads is a
 per-constraint choice made where the constraint is defined
 (GraphOfConstraints.add_edge_constraint(..., live=True) --
-graph_of_constraints.hpp's docstring) -- GraphOrderingSpec reads
-`graph.live_edge_phis` straight off the graph itself, not something this
-class threads through as a constructor argument (there is nothing for a
-caller here to legitimately override; see GraphOrderingSpec.__init__'s own
-docstring comment), nor something this class rebinds or tracks per node --
-there is no "rewrite
+graph_of_constraints.hpp's docstring) -- build_graph_ordering_problem reads
+`graph.live_edge_phis` straight off the graph itself, not something it
+threads through as its own argument (there is nothing for a caller here to
+legitimately override; see build_graph_ordering_problem's own docstring
+comment), nor something it rebinds or tracks per node -- there is no "rewrite
 this row because the node just passed" step anywhere here, deliberately: a
 constraint that wants the mobile real state (e.g. a rigid-transport edge,
 where the *real* carried-object position should keep tracking the *real*
@@ -85,8 +85,8 @@ anything else defaults to frozen, matching `main` branch's
 DeferredEdgeOp.waypoint_builder x_u argument (previous_X.row(u_node)) with no
 artificial rebind hack layered on top. Node constraints have no live/frozen
 choice to make at all (graph_of_constraints.hpp's live_edge_phis comment) --
-GraphOrderingSpec._resolve_symbolic_constraints hardcodes "frozen" for every
-one of them.
+spec.py's _resolve_symbolic_constraints hardcodes "frozen" for every one of
+them.
 
 Because AnchorState is a fixed-shape pytree (n_nodes/n_variables never
 change), passing a different `anchor` value on each call -- like `x0` -- adds
@@ -106,7 +106,7 @@ import jax
 import numpy as np
 import jax.numpy as jnp
 
-from .spec import GraphOrderingSpec
+from .spec import build_graph_ordering_problem
 from .problem import AnchorState
 from .solver import (
     run_lamarckian_al,
@@ -159,7 +159,6 @@ class EvolutionaryWaypointSolver:
 
         # Built once, on the first solve()/warmup() call -- see module
         # docstring -- and never rebuilt again.
-        self._spec = None
         self._problem = None
         self._ga_fn = None
         self._carry = None
@@ -169,13 +168,13 @@ class EvolutionaryWaypointSolver:
 
     def add_python_constraint(self, node, fn, kind="eq", name=None):
         """Registers fn(wp_row, assign) -> (k,) on `node`'s whole row (see
-        GraphOrderingSpec.add_python_constraint), baked into `_problem`'s
-        structure the first time it's built (the first solve()/warmup()
-        call). Must be called before that first call -- structure is built
-        once and reused for this solver's whole lifetime (see module
-        docstring), so there's no later point at which a newly-registered
-        constraint could take effect."""
-        if self._spec is not None:
+        spec.build_graph_ordering_problem's docstring), baked into
+        `_problem`'s structure the first time it's built (the first
+        solve()/warmup() call). Must be called before that first call --
+        structure is built once and reused for this solver's whole lifetime
+        (see module docstring), so there's no later point at which a
+        newly-registered constraint could take effect."""
+        if self._problem is not None:
             raise RuntimeError(
                 "add_python_constraint() called after the first solve()/warmup() -- "
                 "structure is built once, from every constraint registered up to that "
@@ -199,20 +198,17 @@ class EvolutionaryWaypointSolver:
         return x0
 
     def _ensure_built(self, x0):
-        if self._spec is not None:
+        if self._problem is not None:
             return
         graph = self._graph
         agents_width = graph.num_agents * graph.dim
         x0_per_agent = x0[:agents_width].reshape(graph.num_agents, graph.dim)
 
-        spec = GraphOrderingSpec.from_graph_of_constraints(
+        problem = build_graph_ordering_problem(
             graph, x0_per_agent, self._wp_bounds,
-            objective=self._objective, edge_cost_fn=self._edge_cost_fn)
-        for node, fn, kind, name in self._python_constraints:
-            spec.add_python_constraint(node, fn, kind=kind, name=name)
-        problem = spec.build_problem()
+            objective=self._objective, edge_cost_fn=self._edge_cost_fn,
+            python_constraints=self._python_constraints)
 
-        self._spec = spec
         self._problem = problem
         self._ga_fn = build_lamarckian_ga(problem, self._pop_size, self._n_gen, **self._lamarckian_kwargs)
 
@@ -220,30 +216,31 @@ class EvolutionaryWaypointSolver:
         """Builds this solve()/warmup() call's AnchorState from
         remaining_vertices plus this solver's own persisted _waypoints/
         _var_assignments -- see module docstring. Cheap (small numpy loops
-        over spec's static, graph-global structure), not part of any
+        over problem's static, graph-global structure), not part of any
         JIT-traced path. Only ever populates anchor_wp -- the "frozen,
         planned" reading; the "live, real state" reading is `x0` itself,
         supplied straight to problem.apply_anchor by the caller (solve()/
         warmup()), not something this method builds."""
-        graph, spec = self._graph, self._spec
+        graph, problem = self._graph, self._problem
         remaining_set = set(remaining_vertices)
+        node_list = range(problem.n_nodes)
 
-        node_active = np.array([node in remaining_set for node in spec._node_list], dtype=bool)
+        node_active = np.array([node in remaining_set for node in node_list], dtype=bool)
 
-        anchor_wp = np.zeros((spec.n_nodes, spec.state_dim))
-        for node in spec._node_list:
+        anchor_wp = np.zeros((problem.n_nodes, problem.state_dim))
+        for node in node_list:
             if node in remaining_set:
                 continue
             anchor_wp[node, :] = np.nan_to_num(self._waypoints[node], nan=0.0)
 
         var_nodes = {}
-        for node, (kind, val) in spec._instance_list:
+        for node, (kind, val) in problem.instance_list:
             if kind == "var":
                 var_nodes.setdefault(val, []).append(node)
 
-        var_committed = np.zeros(spec.n_variables, dtype=bool)
-        var_anchor = np.zeros(spec.n_variables, dtype=np.int32)
-        for var_id, slot in spec._var_id_to_slot.items():
+        var_committed = np.zeros(problem.n_variables, dtype=bool)
+        var_anchor = np.zeros(problem.n_variables, dtype=np.int32)
+        for var_id, slot in problem.var_id_to_slot.items():
             nodes = var_nodes.get(var_id, [])
             if any(node not in remaining_set for node in nodes):
                 assert self._var_assignments[var_id] != -1, (
@@ -289,9 +286,9 @@ class EvolutionaryWaypointSolver:
         start = time.perf_counter()
         graph = self._graph
         x0 = self._check_x0(x0)
-        was_already_built = self._spec is not None
+        was_already_built = self._problem is not None
         self._ensure_built(x0)
-        spec, problem, ga_fn = self._spec, self._problem, self._ga_fn
+        problem, ga_fn = self._problem, self._ga_fn
         x0_arr = jnp.asarray(x0)
         params_arr = jnp.asarray(self._graph.view_param_values())
         remaining_set = set(remaining_vertices)
@@ -332,7 +329,7 @@ class EvolutionaryWaypointSolver:
 
         assign, _cond_binary, t, wp = problem._extract_single(np.asarray(result.X))
         wp = np.asarray(wp)
-        owner_variable = (np.argmax(np.asarray(assign), axis=-1) if spec.n_variables > 0
+        owner_variable = (np.argmax(np.asarray(assign), axis=-1) if problem.n_variables > 0
                           else np.zeros(0, dtype=int))
 
         # Copy the whole solved row through unconditionally for every
@@ -343,7 +340,7 @@ class EvolutionaryWaypointSolver:
         # agent/object a constraint or graph.get_agent_paths actually routes
         # through, so a column at a node that never references it is simply
         # never read, whatever it holds. Restricted to remaining_vertices
-        # (spec._var_id_to_slot's write-back below is too, for the same
+        # (problem.var_id_to_slot's write-back below is too, for the same
         # reason) so an already-passed node's frozen anchor is never
         # overwritten with this solve's masked-out/inert GA output. A node
         # id is directly its own row index into wp/t (spec.py gives every
@@ -366,7 +363,7 @@ class EvolutionaryWaypointSolver:
         for node in remaining_set:
             self._t_by_node_id[node] = float(node_rank[node])
 
-        for var_id, slot in spec._var_id_to_slot.items():
+        for var_id, slot in problem.var_id_to_slot.items():
             if var_committed_np[slot]:
                 continue  # already correctly frozen; don't overwrite with this solve's inert output
             self._var_assignments[var_id] = int(owner_variable[slot])

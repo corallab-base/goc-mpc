@@ -698,9 +698,9 @@ def build_initial_carry_fn(problem, pop_size, anchor, rho0=1.0,
     at which point remaining_vertices == every graph node (problem.
     full_active_anchor), so there's no drift to track across calls the way
     build_lamarckian_ga's `step` must track x0/anchor drift. `problem.x0` is
-    only ever agent-shaped (the structural x0 GraphOrderingSpec was built
-    from, see problem.GraphOrderingRelaxed), so it's zero-padded out to the
-    full state_dim width every other `x0` here now carries (problem.
+    only ever agent-shaped (the structural x0 build_graph_ordering_problem
+    was built from, see problem.GraphOrderingRelaxed), so it's zero-padded
+    out to the full state_dim width every other `x0` here now carries (problem.
     pad_to_state_dim) -- inert padding, since full_active_anchor never
     actually reads it (nothing's passed yet)."""
     n_var = problem.n_var
