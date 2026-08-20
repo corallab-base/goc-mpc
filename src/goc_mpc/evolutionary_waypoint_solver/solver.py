@@ -513,9 +513,11 @@ def _tournament_select_jax(key, S, pop_size, k=2):
 
 def _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob,
                        ox_prob, n_2opt_trials, or_opt_prob, max_or_opt_seg_len,
-                       tournament_k, w0, cv_tol0, w_growth, cv_tol_floor_frac, x0, params, anchor):
+                       tournament_k, w0, cv_tol0, w_growth, cv_tol_floor_frac, x0, params, anchor,
+                       wp_mut_scale=0.0):
     n_var = problem.n_var
     n_nodes = problem.n_nodes
+    wp_offset = problem.wp_offset
     xl, xu = jnp.asarray(problem.xl), jnp.asarray(problem.xu)
 
     def gen_step(carry, gen):
@@ -526,14 +528,55 @@ def _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob
 
         p1 = _tournament_select_jax(k_p1, S, pop_size, k=tournament_k)
         p2 = _tournament_select_jax(k_p2, S, pop_size, k=tournament_k)
+        # Whichever of the two independently-drawn tournament winners is
+        # ITSELF fitter -- hoisted up here (out of its original spot, right
+        # before its first use for child_mu/lam/rho below) so both the
+        # no-crossover fallback just below and wp_mut_scale's freeze,
+        # further down, can anchor on this "better parent" instead of the
+        # otherwise-arbitrary p1 (an offspring not chosen for crossover used
+        # to always clone p1 specifically, for no reason evident in the
+        # code -- p1/p2 are two independent tournament draws, not "the best
+        # one and a partner").
+        parent = jnp.where(S[p1] < S[p2], p1, p2)
 
         do_cx = jax.random.uniform(k_cx_mask, (pop_size,)) < cx_prob
         alpha = jax.random.uniform(k_cx_alpha, (pop_size, n_var), minval=-0.5, maxval=1.5)
         blended = X[p1] + alpha * (X[p2] - X[p1])
-        child_X = jnp.where(do_cx[:, None], blended, X[p1])
+        child_X = jnp.where(do_cx[:, None], blended, X[parent])
         noise = jax.random.normal(k_mut, (pop_size, n_var), dtype=xl.dtype) * mut_sigma
         child_X = child_X + noise * (xu - xl)
         child_X = jnp.clip(child_X, xl, xu)
+
+        # wp_mut_scale interpolates each offspring's `wp` block (agent/
+        # object configuration per node) between "untouched -- the fitter
+        # parent's own, already Lamarckian-refined value" (0.0) and "the
+        # ordinary crossover-blend + mutation-noise result above, same as
+        # every other decision variable" (1.0). local_refine below always
+        # re-optimizes `wp` regardless (a real AL+L-BFGS gradient solve, not
+        # GA search) -- crossover/mutation on top of that is only useful for
+        # hopping BETWEEN basins in a genuinely non-convex `wp` landscape
+        # (e.g. multiple qualitatively different valid placements/routes);
+        # for anything convex given the current (assign, cond_binary, t) --
+        # e.g. projecting onto a single placement region, the common case --
+        # it's pure noise: local_refine already finds the unique optimum on
+        # its own, so restarting it from a perturbed point every generation
+        # under a small fixed iteration budget just risks under-converging,
+        # and the population's single combined-score-based selection
+        # (_combined_score/keep, below) has no way to protect an
+        # already-converged node's `wp` from being dragged along by an
+        # unrelated improvement elsewhere in the same individual. Confirmed
+        # on po_goc_mpc's pick_place_task: with wp_mut_scale=0.0, two
+        # unrelated agents' Place targets that previously jumped 0.1-1.0m in
+        # lockstep every few cycles (the "avg" objective accepting a whole
+        # mutated individual whenever its NET score improved, even if one
+        # agent's own term got worse) settle and stay put. Default 0.0 on
+        # that evidence; raise it (up to 1.0, the original
+        # unconditional-mutation behavior) if a graph's own `wp` landscape
+        # turns out to need basin-hopping local_refine alone can't provide.
+        if wp_mut_scale < 1.0:
+            parent_wp = X[parent][:, wp_offset:]
+            child_X = child_X.at[:, wp_offset:].set(
+                parent_wp + wp_mut_scale * (child_X[:, wp_offset:] - parent_wp))
 
         _, _, t_p1, _ = problem._extract_batch(X[p1])
         _, _, t_p2, _ = problem._extract_batch(X[p2])
@@ -546,7 +589,6 @@ def _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob
         _, _, t_blx, _ = problem._extract_batch(child_X)
         child_X = _write_t_batch_jax(problem, child_X, jnp.where(do_ox[:, None], t_ox, t_blx))
 
-        parent = jnp.where(S[p1] < S[p2], p1, p2)
         child_mu, child_lam, child_rho = mu[parent], lam[parent], rho[parent]
 
         child_assign, child_cond_binary, child_t, child_wp0 = problem._extract_batch(child_X)
@@ -761,7 +803,8 @@ def build_lamarckian_ga(problem, pop_size, n_gen, outer_iters=1, inner_maxiter=2
                          lbfgs_history=10, ls_max_trials=10, tournament_k=2,
                          w=None, cv_tol=None, w_frac=1.0, cv_tol_frac=0.05,
                          w_growth=10.0, cv_tol_floor_frac=0.0,
-                         ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3):
+                         ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
+                         wp_mut_scale=0.0):
     """Builds a jitted `step(carry_in, x0, params, anchor) -> carry_out`
     running `n_gen` generations of the Lamarckian GA+AL loop starting from an
     arbitrary carry (see `build_initial_carry_fn`/`carry_from_population`),
@@ -786,6 +829,16 @@ def build_lamarckian_ga(problem, pop_size, n_gen, outer_iters=1, inner_maxiter=2
     one schedule across chunks -- fine for warm-starting the population/
     AL-state between calls, but worth knowing before relying on it for a
     single continuous schedule across chunk boundaries.
+
+    `wp_mut_scale` (default 0.0): how much of the ordinary crossover-blend +
+    mutation-noise result to let `wp` (each node's agent/object
+    configuration) keep, versus reverting it to the fitter tournament
+    parent's own already-refined value before local_refine's real AL+L-BFGS
+    gradient solve re-optimizes it anyway -- see _make_gen_step_fn's own
+    comment for why 0.0 (no GA search on `wp` at all, purely gradient-
+    refined) is the right default for a convex-given-fixed-(assign,
+    cond_binary, t) `wp` subproblem (e.g. projecting onto one placement
+    region), and when a caller might want to raise it instead.
     """
     local_refine = make_batched_local_refine(
         problem, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
@@ -802,7 +855,7 @@ def build_lamarckian_ga(problem, pop_size, n_gen, outer_iters=1, inner_maxiter=2
         gen_step = _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob,
                                       ox_prob, n_2opt_trials, or_opt_prob, max_or_opt_seg_len,
                                       tournament_k, w_val, cv_tol_val, w_growth, cv_tol_floor_frac, x0, params,
-                                      anchor)
+                                      anchor, wp_mut_scale=wp_mut_scale)
 
         init_carry = (X0, mu0, lam0, rho_arr0, F0, CV0, key, best_X0, best_F0, best_CV0)
         final_carry, _ = jax.lax.scan(lambda c, g: (gen_step(c, g), None),
@@ -834,6 +887,7 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
                        w_growth=10.0, cv_tol_floor_frac=0.0,
                        ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
                        n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05,
+                       wp_mut_scale=0.0,
                        _ga_fn=None, _init_carry=None, x0=None, params=None):
     """`x0` (the full configuration -- state_dim-wide, see problem.
     apply_anchor) defaults to `problem.x0` (zero-padded out from its
@@ -849,7 +903,7 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
     caller by mistake; see EvolutionaryWaypointSolver._compute_anchor
     (mpc.py) for how to build it from a live remaining_vertices set, or
     problem.full_active_anchor for the "every node still remaining"
-    bootstrap case."""
+    bootstrap case. `wp_mut_scale` -- see build_lamarckian_ga's docstring."""
     start = time.perf_counter()
     x0_arr = jnp.asarray(x0) if x0 is not None else pad_to_state_dim(
         jnp.asarray(problem.x0).reshape(-1), problem.state_dim)
@@ -862,7 +916,7 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
         w=w, cv_tol=cv_tol, w_frac=w_frac, cv_tol_frac=cv_tol_frac,
         w_growth=w_growth, cv_tol_floor_frac=cv_tol_floor_frac,
         ox_prob=ox_prob, n_2opt_trials=n_2opt_trials, or_opt_prob=or_opt_prob,
-        max_or_opt_seg_len=max_or_opt_seg_len)
+        max_or_opt_seg_len=max_or_opt_seg_len, wp_mut_scale=wp_mut_scale)
 
     if _init_carry is not None:
         carry_in = _init_carry
@@ -889,11 +943,13 @@ def warmup_lamarckian_al(problem, anchor, pop_size, n_gen, outer_iters=1, inner_
                           w_growth=10.0, cv_tol_floor_frac=0.0,
                           ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
                           n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05,
+                          wp_mut_scale=0.0,
                           x0=None, params=None):
     """`x0` (the full configuration) defaults to `problem.x0` (zero-padded,
     see run_lamarckian_al's docstring) when not given; `params` likewise
     defaults to `problem.params`; `anchor` is required -- see
-    run_lamarckian_al's docstring."""
+    run_lamarckian_al's docstring. `wp_mut_scale` -- see build_lamarckian_ga's
+    docstring."""
     ga_fn = build_lamarckian_ga(
         problem, pop_size, n_gen, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
         rho_growth=rho_growth, rho_max=rho_max,
@@ -902,7 +958,7 @@ def warmup_lamarckian_al(problem, anchor, pop_size, n_gen, outer_iters=1, inner_
         w=w, cv_tol=cv_tol, w_frac=w_frac, cv_tol_frac=cv_tol_frac,
         w_growth=w_growth, cv_tol_floor_frac=cv_tol_floor_frac,
         ox_prob=ox_prob, n_2opt_trials=n_2opt_trials, or_opt_prob=or_opt_prob,
-        max_or_opt_seg_len=max_or_opt_seg_len)
+        max_or_opt_seg_len=max_or_opt_seg_len, wp_mut_scale=wp_mut_scale)
     init_fn = build_initial_carry_fn(
         problem, pop_size, anchor, rho0=rho0, n_seed_individuals=n_seed_individuals,
         seed_jitter_t=seed_jitter_t, seed_jitter_wp_frac=seed_jitter_wp_frac)
