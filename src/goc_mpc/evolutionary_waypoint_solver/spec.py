@@ -67,7 +67,8 @@ A constraint referencing a placeholder genuinely outside this scope (e.g.
 u_agent_q/v_agent_q inside a *node* constraint, which has no u/v side) raises
 at spec-construction time. For anything outside this solver's symbolic scope
 entirely (e.g. a non-symbolic/black-box cost), add_python_constraint remains
-available as an escape hatch (single agent-instance scope only)."""
+available as an escape hatch, scoped to a single node's whole row (no
+routing instance required there -- see add_python_constraint's docstring)."""
 
 import jax
 import jax.numpy as jnp
@@ -80,11 +81,14 @@ from .problem import GraphOrderingRelaxed
 
 
 def target_eq_constraint(target):
-    """Convenience single-instance constraint: pins a node's waypoint to a
-    fixed target exactly (H = wp_row - target, feasible at H=0)."""
+    """Convenience constraint: pins a node's WHOLE row to a fixed target
+    exactly (H = wp_row - target, feasible at H=0). `target` must match the
+    node's full row width (state_dim) -- every agent's slot plus every
+    object's column -- not just one agent's own slice (see
+    add_python_constraint)."""
     target = np.asarray(target, dtype=float)
 
-    def fn(wp_row):
+    def fn(wp_row, assign):
         return wp_row - target
     fn.node_target = target
     return fn
@@ -596,47 +600,29 @@ def _batch_depot_stationary_fn(v, seg_slice, hold_node_pairs, decode_node_rank, 
     return batched
 
 
-def _batch_python_constraint_fn(fn, node, kind, val, agent_widths, slot_width, n_variables):
-    """Wraps a single-instance add_python_constraint fn(wp_row) -> (k,) (see
-    target_eq_constraint) into the batched (assign, cond_binary, t,
-    wp_frozen, wp_live, node_active) -> (pop, k) contract, gathering that
-    instance's own agent slice out of its node's row -- the same kind of
-    gather kernel.py's routing performs for every instance at once, just for
-    this one instance. Always reads wp_frozen (add_python_constraint has no
-    live/frozen choice -- it's a single-node, single-instance escape hatch,
+def _batch_python_constraint_fn(fn, node):
+    """Wraps a single-node add_python_constraint fn(wp_row, assign) -> (k,)
+    (see target_eq_constraint) into the batched (assign, cond_binary, t,
+    wp_frozen, wp_live, node_active, x0, params) -> (pop, k) contract every
+    eq/ineq constraint closure shares, via jax.vmap over the population.
+    `wp_row` is `node`'s WHOLE row (state_dim,) -- every agent's slot plus
+    every object's column, unsliced -- and `assign` is the raw one-hot
+    assignment tensor (n_variables, num_agents) for that population member,
+    so fn does its own gather (e.g. jnp.argmax(assign, axis=-1) for
+    owner_variable, then index into wp_row by agent*slot_width) if it needs
+    one, rather than this wrapper picking an agent slice on `node`'s behalf
+    -- unlike kernel.py's routing-instance gather, this constraint isn't
+    scoped to any one instance. Always reads wp_frozen (add_python_
+    constraint has no live/frozen choice -- it's a single-node escape hatch,
     not a u_/v_-prefixed relational edge formula, so there's no "which side
     is passed" question for it to answer); wp_live/cond_binary/node_active/
     x0/params are accepted only to match the uniform 8-arg contract every
-    eq/ineq constraint closure shares.
-
-    The gathered slice's width differs by `kind`: a "fixed" instance's agent
-    is known at spec-build time, so it gets exactly that agent's own real
-    width (agent_widths[fixed_agent], no padding). A "var" instance's agent
-    is GA-searched (one value per population member), so the gather can only
-    use one static width valid for every candidate -- slot_width, the padded
-    per-agent slot (see _slot_width's docstring) -- meaning fn may see
-    trailing zero padding past a narrower candidate's real width. The column
-    OFFSET is always `agent * slot_width` either way (every agent's slot
-    starts at the same static stride, real width or not)."""
+    eq/ineq constraint closure shares."""
     vmapped = jax.vmap(fn)
-    is_var = (kind == "var")
-    fixed_agent = val if kind == "fixed" else 0
-    var_slot = val if kind == "var" else 0
-    width = slot_width if is_var else agent_widths[fixed_agent]
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node=node, is_var=is_var,
-                fixed_agent=fixed_agent, var_slot=var_slot, slot_width=slot_width, width=width,
-                n_variables=n_variables, vmapped=vmapped):
-        node_row = wp_frozen[:, node, :]
-        if n_variables > 0 and is_var:
-            owner_variable = jnp.argmax(assign, axis=-1)
-            agent = owner_variable[:, var_slot]
-        else:
-            agent = jnp.full((wp_frozen.shape[0],), fixed_agent, dtype=jnp.int32)
-        col = agent * slot_width
-        idx = col[:, None] + jnp.arange(width)[None, :]
-        row = jnp.take_along_axis(node_row, idx, axis=1)
-        return vmapped(row)
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node=node, vmapped=vmapped):
+        row = wp_frozen[:, node, :]
+        return vmapped(row, assign)
     return batched
 
 
@@ -678,7 +664,7 @@ class GraphOrderingSpec:
         # "frozen" for every node constraint), so any present would simply
         # be inert.
         self._live_phi_ids = frozenset(graph.live_edge_phis)
-        self._python_constraints = []  # (instance_local_idx, fn, kind, name)
+        self._python_constraints = []  # (node, fn, kind, name)
         self._symbolic_constraints = []  # (node_locals_tuple, fn, kind, mode, name)
         self._interior_constraints = []  # (batched_fn, name) -- see _batch_along_edge_interior_fn
         self._stationary_constraints = []  # (batched_fn, name) -- see _batch_stationary_edge_fn
@@ -1184,31 +1170,22 @@ class GraphOrderingSpec:
     # -- constraints -------------------------------------------------------
 
     def add_python_constraint(self, node, fn, kind="eq", name=None):
-        """Registers a single-instance constraint fn(wp_row) -> (k,) on
-        `node`'s waypoint. kind="eq" feeds pymoo/AL's H (feasible at 0),
-        kind="ineq" feeds G (feasible at <=0)."""
-        instances = self._node_instances.get(node, [])
-        if not instances:
-            raise ValueError(f"node {node} has no resolvable agent source "
-                              "(no phi registered establishing a routing instance there)")
-        if len(instances) > 1:
-            raise ValueError(
-                f"node {node} has {len(instances)} distinct agent-source instances -- "
-                "add_python_constraint can't disambiguate which waypoint row to target; "
-                "use the graph's symbolic add_constraint/add_assignable_constraint API instead")
+        """Registers a constraint fn(wp_row, assign) -> (k,) on `node`'s
+        WHOLE row (every agent's slot plus every object's column -- see
+        _batch_python_constraint_fn). kind="eq" feeds pymoo/AL's H (feasible
+        at 0), kind="ineq" feeds G (feasible at <=0). `node` needs no
+        routing instance of its own -- this is a plain per-node escape
+        hatch, independent of routing/ordering."""
         if kind not in ("eq", "ineq"):
             raise ValueError(f"Unknown constraint kind {kind!r}, expected 'eq' or 'ineq'")
-        self._python_constraints.append((instances[0], fn, kind, name))
+        self._python_constraints.append((node, fn, kind, name))
 
     # -- build ---------------------------------------------------------
 
     def build_problem(self):
         eq_constraints, ineq_constraints = [], []
-        for instance_local, fn, kind, _name in self._python_constraints:
-            node, source = self._instance_list[instance_local]
-            src_kind, val = source
-            batched = _batch_python_constraint_fn(
-                fn, node, src_kind, val, self._agent_widths, self._slot_width, self.n_variables)
+        for node, fn, kind, _name in self._python_constraints:
+            batched = _batch_python_constraint_fn(fn, node)
             (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
         for node_locals, fn, kind, mode, _name in self._symbolic_constraints:
             batched = _batch_symbolic_constraint_fn(fn, node_locals, mode=mode)

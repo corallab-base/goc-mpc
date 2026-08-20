@@ -168,7 +168,8 @@ class EvolutionaryWaypointSolver:
         self._last_compile_time = 0.0
 
     def add_python_constraint(self, node, fn, kind="eq", name=None):
-        """Registers fn(wp_row) -> (k,) on `node`, baked into `_problem`'s
+        """Registers fn(wp_row, assign) -> (k,) on `node`'s whole row (see
+        GraphOrderingSpec.add_python_constraint), baked into `_problem`'s
         structure the first time it's built (the first solve()/warmup()
         call). Must be called before that first call -- structure is built
         once and reused for this solver's whole lifetime (see module
