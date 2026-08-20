@@ -328,15 +328,27 @@ std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_
 //
 // A statically-assigned hold (add_hold, robot_ag set) resolves
 // immediately. An assignable hold (add_assignable_hold, var_id set)
-// resolves once `committed_assignments` has an entry for that var --
-// populated the instant its u_node (Pick, the hold's own commit trigger --
-// see add_variable_commit) completes (GraphOfConstraintsMPC._maybe_commit)
-// -- which is always before a downstream node's ownership is asked for
-// here: a v_node only re-enters get_agent_paths' traversal once its u_node
-// predecessor is done. Returns {} for a still-uncommitted assignable hold
-// (no opinion yet, same contract as EdgePhiOwningAgents/PhiOwningAgents),
-// not the committed agent guessed early.
-std::set<int> HoldOwningAgents(const GraphOfConstraints& graph, int u, int v) {
+// resolves through `var_to_agent` -- THIS solve's own variable assignment
+// (see get_agent_paths, which builds it fresh from assignments/
+// phi_to_variable_map every call), not `committed_assignments` (which only
+// gets an entry once the hold's u_node -- Pick -- has actually COMPLETED
+// at runtime; see add_variable_commit/GraphOfConstraintsMPC._maybe_commit).
+// get_agent_paths runs every cycle to route the WHOLE remaining graph
+// (_solve_for_timing), well before a not-yet-reached Pick ever completes --
+// waiting on commit left every such Place node's ownership undecided until
+// then, which fell through to the "assign to every agent" branch below:
+// the OTHER agent's totally unconstrained column at that node got fed to
+// the timing solver as a real waypoint, plus a spurious cross-agent EQUAL
+// sync constraint got attached to a node the other agent has no actual
+// business visiting (confirmed on po_goc_mpc's pick_place_task: stray
+// waypoint circles at room corners nowhere near any surface, and the
+// second robot deadlocked in place, never reaching its own Pick). The
+// solver's own `assignments` already resolves every declared variable as
+// soon as a solve succeeds -- no need to wait for the physical Pick.
+// Returns {} if `var_to_agent` has no entry for the hold's var (defensive;
+// same "no opinion yet" contract as EdgePhiOwningAgents/PhiOwningAgents).
+std::set<int> HoldOwningAgents(const GraphOfConstraints& graph, int u, int v,
+                               const std::map<int, int>& var_to_agent) {
 	std::set<int> owners;
 	for (const auto& [hold_id, hold] : graph.hold_ops) {
 		if (hold.u_node != u || hold.v_node != v) continue;
@@ -345,8 +357,8 @@ std::set<int> HoldOwningAgents(const GraphOfConstraints& graph, int u, int v) {
 			continue;
 		}
 		if (!hold.var_id.has_value()) continue;  // defensive; HoldDeclaration always sets one
-		const auto it = graph.committed_assignments.find(*hold.var_id);
-		if (it != graph.committed_assignments.end()) owners.insert(it->second);
+		const auto it = var_to_agent.find(*hold.var_id);
+		if (it != var_to_agent.end()) owners.insert(it->second);
 	}
 	return owners;
 }
@@ -532,6 +544,20 @@ std::tuple<std::vector<std::optional<int>>,
 	std::map<int, std::set<int>> node_to_agents_map;
 	std::vector<struct AgentInteraction> agent_interactions;
 
+	// var_id -> its resolved agent, from THIS solve's own `assignments`
+	// (indexed by phi_id -- see PhiOwningAgents) via phi_to_variable_map --
+	// built once here, rather than re-derived per hold lookup, since
+	// several phis can share one var_id (e.g. Pick's x/y/yaw equalities are
+	// 3 separate phis all tied to the same Robot variable) and they always
+	// agree once assigned. Feeds HoldOwningAgents below; see its own
+	// docstring for why this replaces committed_assignments as that
+	// function's source of truth.
+	std::map<int, int> var_to_agent;
+	for (const auto& [phi_id, var_id] : phi_to_variable_map) {
+		const int a = assignments(phi_id);
+		if (a != -1) var_to_agent[var_id] = a;
+	}
+
 	// Cross-agent-ness for an edge (or co-ownership of a single node) is
 	// "no agent is common to both owner sets" -- not "some pair of agents
 	// differs" (that's true of almost any two multi-owner sets and would
@@ -598,7 +624,7 @@ std::tuple<std::vector<std::optional<int>>,
 			// well-scaled remaining-path costs to another agent's
 			// already-arrived, near-zero ones in the same shared QP).
 			for (const auto& e : full_sg.neighbors(node)) {
-				const std::set<int> hold_owners = HoldOwningAgents(*this, node, e.to);
+				const std::set<int> hold_owners = HoldOwningAgents(*this, node, e.to, var_to_agent);
 				owners.insert(hold_owners.begin(), hold_owners.end());
 				const auto phis_it = edge_to_phis_map.find({node, e.to});
 				if (phis_it == edge_to_phis_map.end()) continue;
@@ -608,7 +634,7 @@ std::tuple<std::vector<std::optional<int>>,
 				}
 			}
 			for (const auto& in : full_sg.incoming_neighbors(node)) {
-				const std::set<int> hold_owners = HoldOwningAgents(*this, in.from, node);
+				const std::set<int> hold_owners = HoldOwningAgents(*this, in.from, node, var_to_agent);
 				owners.insert(hold_owners.begin(), hold_owners.end());
 				const auto phis_it = edge_to_phis_map.find({in.from, node});
 				if (phis_it == edge_to_phis_map.end()) continue;
