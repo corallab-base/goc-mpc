@@ -8,7 +8,7 @@ from goc_mpc.graphs import Graph
 # Configure verbosity via logging.getLogger("goc_mpc").setLevel(...).
 logger = logging.getLogger(__name__)
 
-from ._ext.configuration_spline import CubicConfigurationSpline, Block
+from ._ext.configuration_spline import CubicConfigurationSpline, Block, BlockType
 from ._ext.goc_mpc import (
     GraphOfConstraints,
     WaypointSolver,
@@ -19,6 +19,20 @@ from ._ext.goc_mpc import (
     GraphShortPathMPC,
     ObstacleSet,
 )
+
+
+def _quat_block_slice(spec):
+    """Ambient (offset, size) of `spec`'s first Block.SO3Quat block, relative
+    to that agent's OWN ambient slice -- or None if it has none. Mirrors
+    default_fk.py's _default_kind (same has_quat-over-Block-list check),
+    used here so step()'s teleport branch renormalizes whichever slice is
+    actually a quaternion for THIS agent instead of a hardcoded [3:7]."""
+    offset = 0
+    for block in spec:
+        if block.type == BlockType.SO3Quat:
+            return offset, block.size
+        offset += block.size
+    return None
 
 
 class GraphOfConstraintsMPC():
@@ -269,7 +283,7 @@ class GraphOfConstraintsMPC():
         time."""
         if not logger.isEnabledFor(logging.DEBUG):
             return
-        dim = self.graph.dim
+        agent_offsets = self.graph.agent_col_offsets
         agent_nodes_list = self.timing_mpc.view_agent_nodes_list()
         time_deltas_list = self.timing_mpc.view_time_deltas_list()
         wps_list = self.timing_mpc.view_wps_list()
@@ -290,7 +304,7 @@ class GraphOfConstraintsMPC():
             if wps_list[i].shape[0] == 0:
                 continue
             first_wp = wps_list[i][0].copy()
-            x_i = x[i * dim:(i + 1) * dim]
+            x_i = x[agent_offsets[i]:agent_offsets[i + 1]]
             distance = np.linalg.norm(x_i - first_wp)
             prev = self._debug_prev_first_wp.get(i)
             jitter = np.linalg.norm(first_wp - prev) if prev is not None else 0.0
@@ -565,14 +579,19 @@ class GraphOfConstraintsMPC():
                 self.timing_mpc.view_time_deltas_list()
             ))
 
+            agent_offsets = self.graph.agent_col_offsets
             for i, (agent_nodes, timings) in enumerate(nodes_and_timings):
                 next_agent_node = next(iter(agent_nodes), -1)
                 next_agent_delta = next(iter(timings), 0.0)
+                lo, hi = agent_offsets[i], agent_offsets[i + 1]
                 if next_agent_node == -1:
-                    next_agent_state = x[i*self.graph.dim:(i+1)*self.graph.dim].copy()
+                    next_agent_state = x[lo:hi].copy()
                 else:
-                    next_agent_state = wps[next_agent_node, i*self.graph.dim:(i+1)*self.graph.dim].copy()
-                next_agent_state[3:7] /= np.linalg.norm(next_agent_state[3:7])
+                    next_agent_state = wps[next_agent_node, lo:hi].copy()
+                quat_slice = _quat_block_slice(self.graph._robot_specs[i])
+                if quat_slice is not None:
+                    qoff, qsize = quat_slice
+                    next_agent_state[qoff:qoff + qsize] /= np.linalg.norm(next_agent_state[qoff:qoff + qsize])
                 next_agent_states.append(next_agent_state)
                 next_agent_deltas.append(next_agent_delta)
 

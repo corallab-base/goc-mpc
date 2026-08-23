@@ -210,7 +210,6 @@ class TracedTimingMPC:
     ):
         self.graph = graph
         self.field = field
-        self.ambient_dim = graph.dim
         self.rdp_tolerance = rdp_tolerance
         self.max_points_per_segment = max_points_per_segment
 
@@ -238,7 +237,7 @@ class TracedTimingMPC:
         solve_dense()'s own separate boundary-condition arguments).
         """
         if len(coarse_node_ids) == 0:
-            return np.zeros((0, self.ambient_dim)), []
+            return np.zeros((0, self.graph.robot_ambient_dim(agent))), []
 
         positions = [x0_i] + [coarse_wps_i[j] for j in range(len(coarse_node_ids))]
         node_ids = [None] + list(coarse_node_ids)
@@ -289,17 +288,19 @@ class TracedTimingMPC:
 
         agent_dense_wps = []
         agent_dense_node_ids = []
+        agent_offsets = self.graph.agent_col_offsets
         for i in range(self.graph.num_agents):
-            x0_i = np.asarray(x0[i * self.ambient_dim:(i + 1) * self.ambient_dim])
+            lo, hi = agent_offsets[i], agent_offsets[i + 1]
+            x0_i = np.asarray(x0[lo:hi])
             node_ids_i = agent_nodes[i]
             # get_agent_paths resolves WHICH real nodes/order, not their
             # positions -- look those up from `waypoints` ourselves, the
             # same indexing build_graph_timing_problem's wps_i uses.
             if len(node_ids_i) == 0:
-                wps_i = np.zeros((0, self.ambient_dim))
+                wps_i = np.zeros((0, hi - lo))
             else:
                 wps_i = np.asarray([
-                    waypoints[node, i * self.ambient_dim:(i + 1) * self.ambient_dim]
+                    waypoints[node, lo:hi]
                     for node in node_ids_i
                 ])
             dense_wps, dense_ids = self._agent_dense_wps_and_ids(i, x0_i, node_ids_i, wps_i)

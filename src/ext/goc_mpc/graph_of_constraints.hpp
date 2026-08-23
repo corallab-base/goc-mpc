@@ -1,6 +1,9 @@
 #pragma once
 
 #include <iostream>
+#include <stdexcept>
+#include <type_traits>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -257,14 +260,26 @@ template <typename Key>
 class PlaceholderVarFamily {
 public:
 	PlaceholderVarFamily() = default;
-	// `width`: fixed size of every key's placeholder vector (e.g. `dim` for
-	// an agent_q family, `non_robot_dim` for an object_q family,
-	// `workspace_dim` for agent_link_pos). `namer(key)`: produces each
-	// entry's debug name (shown in printed formulas).
+	// `width`: fixed size of every key's placeholder vector, the SAME for
+	// every key (e.g. `workspace_dim` for agent_link_pos, 1 for param).
+	// `namer(key)`: produces each entry's debug name (shown in printed
+	// formulas).
 	PlaceholderVarFamily(int width, std::function<std::string(const Key&)> namer)
 		: width_(width), namer_(std::move(namer)) {}
 
-	int width() const { return width_; }
+	// Per-KEY width (agent_q/object_q/var_agent_q and their u_/v_
+	// counterparts -- agents/objects/variables need not share a width with
+	// each other). `Key` must be `int` (an agent/object/variable id, used
+	// directly as the vector index) -- `widths` is a non-owning pointer to
+	// a vector the CALLER (GraphOfConstraints, which owns both this family
+	// and the vector as sibling members) keeps alive and may mutate/grow in
+	// place for this family's whole lifetime; `push_back` never invalidates
+	// the vector's own address, only iterators/pointers to individual
+	// elements, so this is safe as long as nothing swaps or reassigns the
+	// vector wholesale. Mirrors this project's existing store-pointer-
+	// caller-keeps-alive convention (e.g. ObstacleSet).
+	PlaceholderVarFamily(const std::vector<int>* widths, std::function<std::string(const Key&)> namer)
+		: widths_(widths), namer_(std::move(namer)) {}
 
 	// True iff `key` already has a placeholder (Vars()/Get() was called for
 	// it before) -- does NOT create one. Used where "was this
@@ -281,7 +296,7 @@ public:
 		auto it = vars_.find(key);
 		if (it == vars_.end()) {
 			it = vars_.emplace(key, drake::symbolic::MakeVectorContinuousVariable(
-				width_, namer_(key))).first;
+				WidthFor(key), namer_(key))).first;
 		}
 		return it->second;
 	}
@@ -323,7 +338,7 @@ public:
 	void SubstituteRange(drake::symbolic::Substitution* sub, int n, RowFn&& row_value) const {
 		for (int i = 0; i < n; ++i) {
 			const auto& vars = Vars(i);
-			for (int j = 0; j < width_; ++j)
+			for (int j = 0; j < vars.size(); ++j)
 				(*sub)[vars[j]] = row_value(i, j);
 		}
 	}
@@ -334,13 +349,39 @@ public:
 	void InsertRange(drake::symbolic::Environment* env, int n, RowFn&& row_value) const {
 		for (int i = 0; i < n; ++i) {
 			const auto& vars = Vars(i);
-			for (int j = 0; j < width_; ++j)
+			for (int j = 0; j < vars.size(); ++j)
 				env->insert(vars[j], row_value(i, j));
 		}
 	}
 
 private:
+	// `if constexpr` (not SFINAE/specialization) discards the untaken
+	// branch's instantiation entirely, so `widths_->at(key)` never has to
+	// type-check for a non-int Key (agent_link_pos/agent_link_rot, keyed by
+	// pair<int,string>) -- those always take the constant-`width_` branch
+	// and never construct a per-key family in the first place. A negative
+	// stored width (see GraphOfConstraints's `_var_widths`) means "not yet
+	// resolvable" -- e.g. an assignable variable whose current candidate
+	// agents don't share a width -- and throws a clear, actionable error
+	// rather than silently returning garbage.
+	int WidthFor(const Key& key) const {
+		if constexpr (std::is_same_v<Key, int>) {
+			if (!widths_) return width_;
+			const int w = widths_->at(key);
+			if (w < 0) {
+				throw std::runtime_error(
+					"PlaceholderVarFamily: " + namer_(key) + " has no resolvable width -- "
+					"its candidate agents don't share a config width; narrow it to a "
+					"uniform-width subset via add_variable_constraint first.");
+			}
+			return w;
+		} else {
+			return width_;
+		}
+	}
+
 	int width_ = 0;
+	const std::vector<int>* widths_ = nullptr;
 	std::function<std::string(const Key&)> namer_;
 	mutable std::map<Key, drake::VectorX<drake::symbolic::Variable>> vars_;
 };
@@ -422,13 +463,50 @@ struct GraphOfConstraints {
 	// Rest
 	int num_phis, num_edge_phis, num_var_phis, num_holds;
 	int num_variables, _num_total_assignables;
-	int num_agents, num_objects, dim, non_robot_dim, total_dim;
+	int num_agents, num_objects, total_dim;
+
+	// Per-entity CUMULATIVE column offset into the flat ambient state row
+	// (`x`/MILP's `W`) -- `_agent_col_offsets[ag]`/`_object_col_offsets[ob]`
+	// is where agent `ag`'s/object `ob`'s own `robot_ambient_dim(ag)`/
+	// `object_ambient_dim(ob)`-wide slice starts. Agents/objects need not
+	// share a width with each other. CSR-style (size `num_agents+1`/
+	// `num_objects+1`): the trailing entry is the total width of that
+	// block, so `agent_col_offset(num_agents)` doubles as "where the object
+	// block starts" (valid even when num_objects==0) and
+	// `object_col_offset(num_objects) == total_dim`. Built once in the
+	// constructor from `_robot_specs`/`_object_specs`.
+	std::vector<int> _agent_col_offsets, _object_col_offsets;
+
+	// Per-entity width -- `_agent_widths[ag] == robot_ambient_dim(ag)`,
+	// `_object_widths[ob] == object_ambient_dim(ob)` (redundant with the
+	// offset tables above, which encode the same thing as differences of
+	// consecutive entries, but each accessor has its own direct consumer:
+	// offsets for column arithmetic, these for _agent_q's/_object_q's own
+	// per-key PlaceholderVarFamily width). Built once, alongside the offset
+	// tables, in the constructor.
+	//
+	// `_var_widths[var]` is DIFFERENT in kind: variables are created one at
+	// a time over the graph's lifetime (add_variable()), not fixed at
+	// construction, so this vector grows via push_back as they are; a
+	// negative entry means "not yet resolvable" (see PlaceholderVarFamily::
+	// WidthFor's own comment) -- var `var`'s candidate agents (every agent,
+	// by default, until add_variable_constraint narrows them) don't
+	// currently share a width. Resolved eagerly in add_variable() when
+	// every agent happens to share one width (the common case, unchanged
+	// from before this refactor); re-resolved (and validated -- throws if
+	// the narrowed candidate set STILL disagrees) in add_variable_constraint.
+	std::vector<int> _agent_widths, _object_widths, _var_widths;
+
+	// A fresh variable's implied candidate set is every agent (until/unless
+	// add_variable_constraint narrows it) -- computed ONCE in the
+	// constructor (agent widths never change after construction) rather
+	// than re-scanning all `num_agents` on every add_variable() call.
+	// Negative when agents don't all share a width.
+	int _default_var_width;
 
 	// Ambient Cartesian workspace dimensionality (2 or 3) that
-	// agent_link_pos/link_pose's REGISTERED-fk_fn path operate in --
-	// distinct from `dim`/`non_robot_dim` (a robot/object's own
-	// configuration width, e.g. dim=4 for a pos_yaw robot in a 3D
-	// workspace). Defaults to 3 for full backward compatibility. Sizes
+	// agent_link_pos/link_pose's REGISTERED-fk_fn path operate in.
+	// Defaults to 3 for full backward compatibility. Sizes
 	// agent_link_pos's placeholder width, so a 2-workspace graph can
 	// compare it against a 2-wide object_q. Also consulted by link_pose's
 	// built-in RobotKind fallback (PoseFromRow, utils.hpp -- kPointMass/
@@ -438,7 +516,7 @@ struct GraphOfConstraints {
 	// the runtime hold-drift check (GraphOfConstraintsMPC, which reads both
 	// link_pose and point_position together) works for a 2-workspace graph
 	// as long as workspace_dim is actually set to 2 (it does NOT follow
-	// non_robot_dim/dim automatically).
+	// any robot's/object's own width automatically).
 	int workspace_dim;
 
 	// Required for big-M computation
@@ -595,6 +673,12 @@ struct GraphOfConstraints {
 	int robot_tangent_dim(int ag) const;
 
 	int object_ambient_dim(int ob) const;
+
+	// See `_agent_col_offsets`/`_object_col_offsets`'s own doc comment.
+	// `ag`/`ob` may equal num_agents/num_objects (one past the last real
+	// entry) to get that block's total width.
+	int agent_col_offset(int ag) const { return _agent_col_offsets.at(ag); }
+	int object_col_offset(int ob) const { return _object_col_offsets.at(ob); }
 
 	// Python-registered forward-kinematics override for a single
 	// (agent_id, link_name), consulted by link_pose before falling back to

@@ -28,7 +28,7 @@ protected:
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> _splines;
 
 	// persistent output buffers;
-	// _waypoints is (_graph.num_nodes, _graph.num_agents * _graph.dim)
+	// _waypoints is (_graph.num_nodes, _graph.total_dim)
 	Eigen::MatrixXd _waypoints;
 	// _assignments is (_graph.num_phis,)
 	Eigen::VectorXi _assignments;

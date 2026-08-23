@@ -52,7 +52,7 @@ inline Eigen::VectorXd seg_width3(const Eigen::VectorXd& lb,
 }
 
 // Bound ||p_WP - p_WE||_2 on one “side” (0, u, or v).
-// If EE is free-body: ee_start3 = robot_ag * robot_dim (where the pos lives).
+// If EE is free-body: ee_start3 = graph->agent_col_offset(robot_ag) (where the pos lives).
 // If articulated: pass ee_span_hint as a per-axis bound on EE motion; otherwise use a conservative constant.
 // `dim` is the robot's workspace_dim (2 or 3) -- both segments read are
 // workspace_dim-wide, matching PointWorldFromRow/PoseFromRow's own sizing.
@@ -111,9 +111,6 @@ static void AddHoldRigidityStaticToX0(
 	const MatrixXDecisionVariable& X,
 	int v,                               // vertex id in the ORIGINAL graph
 	const HoldSpec& spec,
-	int robot_dim,
-	int objs_start,
-	int non_robot_dim,
 	const Eigen::VectorXd& x0,
 	bool exact_rigidity) {
 
@@ -129,9 +126,9 @@ static void AddHoldRigidityStaticToX0(
 	if (exact_rigidity) {
 		for (int obj_id : spec.held_point_ids) {
 			const Eigen::VectorX<Expression> p_WP_0 =
-				PointWorldFromRow(x0_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(x0_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 			const Eigen::VectorX<Expression> p_WP_v =
-				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(X_v_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 
 			const Eigen::VectorX<Expression> rel_0 =
 				R_WE_0.transpose() * (p_WP_0 - p_WE_0);
@@ -169,13 +166,13 @@ static void AddHoldRigidityStaticToX0(
 				const int id_j = spec.held_point_ids[j];
 
 				const Eigen::VectorX<Expression> p_i_0 =
-					PointWorldFromRow(x0_expr, objs_start, non_robot_dim, id_i, workspace_dim);
+					PointWorldFromRow(x0_expr, graph->object_col_offset(id_i), graph->object_ambient_dim(id_i), workspace_dim);
 				const Eigen::VectorX<Expression> p_i_v =
-					PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_i, workspace_dim);
+					PointWorldFromRow(X_v_expr, graph->object_col_offset(id_i), graph->object_ambient_dim(id_i), workspace_dim);
 				const Eigen::VectorX<Expression> p_j_0 =
-					PointWorldFromRow(x0_expr, objs_start, non_robot_dim, id_j, workspace_dim);
+					PointWorldFromRow(x0_expr, graph->object_col_offset(id_j), graph->object_ambient_dim(id_j), workspace_dim);
 				const Eigen::VectorX<Expression> p_j_v =
-					PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_j, workspace_dim);
+					PointWorldFromRow(X_v_expr, graph->object_col_offset(id_j), graph->object_ambient_dim(id_j), workspace_dim);
 
 				const Eigen::VectorX<Expression> d_0 = p_i_0 - p_j_0;
 				const Eigen::VectorX<Expression> d_v = p_i_v - p_j_v;
@@ -188,9 +185,9 @@ static void AddHoldRigidityStaticToX0(
 
 		for (int obj_id : spec.held_point_ids) {
 			const Eigen::VectorX<Expression> p_WP_0 =
-				PointWorldFromRow(x0_expr,   objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(x0_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 			const Eigen::VectorX<Expression> p_WP_v =
-				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(X_v_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 
 			const Eigen::VectorX<Expression> d_0 = p_WP_0 - p_WE_0;
 			const Eigen::VectorX<Expression> d_v = p_WP_v - p_WE_v;
@@ -213,9 +210,6 @@ static void AddHoldRigidityStatic(
 	const MatrixXDecisionVariable& X,
 	int u, int v,                         // graph vertex ids in the *original* graph
 	const HoldSpec& spec,
-	int robot_dim,
-	int objs_start,
-	int non_robot_dim,
 	bool exact_rigidity) {
 
 	// Map original graph ids to subgraph row ids
@@ -235,9 +229,9 @@ static void AddHoldRigidityStatic(
 	if (exact_rigidity) {
 		for (int obj_id : spec.held_point_ids) {
 			const Eigen::VectorX<Expression> p_WP_u =
-				PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(X_u_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 			const Eigen::VectorX<Expression> p_WP_v =
-				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(X_v_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 
 			const Eigen::VectorX<Expression> rel_u =
 				R_WE_u.transpose() * (p_WP_u - p_WE_u);
@@ -272,13 +266,13 @@ static void AddHoldRigidityStatic(
 				const int id_j = spec.held_point_ids[j];
 
 				const Eigen::VectorX<Expression> p_i_u =
-					PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, id_i, workspace_dim);
+					PointWorldFromRow(X_u_expr, graph->object_col_offset(id_i), graph->object_ambient_dim(id_i), workspace_dim);
 				const Eigen::VectorX<Expression> p_i_v =
-					PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_i, workspace_dim);
+					PointWorldFromRow(X_v_expr, graph->object_col_offset(id_i), graph->object_ambient_dim(id_i), workspace_dim);
 				const Eigen::VectorX<Expression> p_j_u =
-					PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, id_j, workspace_dim);
+					PointWorldFromRow(X_u_expr, graph->object_col_offset(id_j), graph->object_ambient_dim(id_j), workspace_dim);
 				const Eigen::VectorX<Expression> p_j_v =
-					PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, id_j, workspace_dim);
+					PointWorldFromRow(X_v_expr, graph->object_col_offset(id_j), graph->object_ambient_dim(id_j), workspace_dim);
 
 				const Eigen::VectorX<Expression> d_u = p_i_u - p_j_u;
 				const Eigen::VectorX<Expression> d_v = p_i_v - p_j_v;
@@ -290,9 +284,9 @@ static void AddHoldRigidityStatic(
 
 		for (int obj_id : spec.held_point_ids) {
 			const Eigen::VectorX<Expression> p_WP_u =
-				PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(X_u_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 			const Eigen::VectorX<Expression> p_WP_v =
-				PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+				PointWorldFromRow(X_v_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 
 			const Eigen::VectorX<Expression> d_u = p_WP_u - p_WE_u;
 			const Eigen::VectorX<Expression> d_v = p_WP_v - p_WE_v;
@@ -311,7 +305,6 @@ void AddHoldRigidityAssignableToX0(
 	const MatrixXDecisionVariable& X,
 	int v,
 	const AssignableHoldSpec& spec,
-	int robot_dim, int objs_start, int non_robot_dim,
 	const Eigen::VectorXd& x0,
 	const VectorXDecisionVariable& A_row) {
 
@@ -337,8 +330,8 @@ void AddHoldRigidityAssignableToX0(
 	for (int obj_id : spec.held_point_ids) {
 		ObjPts o;
 		o.id = obj_id;
-		o.p_WP_0 = PointWorldFromRow(x0_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
-		o.p_WP_v = PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+		o.p_WP_0 = PointWorldFromRow(x0_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
+		o.p_WP_v = PointWorldFromRow(X_v_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 		objects.push_back(std::move(o));
 	}
 
@@ -352,7 +345,7 @@ void AddHoldRigidityAssignableToX0(
 		auto [p_WE_v, R_WE_v] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, X_v_expr);
 
 		// For free-body agent k:
-		const int ee_start3 = k * robot_dim;  // assuming first workspace_dim coords are world position
+		const int ee_start3 = graph->agent_col_offset(k);  // assuming first workspace_dim coords are world position
 
 		// Gate each held point’s exact-rigidity residual.
 		for (size_t idx = 0; idx < spec.held_point_ids.size(); ++idx) {
@@ -360,7 +353,7 @@ void AddHoldRigidityAssignableToX0(
 			const auto& p_WP_v = objects[idx].p_WP_v;
 
 			// For each held object (obj_id):
-			const int obj_start3 = objs_start + objects[idx].id * non_robot_dim;
+			const int obj_start3 = graph->object_col_offset(objects[idx].id);
 
 			const Eigen::VectorXd Mvec = M_exact_toX0_componentwise(
 				graph->_global_x_lb, graph->_global_x_ub,
@@ -418,7 +411,6 @@ void AddHoldRigidityAssignable(
 	const MatrixXDecisionVariable& X,
 	int u, int v,
 	const AssignableHoldSpec& spec,
-	int robot_dim, int objs_start, int non_robot_dim,
 	const VectorXDecisionVariable& A_row) {
 
 	using drake::symbolic::Expression;
@@ -448,8 +440,8 @@ void AddHoldRigidityAssignable(
 	for (int obj_id : spec.held_point_ids) {
 		ObjPtsUV o;
 		o.id = obj_id;
-		o.p_WP_u = PointWorldFromRow(X_u_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
-		o.p_WP_v = PointWorldFromRow(X_v_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+		o.p_WP_u = PointWorldFromRow(X_u_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
+		o.p_WP_v = PointWorldFromRow(X_v_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 		objects.push_back(std::move(o));
 	}
 
@@ -463,7 +455,7 @@ void AddHoldRigidityAssignable(
 		auto [p_WE_v, R_WE_v] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, X_v_expr);
 
 		// For free-body agent k:
-		const int ee_start3 = k * robot_dim;  // assuming first workspace_dim coords are world position
+		const int ee_start3 = graph->agent_col_offset(k);  // assuming first workspace_dim coords are world position
 
 		for (size_t idx = 0; idx < spec.held_point_ids.size(); ++idx) {
 			const auto& p_WP_u = objects[idx].p_WP_u;
@@ -478,7 +470,7 @@ void AddHoldRigidityAssignable(
 			const Eigen::VectorX<Expression> residual = rel_u - rel_v;
 
 			// For each held object (obj_id):
-			const int obj_start3 = objs_start + objects[idx].id * non_robot_dim;
+			const int obj_start3 = graph->object_col_offset(objects[idx].id);
 
 			// u->v:
 			const Eigen::VectorXd Mvec_uv = M_exact_edge_componentwise(
@@ -536,7 +528,6 @@ static void AddHoldRigidityStaticGated(
 	const Eigen::VectorX<Expression>& ref_expr,
 	const Eigen::VectorX<Expression>& cand_expr,
 	const HoldSpec& spec,
-	int robot_dim, int objs_start, int non_robot_dim,
 	const Variable& gate,
 	const std::string& desc) {
 
@@ -545,21 +536,21 @@ static void AddHoldRigidityStaticGated(
 	const int workspace_dim = graph->workspace_dim;
 
 	const int k = spec.robot_ag;
-	const int ee_start3 = k * robot_dim;
+	const int ee_start3 = graph->agent_col_offset(k);
 	const Eigen::VectorXd ee_span_hint = Eigen::VectorXd::Constant(workspace_dim, 2.0);
 
 	auto [p_WE_ref, R_WE_ref]   = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, ref_expr);
 	auto [p_WE_cand, R_WE_cand] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, cand_expr);
 
 	for (int obj_id : spec.held_point_ids) {
-		const Eigen::VectorX<Expression> p_WP_ref  = PointWorldFromRow(ref_expr,  objs_start, non_robot_dim, obj_id, workspace_dim);
-		const Eigen::VectorX<Expression> p_WP_cand = PointWorldFromRow(cand_expr, objs_start, non_robot_dim, obj_id, workspace_dim);
+		const Eigen::VectorX<Expression> p_WP_ref  = PointWorldFromRow(ref_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
+		const Eigen::VectorX<Expression> p_WP_cand = PointWorldFromRow(cand_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim);
 
 		const Eigen::VectorX<Expression> rel_ref  = R_WE_ref.transpose()  * (p_WP_ref  - p_WE_ref);
 		const Eigen::VectorX<Expression> rel_cand = R_WE_cand.transpose() * (p_WP_cand - p_WE_cand);
 		const Eigen::VectorX<Expression> residual = rel_ref - rel_cand;
 
-		const int obj_start3 = objs_start + obj_id * non_robot_dim;
+		const int obj_start3 = graph->object_col_offset(obj_id);
 		const Eigen::VectorXd Mvec = M_exact_edge_componentwise(
 			graph->_global_x_lb, graph->_global_x_ub,
 			obj_start3,
@@ -605,7 +596,6 @@ static void AddHoldRigidityAssignableGated(
 	const Eigen::VectorX<Expression>& ref_expr,
 	const Eigen::VectorX<Expression>& cand_expr,
 	const AssignableHoldSpec& spec,
-	int robot_dim, int objs_start, int non_robot_dim,
 	const VectorXDecisionVariable& A_row,
 	const Variable& gate,
 	const std::string& desc) {
@@ -626,14 +616,14 @@ static void AddHoldRigidityAssignableGated(
 	for (int obj_id : spec.held_point_ids) {
 		objects.push_back(ObjPts{
 			obj_id,
-			PointWorldFromRow(ref_expr,  objs_start, non_robot_dim, obj_id, workspace_dim),
-			PointWorldFromRow(cand_expr, objs_start, non_robot_dim, obj_id, workspace_dim)});
+			PointWorldFromRow(ref_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim),
+			PointWorldFromRow(cand_expr, graph->object_col_offset(obj_id), graph->object_ambient_dim(obj_id), workspace_dim)});
 	}
 
 	for (int k = 0; k < num_agents; ++k) {
 		auto [p_WE_ref, R_WE_ref]   = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, ref_expr);
 		auto [p_WE_cand, R_WE_cand] = PoseFromRow<Expression>(graph, k, spec.ee_frame_name, cand_expr);
-		const int ee_start3 = k * robot_dim;
+		const int ee_start3 = graph->agent_col_offset(k);
 
 		for (size_t idx = 0; idx < spec.held_point_ids.size(); ++idx) {
 			const auto& p_WP_ref  = objects[idx].p_WP_ref;
@@ -643,7 +633,7 @@ static void AddHoldRigidityAssignableGated(
 			const Eigen::VectorX<Expression> rel_cand = R_WE_cand.transpose() * (p_WP_cand - p_WE_cand);
 			const Eigen::VectorX<Expression> residual = rel_ref - rel_cand;
 
-			const int obj_start3 = objs_start + objects[idx].id * non_robot_dim;
+			const int obj_start3 = graph->object_col_offset(objects[idx].id);
 			const Eigen::VectorXd Mvec = M_exact_edge_componentwise(
 				graph->_global_x_lb, graph->_global_x_ub,
 				obj_start3,
@@ -1054,10 +1044,6 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	// record the subgraph
 	problem.subgraph = std::make_unique<SubgraphOfConstraints>(subgraph);
 
-	const int robot_dim = graph->dim;
-	const int objs_start = graph->num_agents * graph->dim;
-	const int non_robot_dim = graph->non_robot_dim;
-
 	// Routing graph N = {depot=0} ∪ task_nodes(1..n_V) ∪ {sink=n_V+1}, |N|=n_N.
 	const int n_V = subgraph.num_nodes();
 	const int n_N = n_V + 2;
@@ -1068,7 +1054,13 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 
 	const double kInf     = std::numeric_limits<double>::infinity();
 	const double x_range  = (graph->_global_x_ub - graph->_global_x_lb).maxCoeff();
-	const double M_cost   = robot_dim * x_range;
+	// Big-M for the routing/cost-linking constraints below (2 & 3, and M_time
+	// off of it) -- must upper-bound the arc cost regardless of which agent
+	// (now possibly a different width from any other) traverses it, hence
+	// the WIDEST agent's own width, not a uniform `robot_dim`.
+	int max_agent_width = 0;
+	for (int j = 0; j < num_agents; ++j) max_agent_width = std::max(max_agent_width, graph->robot_ambient_dim(j));
+	const double M_cost   = max_agent_width * x_range;
 	const double M_time   = (n_N - 1) * M_cost + 1.0;
 
 	///////////////////////////////////////////////////////////////////////
@@ -1089,8 +1081,10 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	problem.Assignments = Assignments;
 	(void)relax_binary_vars;
 
-	// W: continuous configuration variables (n x m*d+o).
-	MatrixXDecisionVariable W = prog.NewContinuousVariables(subgraph.num_nodes(), num_agents * robot_dim + num_objects * non_robot_dim, "W");
+	// W: continuous configuration variables (n x graph->total_dim -- agents
+	// then objects, each its own width, not a uniform per-agent/per-object
+	// stride -- see GraphOfConstraints::agent_col_offset/object_col_offset).
+	MatrixXDecisionVariable W = prog.NewContinuousVariables(subgraph.num_nodes(), graph->total_dim, "W");
 	problem.W = W;
 
 	// Z: binary per-agent path indicators
@@ -1156,15 +1150,19 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	// Constraints 2 & 3: cost-linking (big-M) and zero cost on sink arcs
 	for (int j = 0; j < num_agents; ++j) {
 
-		// Helper for getting waypoint vector for agent j at node node_ri
+		// Helper for getting waypoint vector for agent j at node node_ri --
+		// agent j's own width/offset, not a uniform robot_dim/j*robot_dim
+		// stride.
+		const int j_offset = graph->agent_col_offset(j);
+		const int j_width = graph->robot_ambient_dim(j);
 		auto get_w = [&](int node_ri) -> Eigen::VectorX<Expression> {
-			Eigen::VectorX<Expression> w(robot_dim);
+			Eigen::VectorX<Expression> w(j_width);
 			if (node_ri == depot_idx) {
-				for (int k = 0; k < robot_dim; ++k)
-					w(k) = Expression(x0(j * robot_dim + k));
+				for (int k = 0; k < j_width; ++k)
+					w(k) = Expression(x0(j_offset + k));
 			} else {
 				// task node: subgraph index (node_ri - 1)
-				w = W.row(node_ri - 1).segment(j * robot_dim, robot_dim)
+				w = W.row(node_ri - 1).segment(j_offset, j_width)
 				      .template cast<Expression>();
 			}
 			return w;
@@ -1470,11 +1468,11 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				// Endpoint (unconditional): a real, always-traversed DAG edge.
 				if (is_static) {
 					AddHoldRigidityStatic(prog, subgraph, graph, W, hold.u_node, hold.v_node,
-							       static_spec, robot_dim, objs_start, non_robot_dim,
+							       static_spec,
 							       /*exact_rigidity=*/true);
 				} else {
 					AddHoldRigidityAssignable(prog, subgraph, graph, W, hold.u_node, hold.v_node,
-								   assignable_spec, robot_dim, objs_start, non_robot_dim, A_row);
+								   assignable_spec, A_row);
 				}
 			} else {
 				// x0-boundary edge: the hold started before this horizon.
@@ -1483,11 +1481,11 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 
 				if (is_static) {
 					AddHoldRigidityStaticToX0(prog, subgraph, graph, W, hold.v_node,
-								   static_spec, robot_dim, objs_start, non_robot_dim,
+								   static_spec,
 								   x0, /*exact_rigidity=*/true);
 				} else {
 					AddHoldRigidityAssignableToX0(prog, subgraph, graph, W, hold.v_node,
-								       assignable_spec, robot_dim, objs_start, non_robot_dim,
+								       assignable_spec,
 								       x0, A_row);
 
 					// Not pinning the holder here anymore: add_assignable_hold
@@ -1515,11 +1513,9 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				Eigen::VectorX<Expression> cand_expr = W.row(sg_w14).template cast<Expression>();
 				const std::string desc = fmt::format("interior rigidity {}->{}", hold.u_node, hold.v_node);
 				if (is_static) {
-					AddHoldRigidityStaticGated(prog, graph, ref_expr, cand_expr, static_spec,
-								    robot_dim, objs_start, non_robot_dim, gate, desc);
+					AddHoldRigidityStaticGated(prog, graph, ref_expr, cand_expr, static_spec, gate, desc);
 				} else {
-					AddHoldRigidityAssignableGated(prog, graph, ref_expr, cand_expr, assignable_spec,
-									robot_dim, objs_start, non_robot_dim, A_row, gate, desc);
+					AddHoldRigidityAssignableGated(prog, graph, ref_expr, cand_expr, assignable_spec, A_row, gate, desc);
 				}
 			}
 		}
@@ -1539,9 +1535,10 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		auto stationary_edge = [&](const Eigen::VectorX<Expression>& seg_a_full, int sg_b,
 					    int t_idx_a, int t_idx_b) {
 			for (int obj = 0; obj < num_objects; ++obj) {
-				const int start = objs_start + obj * non_robot_dim;
-				Eigen::VectorX<Expression> seg_a = seg_a_full.segment(start, non_robot_dim);
-				Eigen::VectorX<Expression> seg_b = W.row(sg_b).segment(start, non_robot_dim)
+				const int start = graph->object_col_offset(obj);
+				const int width = graph->object_ambient_dim(obj);
+				Eigen::VectorX<Expression> seg_a = seg_a_full.segment(start, width);
+				Eigen::VectorX<Expression> seg_b = W.row(sg_b).segment(start, width)
 									.template cast<Expression>();
 
 				// Every hold (anywhere in the graph) that might move this object.
@@ -1571,15 +1568,15 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				}
 
 				if (!any_gate) {
-					prog.AddLinearEqualityConstraint(seg_a - seg_b, Eigen::VectorXd::Zero(non_robot_dim))
+					prog.AddLinearEqualityConstraint(seg_a - seg_b, Eigen::VectorXd::Zero(width))
 						.evaluator()->set_description(fmt::format("stationary point {}", obj));
 					continue;
 				}
 
-				const double m_stat = (graph->_global_x_ub.segment(start, non_robot_dim) -
-							graph->_global_x_lb.segment(start, non_robot_dim))
+				const double m_stat = (graph->_global_x_ub.segment(start, width) -
+							graph->_global_x_lb.segment(start, width))
 							.cwiseAbs().maxCoeff();
-				for (int i = 0; i < non_robot_dim; ++i) {
+				for (int i = 0; i < width; ++i) {
 					const Expression slack = m_stat * gate_sum;
 					prog.AddLinearConstraint(seg_a(i) - seg_b(i) - slack, -kInf, 0.0)
 						.evaluator()->set_description(fmt::format("gated stationary point {}", obj));

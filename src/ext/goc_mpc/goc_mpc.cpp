@@ -78,9 +78,22 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("num_objects", &GraphOfConstraints::num_objects)
 		.def_readonly("num_phis", &GraphOfConstraints::num_phis)
 		.def_readonly("num_variables", &GraphOfConstraints::num_variables)
-		.def_readonly("dim", &GraphOfConstraints::dim)
-		.def_readonly("non_robot_dim", &GraphOfConstraints::non_robot_dim)
 		.def_readonly("total_dim", &GraphOfConstraints::total_dim)
+		// Per-agent/per-object ambient width and CUMULATIVE column offset
+		// into the flat state row (x/MILP's W) -- see GraphOfConstraints::
+		// agent_col_offset/object_col_offset's own doc comment. Agents/
+		// objects need not share a width with each other; there is no
+		// single graph-wide `dim`/`non_robot_dim` any more.
+		.def("robot_ambient_dim", &GraphOfConstraints::robot_ambient_dim, py::arg("agent_id"))
+		.def("robot_tangent_dim", &GraphOfConstraints::robot_tangent_dim, py::arg("agent_id"))
+		.def("object_ambient_dim", &GraphOfConstraints::object_ambient_dim, py::arg("object_id"))
+		.def("agent_col_offset", &GraphOfConstraints::agent_col_offset, py::arg("agent_id"))
+		.def("object_col_offset", &GraphOfConstraints::object_col_offset, py::arg("object_id"))
+		// Whole-array form of the above (agent_col_offset(i) for i in
+		// 0..num_agents inclusive, etc.) -- more ergonomic than a Python
+		// loop of per-index calls for callers that need the full table.
+		.def_readonly("agent_col_offsets", &GraphOfConstraints::_agent_col_offsets)
+		.def_readonly("object_col_offsets", &GraphOfConstraints::_object_col_offsets)
 		.def_readonly("unpassable_nodes", &GraphOfConstraints::unpassable_nodes)
 		.def_readonly("backtrack_map", &GraphOfConstraints::backtrack_map)
 		.def_readonly("phi_to_variable_map", &GraphOfConstraints::phi_to_variable_map)

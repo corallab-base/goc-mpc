@@ -107,7 +107,7 @@ import jax
 import numpy as np
 import jax.numpy as jnp
 
-from .spec import build_graph_ordering_problem
+from .spec import build_graph_ordering_problem, _agent_widths, _slot_width
 from .problem import AnchorState
 from .solver import (
     run_lamarckian_al,
@@ -144,7 +144,7 @@ class EvolutionaryWaypointSolver:
         self._python_constraints = []  # (node, fn, kind, name)
 
         num_nodes = graph.structure.num_nodes
-        agents_width = graph.num_agents * graph.dim
+        agents_width = graph.agent_col_offsets[-1]
         # One row per node -- agent columns then object columns,
         # mirroring MILP's per-node joint configuration `W` (see module
         # docstring). Object columns start NaN (never-referenced sentinel,
@@ -202,8 +202,18 @@ class EvolutionaryWaypointSolver:
         if self._problem is not None:
             return
         graph = self._graph
-        agents_width = graph.num_agents * graph.dim
-        x0_per_agent = x0[:agents_width].reshape(graph.num_agents, graph.dim)
+        # Per-agent padded-slot layout (see spec.py's _agent_widths/
+        # _slot_width docstrings) -- build_graph_ordering_problem derives
+        # the SAME agent_widths/slot_width internally and requires this
+        # x0 argument's shape to agree with it; a plain reshape only works
+        # when every agent happens to share one width, which is no longer
+        # guaranteed.
+        agent_widths = _agent_widths(graph)
+        slot_width = _slot_width(agent_widths)
+        agent_offsets = graph.agent_col_offsets
+        x0_per_agent = np.zeros((graph.num_agents, slot_width))
+        for k in range(graph.num_agents):
+            x0_per_agent[k, :agent_widths[k]] = x0[agent_offsets[k]:agent_offsets[k + 1]]
 
         problem = build_graph_ordering_problem(
             graph, x0_per_agent, self._wp_bounds,
@@ -425,14 +435,13 @@ class EvolutionaryWaypointSolver:
         return self._waypoints
 
     def view_object_waypoints(self):
-        """(num_nodes, num_objects * non_robot_dim) solved object positions --
-        a view onto _waypoints' object-column slice (see view_waypoints()),
+        """(num_nodes, total object width) solved object positions -- a view
+        onto _waypoints' object-column slice (see view_waypoints()),
         matching its node-indexed convention. NaN for any node not yet
         covered by any solve() call; every node in the last solve()'s
         remaining_vertices carries a real, GA-solved value regardless of
         whether any constraint referenced it there."""
-        agents_width = self._graph.num_agents * self._graph.dim
-        return self._waypoints[:, agents_width:]
+        return self._waypoints[:, self._graph.agent_col_offsets[-1]:]
 
     def view_assignments(self):
         return self._assignments

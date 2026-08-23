@@ -123,38 +123,41 @@ Eigen::RowVectorX<Expression> AsExprRow(const Eigen::MatrixBase<Derived>& row) {
 // World position of a "point" from a row of X, sized to workspace_dim --
 // stays shape-compatible with PoseFromRow's own R_WE/p_WE (workspace_dim x
 // workspace_dim / workspace_dim x 1 for a kPosYaw robot at workspace_dim ==
-// 2), instead of always 3. Padded/truncated the same way PointPosFromRow
-// already is for an object whose own non_robot_dim is narrower than
-// workspace_dim (e.g. a PyRoboGym-style planar item with no z of its own),
-// never reading past that object's own slice in row_in.
+// 2), instead of always 3. `obj_col_offset`/`obj_width` are this object's
+// OWN column offset/ambient width (graph->object_col_offset(obj_id)/
+// graph->object_ambient_dim(obj_id) -- objects need not share a width with
+// each other), not a uniform per-object stride. Padded/truncated the same
+// way PointPosFromRow already is for an object whose own width is narrower
+// than workspace_dim (e.g. a PyRoboGym-style planar item with no z of its
+// own), never reading past that object's own slice in row_in.
 template <class DerivedRow>
 Eigen::VectorX<Expression> PointWorldFromRow(
 	const Eigen::MatrixBase<DerivedRow>& row_in,
-	int objs_start, int non_robot_dim, int obj_id, int workspace_dim) {
+	int obj_col_offset, int obj_width, int workspace_dim) {
 
 	Eigen::RowVectorX<Expression> row = AsExprRow(row_in);
-	const int n = std::min(non_robot_dim, workspace_dim);
+	const int n = std::min(obj_width, workspace_dim);
 	Eigen::VectorX<Expression> p_WP = Eigen::VectorX<Expression>::Zero(workspace_dim);
-	p_WP.segment(0, n) = row.segment(objs_start + obj_id * non_robot_dim, n).transpose();
+	p_WP.segment(0, n) = row.segment(obj_col_offset, n).transpose();
 	return p_WP;
 }
 
 // Returns a Vector3 regardless of the object's own declared width
-// (graph->non_robot_dim) -- every caller of this (and of PoseFromRow, which
-// this pairs with) expects a fixed 3D point. For a workspace_dim==3 graph
-// (or any object whose non_robot_dim >= 3) this reads the same 3 components
-// as before; for a genuinely 2D object (non_robot_dim < 3, e.g. a
-// PyRoboGym-style planar item with no z/yaw of its own) it reads only the
-// object's own real components and leaves the rest at 0 (a z==0 point in
-// the workspace's plane), instead of reading past the end of that object's
-// own slice in q into whatever happens to sit next in memory.
+// (graph->object_ambient_dim(point_index)) -- every caller of this (and of
+// PoseFromRow, which this pairs with) expects a fixed 3D point. For a
+// workspace_dim==3 graph (or any object whose own width >= 3) this reads
+// the same 3 components as before; for a genuinely 2D object (width < 3,
+// e.g. a PyRoboGym-style planar item with no z/yaw of its own) it reads
+// only the object's own real components and leaves the rest at 0 (a z==0
+// point in the workspace's plane), instead of reading past the end of that
+// object's own slice in q into whatever happens to sit next in memory.
 template <typename T>
 Eigen::Vector3<T>
 PointPosFromRow(const struct GraphOfConstraints* graph,
 		const int point_index,
 		const Eigen::Matrix<T,Eigen::Dynamic,1>& q) {
-	const int point_pos_offset = graph->num_agents * graph->dim + point_index * graph->non_robot_dim;
-	const int n = std::min(graph->non_robot_dim, 3);
+	const int point_pos_offset = graph->object_col_offset(point_index);
+	const int n = std::min(graph->object_ambient_dim(point_index), 3);
 	Eigen::Vector3<T> p_WC = Eigen::Vector3<T>::Zero();
 	p_WC.segment(0, n) = q.segment(point_pos_offset, n);
 	return p_WC;
@@ -178,7 +181,7 @@ PoseFromRow(const struct GraphOfConstraints* graph,
 	    const std::string ee_frame_name,
 	    const Eigen::Matrix<T,Eigen::Dynamic,1>& q) {
 
-	const int agent_config_offset = agent_index * graph->dim;
+	const int agent_config_offset = graph->agent_col_offset(agent_index);
 	const int workspace_dim = graph->workspace_dim;
 
 	switch (graph->robot_kind(agent_index)) {

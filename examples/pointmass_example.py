@@ -56,7 +56,7 @@ def build_graph() -> GraphOfConstraints:
     graph.structure.add_edge(1, 2, True)
 
     for node, target in NODE_TARGETS.items():
-        graph.add_robot_linear_eq(node, 0, np.eye(graph.dim), target)
+        graph.add_robot_linear_eq(node, 0, np.eye(graph.robot_ambient_dim(0)), target)
 
     return graph
 
@@ -82,7 +82,7 @@ def build_evolutionary_waypoint_mpc(graph, spline_spec, pop_size=40, n_gen=80,
 
     if warm_start:
         remaining = list(range(graph.structure.num_nodes))
-        x0 = np.zeros(graph.num_agents * graph.dim)
+        x0 = np.zeros(graph.num_agents * graph.robot_ambient_dim(0))
         compile_time = waypoint_mpc.warmup(remaining, x0)
         print(f"[evolutionary] warm-up compile time: {compile_time * 1e3:.1f} ms")
 
@@ -149,7 +149,7 @@ def benchmark_waypoint_solvers(n_iters=50, pop_size=40, n_gen=80, n_cold_iters=5
     graph = build_graph()
     spline_spec = [Block.R(3)]
     remaining = list(range(graph.structure.num_nodes))
-    x0 = np.zeros(graph.num_agents * graph.dim)
+    x0 = np.zeros(graph.num_agents * graph.robot_ambient_dim(0))
 
     # --- MILP baseline ---
     milp = MILPWaypointMPC(graph, [CubicConfigurationSpline(spline_spec)],

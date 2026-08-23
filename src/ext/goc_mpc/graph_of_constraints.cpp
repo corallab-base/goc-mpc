@@ -37,8 +37,6 @@ GraphOfConstraints::GraphOfConstraints(
 	  _num_total_assignables(0),
 	  num_agents(robot_specs.size()),
 	  num_objects(object_specs.size()),
-	  dim(0),
-	  non_robot_dim(0),
 	  workspace_dim(workspace_dim) {
 
 	if (!robot_names.empty() && robot_names.size() != robot_specs.size())
@@ -65,41 +63,47 @@ GraphOfConstraints::GraphOfConstraints(
 		else                  _robot_kinds.push_back(RobotKind::kArticulated);
 	}
 
-	for (const auto& spec : robot_specs) {
-		int robot_qdim = 0;
-		for (const auto& b : spec) robot_qdim += b.size;
-		if (dim == 0) {
-			dim = robot_qdim;
-		} else if (dim != robot_qdim) {
-			throw std::runtime_error("Only supporting robots with the same dimension.");
+	// Per-entity widths/offsets -- see these members' own doc comments
+	// (graph_of_constraints.hpp). Agents/objects need not share a width
+	// with each other.
+	_agent_widths.reserve(num_agents);
+	_agent_col_offsets.assign(num_agents + 1, 0);
+	for (int ag = 0; ag < num_agents; ++ag) {
+		_agent_widths.push_back(robot_ambient_dim(ag));
+		_agent_col_offsets[ag + 1] = _agent_col_offsets[ag] + _agent_widths[ag];
+	}
+	_object_widths.reserve(num_objects);
+	_object_col_offsets.assign(num_objects + 1, _agent_col_offsets[num_agents]);
+	for (int ob = 0; ob < num_objects; ++ob) {
+		_object_widths.push_back(object_ambient_dim(ob));
+		_object_col_offsets[ob + 1] = _object_col_offsets[ob] + _object_widths[ob];
+	}
+	total_dim = _object_col_offsets[num_objects];
+
+	// A fresh variable's implied candidate set is every agent -- see
+	// `_default_var_width`'s own doc comment.
+	_default_var_width = num_agents > 0 ? _agent_widths[0] : -1;
+	for (int ag = 1; ag < num_agents; ++ag) {
+		if (_agent_widths[ag] != _default_var_width) {
+			_default_var_width = -1;
+			break;
 		}
 	}
-
-	for (const auto& spec : object_specs) {
-		int obj_dim = 0;
-		for (const auto& b : spec) obj_dim += b.size;
-		if (non_robot_dim == 0) {
-			non_robot_dim = obj_dim;
-		} else if (non_robot_dim != obj_dim) {
-			throw std::runtime_error("Only supporting objects with the same dimension.");
-		}
-	}
-
-	total_dim = num_agents * dim + num_objects * non_robot_dim;
 
 	_global_x_lb = Eigen::VectorXd::Constant(total_dim, global_x_lb);
 	_global_x_ub = Eigen::VectorXd::Constant(total_dim, global_x_ub);
 
 	// Placeholder families -- see PlaceholderVarFamily's docstring for why
 	// these are assigned here (constructor body) rather than in the
-	// initializer list: their width depends on dim/non_robot_dim/
-	// workspace_dim, none of which are known until the computations above
-	// run. Every family is lazily populated regardless -- this assignment
-	// doesn't itself create any placeholder Variables, just records each
-	// family's width/namer for when agent_q()/object_q()/etc. first do.
-	_agent_q = PlaceholderVarFamily<int>(dim, [](const int& i) { return fmt::format("agent_{}_q", i); });
-	_object_q = PlaceholderVarFamily<int>(non_robot_dim, [](const int& o) { return fmt::format("object_{}_q", o); });
-	_var_agent_q = PlaceholderVarFamily<int>(dim, [](const int& v) { return fmt::format("var_{}_agent_q", v); });
+	// initializer list: their width depends on _agent_widths/
+	// _object_widths/workspace_dim, none of which are known until the
+	// computations above run. Every family is lazily populated regardless
+	// -- this assignment doesn't itself create any placeholder Variables,
+	// just records each family's width/namer for when agent_q()/object_q()/
+	// etc. first do.
+	_agent_q = PlaceholderVarFamily<int>(&_agent_widths, [](const int& i) { return fmt::format("agent_{}_q", i); });
+	_object_q = PlaceholderVarFamily<int>(&_object_widths, [](const int& o) { return fmt::format("object_{}_q", o); });
+	_var_agent_q = PlaceholderVarFamily<int>(&_var_widths, [](const int& v) { return fmt::format("var_{}_agent_q", v); });
 	_param = PlaceholderVarFamily<int>(1, [](const int& p) { return fmt::format("param_{}", p); });
 	_agent_link_pos = PlaceholderVarFamily<std::pair<int, std::string>>(
 		workspace_dim, [](const std::pair<int, std::string>& k) {
@@ -109,12 +113,12 @@ GraphOfConstraints::GraphOfConstraints(
 		workspace_dim * workspace_dim, [](const std::pair<int, std::string>& k) {
 			return fmt::format("agent_{}_link_{}_rot", k.first, k.second);
 		});
-	_agent_q_u = PlaceholderVarFamily<int>(dim, [](const int& i) { return fmt::format("agent_{}_q_u", i); });
-	_agent_q_v = PlaceholderVarFamily<int>(dim, [](const int& i) { return fmt::format("agent_{}_q_v", i); });
-	_object_q_u = PlaceholderVarFamily<int>(non_robot_dim, [](const int& o) { return fmt::format("object_{}_q_u", o); });
-	_object_q_v = PlaceholderVarFamily<int>(non_robot_dim, [](const int& o) { return fmt::format("object_{}_q_v", o); });
-	_var_agent_q_u = PlaceholderVarFamily<int>(dim, [](const int& v) { return fmt::format("var_{}_agent_q_u", v); });
-	_var_agent_q_v = PlaceholderVarFamily<int>(dim, [](const int& v) { return fmt::format("var_{}_agent_q_v", v); });
+	_agent_q_u = PlaceholderVarFamily<int>(&_agent_widths, [](const int& i) { return fmt::format("agent_{}_q_u", i); });
+	_agent_q_v = PlaceholderVarFamily<int>(&_agent_widths, [](const int& i) { return fmt::format("agent_{}_q_v", i); });
+	_object_q_u = PlaceholderVarFamily<int>(&_object_widths, [](const int& o) { return fmt::format("object_{}_q_u", o); });
+	_object_q_v = PlaceholderVarFamily<int>(&_object_widths, [](const int& o) { return fmt::format("object_{}_q_v", o); });
+	_var_agent_q_u = PlaceholderVarFamily<int>(&_var_widths, [](const int& v) { return fmt::format("var_{}_agent_q_u", v); });
+	_var_agent_q_v = PlaceholderVarFamily<int>(&_var_widths, [](const int& v) { return fmt::format("var_{}_agent_q_v", v); });
 
 	int offset = 0;
 	for (int ag = 0; ag < num_agents; ++ag) {
@@ -151,6 +155,9 @@ int GraphOfConstraints::add_variable()
 	drake::symbolic::Variable sym_var("r_" + std::to_string(id));
 	_assignment_sym_vars.push_back(sym_var);
 	_sym_id_to_variable_id[sym_var.get_id()] = id;
+	// See `_var_widths`'s own doc comment -- a fresh variable's implied
+	// candidate set is every agent until add_variable_constraint narrows it.
+	_var_widths.push_back(_default_var_width);
 	return id;
 }
 
@@ -188,7 +195,7 @@ std::pair<Eigen::VectorXd, Eigen::MatrixXd> GraphOfConstraints::link_pose(int ag
 
 	auto it = robot_fk_registry.find({agent_id, link_name});
 	if (it != robot_fk_registry.end()) {
-		const Eigen::VectorXd q_agent = x.segment(agent_id * dim, dim);
+		const Eigen::VectorXd q_agent = x.segment(agent_col_offset(agent_id), robot_ambient_dim(agent_id));
 		py::tuple result = it->second(q_agent);
 		DRAKE_DEMAND(result.size() == 2);
 		// Coerce through numpy.asarray explicitly rather than relying on
@@ -981,6 +988,27 @@ int GraphOfConstraints::add_variable_constraint(
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
 	for (int robot_id : robot_ids) {
 		DRAKE_DEMAND(robot_id >= 0 && robot_id < num_agents);
+	}
+
+	// Resolve/re-resolve var_agent_q(var)'s width from THIS call's own
+	// robot_ids (not intersected with any earlier call -- each call fully
+	// re-specifies the width-relevant candidate set) -- see `_var_widths`'s
+	// own doc comment. Loud throw (not left unresolved) since an explicit,
+	// non-empty robot_ids that still disagrees in width is a real caller
+	// error, not just "not yet narrowed enough".
+	if (!robot_ids.empty()) {
+		int width = -1;
+		for (int robot_id : robot_ids) {
+			if (width == -1) {
+				width = _agent_widths[robot_id];
+			} else if (_agent_widths[robot_id] != width) {
+				throw std::runtime_error(
+					"add_variable_constraint: robot_ids for var " + std::to_string(var) +
+					" don't share a config width -- var_agent_q(var) needs every "
+					"candidate agent to be the same width.");
+			}
+		}
+		_var_widths[var] = width;
 	}
 
  	return _add_var_op(
