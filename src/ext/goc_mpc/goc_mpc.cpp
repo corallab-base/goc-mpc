@@ -467,10 +467,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::return_value_policy::reference_internal);
 
 	py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
-		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, unsigned int, double,
+		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, double,
 		     const ObstacleSet&, Eigen::VectorXd, double, double, double, double, int, double, double,
 		     double, double, double>(),
-		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"), py::arg("dim"),
+		     // No `dim` argument (Stage 5, graph_short_path_mpc.hpp) -- every
+		     // agent's tangent_dim/ambient_dim comes straight from `graph`'s
+		     // own per-agent robot specs, agents are no longer required to
+		     // agree on either.
+		     py::arg("graph"), py::arg("num_steps"), py::arg("num_agents"),
 		     py::arg("time_per_step"), py::arg("obstacles"),
 		     py::arg("agent_radii") = Eigen::VectorXd(),
 		     py::arg("tracking_weight") = 1.0, py::arg("velocity_tracking_weight") = 1.0,
@@ -487,7 +491,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     // this too, e.g. GraphOfConstraintsMPC.self.graph; keep_alive
 		     // makes the `obstacles` half of that contract explicit and
 		     // safe even if a caller forgets to hold its own reference).
-		     py::keep_alive<1, 2>(), py::keep_alive<1, 7>())
+		     // Arg index 6 (was 7 before `dim` was dropped): self=1, graph=2,
+		     // num_steps=3, num_agents=4, time_per_step=5, obstacles=6.
+		     py::keep_alive<1, 2>(), py::keep_alive<1, 6>())
 		.def("solve", &GraphShortPathMPC::solve)
 		.def("view_points", &GraphShortPathMPC::view_points, py::return_value_policy::reference_internal)
 		.def("view_vels", &GraphShortPathMPC::view_vels, py::return_value_policy::reference_internal)

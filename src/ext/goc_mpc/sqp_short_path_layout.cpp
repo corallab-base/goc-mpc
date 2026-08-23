@@ -51,6 +51,16 @@ std::vector<int> BuildAgentAxisOffsets(const std::vector<CubicConfigurationSplin
 	return offsets;
 }
 
+std::vector<int> BuildAgentAmbientOffsets(const std::vector<CubicConfigurationSpline>& agent_shapes) {
+	std::vector<int> offsets(agent_shapes.size());
+	int running = 0;
+	for (int ag = 0; ag < static_cast<int>(agent_shapes.size()); ++ag) {
+		offsets[ag] = running;
+		running += agent_shapes[ag].ambient_dim();
+	}
+	return offsets;
+}
+
 Eigen::MatrixXd BuildAxisHessianBlock(int num_steps, double tau, const SmoothCostWeights& weights) {
 	const int n = 2 * num_steps;
 	Eigen::MatrixXd H = Eigen::MatrixXd::Zero(n, n);
@@ -406,14 +416,15 @@ double ObstacleExtent(const Obstacle& obstacle, int workspace_dim) {
 }  // namespace
 
 std::vector<std::vector<const Obstacle*>> PruneObstaclesByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
-	const ObstacleSet& obstacles, double prune_margin) {
+	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const ObstacleSet& obstacles, double prune_margin) {
 	std::vector<std::vector<const Obstacle*>> per_agent_obstacles(num_agents);
 	if (obstacles.obstacles().empty()) {
 		return per_agent_obstacles;
 	}
 	for (int ag = 0; ag < num_agents; ++ag) {
-		const Eigen::MatrixXd traj = ref_points.block(0, ag * ambient_dim, ref_points.rows(), workspace_dim);
+		const Eigen::MatrixXd traj =
+			ref_points.block(0, agent_ambient_offsets[ag], ref_points.rows(), workspace_dim);
 		const BoundingSphere sphere = TrajectoryBoundingSphere(traj);
 		for (const Obstacle& obstacle : obstacles.obstacles()) {
 			const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
@@ -427,8 +438,8 @@ std::vector<std::vector<const Obstacle*>> PruneObstaclesByDistance(
 }
 
 std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
-	const Eigen::VectorXd& agent_radii, double prune_margin) {
+	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const Eigen::VectorXd& agent_radii, double prune_margin) {
 	std::vector<std::pair<int, int>> active_pairs;
 	if (num_agents < 2) {
 		return active_pairs;
@@ -436,7 +447,8 @@ std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
 	std::vector<BoundingSphere> spheres;
 	spheres.reserve(num_agents);
 	for (int ag = 0; ag < num_agents; ++ag) {
-		const Eigen::MatrixXd traj = ref_points.block(0, ag * ambient_dim, ref_points.rows(), workspace_dim);
+		const Eigen::MatrixXd traj =
+			ref_points.block(0, agent_ambient_offsets[ag], ref_points.rows(), workspace_dim);
 		spheres.push_back(TrajectoryBoundingSphere(traj));
 	}
 	for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
@@ -451,13 +463,13 @@ std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
 	return active_pairs;
 }
 
-double EvaluateObstacleViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
-				  const Eigen::MatrixXd& points,
+double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
+				  int workspace_dim, const Eigen::MatrixXd& points,
 				  const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles) {
 	double violation = 0.0;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
-			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+			const Eigen::VectorXd p = points.row(i).segment(agent_ambient_offsets[ag], workspace_dim).transpose();
 			for (const Obstacle* obstacle : per_agent_obstacles[ag]) {
 				const double value = (obstacle->kind == ObstacleKind::kSphere)
 					? SphereSdf(p, *obstacle, workspace_dim).value
@@ -470,13 +482,13 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, int ambient_dim,
 }
 
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
-	int workspace_dim, const Eigen::MatrixXd& points,
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
+	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
 	const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles) {
 	std::vector<ConstraintRow> rows;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
-			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+			const Eigen::VectorXd p = points.row(i).segment(agent_ambient_offsets[ag], workspace_dim).transpose();
 			for (const Obstacle* obstacle : per_agent_obstacles[ag]) {
 				const SdfResult sdf = (obstacle->kind == ObstacleKind::kSphere)
 					? SphereSdf(p, *obstacle, workspace_dim)
@@ -501,14 +513,16 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	return rows;
 }
 
-double EvaluateAgentPairViolation(int num_steps, int ambient_dim, int workspace_dim,
+double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_ambient_offsets, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
 				   const std::vector<std::pair<int, int>>& active_pairs) {
 	double violation = 0.0;
 	for (int i = 0; i < num_steps; ++i) {
 		for (const auto& [ag_a, ag_b] : active_pairs) {
-			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * ambient_dim, workspace_dim).transpose();
-			const Eigen::VectorXd p_b = points.row(i).segment(ag_b * ambient_dim, workspace_dim).transpose();
+			const Eigen::VectorXd p_a =
+				points.row(i).segment(agent_ambient_offsets[ag_a], workspace_dim).transpose();
+			const Eigen::VectorXd p_b =
+				points.row(i).segment(agent_ambient_offsets[ag_b], workspace_dim).transpose();
 			const double R = agent_radii(ag_a) + agent_radii(ag_b);
 			const double value = SphereSdfCore(p_b, p_a, R).value;
 			violation += std::max(0.0, -value);
@@ -518,14 +532,16 @@ double EvaluateAgentPairViolation(int num_steps, int ambient_dim, int workspace_
 }
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int ambient_dim, int workspace_dim,
-	const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
+	const std::vector<int>& agent_axis_offsets, int num_steps, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
 	const std::vector<std::pair<int, int>>& active_pairs) {
 	std::vector<ConstraintRow> rows;
 	for (int i = 0; i < num_steps; ++i) {
 		for (const auto& [ag_a, ag_b] : active_pairs) {
-			const Eigen::VectorXd p_a = points.row(i).segment(ag_a * ambient_dim, workspace_dim).transpose();
-			const Eigen::VectorXd p_b = points.row(i).segment(ag_b * ambient_dim, workspace_dim).transpose();
+			const Eigen::VectorXd p_a =
+				points.row(i).segment(agent_ambient_offsets[ag_a], workspace_dim).transpose();
+			const Eigen::VectorXd p_b =
+				points.row(i).segment(agent_ambient_offsets[ag_b], workspace_dim).transpose();
 			const double R = agent_radii(ag_a) + agent_radii(ag_b);
 
 			// Treat agent b's own position as agent a's "obstacle
@@ -668,13 +684,14 @@ bool SphereOverlapsAabb(const Eigen::VectorXd& center, double radius, const Aabb
 }  // namespace
 
 std::vector<const AgentSdfGrid*> PruneAgentSdfGridsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
-	const ObstacleSet& obstacles, double prune_margin) {
+	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const ObstacleSet& obstacles, double prune_margin) {
 	std::vector<const AgentSdfGrid*> active_grids(num_agents, nullptr);
 	for (int ag = 0; ag < num_agents; ++ag) {
 		const AgentSdfGrid* grid = obstacles.agent_sdf_grid(ag);
 		if (!grid) continue;
-		const Eigen::MatrixXd traj = ref_points.block(0, ag * ambient_dim, ref_points.rows(), workspace_dim);
+		const Eigen::MatrixXd traj =
+			ref_points.block(0, agent_ambient_offsets[ag], ref_points.rows(), workspace_dim);
 		const BoundingSphere sphere = TrajectoryBoundingSphere(traj);
 		if (SphereOverlapsAabb(sphere.center, sphere.radius + prune_margin, GridAabb(*grid))) {
 			active_grids[ag] = grid;
@@ -683,15 +700,15 @@ std::vector<const AgentSdfGrid*> PruneAgentSdfGridsByDistance(
 	return active_grids;
 }
 
-double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
-				      const Eigen::MatrixXd& points,
+double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
+				      int workspace_dim, const Eigen::MatrixXd& points,
 				      const std::vector<const AgentSdfGrid*>& active_grids) {
 	double violation = 0.0;
 	for (int ag = 0; ag < num_agents; ++ag) {
 		const AgentSdfGrid* grid = active_grids[ag];
 		if (!grid) continue;
 		for (int i = 0; i < num_steps; ++i) {
-			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+			const Eigen::VectorXd p = points.row(i).segment(agent_ambient_offsets[ag], workspace_dim).transpose();
 			violation += std::max(0.0, -QueryAgentSdfGrid(*grid, p, workspace_dim).value);
 		}
 	}
@@ -699,14 +716,15 @@ double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, int ambient_
 }
 
 std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
-	int workspace_dim, const Eigen::MatrixXd& points, const std::vector<const AgentSdfGrid*>& active_grids) {
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
+	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
+	const std::vector<const AgentSdfGrid*>& active_grids) {
 	std::vector<ConstraintRow> rows;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
 			const AgentSdfGrid* grid = active_grids[ag];
 			if (!grid) continue;
-			const Eigen::VectorXd p = points.row(i).segment(ag * ambient_dim, workspace_dim).transpose();
+			const Eigen::VectorXd p = points.row(i).segment(agent_ambient_offsets[ag], workspace_dim).transpose();
 			const SdfSample sdf = QueryAgentSdfGrid(*grid, p, workspace_dim);
 
 			ConstraintRow row;

@@ -210,8 +210,7 @@ def main():
 
     def build_mpc(num_agents: int, with_orientation: bool, obstacles: ObstacleSet) -> GraphShortPathMPC:
         graph = make_graph(num_agents, with_orientation)
-        dim = 6 if with_orientation else 3
-        return GraphShortPathMPC(graph, NUM_STEPS, num_agents, dim, TIME_PER_STEP, obstacles,
+        return GraphShortPathMPC(graph, NUM_STEPS, num_agents, TIME_PER_STEP, obstacles,
                                 agent_radii_for(num_agents), **current_weights())
 
     def build_obstacles(num_obstacles: int) -> ObstacleSet:

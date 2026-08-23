@@ -27,6 +27,18 @@
 // iterate, so it gets separate, per-outer-iteration treatment
 // (AccumulateSO3QuatBlock) instead -- see the project plan's Stage 4
 // section for the full rationale.
+//
+// Stage 5: agents are no longer required to share a common tangent_dim or
+// ambient_dim with each other -- each agent's own CubicConfigurationSpline
+// (BuildAgentShapes, built from that agent's own graph._robot_specs entry)
+// is already fully heterogeneous; the only thing that used to force
+// uniformity was GraphShortPathMPC slicing every per-agent matrix with a
+// single shared stride (`ag * dim`/`ag * ambient_dim`). Every function here
+// now takes `agent_axis_offsets`/`agent_ambient_offsets` (CUMULATIVE
+// per-agent offsets, built once by BuildAgentAxisOffsets/
+// BuildAgentAmbientOffsets) instead of a uniform stride int, and slices
+// agent ag's own columns as `[offsets[ag], offsets[ag] + agent_shapes[ag].
+// tangent_dim()/.ambient_dim())` rather than `[ag*dim, (ag+1)*dim)`.
 namespace sqp_short_path {
 
 // One scalar decision axis: a single tangent-space component of one
@@ -53,6 +65,16 @@ std::vector<CubicConfigurationSpline> BuildAgentShapes(const GraphOfConstraints&
 // vector) -- fixed for the lifetime of a solver instance.
 std::vector<AxisLayout> BuildAxisList(const std::vector<CubicConfigurationSpline>& agent_shapes);
 std::vector<int> BuildAgentAxisOffsets(const std::vector<CubicConfigurationSpline>& agent_shapes);
+
+// AMBIENT-space counterpart to BuildAgentAxisOffsets: `offsets[ag]` is where
+// agent `ag`'s own ambient columns start within the flat (agent-major)
+// AMBIENT layout x0/points/ref_points use, i.e. `x0.segment(offsets[ag],
+// agent_shapes[ag].ambient_dim())` is agent ag's own ambient state. Agents
+// are no longer required to share a common ambient (or tangent) width --
+// each is whatever `agent_shapes[ag]` itself reports -- so this, like
+// BuildAgentAxisOffsets, is a per-agent CUMULATIVE offset, not a uniform
+// `ag * ambient_dim` stride.
+std::vector<int> BuildAgentAmbientOffsets(const std::vector<CubicConfigurationSpline>& agent_shapes);
 
 // Decision-vector indices for axis `axis`, step `step`, within the
 // flattened (num_axes * 2 * num_steps) QP position/velocity-step block --
@@ -221,8 +243,8 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 // correctness/feasibility -- see that function's own comment for why this
 // asymmetry is safe to lean on.
 std::vector<std::vector<const Obstacle*>> PruneObstaclesByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
-	const ObstacleSet& obstacles, double prune_margin);
+	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const ObstacleSet& obstacles, double prune_margin);
 
 // Same idea for inter-agent pairs: (ag_a, ag_b) survives if their own
 // reference-trajectory bounding spheres could plausibly bring them within
@@ -233,8 +255,8 @@ std::vector<std::vector<const Obstacle*>> PruneObstaclesByDistance(
 // count grows as `num_agents*(num_agents-1)/2`, quadratic in agent count,
 // while unpruned obstacle rows only grow linearly in obstacle count.
 std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
-	const Eigen::VectorXd& agent_radii, double prune_margin);
+	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const Eigen::VectorXd& agent_radii, double prune_margin);
 
 // Total obstacle-constraint violation (Sum of max(0, -c(q)) over every
 // (step, agent, obstacle) SURVIVING PruneObstaclesByDistance) at the given
@@ -245,15 +267,15 @@ std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
 // full unpruned obstacle list) -- the merit function must score exactly
 // what the QP can act on, or the trust-region ratio test (predicted vs.
 // actual reduction) becomes meaningless for whatever it silently omitted.
-// `ambient_dim`: per-agent AMBIENT stride used to slice `points`
-// (points.row(i).segment(ag*ambient_dim, workspace_dim) is agent ag's
-// world position at step i) -- NOT the tangent/decision-space stride
-// `agent_axis_offsets` is built from; the two differ once an agent has an
-// SO3Quat block (ambient 4 vs tangent 3 per block, see the project plan's
-// Stage 4). Uniform across agents (same assumption GraphShortPathMPC's own
-// a_dim/t_dim split already makes).
-double EvaluateObstacleViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
-				  const Eigen::MatrixXd& points,
+// `agent_ambient_offsets`: per-agent AMBIENT offset used to slice `points`
+// (points.row(i).segment(agent_ambient_offsets[ag], workspace_dim) is agent
+// ag's world position at step i) -- NOT the tangent/decision-space offsets
+// `agent_axis_offsets` holds; the two differ once an agent has an SO3Quat
+// block (ambient 4 vs tangent 3 per block, see the project plan's Stage 4),
+// and neither is required to be uniform across agents (Stage 5: agents may
+// have entirely different specs/tangent widths from one another).
+double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
+				  int workspace_dim, const Eigen::MatrixXd& points,
 				  const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles);
 
 // Every (step, agent, obstacle) row for `per_agent_obstacles[ag]` (see
@@ -268,8 +290,8 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, int ambient_dim,
 // decision variables (and hence the QP) live in tangent space regardless
 // of `ambient_dim`.
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
-	int workspace_dim, const Eigen::MatrixXd& points,
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
+	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
 	const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles);
 
 // Inter-agent avoidance: every (step, agent-pair) SURVIVING
@@ -295,13 +317,13 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 // Fast path only (same assumption as LinearizeObstacleConstraints): agent
 // positions are read directly from the leading `workspace_dim` ambient
 // columns, no fk chain rule.
-double EvaluateAgentPairViolation(int num_steps, int ambient_dim, int workspace_dim,
+double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_ambient_offsets, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
 				   const std::vector<std::pair<int, int>>& active_pairs);
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int ambient_dim, int workspace_dim,
-	const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
+	const std::vector<int>& agent_axis_offsets, int num_steps, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
 	const std::vector<std::pair<int, int>>& active_pairs);
 
 // Value + gradient of one AgentSdfGrid, multilinearly interpolated
@@ -344,15 +366,15 @@ SdfSample QueryAgentSdfGrid(const AgentSdfGrid& grid, const Eigen::VectorXd& p, 
 // safety-projection pass (graph_short_path_mpc.cpp) checks every agent's
 // registered grid regardless of this pruning.
 std::vector<const AgentSdfGrid*> PruneAgentSdfGridsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, int ambient_dim, int workspace_dim,
-	const ObstacleSet& obstacles, double prune_margin);
+	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
+	int workspace_dim, const ObstacleSet& obstacles, double prune_margin);
 
 // Total grid-constraint violation (sum of max(0, -value) over every (step,
 // agent) with a non-null `active_grids[ag]`) at the given absolute
 // `points` -- the merit function's penalty term, same role as
 // EvaluateObstacleViolation but for grid obstacles.
-double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, int ambient_dim, int workspace_dim,
-				      const Eigen::MatrixXd& points,
+double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
+				      int workspace_dim, const Eigen::MatrixXd& points,
 				      const std::vector<const AgentSdfGrid*>& active_grids);
 
 // One (step, agent) row per non-null `active_grids[ag]`, linearized at the
@@ -362,7 +384,8 @@ double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, int ambient_
 // of a field representation over Stage 3's reverted one-row-per-point
 // approach -- see the project plan).
 std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
-	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents, int ambient_dim,
-	int workspace_dim, const Eigen::MatrixXd& points, const std::vector<const AgentSdfGrid*>& active_grids);
+	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
+	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
+	const std::vector<const AgentSdfGrid*>& active_grids);
 
 }  // namespace sqp_short_path

@@ -197,7 +197,7 @@ def main():
         agent_radii = (np.full(num_agents, agent_radius_slider.value)
                         if num_agents == 2 else np.array([]))
         mpc_holder["mpc"] = GraphShortPathMPC(
-            graph, NUM_STEPS, num_agents, DIM, TIME_PER_STEP, obstacles, agent_radii,
+            graph, NUM_STEPS, num_agents, TIME_PER_STEP, obstacles, agent_radii,
             acceleration_weight=10.0 ** accel_log_slider.value,
             penalty_weight=weight_slider.value)
         mpc_holder["num_agents"] = num_agents

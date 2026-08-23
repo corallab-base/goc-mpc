@@ -65,17 +65,7 @@ namespace py = pybind11;
 // doc comment) without changing its call site.
 struct GraphShortPathMPC {
 	const GraphOfConstraints* _graph;
-	unsigned int _num_steps, _num_agents, _dim;
-	// AMBIENT per-agent stride, derived (not caller-supplied) from
-	// `_agent_shapes` in the constructor -- equals `_dim` (== tangent_dim)
-	// for R/Torus-only agents (ambient_dim==tangent_dim always holds for
-	// those), differs once an agent has an SO3Quat block (ambient 4 vs
-	// tangent 3 per block). `_dim` stays the TANGENT/decision-space stride
-	// throughout this file (what IdxP/IdxV, vels, v0, agent_radii use);
-	// `_ambient_dim` is only for x0/points/ref_points (AMBIENT
-	// configuration) slicing. Uniform across agents (a simplifying
-	// assumption), validated in the constructor.
-	unsigned int _ambient_dim;
+	unsigned int _num_steps, _num_agents;
 	double _time_per_step;
 	Eigen::VectorXd _times;
 
@@ -103,11 +93,18 @@ struct GraphShortPathMPC {
 	double _constraint_prune_margin;
 
 	// Fixed for this instance's whole lifetime (depend only on `graph`/
-	// `dim`/`time_per_step`, never on a particular solve() call's
-	// references/obstacles) -- built once in the constructor.
+	// `time_per_step`, never on a particular solve() call's
+	// references/obstacles) -- built once in the constructor. Agents are
+	// NOT required to share a tangent_dim/ambient_dim with each other
+	// (Stage 5) -- each agent's own entry in `_agent_shapes` is whatever
+	// `graph._robot_specs.at(ag)` says, and `_agent_axis_offsets`/
+	// `_agent_ambient_offsets` are the CUMULATIVE per-agent offsets every
+	// per-agent matrix (points/vels/ref_points/ref_velocities/x0/v0) is
+	// sliced with -- NOT a uniform `ag * dim` stride.
 	std::vector<CubicConfigurationSpline> _agent_shapes;
 	std::vector<sqp_short_path::AxisLayout> _axes;
 	std::vector<int> _agent_axis_offsets;
+	std::vector<int> _agent_ambient_offsets;
 	// The smooth (tracking + velocity-tracking + acceleration-smoothing)
 	// cost's normal-equations Hessian FOR EVERY R/TORUS AXIS -- block-
 	// diagonal across those axes, PROVABLY constant across every outer SQP
@@ -142,16 +139,20 @@ struct GraphShortPathMPC {
 
 	// No default value for `obstacles` -- storing a pointer to a
 	// default-constructed temporary would dangle immediately.
-	// dim: every agent's TANGENT width (== ambient width for R/Torus-only
-	// agents, the only case before Stage 4 -- so this is a fully
-	// backward-compatible reinterpretation, not a behavior change for
-	// existing callers). x0/points/ref_points are AMBIENT-width instead
-	// (`_ambient_dim`, derived from `graph`/`agent_shapes` internally, see
-	// that member's own comment) -- for an agent with an SO3Quat block,
-	// `dim` must be its tangent_dim (3 per quat block), NOT its ambient_dim
-	// (4 per quat block); x0 must be sized with the agent's AMBIENT width
-	// accordingly (a quaternion needs 4 numbers to specify, even though its
-	// own step lives in a 3-dim tangent space).
+	// No `dim` parameter (removed, Stage 5): every agent's tangent_dim/
+	// ambient_dim is derived entirely from `graph._robot_specs.at(ag)`
+	// (BuildAgentShapes) and agents are no longer required to agree with
+	// each other -- one agent can be a Block::R(2) point mass next to
+	// another that's Block::Torus(1)+Block::SO3Quat. x0/v0 (and every
+	// per-agent matrix this solver builds) are laid out agent-major,
+	// AMBIENT-width for x0/points/ref_points and TANGENT-width for v0/vels/
+	// agent_radii, using each agent's own width in turn (see
+	// `_agent_ambient_offsets`/`_agent_axis_offsets`) -- NOT `num_agents *`
+	// a shared per-agent width. For an agent with an SO3Quat block its
+	// ambient slice (4 numbers per quat block) is wider than its tangent
+	// slice (3 numbers per quat block); this was already true per-agent as
+	// of Stage 4, just no longer required to be the SAME width across
+	// agents.
 	// agent_radii: one entry per agent, default EMPTY meaning "every agent
 	// has radius 0" (point agents that still must not occupy the same
 	// position at the same step -- see LinearizeAgentPairConstraints's own
@@ -179,7 +180,6 @@ struct GraphShortPathMPC {
 	GraphShortPathMPC(const GraphOfConstraints& graph,
 			 unsigned int num_steps,
 			 unsigned int num_agents,
-			 unsigned int dim,
 			 double time_per_step,
 			 const ObstacleSet& obstacles,
 			 Eigen::VectorXd agent_radii = Eigen::VectorXd(),

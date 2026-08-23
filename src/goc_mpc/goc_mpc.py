@@ -1,5 +1,6 @@
 import logging
 import pickle
+import time
 import numpy as np
 
 from goc_mpc.graphs import Graph
@@ -149,7 +150,6 @@ class GraphOfConstraintsMPC():
     ):
         # problem definition data
         num_agents = graph.num_agents
-        dim = graph.dim
 
         # persistent data
         self.graph = graph
@@ -162,6 +162,16 @@ class GraphOfConstraintsMPC():
         self.last_cycle_short_path = None
         self.last_cycle_backtracked_phases = set()
         self.last_grasp_commands = []
+        # Wall-clock cost of the last step() call, broken down by the
+        # sub-solve that spent it -- "backtrack"/"waypoint"/"timing"/
+        # "short_path"/"total" (a phase absent from a given cycle, e.g.
+        # "short_path" when short_path_mpc is None, or "timing" once
+        # remaining_phases is empty, is simply left out of the dict rather
+        # than recorded as 0.0). Callers (e.g. drive_loop.py's per-cycle
+        # log line) read this right after step() returns to show where a
+        # slow cycle's time actually went, instead of only ever seeing
+        # step()'s combined total.
+        self.last_cycle_solve_times = {}
         self.completed_phases = set()
         self.remaining_phases = list(range(graph.structure.num_nodes))
         # Nominal end-effector -> held-point transform for each currently
@@ -222,7 +232,7 @@ class GraphOfConstraintsMPC():
             # by value (see obstacle_set.hpp's doc comment).
             self.obstacles = obstacles if obstacles is not None else ObstacleSet()
             self.short_path_mpc = GraphShortPathMPC(graph, short_path_length,
-                                                    num_agents, dim, short_path_time_per_step,
+                                                    num_agents, short_path_time_per_step,
                                                     self.obstacles,
                                                     agent_radii if agent_radii is not None else np.array([]),
                                                     tracking_weight, velocity_tracking_weight,
@@ -521,15 +531,29 @@ class GraphOfConstraintsMPC():
 
         self.last_grasp_commands = []
 
-        if self.last_cycle_var_assignments is not None:
-            self._backtrack(x, x_dot)
+        # Reset rather than mutate in place: a phase this cycle doesn't
+        # reach (e.g. "short_path" while teleport=True, or anything after
+        # a RuntimeError below) should read as absent, not carry over a
+        # stale value from the previous step() call.
+        self.last_cycle_solve_times = {}
+        step_start = time.perf_counter()
 
+        if self.last_cycle_var_assignments is not None:
+            phase_start = time.perf_counter()
+            self._backtrack(x, x_dot)
+            self.last_cycle_solve_times["backtrack"] = time.perf_counter() - phase_start
+
+        phase_start = time.perf_counter()
         success = self._solve_for_waypoints(x)
+        self.last_cycle_solve_times["waypoint"] = time.perf_counter() - phase_start
 
         if not success:
+            self.last_cycle_solve_times["total"] = time.perf_counter() - step_start
             raise RuntimeError("WaypointsMPC Failed!")
 
+        phase_start = time.perf_counter()
         success = self._solve_for_timing(delta, x, x_dot)
+        self.last_cycle_solve_times["timing"] = time.perf_counter() - phase_start
 
         if teleport:
             wps = self.waypoint_mpc.view_waypoints()
@@ -558,15 +582,22 @@ class GraphOfConstraintsMPC():
             next_agent_times = np.array(max(next_agent_deltas))
             next_agent_times = np.tile(next_agent_times, (self.short_path_length,))
 
+            self.last_cycle_solve_times["total"] = time.perf_counter() - step_start
             return next_agent_states, None, next_agent_times
 
         if not success:
+            self.last_cycle_solve_times["total"] = time.perf_counter() - step_start
             raise RuntimeError("TimingMPC Failed!")
 
+        phase_start = time.perf_counter()
         success = self._solve_for_short_path(x, x_dot)
+        self.last_cycle_solve_times["short_path"] = time.perf_counter() - phase_start
 
         if not success:
+            self.last_cycle_solve_times["total"] = time.perf_counter() - step_start
             raise RuntimeError("ShortPathMPC Failed!")
+
+        self.last_cycle_solve_times["total"] = time.perf_counter() - step_start
 
         # tuple:
         # points: n by d_pos
