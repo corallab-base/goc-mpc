@@ -40,7 +40,6 @@ class GraphOfConstraintsMPC():
     def __init__(
             self,
             graph: GraphOfConstraints,
-            spline_spec: list[Block],
             # waypoint mpc hyperparameters
             waypoint_solver: WaypointSolver = WaypointSolver.kGurobi,
             waypoint_objective: WaypointObjective = WaypointObjective.kMinMaxL1,
@@ -89,13 +88,7 @@ class GraphOfConstraintsMPC():
             arclength_cost: float = 0.0,
             time_delta_cutoff: float = 0.4,
             phi_tolerance: float = 0.03,
-            # A bare float broadcasts to every block in spline_spec; a
-            # list[float] must have exactly one entry per block, in
-            # spline_spec order (e.g. [linear_bound, angular_bound] for a
-            # [Block.R(2), Block.Torus(1)] pos+yaw robot). NOT supported by
-            # GraphTimingMPC's current (trust-region SQP) implementation --
-            # constructing it with an actual (> 0) bound throws; the
-            # unbounded sentinel <= 0 (the default) is fine.
+            # Currently defunct
             max_vel: float | list[float] = -1.0,
             max_acc: float | list[float] = -1.0,
             max_jerk: float | list[float] = -1.0,
@@ -139,7 +132,7 @@ class GraphOfConstraintsMPC():
             # GraphShortPathMPC's own doc comment) so this class's call site
             # (_solve_for_short_path) works unmodified. As with
             # waypoint_mpc/timing_mpc, the caller is responsible for having
-            # built it against the same graph/spline_spec/short_path_length,
+            # built it against the same graph/specs/short_path_length,
             # and for keeping its own ObstacleSet alive (this class's
             # `self.obstacles` below is only populated in the
             # auto-constructed path).
@@ -168,7 +161,7 @@ class GraphOfConstraintsMPC():
         # persistent data
         self.graph = graph
         self.last_cycle_time = 0.0
-        self.last_cycle_splines = [CubicConfigurationSpline(spline_spec) for _ in range(num_agents)]
+        self.last_cycle_splines = [CubicConfigurationSpline(spec) for spec in graph._robot_specs]
         for s in self.last_cycle_splines:
             s.set_linear(linear_interpolation)
         self.last_cycle_waypoints = None
@@ -215,7 +208,7 @@ class GraphOfConstraintsMPC():
         # solvers
         if waypoint_mpc is not None:
             # caller is responsible for having constructed waypoint_mpc with
-            # splines built from the same spline_spec/agent count as this
+            # splines built from the same spec/agent count as this
             # instance (each C++ solver keeps its own copy of the splines
             # passed at construction, same as the auto-built path below).
             self.waypoint_mpc = waypoint_mpc
@@ -226,7 +219,7 @@ class GraphOfConstraintsMPC():
                                                 enforce_rigidity = waypoint_enforce_rigidity)
         if timing_mpc is not None:
             # caller is responsible for having constructed timing_mpc with
-            # splines built from the same spline_spec/agent count as this
+            # splines built from the same spec/agent count as this
             # instance (each C++ solver keeps its own copy of the splines
             # passed at construction, same as the auto-built path below) --
             # fill_cubic_splines is called with self.last_cycle_splines

@@ -98,14 +98,13 @@ def pointmass_example_setup(use_evolutionary: bool = False, warm_start: bool = T
         waypoint_mpc = build_evolutionary_waypoint_mpc(graph, spline_spec, warm_start=warm_start)
 
     # GoC-MPC
-    goc_mpc = GraphOfConstraintsMPC(graph, spline_spec,
+    goc_mpc = GraphOfConstraintsMPC(graph,
                                     # for waypoint solver (ignored when waypoint_mpc is set):
                                     waypoint_solver = WaypointSolver.kGurobi,
                                     waypoint_objective = WaypointObjective.kMinMaxL2,
                                     waypoint_enforce_rigidity = False,
                                     waypoint_mpc = waypoint_mpc,
                                     # for timing solver:
-                                    time_delta_cutoff = 0.3,
                                     short_path_time_per_step = 0.1,
                                     phi_tolerance = 0.05,
                                     # max_vel/max_acc/max_jerk hard bounds are not supported by

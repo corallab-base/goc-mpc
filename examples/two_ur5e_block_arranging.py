@@ -132,11 +132,9 @@ def build_goc_mpc(graph: GraphOfConstraints):
     spline_spec = [Block.R(3)]
     return GraphOfConstraintsMPC(
         graph,
-        spline_spec,
         waypoint_solver=WaypointSolver.kGurobi,
         waypoint_objective=WaypointObjective.kMinMaxL2,
         waypoint_enforce_rigidity=False,
-        time_delta_cutoff=0.3,
         short_path_time_per_step=0.1,
         phi_tolerance=0.05,
         linear_interpolation=True,
