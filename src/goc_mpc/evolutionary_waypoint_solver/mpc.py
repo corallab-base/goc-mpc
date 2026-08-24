@@ -107,7 +107,10 @@ import jax
 import numpy as np
 import jax.numpy as jnp
 
-from .spec import build_graph_ordering_problem, _agent_widths, _slot_width
+from .spec import (
+    build_graph_ordering_problem, _agent_widths, _slot_width,
+    _object_widths, _object_slot_width,
+)
 from .problem import AnchorState
 from .solver import (
     run_lamarckian_al,
@@ -185,12 +188,15 @@ class EvolutionaryWaypointSolver:
 
     def _check_x0(self, x0):
         """`x0` is always the single full-configuration state vector
-        (graph.total_dim,) -- agent columns then object columns, exactly
-        what GraphOfConstraintsMPC.step() passes and what problem.
-        apply_anchor's wp_eff_live substitution reads as one global joint
-        state. There is no separate agent-only depot convention: a caller
-        with no real object state to report (e.g. a fresh solve before
-        anything's been grasped) zero-fills those columns itself."""
+        (graph.total_dim,) -- agent columns then object columns, PACKED
+        (graph.agent_col_offsets/object_col_offsets' cumulative convention),
+        exactly what GraphOfConstraintsMPC.step() passes. solve()/warmup()
+        convert it to the padded-slot layout (via _to_padded_row) before
+        handing it to the JAX kernel, where it's what problem.apply_anchor's
+        wp_eff_live substitution reads as one global joint state. There is
+        no separate agent-only depot convention: a caller with no real
+        object state to report (e.g. a fresh solve before anything's been
+        grasped) zero-fills those columns itself."""
         x0 = np.asarray(x0)
         graph = self._graph
         assert x0.size == graph.total_dim, (
@@ -215,6 +221,22 @@ class EvolutionaryWaypointSolver:
         for k in range(graph.num_agents):
             x0_per_agent[k, :agent_widths[k]] = x0[agent_offsets[k]:agent_offsets[k + 1]]
 
+        # Stashed for _to_padded_row/_to_packed_row below -- the packed
+        # (graph.agent_col_offsets/object_col_offsets cumulative convention,
+        # graph.total_dim-wide -- _waypoints'/x0's own layout) <-> padded-
+        # slot (spec.py's _slot_width/_object_slot_width layout, problem.
+        # state_dim-wide -- anchor_wp's/wp's/the JAX kernel's own x0
+        # argument's layout) row conversion every caller of those needs.
+        # Structural (graph.structure never changes after construction), so
+        # computed once here alongside the rest of _ensure_built's one-time
+        # setup.
+        self._agent_widths = agent_widths
+        self._slot_width = slot_width
+        self._object_widths = _object_widths(graph)
+        self._object_slot_width = _object_slot_width(self._object_widths)
+        self._agent_offsets = agent_offsets
+        self._object_offsets = graph.object_col_offsets
+
         problem = build_graph_ordering_problem(
             graph, x0_per_agent, self._wp_bounds,
             objective=self._objective, edge_cost_fn=self._edge_cost_fn,
@@ -227,6 +249,46 @@ class EvolutionaryWaypointSolver:
         # why the un-jitted, generic carry_from_population is the wrong
         # thing to call there every cycle).
         self._resume_fn = build_resume_carry_fn(problem, self._pop_size)
+
+    def _to_padded_row(self, packed_row):
+        """Expands a (graph.total_dim,) packed row -- graph.agent_col_offsets/
+        object_col_offsets' cumulative convention, the layout _waypoints and
+        the x0 callers pass in both use -- out to a (problem.state_dim,)
+        padded-slot row: every agent/object gets an equal-width slot_width/
+        object_slot_width column span (spec.py's _slot_width docstring),
+        real config left-justified within it and zero past its own width.
+        This is the layout anchor_wp/wp/the JAX kernel's own x0 argument
+        all actually operate in -- see mpc.py's module docstring and
+        problem.apply_anchor's."""
+        agent_widths, slot_width = self._agent_widths, self._slot_width
+        object_widths, object_slot_width = self._object_widths, self._object_slot_width
+        agent_offsets, object_offsets = self._agent_offsets, self._object_offsets
+        agents_width = len(agent_widths) * slot_width
+        out = np.zeros(agents_width + len(object_widths) * object_slot_width)
+        for k, w in enumerate(agent_widths):
+            out[k * slot_width:k * slot_width + w] = packed_row[agent_offsets[k]:agent_offsets[k] + w]
+        for k, w in enumerate(object_widths):
+            col0 = agents_width + k * object_slot_width
+            out[col0:col0 + w] = packed_row[object_offsets[k]:object_offsets[k] + w]
+        return out
+
+    def _to_packed_row(self, padded_row):
+        """Inverse of _to_padded_row: strips a (problem.state_dim,) padded-
+        slot row back down to a (graph.total_dim,) packed row -- _waypoints'
+        own layout (what view_waypoints()/view_object_waypoints()/
+        get_agent_paths callers expect, matching GraphOfConstraintsMPC.
+        step()'s own agent_col_offsets slicing)."""
+        agent_widths, slot_width = self._agent_widths, self._slot_width
+        object_widths, object_slot_width = self._object_widths, self._object_slot_width
+        agent_offsets, object_offsets = self._agent_offsets, self._object_offsets
+        agents_width = len(agent_widths) * slot_width
+        out = np.zeros(self._graph.total_dim)
+        for k, w in enumerate(agent_widths):
+            out[agent_offsets[k]:agent_offsets[k] + w] = padded_row[k * slot_width:k * slot_width + w]
+        for k, w in enumerate(object_widths):
+            col0 = agents_width + k * object_slot_width
+            out[object_offsets[k]:object_offsets[k] + w] = padded_row[col0:col0 + w]
+        return out
 
     def _compute_anchor(self, remaining_vertices):
         """Builds this solve()/warmup() call's AnchorState from
@@ -247,7 +309,7 @@ class EvolutionaryWaypointSolver:
         for node in node_list:
             if node in remaining_set:
                 continue
-            anchor_wp[node, :] = np.nan_to_num(self._waypoints[node], nan=0.0)
+            anchor_wp[node, :] = self._to_padded_row(np.nan_to_num(self._waypoints[node], nan=0.0))
 
         var_nodes = {}
         for node, (kind, val) in problem.instance_list:
@@ -301,7 +363,7 @@ class EvolutionaryWaypointSolver:
         Returns the compile time."""
         x0 = self._check_x0(x0)
         self._ensure_built(x0)
-        x0_arr = jnp.asarray(x0)
+        x0_arr = jnp.asarray(self._to_padded_row(x0))
         params_arr = jnp.asarray(self._graph.view_param_values())
         anchor = self._compute_anchor(remaining_vertices)
 
@@ -340,7 +402,7 @@ class EvolutionaryWaypointSolver:
         was_already_built = self._problem is not None
         self._ensure_built(x0)
         problem, ga_fn = self._problem, self._ga_fn
-        x0_arr = jnp.asarray(x0)
+        x0_arr = jnp.asarray(self._to_padded_row(x0))
         params_arr = jnp.asarray(self._graph.view_param_values())
         remaining_set = set(remaining_vertices)
 
@@ -398,7 +460,7 @@ class EvolutionaryWaypointSolver:
         # graph node a row, matching MILP), so no node-id -> row-index
         # conversion is needed anywhere below.
         for node in remaining_set:
-            self._waypoints[node, :] = wp[node, :]
+            self._waypoints[node, :] = self._to_packed_row(wp[node, :])
 
         # Report the DECODED visiting-order rank, not the raw priority `t`:
         # `t` only carries a meaningful order after kernel.py's topological
