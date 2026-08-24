@@ -133,6 +133,26 @@ void AssembleObjective(
 
 namespace {
 
+// Where each agent's own dims[i]-wide block starts within a concatenated x0
+// (ambient) or v0 (tangent) vector -- agents need not share one width (e.g.
+// a Torus-only mobile base vs. an SO3Quat end effector), so plain
+// `i * splines.at(0).ambient_dim()`-style indexing silently misaligns every
+// agent after the first whenever widths differ. That misalignment doesn't
+// throw: it just reads/writes the WRONG slice of a big enough buffer, or
+// walks past the end of one -- surfacing later, often as an unrelated
+// `malloc(): unsorted double linked list corrupted` abort inside some other
+// Eigen allocation entirely (confirmed via gdb), not at the actual
+// out-of-bounds write.
+std::vector<int> CumulativeOffsets(const std::vector<int>& dims) {
+	std::vector<int> offsets(dims.size());
+	int off = 0;
+	for (size_t i = 0; i < dims.size(); ++i) {
+		offsets[i] = off;
+		off += dims[i];
+	}
+	return offsets;
+}
+
 // Shared core: builds segments/interactions/x_init given each agent's
 // already-resolved (node_ids, wps) pair (real node ids, or -1 for a
 // synthetic/traced interior point in the dense case) and already-resolved
@@ -154,8 +174,13 @@ ProblemLayout BuildProblemLayoutCore(
 
 	ProblemLayout layout;
 	const int num_agents = static_cast<int>(splines.size());
-	const int ambient_dim = splines.at(0).ambient_dim();
-	const int tangent_dim = splines.at(0).tangent_dim();
+	std::vector<int> ambient_dims(num_agents), tangent_dims(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		ambient_dims[i] = splines[i].ambient_dim();
+		tangent_dims[i] = splines[i].tangent_dim();
+	}
+	const std::vector<int> ambient_offsets = CumulativeOffsets(ambient_dims);
+	const std::vector<int> tangent_offsets = CumulativeOffsets(tangent_dims);
 
 	layout.agents.resize(num_agents);
 
@@ -172,7 +197,7 @@ ProblemLayout BuildProblemLayoutCore(
 		n += K;
 		if (K > 1) {
 			layout.agents[i].v_offset = n;
-			n += (K - 1) * tangent_dim;
+			n += (K - 1) * tangent_dims[i];
 		}
 	}
 	layout.n = n;
@@ -185,7 +210,7 @@ ProblemLayout BuildProblemLayoutCore(
 		const AgentLayout& al = layout.agents[i];
 		for (int j = 0; j < al.K; ++j) layout.x_init(al.tau_offset + j) = 10.0;
 		if (al.K > 1) {
-			for (int k = al.v_offset; k < al.v_offset + (al.K - 1) * tangent_dim; ++k) {
+			for (int k = al.v_offset; k < al.v_offset + (al.K - 1) * tangent_dims[i]; ++k) {
 				layout.x_init(k) = 1.0;
 			}
 		}
@@ -196,8 +221,8 @@ ProblemLayout BuildProblemLayoutCore(
 		const AgentLayout& al = layout.agents[i];
 		if (al.K == 0) continue;
 		const Eigen::MatrixXd& wps_i = agent_wps[i];
-		const Eigen::VectorXd x0_i = x0.segment(i * ambient_dim, ambient_dim);
-		const Eigen::VectorXd v0_i = v0.segment(i * tangent_dim, tangent_dim);
+		const Eigen::VectorXd x0_i = x0.segment(ambient_offsets[i], ambient_dims[i]);
+		const Eigen::VectorXd v0_i = v0.segment(tangent_offsets[i], tangent_dims[i]);
 		const CubicConfigurationSpline& spline = splines.at(i);
 
 		for (int j = 0; j < al.K; ++j) {
@@ -205,22 +230,22 @@ ProblemLayout BuildProblemLayoutCore(
 			seg.tau_idx = al.tau_offset + j;
 			seg.spline = &spline;
 
-			Eigen::VectorXd xJm1(ambient_dim);
+			Eigen::VectorXd xJm1(ambient_dims[i]);
 			if (j == 0) {
 				xJm1 = x0_i;
 				seg.v0_idx = -1;
 				seg.v0_const = v0_i;
 			} else {
 				xJm1 = wps_i.row(j - 1).transpose();
-				seg.v0_idx = al.v_offset + (j - 1) * tangent_dim;
+				seg.v0_idx = al.v_offset + (j - 1) * tangent_dims[i];
 			}
 
 			const Eigen::VectorXd xJ = wps_i.row(j).transpose();
 			if (j == al.K - 1) {
 				seg.v1_idx = -1;
-				seg.v1_const = Eigen::VectorXd::Zero(tangent_dim);
+				seg.v1_const = Eigen::VectorXd::Zero(tangent_dims[i]);
 			} else {
-				seg.v1_idx = al.v_offset + j * tangent_dim;
+				seg.v1_idx = al.v_offset + j * tangent_dims[i];
 			}
 
 			seg.disp = spline.PositionDelta<double>(xJ, xJm1);
@@ -267,8 +292,8 @@ ProblemLayout BuildProblemLayoutCore(
 				layout.x_init(al.tau_offset + j_new) = prev_time_deltas_list[i](j_old);
 			}
 			if (j_old < prev_vs_list[i].rows() && j_new < al.K - 1) {
-				for (int c = 0; c < tangent_dim; ++c) {
-					layout.x_init(al.v_offset + j_new * tangent_dim + c) =
+				for (int c = 0; c < tangent_dims[i]; ++c) {
+					layout.x_init(al.v_offset + j_new * tangent_dims[i] + c) =
 						prev_vs_list[i](j_old, c);
 				}
 			}
@@ -297,7 +322,6 @@ ProblemLayout BuildProblemLayout(
 		const std::map<int, int>& prev_agent_spline_length_map) {
 
 	const int num_agents = graph.num_agents;
-	const int ambient_dim = splines.at(0).ambient_dim();
 
 	auto [parents, agent_nodes, agent_interactions] =
 		graph.get_agent_paths(remaining_vertices, assignments, t_by_node);
@@ -312,11 +336,17 @@ ProblemLayout BuildProblemLayout(
 		const int K = static_cast<int>(agent_i_nodes.size());
 		if (K == 0) continue;
 
-		Eigen::MatrixXd wps_i(K, ambient_dim);
+		// Per-agent width/column-offset, not a shared splines.at(0) width --
+		// agent_col_offset is `waypoints`' own authoritative column layout
+		// (agent i's block need not start at i * ambient_dim once widths
+		// differ -- see CumulativeOffsets' own comment above).
+		const int ambient_dim_i = splines.at(i).ambient_dim();
+		const int col_offset_i = graph.agent_col_offset(i);
+		Eigen::MatrixXd wps_i(K, ambient_dim_i);
 		for (int j = 0; j < K; ++j) {
 			const int node = agent_i_nodes[j];
-			for (int k = 0; k < ambient_dim; ++k) {
-				wps_i(j, k) = waypoints(node, i * ambient_dim + k);
+			for (int k = 0; k < ambient_dim_i; ++k) {
+				wps_i(j, k) = waypoints(node, col_offset_i + k);
 			}
 		}
 		agent_wps[i] = wps_i;

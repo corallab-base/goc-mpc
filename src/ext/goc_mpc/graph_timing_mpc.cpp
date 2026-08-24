@@ -93,15 +93,16 @@ GraphTimingMPC::GraphTimingMPC(const GraphOfConstraints& graph,
 
 	const int num_agents = _graph->num_agents;
 	const int num_nodes = _graph->structure.num_nodes();
-	// Assuming all the same -- same assumption the implementation this
-	// replaces made.
-	const int ambient_dim = _splines->at(0).ambient_dim();
-	const int tangent_dim = _splines->at(0).tangent_dim();
 
+	// Per-agent, NOT a shared splines->at(0) width -- agents need not share
+	// one ambient/tangent width (see timing_gn_layout.cpp's CumulativeOffsets
+	// comment for why that assumption used to silently corrupt memory).
 	_wps_list.resize(num_agents);
-	for (int i = 0; i < num_agents; ++i) _wps_list[i] = Eigen::MatrixXd::Zero(num_nodes, ambient_dim);
+	for (int i = 0; i < num_agents; ++i)
+		_wps_list[i] = Eigen::MatrixXd::Zero(num_nodes, _splines->at(i).ambient_dim());
 	_vs_list.resize(num_agents);
-	for (int i = 0; i < num_agents; ++i) _vs_list[i] = Eigen::MatrixXd::Zero(num_nodes, tangent_dim);
+	for (int i = 0; i < num_agents; ++i)
+		_vs_list[i] = Eigen::MatrixXd::Zero(num_nodes, _splines->at(i).tangent_dim());
 	_time_deltas_list.resize(num_agents);
 	for (int i = 0; i < num_agents; ++i) _time_deltas_list[i] = Eigen::VectorXd::Zero(num_nodes);
 }
@@ -427,13 +428,18 @@ void StoreResult(
 		const GraphOfConstraints& graph,
 		const ProblemLayout& layout,
 		const SqpResult& result,
-		int tangent_dim,
+		const std::vector<CubicConfigurationSpline>& splines,
 		std::vector<Eigen::MatrixXd>* vs_list,
 		std::vector<Eigen::VectorXd>* time_deltas_list,
 		std::map<int, int>* agent_spline_length_map,
 		const std::vector<std::vector<int>>& agent_nodes_list) {
 
 	for (int i = 0; i < graph.num_agents; ++i) {
+		// Per-agent, not a single shared width -- see this file's
+		// constructor and timing_gn_layout.cpp's CumulativeOffsets comment
+		// for why a shared width silently corrupts memory once agents'
+		// tangent widths actually differ.
+		const int tangent_dim = splines.at(i).tangent_dim();
 		const int K = static_cast<int>(agent_nodes_list[i].size());
 		if (K == 0) {
 			// No active spline for this agent this cycle -- erase (not
@@ -519,7 +525,7 @@ bool GraphTimingMPC::solve(
 	_last_trust_radius = result.trust_radius;
 	_last_solve_time = _timer.Tick();
 
-	StoreResult(*_graph, layout, result, _splines->at(0).tangent_dim(),
+	StoreResult(*_graph, layout, result, *_splines,
 		    &_vs_list, &_time_deltas_list, &_agent_spline_length_map, _agent_nodes_list);
 	return true;
 }
@@ -569,7 +575,7 @@ bool GraphTimingMPC::solve_dense(
 	_last_trust_radius = result.trust_radius;
 	_last_solve_time = _timer.Tick();
 
-	StoreResult(*_graph, layout, result, _splines->at(0).tangent_dim(),
+	StoreResult(*_graph, layout, result, *_splines,
 		    &_vs_list, &_time_deltas_list, &_agent_spline_length_map, _agent_nodes_list);
 	return true;
 }
@@ -624,19 +630,33 @@ std::set<int> GraphTimingMPC::set_progressed_time(double delta, double tau_cutof
 void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& splines,
 					 const Eigen::VectorXd& x0,
 					 const Eigen::VectorXd& v0) const {
-	const int a_d = splines[0]->ambient_dim();
-	const int t_d = splines[0]->tangent_dim();
+	// Per-agent width AND cumulative offset -- not a shared splines[0] width
+	// times a flat agent index -- once agents' ambient/tangent widths
+	// differ, agent i's own block in x0/v0 no longer starts at i * a_d/t_d
+	// (see timing_gn_layout.cpp's CumulativeOffsets comment).
+	std::vector<int> a_offset(_graph->num_agents), t_offset(_graph->num_agents);
+	{
+		int a_off = 0, t_off = 0;
+		for (int i = 0; i < _graph->num_agents; ++i) {
+			a_offset[i] = a_off;
+			t_offset[i] = t_off;
+			a_off += splines[i]->ambient_dim();
+			t_off += splines[i]->tangent_dim();
+		}
+	}
 
 	for (int i = 0; i < _graph->num_agents; ++i) {
+		const int a_d = splines[i]->ambient_dim();
+		const int t_d = splines[i]->tangent_dim();
 		const int spline_length_i = get_agent_spline_length(i);
 
 		if (spline_length_i > 1) {
-			Eigen::VectorXd x0_i = x0.segment(i * a_d, a_d);
+			Eigen::VectorXd x0_i = x0.segment(a_offset[i], a_d);
 			Eigen::MatrixXd wps_i(spline_length_i, a_d);
 			wps_i.row(0) = x0_i;
 			wps_i.bottomRows(spline_length_i - 1) = _wps_list[i];
 
-			Eigen::VectorXd v0_i = v0.segment(i * t_d, t_d);
+			Eigen::VectorXd v0_i = v0.segment(t_offset[i], t_d);
 			Eigen::MatrixXd vs_i(spline_length_i, t_d);
 			vs_i.row(0) = v0_i;
 			vs_i.block(1, 0, spline_length_i - 2, t_d) = _vs_list[i];
@@ -647,12 +667,12 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 			splines[i]->set(wps_i, vs_i, times_i);
 		} else {
 			// Dummy spline that stays at x0, and comes to a stop after 1 second.
-			Eigen::VectorXd x0_i = x0.segment(i * a_d, a_d);
+			Eigen::VectorXd x0_i = x0.segment(a_offset[i], a_d);
 			Eigen::MatrixXd wps_i(2, a_d);
 			wps_i.row(0) = x0_i;
 			wps_i.row(1) = x0_i;
 
-			Eigen::VectorXd v0_i = v0.segment(i * t_d, t_d);
+			Eigen::VectorXd v0_i = v0.segment(t_offset[i], t_d);
 			Eigen::MatrixXd vs_i(2, t_d);
 			vs_i.row(0) = v0_i;
 			vs_i.row(1).setZero();
