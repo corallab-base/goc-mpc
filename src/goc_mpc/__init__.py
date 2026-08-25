@@ -14,6 +14,8 @@ from .goc_mpc import (
     GraphTimingMPC,
     GraphShortPathMPC,
     ObstacleSet,
+    agent_link_names,
+    agent_workspace_tracks,
 )
 try:
     from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, build_graph_ordering_problem

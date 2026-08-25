@@ -35,6 +35,73 @@ def _quat_block_slice(spec):
     return None
 
 
+def agent_link_names(graph, agent_id: int) -> list[str]:
+    """`[""]` (this agent's own body/base pose) plus every link name with a
+    registered FK for this agent (`graph.robot_fk_registry`), in insertion
+    order -- e.g. `["", "left_hand"]` for a G1 with an active arm whose body
+    AND hand both have a registered `fk_fn`.
+
+    `""` is the convention this function (and `agent_workspace_tracks`,
+    below) uses for "the agent's own body pose": `link_pose`'s built-in
+    `RobotKind` row-slicing fallback (no `fk_fn` registered) is correct for
+    it whenever the agent's ENTIRE row already is a meaningful Cartesian
+    pose -- a plain mobile base (`kPosYaw`/`kPointMass`), or a single-EE arm
+    agent like a UR5e (`kPosQuat`, whose whole row IS the EE pose). An agent
+    whose row mixes a planar base with something else (a G1 + active arm,
+    whose leading 3 columns are `(x, y, yaw)`, not any single Cartesian
+    point) needs `""` registered explicitly via `set_robot_fk`, same as any
+    other link.
+    """
+    return [""] + [link for (ag, link) in graph.robot_fk_registry if ag == agent_id and link != ""]
+
+
+def agent_workspace_tracks(graph, rows: np.ndarray, agent_id: int,
+                            link_names: list[str] | None = None) -> dict:
+    """One `(n, workspace_dim)` Cartesian track per link name (default:
+    `agent_link_names(graph, agent_id)`) for one agent, resolved from a row
+    array -- e.g. `WaypointMPC.view_waypoints()` (`(n, graph.total_dim)`,
+    agent columns THEN object columns) or one MPC cycle's own short-horizon
+    route (`xi_h`, `(n, graph.agent_col_offsets[-1])` -- agent columns ONLY:
+    `GraphOfConstraintsMPC.step`'s own returned horizon carries no object
+    state even when its INPUT `x` does) -- via `graph.link_pose(agent_id,
+    row, link_name)` per row, per link. Lets a caller that only has a flat
+    state/waypoint row recover the actual workspace point(s) that row maps
+    to for one agent -- e.g. both a G1's body AND hand position, not just
+    whatever its leading columns happen to be.
+
+    `link_pose` itself hard-requires an exactly-`total_dim` row (`DRAKE_
+    DEMAND`, not relaxed here -- every OTHER caller, e.g.
+    `GraphOfConstraintsMPC`'s own hold tracking, always has and wants that
+    strict full-state check kept, and it's what catches a caller that
+    forgot to include object columns immediately instead of silently
+    reading zeros for them). So `rows` narrower than `total_dim` (exactly
+    `graph.agent_col_offsets[-1]` wide -- agent-only) are zero-padded to
+    `total_dim` HERE, at this one caller that legitimately has them, before
+    each `link_pose` call -- harmless, since `link_pose` only ever reads
+    THIS agent's own column slice (never the object columns) once it's
+    resolved which `fk_fn`/dispatch to use. Any other width raises.
+    """
+    agent_width = graph.agent_col_offsets[-1]
+    if rows.shape[1] == graph.total_dim:
+        full_rows = rows
+    elif rows.shape[1] == agent_width:
+        full_rows = np.zeros((len(rows), graph.total_dim), dtype=rows.dtype)
+        full_rows[:, :agent_width] = rows
+    else:
+        raise ValueError(
+            f"agent_workspace_tracks: rows.shape[1] ({rows.shape[1]}) is neither "
+            f"graph.total_dim ({graph.total_dim}) nor graph.agent_col_offsets[-1] "
+            f"({agent_width}) -- pass agent-only or full-width rows.")
+    if link_names is None:
+        link_names = agent_link_names(graph, agent_id)
+    tracks = {name: np.empty((len(rows), graph.workspace_dim)) for name in link_names}
+    for i, row in enumerate(full_rows):
+        for name in link_names:
+            position, _rotation = graph.link_pose(agent_id, row, name)
+            tracks[name][i] = position
+    return tracks
+
+
 class GraphOfConstraintsMPC():
 
     def __init__(
