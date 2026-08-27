@@ -220,6 +220,60 @@ class GraphOfConstraintsMPC():
             # add_robot_holding_cube_constraint + add_manual_backtrack_links)
             # just to get this.
             hold_drift_tolerance: float = 0.3,
+            # _solve_for_timing feeds the CURRENT measured (x, x_dot) as a
+            # HARD boundary condition into BOTH timing_mpc.solve() (inside
+            # BuildProblemLayout, timing_gn_layout.cpp) AND timing_mpc.
+            # fill_cubic_splines() right after it, every cycle -- correct
+            # for x (a fresh position fix is exactly what a receding-
+            # horizon replan needs), but for x_dot this means ANY nonzero
+            # velocity-tracking residual at the exact replan instant
+            # perturbs the near-boundary shape of BOTH the newly re-timed
+            # solve AND the newly-fit curve (a cubic segment's shape is
+            # fully determined by its endpoint position+velocity; solve()'s
+            # own warm start from its previous converged solution --
+            # prev_vs_list/prev_time_deltas_list, see GraphTimingMPC::
+            # solve's own comment -- does NOT change this, since the
+            # boundary condition is still a hard constraint the warm-started
+            # solve must satisfy exactly). Confirmed (not just suspected) as
+            # the cause of a real, visible failure: a UR5e's short-path
+            # spline visibly changing shape every ~1s replan cycle near a
+            # waypoint, tracked faithfully by an otherwise well-tuned
+            # controller (steady-state tracking error ~1cm/~0.01rad on an
+            # unrelated, harder, moving-target test) into a persistent
+            # position oscillation that never registered the waypoint as
+            # reached across a full run -- the residual velocity swings
+            # sign cycle to cycle, each new spline gets anchored to
+            # whichever sign it landed on, the controller chases it, the
+            # NEXT residual lands on the other side, repeat. (An earlier
+            # version of this fix touched only fill_cubic_splines' own v0 --
+            # confirmed empirically NOT sufficient on its own: solve()'s
+            # OWN v0 boundary condition alone was still enough to reproduce
+            # the oscillation, warm start notwithstanding.)
+            #
+            # spline_velocity_deadband (default 0.0, i.e. today's exact
+            # behavior -- fully opt-in): when a component of the measured
+            # x_dot differs from what the spline BEING REPLACED already
+            # committed to, at THIS instant, by less than this amount, use
+            # the PLANNED value instead of the measured one as that
+            # component's boundary condition (for BOTH calls above) --
+            # perfect continuity, zero reshaping, for a difference small
+            # enough to be tracking noise rather than a real disturbance.
+            # Differences at or above the deadband still use the full
+            # measured value, unchanged -- this does not reduce MPC's own
+            # responsiveness to genuine disturbances/drift, only its
+            # sensitivity to sub-noise-floor residuals at the exact replan
+            # boundary. Units match x_dot's own per-component units (mixed
+            # linear/angular across a multi-agent graph's tangent space) --
+            # a single scalar broadcasts to every component; pass a value
+            # comfortably above your own controller's OWN measured steady-
+            # state velocity tracking error (see this parameter's own
+            # history above for how to get that number) as a starting
+            # point, not a guess -- and expect a persistently-converging
+            # component (e.g. angular velocity while orientation is still
+            # actively rotating toward a target over several seconds) to
+            # legitimately and correctly stay OUTSIDE the deadband the
+            # whole time, not a bug to chase by loosening it further.
+            spline_velocity_deadband: float = 0.0,
     ):
         # problem definition data
         num_agents = graph.num_agents
@@ -230,6 +284,16 @@ class GraphOfConstraintsMPC():
         self.last_cycle_splines = [CubicConfigurationSpline(spec) for spec in graph._robot_specs]
         for s in self.last_cycle_splines:
             s.set_linear(linear_interpolation)
+        self.spline_velocity_deadband = spline_velocity_deadband
+        # Absolute time self.last_cycle_splines was last actually (re)fit at
+        # -- see _blend_velocity_for_spline_fit's own doc comment for why
+        # this (not last_cycle_time, which step() overwrites to the NEW t
+        # before _solve_for_timing runs) is what elapsed time gets measured
+        # against. _has_prior_spline distinguishes "no spline fit yet" (the
+        # first cycle, or right after reset()) from a legitimate elapsed
+        # time of 0.0 -- there is nothing to blend against yet either way.
+        self._prev_spline_time = 0.0
+        self._has_prior_spline = False
         self.last_cycle_waypoints = None
         self.last_cycle_var_assignments = None
         self.last_cycle_short_path = None
@@ -500,9 +564,27 @@ class GraphOfConstraintsMPC():
 
         if len(self.remaining_phases) > 0:
             t_by_node = self.waypoint_mpc.view_t_by_node()
-            success = self.timing_mpc.solve(x, x_dot, self.remaining_phases, waypoints, assignments, t_by_node)
+            # Computed from the OUTGOING self.last_cycle_splines, before
+            # fill_cubic_splines below overwrites them -- see this method's
+            # own doc comment. Used for BOTH calls below, not just
+            # fill_cubic_splines: v0 is ALSO a hard boundary condition
+            # inside timing_mpc.solve()'s own BuildProblemLayout
+            # (timing_gn_layout.cpp) -- that solve IS already warm-started
+            # from its own previous cycle's converged solution (prev_vs_list/
+            # prev_time_deltas_list, see GraphTimingMPC::solve's own
+            # comment), but the boundary condition itself is still a HARD
+            # constraint the warm-started solve must satisfy exactly, so a
+            # shifting v0 still perturbs the near-boundary solved shape
+            # regardless of warm-starting -- confirmed empirically: blending
+            # v0 into fill_cubic_splines ALONE (an earlier version of this
+            # fix) did not resolve the oscillation this exists to fix, this
+            # second call site was the missing half.
+            v0_for_spline = self._blend_velocity_for_spline_fit(x_dot)
+            success = self.timing_mpc.solve(x, v0_for_spline, self.remaining_phases, waypoints, assignments, t_by_node)
             if success:
-                self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, x_dot)
+                self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, v0_for_spline)
+                self._prev_spline_time = self.last_cycle_time
+                self._has_prior_spline = True
                 return True
             else:
                 return False
@@ -681,6 +763,8 @@ class GraphOfConstraintsMPC():
 
     def reset(self):
         self.last_cycle_time = 0.0
+        self._prev_spline_time = 0.0
+        self._has_prior_spline = False
         self.remaining_phases = list(range(self.graph.structure.num_nodes))
         self._hold_nominal_offsets = {}
 
