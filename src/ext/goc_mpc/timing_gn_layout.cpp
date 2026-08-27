@@ -203,8 +203,14 @@ ProblemLayout BuildProblemLayoutCore(
 	layout.n = n;
 
 	// Default initial guess: tau=10 (interior to [kTauMin, kTauMax]), v=1 --
-	// same generic guess add_agent_timing_segments used. Overwritten below
-	// wherever a warm-start match is found.
+	// same generic guess add_agent_timing_segments used. Overwritten below,
+	// per row, by whichever of the two later passes actually has something
+	// better to say about that row: an exact warm-start match against the
+	// previous cycle's own converged solution where one exists, else a
+	// distance/speed-based estimate (see that pass's own comment) -- this
+	// flat value only ever survives to `RunTrustRegionSqp` for a tau row
+	// neither pass could inform (in practice: no previous cycle to warm
+	// start from at all, i.e. this episode's very first solve).
 	layout.x_init = Eigen::VectorXd::Zero(n);
 	for (int i = 0; i < num_agents; ++i) {
 		const AgentLayout& al = layout.agents[i];
@@ -276,6 +282,14 @@ ProblemLayout BuildProblemLayoutCore(
 	// cycles (the traced polyline itself shifts as x0 moves), so matching
 	// one arbitrary -1 to another would seed the solver from an unrelated
 	// point instead of just leaving it at the generic guess above.
+	//
+	// tau_matched tracks which tau rows this loop actually overwrote, so
+	// the distance-based fallback below (for every row it COULDN'T match --
+	// e.g. the ever-present x0 -> first-remaining-node leg, always -1
+	// since x0 itself is never a graph node, or any genuine RDP-surviving
+	// interior point on an obstacle-routed edge) knows which ones to leave
+	// alone.
+	std::vector<bool> tau_matched(n, false);
 	for (int i = 0; i < num_agents; ++i) {
 		if (!prev_agent_spline_length_map.contains(i)) continue;
 		const AgentLayout& al = layout.agents[i];
@@ -290,11 +304,60 @@ ProblemLayout BuildProblemLayoutCore(
 
 			if (j_old < prev_time_deltas_list[i].size()) {
 				layout.x_init(al.tau_offset + j_new) = prev_time_deltas_list[i](j_old);
+				tau_matched[al.tau_offset + j_new] = true;
 			}
 			if (j_old < prev_vs_list[i].rows() && j_new < al.K - 1) {
 				for (int c = 0; c < tangent_dims[i]; ++c) {
 					layout.x_init(al.v_offset + j_new * tangent_dims[i] + c) =
 						prev_vs_list[i](j_old, c);
+				}
+			}
+		}
+	}
+
+	// Distance/speed-based fallback for every tau row warm-start matching
+	// above left untouched, in place of the flat, cycle-independent
+	// tau=10.0 guess the first pass set every row to. That flat guess is
+	// wrong by up to 3 orders of magnitude for a short leg (e.g. this
+	// suite's ~0.3m UR5e hops, or a single control cycle's worth of
+	// residual distance to a not-yet-reached node) -- confirmed
+	// empirically (`ur5e_multi_waypoint_experiment.py`, see PR/commit
+	// description) to let the trust-region loop wander into a materially
+	// different schedule cycle to cycle purely because ITS OWN starting
+	// guess for one segment (almost always the x0 -> first-remaining-node
+	// leg, which can never be node-id-matched -- x0 is never a graph node)
+	// was off by 3 orders of magnitude, not because the underlying problem
+	// itself changed.
+	//
+	// Rather than hardcoding any particular speed (this solver is generic
+	// across robot types/units -- meters for a mobile base, radians for a
+	// joint-space arm, etc., so there's no one "reasonable m/s" constant
+	// that's valid everywhere), this estimates a speed FROM the very rows
+	// warm-start matching above just confirmed are trustworthy this same
+	// cycle: avg_speed = mean(segment displacement / matched tau) over
+	// every successfully-matched row, then applies that same speed to each
+	// unmatched row's own (always-known) displacement. Falls back to the
+	// original flat default only when there's nothing to learn a speed
+	// from at all (e.g. the very first solve of an episode, before any
+	// row has ever been matched).
+	{
+		double speed_sum = 0.0;
+		int speed_count = 0;
+		for (const auto& seg : layout.segments) {
+			if (!tau_matched[seg.tau_idx]) continue;
+			const double tau = layout.x_init(seg.tau_idx);
+			if (tau > 1e-6) {
+				speed_sum += seg.disp.norm() / tau;
+				++speed_count;
+			}
+		}
+		if (speed_count > 0) {
+			const double avg_speed = speed_sum / speed_count;
+			if (avg_speed > 1e-6) {
+				for (const auto& seg : layout.segments) {
+					if (tau_matched[seg.tau_idx]) continue;
+					const double est_tau = seg.disp.norm() / avg_speed;
+					layout.x_init(seg.tau_idx) = std::clamp(est_tau, kTauMin, kTauMax);
 				}
 			}
 		}
