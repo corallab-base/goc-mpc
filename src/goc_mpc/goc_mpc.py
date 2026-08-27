@@ -153,7 +153,6 @@ class GraphOfConstraintsMPC():
             # severe per-cycle slowdowns under the old implementation.
             energy_cost: float = 0.0,
             arclength_cost: float = 0.0,
-            time_delta_cutoff: float = 0.4,
             phi_tolerance: float = 0.03,
             # Currently defunct
             max_vel: float | list[float] = -1.0,
@@ -253,14 +252,8 @@ class GraphOfConstraintsMPC():
         # hold_id. Populated the instant a hold's u_node completes; dropped
         # once its v_node completes or its u_node gets reopened (backtrack).
         self._hold_nominal_offsets = {}
-        # Previous cycle's first dense waypoint per agent, DEBUG-logging
-        # only (_log_timing_progression) -- lets that log flag whether the
-        # near-term target is jittering cycle to cycle instead of holding
-        # still while the robot closes in on it.
-        self._debug_prev_first_wp = {}
 
         # configuration
-        self.time_delta_cutoff = time_delta_cutoff
         self.phi_tolerance = phi_tolerance
         self.solve_for_waypoints_once = solve_for_waypoints_once
         self.time_cost = time_cost
@@ -329,90 +322,181 @@ class GraphOfConstraintsMPC():
         self.remaining_phases.remove(node)
         self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
 
-    def _log_timing_progression(self, time_delta, x):
-        """DEBUG-only: per agent, walks the same cumulative-tau rows
-        set_progressed_time is about to walk, marking the first row it
-        won't consider passed yet -- shows directly whether/where that
-        walk falls short of time_delta_cutoff, instead of only seeing the
-        aggregate passed_nodes result. Also reports the real distance from
-        `x` to the current first dense waypoint, and whether that
-        waypoint's own position moved since last cycle -- a tau that stays
-        flat while distance is genuinely shrinking points at the timing
-        solve itself; a first waypoint that jitters cycle to cycle instead
-        of holding still points at the retraced target, not set_progressed_
-        time."""
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-        agent_offsets = self.graph.agent_col_offsets
-        agent_nodes_list = self.timing_mpc.view_agent_nodes_list()
-        time_deltas_list = self.timing_mpc.view_time_deltas_list()
-        wps_list = self.timing_mpc.view_wps_list()
-        for i, (nodes, taus) in enumerate(zip(agent_nodes_list, time_deltas_list)):
-            cumulative = 0.0
-            rows = []
-            for node_id, tau in zip(nodes, taus):
-                cumulative += tau
-                label = self.graph.get_node_name(node_id) if node_id >= 0 else "interior"
-                not_reached = time_delta < cumulative - self.time_delta_cutoff
-                rows.append(f"{label}(tau={tau:.4f},cum={cumulative:.4f})"
-                            + (" [NOT REACHED]" if not_reached else " [passed]"))
-                if not_reached:
+    def _frontier_nodes(self) -> set:
+        """The next REAL (non-synthetic, `node_id >= 0`) node each agent is
+        currently en route to, per the last-solved plan's own ordering
+        (`timing_mpc.view_agent_nodes_list()`) -- deduplicated, since a
+        shared node (e.g. a handoff) can be two agents' frontier at once.
+        This is what `_check_progression` actually tests each call,
+        instead of every node still in `remaining_phases` (which would
+        also test nodes deeper in the plan that haven't genuinely been
+        reached yet, in whatever order their own residual happens to
+        already read as satisfied -- order-unsafe) or this method's own
+        predecessor: a wall-clock "has the schedule's cumulative time for
+        this node elapsed" gate (`set_progressed_time`, no longer called
+        anywhere in this file -- dropped along with the
+        now-unused `time_delta_cutoff` constructor arg it was paired
+        with)."""
+        frontier = set()
+        for nodes in self.timing_mpc.view_agent_nodes_list():
+            for node_id in nodes:
+                if node_id >= 0:
+                    frontier.add(node_id)
                     break
-            logger.debug("agent %d progression: delta=%.4f tau_cutoff=%.4f rows=%s",
-                         i, time_delta, self.time_delta_cutoff, rows)
+        return frontier
 
-            if wps_list[i].shape[0] == 0:
+    def _check_progression(self, x) -> bool:
+        """Completes (removes from `remaining_phases`, runs the same
+        commit/hold/grasp bookkeeping `step()`'s old inline progression
+        block did) whichever currently-frontier nodes (`_frontier_nodes`)
+        already satisfy their own phi against the LIVE `x` -- no
+        wall-clock gating, no dependence on how long it's been since the
+        last call. Returns whether anything completed, so `poll()` (and
+        `step()`, via `poll()`) knows whether `remaining_phases` actually
+        changed.
+
+        Safe to call every real control tick: unlike a fresh waypoint/
+        timing/short_path solve, this only evaluates already-compiled
+        residual expressions against `x` -- no solver runs. Calling it
+        more often only ever detects a completion sooner, never
+        differently -- the frontier itself only changes across a `step()`
+        call (a fresh solve), so repeated calls between `step()`s just
+        keep re-testing the same frontier until it's satisfied or `step()`
+        replans a new one.
+        """
+        if len(self.remaining_phases) == 0:
+            return False
+        assignments = self.waypoint_mpc.view_assignments()
+        var_assignments = self.waypoint_mpc.view_var_assignments()
+        changed = False
+        for node in self._frontier_nodes():
+            if node in self.graph.unpassable_nodes or node not in self.remaining_phases:
                 continue
-            first_wp = wps_list[i][0].copy()
-            x_i = x[agent_offsets[i]:agent_offsets[i + 1]]
-            distance = np.linalg.norm(x_i - first_wp)
-            prev = self._debug_prev_first_wp.get(i)
-            jitter = np.linalg.norm(first_wp - prev) if prev is not None else 0.0
-            logger.debug("agent %d first_wp: distance_to_x=%.4f jitter_since_last_cycle=%.4f",
-                         i, distance, jitter)
-            self._debug_prev_first_wp[i] = first_wp
+            phi_results = {phi_id: self.graph.evaluate_phi(phi_id, x, assignments, self.phi_tolerance)
+                           for phi_id in self.graph.get_phi_ids(node)}
+            if not all(phi_results.values()):
+                if logger.isEnabledFor(logging.DEBUG):
+                    failed_phi_ids = [phi_id for phi_id, ok in phi_results.items() if not ok]
+                    logger.debug("Did not complete %s -- failed phi id(s): %s",
+                                 self.graph.get_node_name(node), failed_phi_ids)
+                continue
+            logger.info("Completed %s", self.graph.get_node_name(node))
+            self.completed_phases |= {node}
+            self.remaining_phases.remove(node)
+            self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
+            self._maybe_commit(node, var_assignments)
+            self._maybe_start_holds(node, x)
+            self._maybe_end_holds(node)
+            changed = True
+        return changed
 
-    def _solve_for_timing(self, time_delta, x, x_dot):
+    def poll(self, x) -> tuple[bool, bool]:
+        """Cheap, solve-free progression/backtracking check against the
+        LIVE state `x`: completes any currently-frontier node whose phi is
+        already satisfied (`_check_progression`) and reopens any node
+        whose edge/hold constraint is currently violated (`_backtrack`) --
+        the same two things `step()` has always done at the top of every
+        cycle, just factored out so a caller can ALSO run them BETWEEN
+        `step()` calls, at whatever real control-tick rate it likes,
+        without paying for a fresh waypoint/timing/short_path solve each
+        time. Returns `(backtracked, progressed)` -- whether EACH one
+        changed `remaining_phases`, kept separate (not OR'd into one flag)
+        because callers care differently about each: a completion means
+        the just-executing plan's own geometry is still valid (the spline
+        was already fit through the WHOLE remaining route, not just the
+        node that happened to complete -- see drive_loop.run_drive_loop's
+        own doc comment on why it only aborts the current chunk for a
+        backtrack, not a plain completion); a backtrack means the opposite
+        -- remaining_phases just grew a node back that the CURRENT plan
+        never accounted for, so anything still executing from it is
+        already wrong.
+
+        Why both are still checked together in one call, not two separate
+        public methods: they're the same shape of operation (evaluate an
+        already-compiled residual against `x`, no solver involved), and a
+        backtrack trigger left undetected for a while is arguably worse
+        than a completion left undetected -- the controller keeps
+        executing a plan built on a now-false assumption (e.g. "still
+        holding this object") for however long it takes the next check to
+        catch it, not just drifting a bit further past an already-reached
+        waypoint. Backtracking is checked first, same order `step()`
+        always ran them in.
+
+        A caller driving a real control loop (e.g. drive_loop.
+        run_drive_loop) should call this after every real `env.step()`
+        while executing a solve's returned horizon, and short-circuit
+        straight to the next `step()` call the moment `backtracked` comes
+        back `True` -- rather than blindly finishing out the rest of a
+        horizon that was planned against a `remaining_phases` set that's
+        now stale in a way the CURRENT plan can't account for. `step()`
+        itself also calls this once, at the top of every cycle (replacing
+        what used to be its own, separately-implemented, wall-clock-
+        schedule-gated version of the progression half only) -- so a
+        caller that never polls between `step()` calls still gets fully
+        correct (if less prompt) behavior, and a caller that does poll
+        just gets the SAME logic running sooner; `step()`'s own call is
+        then a cheap, usually-no-op re-check, not a second implementation.
+
+        No-ops (returns `(False, False)`) before the first successful
+        `step()` call, same as the old inline check did -- nothing to
+        backtrack/progress against yet (`last_cycle_var_assignments` is
+        `None` until a waypoint solve has actually run).
+        """
+        if self.last_cycle_var_assignments is None:
+            return False, False
+        backtracked = self._backtrack(x)
+        progressed = self._check_progression(x)
+        return backtracked, progressed
+
+    def _blend_velocity_for_spline_fit(self, x_dot: np.ndarray) -> np.ndarray:
+        """The velocity boundary condition `fill_cubic_splines` (called
+        right after this, in `_solve_for_timing`) should actually use --
+        `x_dot` unchanged if `spline_velocity_deadband <= 0` (the default)
+        or there's no PRIOR spline yet to blend against (first cycle, or
+        right after `reset()`); otherwise, per tangent-space component,
+        whichever of `x_dot` (measured) or the OUTGOING `self.
+        last_cycle_splines`' own already-committed velocity AT THIS EXACT
+        INSTANT is closer to continuity -- see `spline_velocity_deadband`'s
+        own doc comment (this class's `__init__`) for the full rationale
+        and the failure mode this exists to fix.
+
+        Must be called BEFORE `fill_cubic_splines` overwrites `self.
+        last_cycle_splines` in place -- it reads the OUTGOING splines, not
+        the ones about to replace them. Elapsed time since those splines
+        were fit is `self.last_cycle_time - self._prev_spline_time`: by the
+        time this runs, `step()` has already advanced `last_cycle_time` to
+        the CURRENT call's own `t`, while `_prev_spline_time` still holds
+        the `t` those (about to be replaced) splines were fit at -- exactly
+        the elapsed time to evaluate them at, since `CubicConfigurationSpline`
+        stores its own knots in RELATIVE time (`begin() == 0`, see
+        `fill_cubic_splines`'s own `CumsumWithZero`-built `times_i`).
+        `CubicConfigurationSpline.eval` clamps its argument into `[begin(),
+        end()]` internally, so this is well-defined even once a spline's
+        own horizon has already fully elapsed (the common case right when a
+        chunk finishes and this cycle's replan is happening BECAUSE of
+        that) -- it simply reads that spline's own converged terminal
+        velocity, typically ~0 approaching a waypoint.
+        """
+        if self.spline_velocity_deadband <= 0.0 or not self._has_prior_spline:
+            return x_dot
+
+        elapsed = self.last_cycle_time - self._prev_spline_time
+        v_planned_parts = []
+        for spline in self.last_cycle_splines:
+            _q, v, _a = spline.eval(elapsed)
+            v_planned_parts.append(v)
+        v_planned = np.concatenate(v_planned_parts)
+
+        close_enough = np.abs(x_dot - v_planned) < self.spline_velocity_deadband
+        return np.where(close_enough, v_planned, x_dot)
+
+    def _solve_for_timing(self, x, x_dot):
 
         # get references to the stored waypoints and assignments solutions from waypoint_mpc
         waypoints = self.waypoint_mpc.view_waypoints()
         assignments = self.waypoint_mpc.view_assignments()
         var_assignments = self.waypoint_mpc.view_var_assignments()
         self.last_cycle_var_assignments = var_assignments
-
-        # PROGRESSION: progress time and potentially change phase
-        # shift timing
-        if len(self.remaining_phases) > 0 and time_delta > 0.0:
-            self._log_timing_progression(time_delta, x)
-            passed_nodes = self.timing_mpc.set_progressed_time(time_delta, self.time_delta_cutoff)
-            logger.debug("passed_nodes: %s", passed_nodes)
-
-            for node in passed_nodes:
-                if node in self.graph.unpassable_nodes:
-                    continue
-
-                phi_results = {phi_id: self.graph.evaluate_phi(phi_id, x, assignments, self.phi_tolerance)
-                               for phi_id in self.graph.get_phi_ids(node)}
-                all_phis_satisfied = all(phi_results.values())
-
-                if all_phis_satisfied:
-                    logger.info("Completed %s", self.graph.get_node_name(node))
-                    self.completed_phases |= {node}
-                    self.remaining_phases.remove(node)
-                    self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
-                    self._maybe_commit(node, var_assignments)
-                    self._maybe_start_holds(node, x)
-                    self._maybe_end_holds(node)
-                else:
-                    failed_phi_ids = [phi_id for phi_id, ok in phi_results.items() if not ok]
-                    logger.info("Did not complete %s -- failed phi id(s): %s",
-                                self.graph.get_node_name(node), failed_phi_ids)
-
-        # if not self.timing_mpc.done():
-        #     # if the closest next phase is further than time_delta_cutoff seconds into the future
-        #     if self.timing_mpc.current_minimum_time_delta() > self.time_delta_cutoff:
-        #         # resolve the timing problem
-        #         # TODO: understand if there is something to do with ctrlErr
 
         if len(self.remaining_phases) > 0:
             t_by_node = self.waypoint_mpc.view_t_by_node()
@@ -527,7 +611,7 @@ class GraphOfConstraintsMPC():
                 return True
         return False
 
-    def _backtrack(self, x, x_dot):
+    def _backtrack(self, x) -> bool:
         self.last_cycle_backtracked_phases = {}
 
         # BACKTRACKING: if the task has been finished
@@ -590,6 +674,11 @@ class GraphOfConstraintsMPC():
             #     self.timing_mpc.update_backtrack();
             #     phase_changed = True
 
+        # Every branch above that sets remaining_phases_changed = True also
+        # records into last_cycle_backtracked_phases, so its truthiness IS
+        # "did anything change this call" -- no separate flag needed.
+        return bool(self.last_cycle_backtracked_phases)
+
     def reset(self):
         self.last_cycle_time = 0.0
         self.remaining_phases = list(range(self.graph.structure.num_nodes))
@@ -600,7 +689,6 @@ class GraphOfConstraintsMPC():
 
         assert x.size == self.graph.total_dim, f"x.size ({x.size}) != self.graph.total_dim ({self.graph.total_dim})"
 
-        delta = t - self.last_cycle_time
         self.last_cycle_time = t
 
         self.last_grasp_commands = []
@@ -612,10 +700,14 @@ class GraphOfConstraintsMPC():
         self.last_cycle_solve_times = {}
         step_start = time.perf_counter()
 
-        if self.last_cycle_var_assignments is not None:
-            phase_start = time.perf_counter()
-            self._backtrack(x, x_dot)
-            self.last_cycle_solve_times["backtrack"] = time.perf_counter() - phase_start
+        # poll() (backtrack + frontier-node completion check) -- a caller
+        # driving a real control loop at higher frequency than step() may
+        # already have called this since the last step(), in which case
+        # this is a cheap, usually-no-op re-check, not a second
+        # implementation of the same logic. See poll()'s own doc comment.
+        phase_start = time.perf_counter()
+        self.poll(x)
+        self.last_cycle_solve_times["poll"] = time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
         success = self._solve_for_waypoints(x)
@@ -626,7 +718,7 @@ class GraphOfConstraintsMPC():
             raise RuntimeError("WaypointsMPC Failed!")
 
         phase_start = time.perf_counter()
-        success = self._solve_for_timing(delta, x, x_dot)
+        success = self._solve_for_timing(x, x_dot)
         self.last_cycle_solve_times["timing"] = time.perf_counter() - phase_start
 
         if teleport:
