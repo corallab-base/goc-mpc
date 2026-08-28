@@ -280,7 +280,14 @@ public:
 
 	struct SegmentPiece {
 		double t0{}, t1{};
-		std::vector<std::variant<EuclPiece, TorusPiece, SO3QuatPiece, SO3MatPiece>> blocks;
+		// One slot per spec block. A slot holds a value when this base knot
+		// interval is where that block's active Hermite piece STARTS; it is
+		// empty (std::nullopt) when an earlier interval's active piece for
+		// that block reaches across this one (a node-skipping bridge -- see
+		// knot_block_active_). A held piece's own `tau` is its true span
+		// (t1 - t0 of the interval it starts in, PLUS every skipped interval
+		// it bridges), which can exceed this SegmentPiece's own t1 - t0.
+		std::vector<std::optional<std::variant<EuclPiece, TorusPiece, SO3QuatPiece, SO3MatPiece>>> blocks;
 	};
 
 	using Spec = std::vector<Block>;
@@ -293,6 +300,16 @@ public:
 
 	Eigen::VectorXd times_;
 	std::vector<SegmentPiece> pieces_;
+
+	// Optional per-(knot, block) mask consulted by the next set(): a 0 at
+	// (i, b) marks knot i as NOT a real knot for block b, so set() bridges
+	// block b straight across knot i with one longer Hermite piece while
+	// every other block still gets its own piece there. Knots 0 and N-1 are
+	// always treated as active regardless (endpoints are never skipped).
+	// Shape must be (num_knots x num_blocks) at set() time or set() throws.
+	// Empty (the default, and what clear() restores) == every knot active
+	// for every block, i.e. the original behavior.
+	Eigen::MatrixXi knot_block_active_;
 
 	bool linear_ = false;
 
@@ -339,10 +356,17 @@ public:
 	void clear() {
 		times_.resize(0);
 		pieces_.clear();
+		knot_block_active_.resize(0, 0);
 	}
 
 	void set_linear(bool linear) { linear_ = linear; }
 	bool is_linear() const { return linear_; }
+
+	// See knot_block_active_. Pass an empty matrix to go back to "every
+	// knot active". Not validated here (num_knots isn't known until set());
+	// set() checks the shape.
+	void set_block_active_mask(const Eigen::MatrixXi& mask) { knot_block_active_ = mask; }
+	const Eigen::MatrixXi& block_active_mask() const { return knot_block_active_; }
 
 	// ----- API: set from waypoints/vels/times -----
 	// pts: (N x ambient_dim), vels: (N x tangent_dim), times: (N)
@@ -350,7 +374,6 @@ public:
 	void set(const Eigen::MatrixBase<DerivedP>& pts,
 		 const Eigen::MatrixBase<DerivedV>& vels,
 		 const Eigen::MatrixBase<DerivedT>& times) {
-		using std::size_t;
 		const int N = static_cast<int>(times.size());
 		if (N < 2) throw std::runtime_error("Need at least 2 waypoints");
 		if (pts.rows() != N || pts.cols() != ambient_dim_)
@@ -362,138 +385,153 @@ public:
 		if ((times_.array().segment(1, N-1) - times_.array().segment(0, N-1)).minCoeff() <= 0.0)
 			throw std::runtime_error("times must be strictly increasing");
 
-		pieces_.clear();
-		pieces_.reserve(N-1);
+		const int NB = static_cast<int>(block_offsets_.size());
+		const bool have_mask = knot_block_active_.size() != 0;
+		if (have_mask && (knot_block_active_.rows() != N || knot_block_active_.cols() != NB))
+			throw std::runtime_error(
+				"CubicConfigurationSpline::set: block active mask shape must be "
+				"(num_knots x num_blocks)");
 
-		for (int i = 0; i < N-1; ++i) {
-			double t0 = times_(i);
-			double t1 = times_(i+1);
-			const double tau = t1 - t0;
+		// One SegmentPiece per base knot interval; every block slot starts
+		// empty and is filled below only at the interval where that block's
+		// active piece begins.
+		pieces_.assign(N - 1, SegmentPiece{});
+		for (int i = 0; i < N - 1; ++i) {
+			pieces_[i].t0 = times_(i);
+			pieces_[i].t1 = times_(i + 1);
+			pieces_[i].blocks.assign(NB, std::nullopt);
+		}
 
-			SegmentPiece seg;
-			seg.t0 = t0; seg.t1 = t1;
+		// Builds block `bi`'s Hermite piece spanning active knots [lo, hi]
+		// (hi may be more than one interval past lo -- the intervening knots
+		// are skipped for this block). Endpoint pos/vel come from rows
+		// lo/hi; the intervening rows are simply not referenced.
+		auto build_block_piece = [&](int bi, int lo, int hi)
+			-> std::variant<EuclPiece, TorusPiece, SO3QuatPiece, SO3MatPiece> {
+			const BlockOffset& bo = block_offsets_[bi];
+			const int a_off = bo.ambient_offset;
+			const int t_off = bo.tangent_offset;
+			const double tau = times_(hi) - times_(lo);
 
-			// Build each block's piece
-			int a_off = 0, t_off = 0;
-			for (const auto& bo : block_offsets_) {
-				switch (bo.type) {
-				case Block::Type::R: {
-					EuclPiece p;
-					p.tau = tau;
-					const int k = bo.ambient_size;
-					p.x0 = pts.row(i).segment(a_off, k).transpose();
-					p.v0 = vels.row(i).segment(t_off, k).transpose();
-					p.x1 = pts.row(i+1).segment(a_off, k).transpose();
-					p.v1 = vels.row(i+1).segment(t_off, k).transpose();
-					// Hermite coeffs in R^k for x(t) = d + t c + t^2 b + t^3 a
-					p.d = p.x0;
-					p.c = p.v0;
-					p.b = (3.0*(p.x1 - p.x0) - tau*(2.0*p.v0 + p.v1)) / (tau*tau);
-					p.a = (-2.0*(p.x1 - p.x0) + tau*(p.v0 + p.v1)) / (tau*tau*tau);
-					seg.blocks.emplace_back(std::move(p));
-					a_off += k; t_off += k;
-					break;
-				}
-				case Block::Type::Torus: {
-					TorusPiece p;
-					p.tau = tau;
-					const int k = bo.ambient_size;
-					p.a0 = pts.row(i).segment(a_off, k).transpose();
-					p.v0 = vels.row(i).segment(t_off, k).transpose();
-					p.delta = Eigen::VectorXd(k);
-					p.v1 = vels.row(i+1).segment(t_off, k).transpose();
-					for (int j = 0; j < k; ++j) {
-						const double a0 = p.a0(j);
-						const double a1 = pts(i+1, a_off + j);
-						const double d  = torus::shortest_delta(a1, a0);
-						p.delta(j) = d;
-					}
-					// φ(t) cubic with φ(0)=0, φ'(0)=v0, φ(τ)=delta, φ'(τ)=v1
-					p.d = Eigen::VectorXd::Zero(k);
-					p.c = p.v0;
-					p.b = (3.0*p.delta - tau*(2.0*p.v0 + p.v1)) / (tau*tau);
-					p.a = (-2.0*p.delta + tau*(p.v0 + p.v1)) / (tau*tau*tau);
-					seg.blocks.emplace_back(std::move(p));
-					a_off += k; t_off += k;
-					break;
-				}
-				case Block::Type::SO3Quat: {
-					SO3QuatPiece p;
-					p.tau = tau;
-					// Read and canonicalize quats (w,x,y,z)
-					Eigen::Quaterniond q0(pts(i, a_off+0), pts(i, a_off+1), pts(i, a_off+2), pts(i, a_off+3));
-					Eigen::Quaterniond q1(pts(i+1, a_off+0), pts(i+1, a_off+1), pts(i+1, a_off+2), pts(i+1, a_off+3));
-					q0.normalize(); if (q0.w() < 0) q0.coeffs() *= -1.0;
-					q1.normalize(); if (q1.w() < 0) q1.coeffs() *= -1.0;
-					// Body angular velocities
-					p.omega0 = vels.row(i).segment(t_off, 3).transpose();
-					p.omega1 = vels.row(i+1).segment(t_off, 3).transpose();
-
-					// Relative motion φ = Log(q0^{-1} * q1), in so(3)
-					Eigen::Quaterniond qrel = q0.conjugate() * q1;
-					p.phi1 = so3::quat::Log(qrel);
-
-					// Cubic in φ(t): φ(0)=0, φ'(0)=v0φ, φ(τ)=φ1, φ'(τ)=v1φ
-					// v0φ = ω0 (since J(0)=I), v1φ = J(φ1)^{-1} ω1
-					const Eigen::Matrix3d J1_inv = so3::left_jacobian_inv(p.phi1);
-					const Eigen::Vector3d v0phi = p.omega0;
-					const Eigen::Vector3d v1phi = J1_inv * p.omega1;
-					p.d = Eigen::Vector3d::Zero();
-					p.c = v0phi;
-					p.b = (3.0*p.phi1 - tau*(2.0*v0phi + v1phi)) / (tau*tau);
-					p.a = (-2.0*p.phi1 + tau*(v0phi + v1phi)) / (tau*tau*tau);
-
-					p.q0 = q0;
-					seg.blocks.emplace_back(std::move(p));
-					a_off += 4; t_off += 3;
-					break;
-				}
-				case Block::Type::SO3Mat: {
-					SO3MatPiece p;
-					p.tau = tau;
-
-					// Read rotation matricies
-					// The validity of these should be
-					// enforced by the constraints of the
-					// waypoint problem or their initialization.
-					Eigen::Matrix3d R0_mat;
-					R0_mat << pts(i, a_off+0), pts(i, a_off+1), pts(i, a_off+2),
-						pts(i, a_off+3), pts(i, a_off+4), pts(i, a_off+5),
-						pts(i, a_off+6), pts(i, a_off+7), pts(i, a_off+8);
-					drake::math::RotationMatrix<double> R0(R0_mat);
-					Eigen::Matrix3d R1_mat;
-					R1_mat << pts(i+1, a_off+0), pts(i+1, a_off+1), pts(i+1, a_off+2),
-						pts(i+1, a_off+3), pts(i+1, a_off+4), pts(i+1, a_off+5),
-						pts(i+1, a_off+6), pts(i+1, a_off+7), pts(i+1, a_off+8);
-					drake::math::RotationMatrix<double> R1(R1_mat);
-
-					// Body angular velocities
-					p.omega0 = vels.row(i).segment(t_off, 3).transpose();
-					p.omega1 = vels.row(i+1).segment(t_off, 3).transpose();
-
-					// Relative motion φ = Log(R0^{-1} * R1), in so(3)
-					drake::math::RotationMatrix<double> Rrel = R0.inverse() * R1;
-					p.phi1 = so3::mat::Log(Rrel);
-
-					// Cubic in φ(t): φ(0)=0, φ'(0)=v0φ, φ(τ)=φ1, φ'(τ)=v1φ
-					// v0φ = ω0 (since J(0)=I), v1φ = J(φ1)^{-1} ω1
-					const Eigen::Matrix3d J1_inv = so3::left_jacobian_inv(p.phi1);
-					const Eigen::Vector3d v0phi = p.omega0;
-					const Eigen::Vector3d v1phi = J1_inv * p.omega1;
-					p.d = Eigen::Vector3d::Zero();
-					p.c = v0phi;
-					p.b = (3.0*p.phi1 - tau*(2.0*v0phi + v1phi)) / (tau*tau);
-					p.a = (-2.0*p.phi1 + tau*(v0phi + v1phi)) / (tau*tau*tau);
-
-					p.R0 = R0;
-					seg.blocks.emplace_back(std::move(p));
-					a_off += 9; t_off += 3;
-					break;
-				}
-				}
+			switch (bo.type) {
+			case Block::Type::R: {
+				EuclPiece p;
+				p.tau = tau;
+				const int k = bo.ambient_size;
+				p.x0 = pts.row(lo).segment(a_off, k).transpose();
+				p.v0 = vels.row(lo).segment(t_off, k).transpose();
+				p.x1 = pts.row(hi).segment(a_off, k).transpose();
+				p.v1 = vels.row(hi).segment(t_off, k).transpose();
+				p.d = p.x0;
+				p.c = p.v0;
+				p.b = (3.0*(p.x1 - p.x0) - tau*(2.0*p.v0 + p.v1)) / (tau*tau);
+				p.a = (-2.0*(p.x1 - p.x0) + tau*(p.v0 + p.v1)) / (tau*tau*tau);
+				return p;
 			}
+			case Block::Type::Torus: {
+				TorusPiece p;
+				p.tau = tau;
+				const int k = bo.ambient_size;
+				p.a0 = pts.row(lo).segment(a_off, k).transpose();
+				p.v0 = vels.row(lo).segment(t_off, k).transpose();
+				p.delta = Eigen::VectorXd(k);
+				p.v1 = vels.row(hi).segment(t_off, k).transpose();
+				for (int j = 0; j < k; ++j) {
+					const double a0 = p.a0(j);
+					const double a1 = pts(hi, a_off + j);
+					p.delta(j) = torus::shortest_delta(a1, a0);
+				}
+				// φ(t) cubic with φ(0)=0, φ'(0)=v0, φ(τ)=delta, φ'(τ)=v1
+				p.d = Eigen::VectorXd::Zero(k);
+				p.c = p.v0;
+				p.b = (3.0*p.delta - tau*(2.0*p.v0 + p.v1)) / (tau*tau);
+				p.a = (-2.0*p.delta + tau*(p.v0 + p.v1)) / (tau*tau*tau);
+				return p;
+			}
+			case Block::Type::SO3Quat: {
+				SO3QuatPiece p;
+				p.tau = tau;
+				// Read and canonicalize quats (w,x,y,z)
+				Eigen::Quaterniond q0(pts(lo, a_off+0), pts(lo, a_off+1), pts(lo, a_off+2), pts(lo, a_off+3));
+				Eigen::Quaterniond q1(pts(hi, a_off+0), pts(hi, a_off+1), pts(hi, a_off+2), pts(hi, a_off+3));
+				q0.normalize(); if (q0.w() < 0) q0.coeffs() *= -1.0;
+				q1.normalize(); if (q1.w() < 0) q1.coeffs() *= -1.0;
+				// Body angular velocities
+				p.omega0 = vels.row(lo).segment(t_off, 3).transpose();
+				p.omega1 = vels.row(hi).segment(t_off, 3).transpose();
 
-			pieces_.push_back(std::move(seg));
+				// Relative motion φ = Log(q0^{-1} * q1), in so(3)
+				Eigen::Quaterniond qrel = q0.conjugate() * q1;
+				p.phi1 = so3::quat::Log(qrel);
+
+				// Cubic in φ(t): φ(0)=0, φ'(0)=v0φ, φ(τ)=φ1, φ'(τ)=v1φ
+				// v0φ = ω0 (since J(0)=I), v1φ = J(φ1)^{-1} ω1
+				const Eigen::Matrix3d J1_inv = so3::left_jacobian_inv(p.phi1);
+				const Eigen::Vector3d v0phi = p.omega0;
+				const Eigen::Vector3d v1phi = J1_inv * p.omega1;
+				p.d = Eigen::Vector3d::Zero();
+				p.c = v0phi;
+				p.b = (3.0*p.phi1 - tau*(2.0*v0phi + v1phi)) / (tau*tau);
+				p.a = (-2.0*p.phi1 + tau*(v0phi + v1phi)) / (tau*tau*tau);
+
+				p.q0 = q0;
+				return p;
+			}
+			case Block::Type::SO3Mat: {
+				SO3MatPiece p;
+				p.tau = tau;
+
+				// Read rotation matricies. The validity of these should be
+				// enforced by the constraints of the waypoint problem or
+				// their initialization.
+				Eigen::Matrix3d R0_mat;
+				R0_mat << pts(lo, a_off+0), pts(lo, a_off+1), pts(lo, a_off+2),
+					pts(lo, a_off+3), pts(lo, a_off+4), pts(lo, a_off+5),
+					pts(lo, a_off+6), pts(lo, a_off+7), pts(lo, a_off+8);
+				drake::math::RotationMatrix<double> R0(R0_mat);
+				Eigen::Matrix3d R1_mat;
+				R1_mat << pts(hi, a_off+0), pts(hi, a_off+1), pts(hi, a_off+2),
+					pts(hi, a_off+3), pts(hi, a_off+4), pts(hi, a_off+5),
+					pts(hi, a_off+6), pts(hi, a_off+7), pts(hi, a_off+8);
+				drake::math::RotationMatrix<double> R1(R1_mat);
+
+				// Body angular velocities
+				p.omega0 = vels.row(lo).segment(t_off, 3).transpose();
+				p.omega1 = vels.row(hi).segment(t_off, 3).transpose();
+
+				// Relative motion φ = Log(R0^{-1} * R1), in so(3)
+				drake::math::RotationMatrix<double> Rrel = R0.inverse() * R1;
+				p.phi1 = so3::mat::Log(Rrel);
+
+				const Eigen::Matrix3d J1_inv = so3::left_jacobian_inv(p.phi1);
+				const Eigen::Vector3d v0phi = p.omega0;
+				const Eigen::Vector3d v1phi = J1_inv * p.omega1;
+				p.d = Eigen::Vector3d::Zero();
+				p.c = v0phi;
+				p.b = (3.0*p.phi1 - tau*(2.0*v0phi + v1phi)) / (tau*tau);
+				p.a = (-2.0*p.phi1 + tau*(v0phi + v1phi)) / (tau*tau*tau);
+
+				p.R0 = R0;
+				return p;
+			}
+			}
+			DRAKE_UNREACHABLE();
+		};
+
+		for (int bi = 0; bi < NB; ++bi) {
+			// This block's active knot indices: 0 and N-1 always, plus every
+			// interior knot the mask marks active (or all of them if unset).
+			std::vector<int> active;
+			active.reserve(N);
+			for (int i = 0; i < N; ++i) {
+				const bool is_active = (i == 0) || (i == N - 1) || !have_mask ||
+						       (knot_block_active_(i, bi) != 0);
+				if (is_active) active.push_back(i);
+			}
+			for (std::size_t s = 0; s + 1 < active.size(); ++s) {
+				const int lo = active[s], hi = active[s + 1];
+				pieces_[lo].blocks[bi] = build_block_piece(bi, lo, hi);
+			}
 		}
 	}
 
@@ -522,20 +560,30 @@ public:
 		else if (t >= end())   t = end();
 
 		const int k = find_piece(t);
-		const auto& seg = pieces_[k];
-		const double tau = seg.t1 - seg.t0;
-		const double local_t = t - seg.t0;
 
 		Eigen::VectorXd q(ambient_dim_);
 		Eigen::VectorXd v(tan_dim_);
 		Eigen::VectorXd a(tan_dim_);
 
-		const double alpha = (tau > 0.0) ? (local_t / tau) : 0.0;
-
-		int a_off = 0, t_off = 0;
-		for (size_t bi = 0; bi < seg.blocks.size(); ++bi) {
+		for (std::size_t bi = 0; bi < block_offsets_.size(); ++bi) {
 			const auto& bo = block_offsets_[bi];
-			const auto& blk = seg.blocks[bi];
+			const int a_off = bo.ambient_offset;
+			const int t_off = bo.tangent_offset;
+
+			// This block may skip knots, so its active piece can start in an
+			// earlier interval than the one holding t -- walk back to it.
+			// Interval 0 is always active for every block, so this
+			// terminates on a filled slot.
+			int s = k;
+			while (s > 0 && !pieces_[s].blocks[bi].has_value()) --s;
+			const auto& blk = *pieces_[s].blocks[bi];
+			const double piece_tau = std::visit([](const auto& p) { return p.tau; }, blk);
+			double local_t = t - pieces_[s].t0;
+			if (local_t < 0.0) local_t = 0.0;
+			else if (local_t > piece_tau) local_t = piece_tau;
+			const double tau = piece_tau;
+			const double alpha = (tau > 0.0) ? (local_t / tau) : 0.0;
+
 			if (std::holds_alternative<EuclPiece>(blk)) {
 				const auto& p = std::get<EuclPiece>(blk);
 				if (linear_) {
@@ -552,7 +600,6 @@ public:
 					v.segment(t_off, p.dim()) = xd;
 					a.segment(t_off, p.dim()) = xdd;
 				}
-				a_off += p.dim(); t_off += p.dim();
 			} else if (std::holds_alternative<TorusPiece>(blk)) {
 				const auto& p = std::get<TorusPiece>(blk);
 				const int kdim = p.dim();
@@ -573,7 +620,6 @@ public:
 					v.segment(t_off, kdim) = phid;
 					a.segment(t_off, kdim) = phidd;
 				}
-				a_off += kdim; t_off += kdim;
 			} else if (std::holds_alternative<SO3QuatPiece>(blk)) {
 				const auto& p = std::get<SO3QuatPiece>(blk);
 				if (linear_) {
@@ -602,7 +648,6 @@ public:
 					v.segment(t_off, 3) = omg;
 					a.segment(t_off, 3) = omgd;
 				}
-				a_off += 4; t_off += 3;
 			} else if (std::holds_alternative<SO3MatPiece>(blk)) {
 				const auto& p = std::get<SO3MatPiece>(blk);
 				if (linear_) {
@@ -633,7 +678,6 @@ public:
 					v.segment(t_off, 3) = omg;
 					a.segment(t_off, 3) = omgd;
 				}
-				a_off += 9; t_off += 3;
 			} else {
 				DRAKE_UNREACHABLE();
 			}

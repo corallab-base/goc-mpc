@@ -70,6 +70,12 @@ void init_submodule_configuration_spline(py::module_& m) {
 		     py::arg("t"))
 		.def("set_linear",    &CubicConfigurationSpline::set_linear,  py::arg("linear"))
 		.def("is_linear",     &CubicConfigurationSpline::is_linear)
+		// Per-(knot, block) knot mask consulted by the next set() -- a 0 at
+		// (i, b) bridges block b straight across knot i (see
+		// knot_block_active_'s own doc comment). Pass an empty array to
+		// restore "every knot active".
+		.def("set_block_active_mask", &CubicConfigurationSpline::set_block_active_mask, py::arg("mask"))
+		.def("block_active_mask",     &CubicConfigurationSpline::block_active_mask)
 		.def("eval_multiple", &CubicConfigurationSpline::eval_multiple)
 		.def("ambient_dim",   &CubicConfigurationSpline::ambient_dim)
 		.def("tangent_dim",   &CubicConfigurationSpline::tangent_dim)
