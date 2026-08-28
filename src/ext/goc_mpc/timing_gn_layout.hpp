@@ -26,26 +26,39 @@ constexpr double kTauMax = 100.0;
 constexpr double kInf = 1e19;
 
 // One agent's tau/v decision-variable ranges within the flat global vector.
+// tau: K contiguous columns at [tau_offset, tau_offset + K), one per base
+// interval. v: this agent's interior-knot velocities, packed PER BLOCK --
+// each block contributes one tangent_size-wide entry per interior knot it
+// treats as a real knot; a block bridged past a knot gets NO v column there
+// (one longer merged BlockSegment spans it instead). v_offset is just the
+// start of that packed region; BlockSegment carries the resolved columns.
 struct AgentLayout {
 	int tau_offset = 0;
 	int v_offset = 0;
-	int K = 0;  // agent_spline_length: number of segments == number of taus
+	int K = 0;  // agent_spline_length: number of base intervals == number of taus
 };
 
-// One cubic-Hermite segment's layout, plus the per-block constant
-// PositionDelta ("disp") data compute_ctrl_cost's D/V residuals are built
-// from. xJ/xJm1 are fixed constants at this phase (upstream waypoint-solve
-// output), so `disp` is computed ONCE in double via
-// CubicConfigurationSpline::PositionDelta -- see graph_timing_mpc.hpp's own
-// doc comment for why that means no autodiff is ever needed through the
-// wrap/quaternion-log branches themselves.
-struct SegmentLayout {
-	int tau_idx = 0;
-	int v0_idx = -1;   // global column of this segment's v0 block start, or -1 if fixed
-	int v1_idx = -1;   // ditto for v1
-	Eigen::VectorXd v0_const;  // used when v0_idx < 0
-	Eigen::VectorXd v1_const;  // used when v1_idx < 0
-	Eigen::VectorXd disp;      // tangent_dim, PositionDelta(xJ, xJm1)
+// One merged cubic-Hermite piece for ONE block of one agent's spline,
+// spanning active knots k_lo -> k_hi (knot 0 == x0, knot k == this agent's
+// k-th resolved node; k_lo/k_hi always land on knots the block treats as
+// real). For an unbridged block k_hi == k_lo + 1 -- exactly one base
+// interval, reducing to the old per-segment residual. For a block bridged
+// past interior knot(s), k_hi - k_lo > 1 and this piece's duration is the
+// SUM of the spanned base-interval taus (tau_indices), matching the single
+// long Hermite piece CubicConfigurationSpline::set() builds for that block
+// under the same active-knot mask. disp / v0_const / v1_const are this
+// block's tangent slice only (tangent_size wide); v0_idx/v1_idx point at
+// this block's own packed v column (component c is at v{0,1}_idx + c).
+struct BlockSegment {
+	int agent = 0;
+	int block_idx = 0;              // index into spline->block_offsets_
+	int k_lo = 0, k_hi = 0;         // this agent's knot indices (StoreResult reads k_hi)
+	std::vector<int> tau_indices;   // global columns of the spanned base taus
+	int v0_idx = -1;   // global column of this block's v at k_lo, or -1 if fixed
+	int v1_idx = -1;   // ditto at k_hi
+	Eigen::VectorXd v0_const;  // tangent_size, used when v0_idx < 0
+	Eigen::VectorXd v1_const;  // tangent_size, used when v1_idx < 0
+	Eigen::VectorXd disp;      // tangent_size, BlockPositionDelta(pos[k_hi], pos[k_lo])
 	const CubicConfigurationSpline* spline = nullptr;  // for block_offsets_
 };
 
@@ -64,9 +77,16 @@ struct InteractionRow {
 struct ProblemLayout {
 	int n = 0;
 	std::vector<AgentLayout> agents;
-	std::vector<SegmentLayout> segments;
+	std::vector<BlockSegment> block_segments;
 	std::vector<InteractionRow> interactions;
 	Eigen::VectorXd x_init;
+	// Per-agent (K+1) x num_blocks active-knot mask (1 == real knot for that
+	// block, 0 == bridge the block past it; rows 0 and K forced to 1). The
+	// SAME matrix GraphTimingMPC::fill_cubic_splines feeds to
+	// CubicConfigurationSpline::set_block_active_mask -- built here so the
+	// timing solve's merged BlockSegments and the output spline's bridged
+	// knots can never disagree. Empty matrix for an agent with K == 0.
+	std::vector<Eigen::MatrixXi> agent_block_active;
 };
 
 Eigen::VectorXd CumsumWithZero(const Eigen::VectorXd& x, int n);
@@ -77,18 +97,20 @@ Eigen::VectorXd CumsumWithZero(const Eigen::VectorXd& x, int n);
 // that piece. time_cost/time_cost2 contribute EXACTLY (already linear/
 // diagonal-quadratic -- no Gauss-Newton approximation needed).
 //
-// acceleration_cost's psi is the only approximated part: each block's D/V
-// residual pair is differentiated locally (only tau and that block's own
-// free v0/v1 are ever seeded -- different blocks within a segment never
-// share v variables, and disp is a precomputed constant, itself already
-// manifold-correct -- CubicConfigurationSpline::PositionDelta wrap-adjusts
-// Torus and quaternion-logs SO3Quat, not a raw ambient subtraction), and
-// every residual's contribution to f/grad/H_GN is accumulated into the
-// GLOBAL arrays at that residual's own global variable indices. H_GN
-// triplets may repeat the same (row, col) pair many times (e.g. every block
-// within a segment touches that segment's shared tau; a shared interior v
-// is touched by both the segment ending there and the one starting there)
-// -- the caller is expected to sum duplicates
+// acceleration_cost's psi is the only approximated part: iterated over
+// layout.block_segments (one merged Hermite piece per block per bridged
+// span), each block-segment's D/V residual pair is differentiated locally
+// -- only the piece's own spanned tau(s) and its own free v0/v1 are ever
+// seeded. A bridged block's piece spans MORE than one base tau, so all of
+// them are seeded and the residual's curvature in their sum produces the
+// cross-tau Gauss-Newton Hessian terms. disp is a precomputed constant,
+// itself manifold-correct (CubicConfigurationSpline::BlockPositionDelta
+// wrap-adjusts Torus and quaternion-logs SO3Quat, not a raw ambient
+// subtraction). Every residual's contribution to f/grad/H_GN is accumulated
+// into the GLOBAL arrays at its own global variable indices. H_GN triplets
+// may repeat the same (row, col) pair many times (block-segments sharing a
+// base tau; a shared interior v touched by the block-segment ending there
+// and the one starting there) -- the caller is expected to sum duplicates
 // (Eigen::SparseMatrix::setFromTriplets does this, or a caller building a
 // dense Hessian can just accumulate directly), not treat this list as
 // already-deduplicated.
@@ -102,11 +124,14 @@ void AssembleObjective(
 	Eigen::VectorXd* grad_out,
 	std::vector<Eigen::Triplet<double>>* hess_out);
 
-// Builds the flat decision-vector layout (agent tau/v ranges, per-segment
-// constant data, interaction rows, initial guess) for one solve() call.
-// Sparse/real-node-only path: ordering/cross-agent interactions are
-// resolved via graph.get_agent_paths, and each agent's waypoint positions
-// looked up from the full `waypoints` matrix by resolved node id.
+// Builds the flat decision-vector layout (agent tau/v ranges, per-
+// block-segment constant data, interaction rows, initial guess, per-agent
+// active-knot mask) for one solve() call. Sparse/real-node-only path:
+// ordering/cross-agent interactions are resolved via graph.get_agent_paths,
+// each agent's waypoint positions looked up from the full `waypoints`
+// matrix by resolved node id, and which blocks each node actually pins
+// (hence which knots the timing solve merges past) from
+// graph.constrained_columns(node, var_assignments).
 ProblemLayout BuildProblemLayout(
 	const GraphOfConstraints& graph,
 	const std::vector<CubicConfigurationSpline>& splines,
@@ -130,13 +155,18 @@ ProblemLayout BuildProblemLayout(
 // GraphOfConstraints::reindex_agent_interactions) and expanded each agent's
 // node sequence into `agent_dense_wps`/`agent_dense_node_ids` (one row per
 // decision-variable segment target; node id -1 for a synthetic/traced
-// interior point). Everything else (per-segment layout, warm start) is
-// identical to BuildProblemLayout's own -- both share BuildProblemLayoutCore.
+// interior point). Everything else (per-block-segment layout, warm start,
+// active-knot mask) is identical to BuildProblemLayout's own -- both share
+// BuildProblemLayoutCore. `graph`/`var_assignments` are still needed (only)
+// to resolve constrained_columns for the real node ids in the dense
+// sequence -- the SAME graph this timing instance was constructed with.
 ProblemLayout BuildDenseProblemLayout(
+	const GraphOfConstraints& graph,
 	const std::vector<CubicConfigurationSpline>& splines,
 	const std::vector<Eigen::MatrixXd>& agent_dense_wps,
 	const std::vector<std::vector<int>>& agent_dense_node_ids,
 	const std::vector<AgentInteraction>& agent_interactions,
+	const Eigen::VectorXi& var_assignments,
 	const std::map<std::pair<int, int>, double>& edge_to_min_tau_map,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,

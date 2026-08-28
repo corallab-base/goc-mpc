@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
+#include <map>
 #include <stdexcept>
 
 #include <unsupported/Eigen/AutoDiff>
@@ -37,88 +39,85 @@ void AssembleObjective(
 	Eigen::VectorXd grad = Eigen::VectorXd::Zero(layout.n);
 	std::vector<Eigen::Triplet<double>> triplets;
 
-	// time_cost / time_cost2: exact, no approximation.
-	for (const auto& seg : layout.segments) {
-		const double tau = x(seg.tau_idx);
-		f += time_cost * tau + time_cost2 * tau * tau;
-		grad(seg.tau_idx) += time_cost + 2.0 * time_cost2 * tau;
-		if (time_cost2 > 0.0) {
-			triplets.emplace_back(seg.tau_idx, seg.tau_idx, 2.0 * time_cost2);
+	// time_cost / time_cost2: exact, no approximation. One term per base
+	// interval tau -- every agent's K contiguous tau columns.
+	for (const auto& al : layout.agents) {
+		for (int j = 0; j < al.K; ++j) {
+			const int idx = al.tau_offset + j;
+			const double tau = x(idx);
+			f += time_cost * tau + time_cost2 * tau * tau;
+			grad(idx) += time_cost + 2.0 * time_cost2 * tau;
+			if (time_cost2 > 0.0) triplets.emplace_back(idx, idx, 2.0 * time_cost2);
 		}
 	}
 
 	if (acceleration_cost > 0.0) {
 		const double sqrt_accel = std::sqrt(acceleration_cost);
 
-		for (const auto& seg : layout.segments) {
-			const double tau_val = x(seg.tau_idx);
+		for (const auto& bs : layout.block_segments) {
+			const auto& off = bs.spline->block_offsets_[bs.block_idx];
+			if (off.type == CubicConfigurationSpline::Block::Type::SO3Mat) {
+				throw std::runtime_error(
+					"GraphTimingMPC: SO3Mat blocks are not supported "
+					"(matches BlockPositionDelta's own unsupported-"
+					"SO3Mat stub)");
+			}
 
-			for (const auto& off : seg.spline->block_offsets_) {
-				if (off.type == CubicConfigurationSpline::Block::Type::SO3Mat) {
-					throw std::runtime_error(
-						"GraphTimingMPC: SO3Mat blocks are not supported "
-						"(matches BlockPositionDelta's own unsupported-"
-						"SO3Mat stub)");
-				}
+			const int tN = off.tangent_size;
+			const int nTau = static_cast<int>(bs.tau_indices.size());
+			const bool v0_free = bs.v0_idx >= 0;
+			const bool v1_free = bs.v1_idx >= 0;
+			const int L = nTau + (v0_free ? tN : 0) + (v1_free ? tN : 0);
 
-				const int tN = off.tangent_size;
-				const bool v0_free = seg.v0_idx >= 0;
-				const bool v1_free = seg.v1_idx >= 0;
-				const int L = 1 + (v0_free ? tN : 0) + (v1_free ? tN : 0);
+			// Local AutoDiff seeds: [tau_0..tau_{nTau-1}, v0_blk?, v1_blk?].
+			// v0_idx/v1_idx already point at this block's own packed column,
+			// so component k is at v{0,1}_idx + k (no + tangent_offset).
+			std::vector<int> global_idx;
+			global_idx.reserve(L);
+			for (int t = 0; t < nTau; ++t) global_idx.push_back(bs.tau_indices[t]);
+			if (v0_free)
+				for (int k = 0; k < tN; ++k) global_idx.push_back(bs.v0_idx + k);
+			if (v1_free)
+				for (int k = 0; k < tN; ++k) global_idx.push_back(bs.v1_idx + k);
 
-				std::vector<int> global_idx;
-				global_idx.reserve(L);
-				global_idx.push_back(seg.tau_idx);
-				if (v0_free) {
-					for (int k = 0; k < tN; ++k) {
-						global_idx.push_back(seg.v0_idx + off.tangent_offset + k);
+			// The merged piece's duration is the SUM of the spanned base
+			// taus; every one is a live derivative.
+			ADS T = ADS(x(bs.tau_indices[0]), L, 0);
+			for (int t = 1; t < nTau; ++t) T += ADS(x(bs.tau_indices[t]), L, t);
+
+			ADVec v0(tN), v1(tN);
+			int next = nTau;
+			for (int k = 0; k < tN; ++k) {
+				v0(k) = v0_free ? ADS(x(bs.v0_idx + k), L, next++)
+						: ADS(bs.v0_const(k));
+			}
+			for (int k = 0; k < tN; ++k) {
+				v1(k) = v1_free ? ADS(x(bs.v1_idx + k), L, next++)
+						: ADS(bs.v1_const(k));
+			}
+
+			const ADS tau_inv = 1.0 / T;
+			const ADS tau_inv_sqrt = sqrt(tau_inv);
+
+			for (int k = 0; k < tN; ++k) {
+				const ADS D = bs.disp(k) - 0.5 * T * (v0(k) + v1(k));
+				const ADS V = v1(k) - v0(k);
+				const ADS r_D = (std::sqrt(12.0) * sqrt_accel) * tau_inv * tau_inv_sqrt * D;
+				const ADS r_V = sqrt_accel * tau_inv_sqrt * V;
+
+				const ADS residuals[2] = {r_D, r_V};
+				for (const ADS& r : residuals) {
+					f += r.value() * r.value();
+					const Eigen::VectorXd& dr = r.derivatives();
+					for (int a = 0; a < L; ++a) {
+						grad(global_idx[a]) += 2.0 * r.value() * dr(a);
 					}
-				}
-				if (v1_free) {
-					for (int k = 0; k < tN; ++k) {
-						global_idx.push_back(seg.v1_idx + off.tangent_offset + k);
-					}
-				}
-
-				// Seed local AutoDiff vars: [tau, v0_blk?, v1_blk?].
-				const ADS tau(tau_val, L, 0);
-				ADVec v0(tN), v1(tN);
-				int next = 1;
-				for (int k = 0; k < tN; ++k) {
-					v0(k) = v0_free
-						? ADS(x(seg.v0_idx + off.tangent_offset + k), L, next++)
-						: ADS(seg.v0_const(off.tangent_offset + k));
-				}
-				for (int k = 0; k < tN; ++k) {
-					v1(k) = v1_free
-						? ADS(x(seg.v1_idx + off.tangent_offset + k), L, next++)
-						: ADS(seg.v1_const(off.tangent_offset + k));
-				}
-
-				const ADS tau_inv = 1.0 / tau;
-				const ADS tau_inv_sqrt = sqrt(tau_inv);
-
-				for (int k = 0; k < tN; ++k) {
-					const ADS D = seg.disp(off.tangent_offset + k)
-						- 0.5 * tau * (v0(k) + v1(k));
-					const ADS V = v1(k) - v0(k);
-					const ADS r_D = (std::sqrt(12.0) * sqrt_accel) * tau_inv * tau_inv_sqrt * D;
-					const ADS r_V = sqrt_accel * tau_inv_sqrt * V;
-
-					const ADS residuals[2] = {r_D, r_V};
-					for (const ADS& r : residuals) {
-						f += r.value() * r.value();
-						const Eigen::VectorXd& dr = r.derivatives();
-						for (int a = 0; a < L; ++a) {
-							grad(global_idx[a]) += 2.0 * r.value() * dr(a);
-						}
-						for (int a = 0; a < L; ++a) {
-							for (int b = 0; b <= a; ++b) {
-								const int ga = global_idx[a], gb = global_idx[b];
-								triplets.emplace_back(
-									std::max(ga, gb), std::min(ga, gb),
-									2.0 * dr(a) * dr(b));
-							}
+					for (int a = 0; a < L; ++a) {
+						for (int b = 0; b <= a; ++b) {
+							const int ga = global_idx[a], gb = global_idx[b];
+							triplets.emplace_back(
+								std::max(ga, gb), std::min(ga, gb),
+								2.0 * dr(a) * dr(b));
 						}
 					}
 				}
@@ -153,17 +152,93 @@ std::vector<int> CumulativeOffsets(const std::vector<int>& dims) {
 	return offsets;
 }
 
-// Shared core: builds segments/interactions/x_init given each agent's
+// Per-(knot, block) active-knot mask for one agent's spline: (K+1) rows
+// (knot 0 == x0, knots 1..K == `node_ids` in order), num_blocks cols. 1 ==
+// this block treats that knot as a real Hermite knot; 0 == bridge the block
+// straight past it with one longer merged piece. Rows 0 and K are forced to
+// 1 (endpoints are always real knots). GraphTimingMPC::fill_cubic_splines
+// consumes the identical matrix, so the two must stay in lockstep -- this
+// is the single source of truth (kept on ProblemLayout, reused there).
+//
+// A real node marks a block active iff >= 1 of that block's ambient
+// components is pinned by some constraint at that node
+// (constrained_columns, cached across agents in `cols_cache`); a partial
+// pin (0 < cnt < ambient_size, e.g. two of a quaternion's four components)
+// still counts as a knot but is worth a one-line warning. A synthetic
+// (-1 id, traced-interior) node is a knot for block b only where BOTH
+// bracketing real knots are -- otherwise it sits inside a span the block is
+// bridging and pinning the trace's merely-interpolated value there would
+// defeat the bridge.
+Eigen::MatrixXi AgentBlockActiveMask(
+		const GraphOfConstraints& graph,
+		const Eigen::VectorXi& var_assignments,
+		const CubicConfigurationSpline& spline,
+		int agent_id,
+		const std::vector<int>& node_ids,
+		std::map<int, Eigen::VectorXi>& cols_cache) {
+	const auto& offs = spline.block_offsets_;
+	const int NB = static_cast<int>(offs.size());
+	const int K = static_cast<int>(node_ids.size());
+	Eigen::MatrixXi mask = Eigen::MatrixXi::Ones(K + 1, NB);
+	if (K == 0) return mask;
+	const int abase = graph.agent_col_offset(agent_id);
+
+	// Pass 1: real nodes.
+	for (int r = 1; r <= K; ++r) {
+		const int node = node_ids[r - 1];
+		if (node < 0) continue;
+		auto it = cols_cache.find(node);
+		if (it == cols_cache.end()) {
+			it = cols_cache.emplace(
+				node, graph.constrained_columns(node, var_assignments)).first;
+		}
+		const Eigen::VectorXi& cols = it->second;
+		for (int b = 0; b < NB; ++b) {
+			const int cnt = cols.segment(abase + offs[b].ambient_offset,
+						     offs[b].ambient_size).sum();
+			if (cnt == 0) {
+				mask(r, b) = 0;
+			} else if (cnt < offs[b].ambient_size) {
+				std::cout << "GraphTimingMPC: agent " << agent_id << " block " << b
+					  << " only partially constrained (" << cnt << "/"
+					  << offs[b].ambient_size << ") at node " << node
+					  << " -- keeping it as a full knot.\n";
+			}
+		}
+	}
+
+	// Pass 2: synthetic (-1) nodes. `p`/`q` scan out to the bracketing real
+	// knots (0 == x0, K == last); a dense sequence always ends on a real
+	// node so `q` terminates, but clamp anyway.
+	for (int r = 1; r <= K; ++r) {
+		if (node_ids[r - 1] >= 0) continue;
+		int p = r - 1;
+		while (p >= 1 && node_ids[p - 1] < 0) --p;
+		int q = r + 1;
+		while (q <= K && node_ids[q - 1] < 0) ++q;
+		const int qq = std::min(q, K);
+		for (int b = 0; b < NB; ++b) mask(r, b) = mask(p, b) & mask(qq, b);
+	}
+
+	mask.row(0).setOnes();
+	mask.row(K).setOnes();
+	return mask;
+}
+
+// Shared core: builds block_segments/interactions/x_init given each agent's
 // already-resolved (node_ids, wps) pair (real node ids, or -1 for a
-// synthetic/traced interior point in the dense case) and already-resolved
-// interactions -- both BuildProblemLayout (sparse) and
-// BuildDenseProblemLayout share this; they differ only in HOW agent_wps/
-// agent_node_ids/interactions get resolved before calling in.
+// synthetic/traced interior point in the dense case), already-resolved
+// interactions, and already-resolved per-agent active-knot mask
+// (`agent_block_active[i]`, (K_i+1) x num_blocks, or an empty matrix ==
+// "every knot active" / agent has no spline). Both BuildProblemLayout
+// (sparse) and BuildDenseProblemLayout share this; they differ only in HOW
+// those inputs get resolved before calling in.
 ProblemLayout BuildProblemLayoutCore(
 		const std::vector<CubicConfigurationSpline>& splines,
 		const std::vector<std::vector<int>>& agent_node_ids,
 		const std::vector<Eigen::MatrixXd>& agent_wps,
 		const std::vector<AgentInteraction>& agent_interactions,
+		const std::vector<Eigen::MatrixXi>& agent_block_active,
 		const std::map<std::pair<int, int>, double>& edge_to_min_tau_map,
 		const Eigen::VectorXd& x0,
 		const Eigen::VectorXd& v0,
@@ -184,9 +259,21 @@ ProblemLayout BuildProblemLayoutCore(
 
 	layout.agents.resize(num_agents);
 
-	// First pass: settle every agent's tau/v ranges (an interaction row can
-	// reference any agent regardless of loop order, so every range must be
-	// known before the interaction-row pass below).
+	auto block_active = [&](int i, int knot, int b) -> bool {
+		const Eigen::MatrixXi& m = agent_block_active[i];
+		return m.size() == 0 || m(knot, b) != 0;
+	};
+
+	// Per-agent, per-block list of active knot indices (always starts 0,
+	// ends K) and, for each interior active knot, the global column of that
+	// block's velocity variable there.
+	std::vector<std::vector<std::vector<int>>> aknots(num_agents);
+	std::vector<std::vector<std::map<int, int>>> vcol(num_agents);
+
+	// First pass: settle every agent's tau range, then its per-block-packed
+	// v range (an interaction row can reference any agent regardless of loop
+	// order, so every range must be known before the interaction-row pass
+	// below). A block bridged past an interior knot gets NO v column there.
 	int n = 0;
 	for (int i = 0; i < num_agents; ++i) {
 		const int K = static_cast<int>(agent_node_ids[i].size());
@@ -195,67 +282,124 @@ ProblemLayout BuildProblemLayoutCore(
 
 		layout.agents[i].tau_offset = n;
 		n += K;
-		if (K > 1) {
-			layout.agents[i].v_offset = n;
-			n += (K - 1) * tangent_dims[i];
+		layout.agents[i].v_offset = n;
+
+		const auto& offs = splines[i].block_offsets_;
+		const int NB = static_cast<int>(offs.size());
+		aknots[i].assign(NB, {});
+		vcol[i].assign(NB, {});
+		for (int b = 0; b < NB; ++b) {
+			aknots[i][b].push_back(0);
+			for (int k = 1; k <= K - 1; ++k) {
+				if (!block_active(i, k, b)) continue;
+				vcol[i][b][k] = n;
+				n += offs[b].tangent_size;
+				aknots[i][b].push_back(k);
+			}
+			aknots[i][b].push_back(K);
 		}
 	}
 	layout.n = n;
 
 	// Default initial guess: tau=10 (interior to [kTauMin, kTauMax]), v=1 --
-	// same generic guess add_agent_timing_segments used. Overwritten below,
-	// per row, by whichever of the two later passes actually has something
-	// better to say about that row: an exact warm-start match against the
-	// previous cycle's own converged solution where one exists, else a
-	// distance/speed-based estimate (see that pass's own comment) -- this
-	// flat value only ever survives to `RunTrustRegionSqp` for a tau row
-	// neither pass could inform (in practice: no previous cycle to warm
-	// start from at all, i.e. this episode's very first solve).
+	// same generic guess the old regular-grid layout used. Overwritten
+	// below, per row, by whichever of the two later passes actually has
+	// something better to say: an exact warm-start match against the
+	// previous cycle's converged solution where one exists, else a
+	// distance/speed-based estimate -- this flat value only ever survives to
+	// `RunTrustRegionSqp` for a tau row neither pass could inform (in
+	// practice: this episode's very first solve).
 	layout.x_init = Eigen::VectorXd::Zero(n);
 	for (int i = 0; i < num_agents; ++i) {
 		const AgentLayout& al = layout.agents[i];
 		for (int j = 0; j < al.K; ++j) layout.x_init(al.tau_offset + j) = 10.0;
-		if (al.K > 1) {
-			for (int k = al.v_offset; k < al.v_offset + (al.K - 1) * tangent_dims[i]; ++k) {
-				layout.x_init(k) = 1.0;
+		if (al.K == 0) continue;
+		const auto& offs = splines[i].block_offsets_;
+		for (int b = 0; b < static_cast<int>(vcol[i].size()); ++b) {
+			for (const auto& [knot, col] : vcol[i][b]) {
+				(void)knot;
+				for (int c = 0; c < offs[b].tangent_size; ++c)
+					layout.x_init(col + c) = 1.0;
 			}
 		}
 	}
 
-	// Second pass: per-segment layout.
+	// Second pass: one merged Hermite BlockSegment per (agent, block,
+	// active-knot span). For an unbridged block this is one per base
+	// interval (k_hi == k_lo + 1); a bridged block collapses the spanned
+	// intervals into a single longer piece whose duration is their tau sum.
 	for (int i = 0; i < num_agents; ++i) {
 		const AgentLayout& al = layout.agents[i];
 		if (al.K == 0) continue;
+		const int K = al.K;
 		const Eigen::MatrixXd& wps_i = agent_wps[i];
 		const Eigen::VectorXd x0_i = x0.segment(ambient_offsets[i], ambient_dims[i]);
 		const Eigen::VectorXd v0_i = v0.segment(tangent_offsets[i], tangent_dims[i]);
 		const CubicConfigurationSpline& spline = splines.at(i);
+		const auto& offs = spline.block_offsets_;
 
+		auto pos_at = [&](int k) -> Eigen::VectorXd {
+			return (k == 0) ? x0_i : Eigen::VectorXd(wps_i.row(k - 1).transpose());
+		};
+
+		for (int b = 0; b < static_cast<int>(offs.size()); ++b) {
+			const auto& off = offs[b];
+			const std::vector<int>& ak = aknots[i][b];
+			for (int s = 0; s + 1 < static_cast<int>(ak.size()); ++s) {
+				const int k_lo = ak[s], k_hi = ak[s + 1];
+				BlockSegment bs;
+				bs.agent = i;
+				bs.block_idx = b;
+				bs.k_lo = k_lo;
+				bs.k_hi = k_hi;
+				bs.spline = &spline;
+				for (int j = k_lo; j < k_hi; ++j)
+					bs.tau_indices.push_back(al.tau_offset + j);
+
+				if (k_lo == 0) {
+					bs.v0_idx = -1;
+					bs.v0_const = v0_i.segment(off.tangent_offset, off.tangent_size);
+				} else {
+					bs.v0_idx = vcol[i][b].at(k_lo);
+				}
+				if (k_hi == K) {
+					bs.v1_idx = -1;
+					bs.v1_const = Eigen::VectorXd::Zero(off.tangent_size);
+				} else {
+					bs.v1_idx = vcol[i][b].at(k_hi);
+				}
+
+				bs.disp = CubicConfigurationSpline::BlockPositionDelta<double>(
+					off, pos_at(k_hi), pos_at(k_lo));
+				layout.block_segments.push_back(std::move(bs));
+			}
+		}
+	}
+
+	// Reliable per-base-interval displacement magnitude (indexed by this
+	// agent's tau column), summed over ONLY the blocks that are a real knot
+	// at both ends of that interval -- a bridged block's waypoint value at a
+	// skipped knot is unconstrained garbage and must not enter the
+	// warm-start scale estimate below. Used only to seed tau guesses.
+	std::vector<double> tau_disp_norm(n, 0.0);
+	for (int i = 0; i < num_agents; ++i) {
+		const AgentLayout& al = layout.agents[i];
+		if (al.K == 0) continue;
+		const auto& offs = splines[i].block_offsets_;
+		const Eigen::VectorXd x0_i = x0.segment(ambient_offsets[i], ambient_dims[i]);
+		const Eigen::MatrixXd& wps_i = agent_wps[i];
+		auto pos_at = [&](int k) -> Eigen::VectorXd {
+			return (k == 0) ? x0_i : Eigen::VectorXd(wps_i.row(k - 1).transpose());
+		};
 		for (int j = 0; j < al.K; ++j) {
-			SegmentLayout seg;
-			seg.tau_idx = al.tau_offset + j;
-			seg.spline = &spline;
-
-			Eigen::VectorXd xJm1(ambient_dims[i]);
-			if (j == 0) {
-				xJm1 = x0_i;
-				seg.v0_idx = -1;
-				seg.v0_const = v0_i;
-			} else {
-				xJm1 = wps_i.row(j - 1).transpose();
-				seg.v0_idx = al.v_offset + (j - 1) * tangent_dims[i];
+			const Eigen::VectorXd plo = pos_at(j), phi = pos_at(j + 1);
+			double sumsq = 0.0;
+			for (int b = 0; b < static_cast<int>(offs.size()); ++b) {
+				if (!block_active(i, j, b) || !block_active(i, j + 1, b)) continue;
+				sumsq += CubicConfigurationSpline::BlockPositionDelta<double>(
+					offs[b], phi, plo).squaredNorm();
 			}
-
-			const Eigen::VectorXd xJ = wps_i.row(j).transpose();
-			if (j == al.K - 1) {
-				seg.v1_idx = -1;
-				seg.v1_const = Eigen::VectorXd::Zero(tangent_dims[i]);
-			} else {
-				seg.v1_idx = al.v_offset + j * tangent_dims[i];
-			}
-
-			seg.disp = spline.PositionDelta<double>(xJ, xJm1);
-			layout.segments.push_back(std::move(seg));
+			tau_disp_norm[al.tau_offset + j] = std::sqrt(sumsq);
 		}
 	}
 
@@ -293,8 +437,10 @@ ProblemLayout BuildProblemLayoutCore(
 	for (int i = 0; i < num_agents; ++i) {
 		if (!prev_agent_spline_length_map.contains(i)) continue;
 		const AgentLayout& al = layout.agents[i];
+		if (al.K == 0) continue;
 		const std::vector<int>& new_nodes = agent_node_ids[i];
 		const std::vector<int>& old_nodes = prev_agent_nodes_list[i];
+		const auto& offs = splines[i].block_offsets_;
 
 		for (int j_new = 0; j_new < static_cast<int>(new_nodes.size()); ++j_new) {
 			if (new_nodes[j_new] < 0) continue;
@@ -306,10 +452,19 @@ ProblemLayout BuildProblemLayoutCore(
 				layout.x_init(al.tau_offset + j_new) = prev_time_deltas_list[i](j_old);
 				tau_matched[al.tau_offset + j_new] = true;
 			}
-			if (j_old < prev_vs_list[i].rows() && j_new < al.K - 1) {
-				for (int c = 0; c < tangent_dims[i]; ++c) {
-					layout.x_init(al.v_offset + j_new * tangent_dims[i] + c) =
-						prev_vs_list[i](j_old, c);
+			// v warm start for interior knot (j_new + 1): copy each block's
+			// previous velocity there, but only for blocks that actually
+			// have a v column at this knot this cycle (an unbridged block).
+			// prev_vs_list[i] rows stay full tangent width -- a block bridged
+			// LAST cycle wrote 0 there, harmless as a starting guess.
+			const int knot = j_new + 1;
+			if (knot <= al.K - 1 && j_old < prev_vs_list[i].rows()) {
+				for (int b = 0; b < static_cast<int>(vcol[i].size()); ++b) {
+					const auto vit = vcol[i][b].find(knot);
+					if (vit == vcol[i][b].end()) continue;
+					for (int c = 0; c < offs[b].tangent_size; ++c)
+						layout.x_init(vit->second + c) =
+							prev_vs_list[i](j_old, offs[b].tangent_offset + c);
 				}
 			}
 		}
@@ -334,30 +489,35 @@ ProblemLayout BuildProblemLayoutCore(
 	// joint-space arm, etc., so there's no one "reasonable m/s" constant
 	// that's valid everywhere), this estimates a speed FROM the very rows
 	// warm-start matching above just confirmed are trustworthy this same
-	// cycle: avg_speed = mean(segment displacement / matched tau) over
-	// every successfully-matched row, then applies that same speed to each
-	// unmatched row's own (always-known) displacement. Falls back to the
-	// original flat default only when there's nothing to learn a speed
-	// from at all (e.g. the very first solve of an episode, before any
-	// row has ever been matched).
+	// cycle: avg_speed = mean(reliable interval displacement / matched tau)
+	// over every successfully-matched row, then applies that same speed to
+	// each unmatched row's own reliable displacement. Falls back to the
+	// original flat default only when there's nothing to learn a speed from
+	// at all (e.g. the very first solve of an episode), or for an interval
+	// with no reliably-known displacement (every block bridged across an
+	// endpoint of it).
 	{
 		double speed_sum = 0.0;
 		int speed_count = 0;
-		for (const auto& seg : layout.segments) {
-			if (!tau_matched[seg.tau_idx]) continue;
-			const double tau = layout.x_init(seg.tau_idx);
-			if (tau > 1e-6) {
-				speed_sum += seg.disp.norm() / tau;
+		for (int idx = 0; idx < n; ++idx) {
+			if (!tau_matched[idx]) continue;
+			const double tau = layout.x_init(idx);
+			if (tau > 1e-6 && tau_disp_norm[idx] > 1e-9) {
+				speed_sum += tau_disp_norm[idx] / tau;
 				++speed_count;
 			}
 		}
 		if (speed_count > 0) {
 			const double avg_speed = speed_sum / speed_count;
 			if (avg_speed > 1e-6) {
-				for (const auto& seg : layout.segments) {
-					if (tau_matched[seg.tau_idx]) continue;
-					const double est_tau = seg.disp.norm() / avg_speed;
-					layout.x_init(seg.tau_idx) = std::clamp(est_tau, kTauMin, kTauMax);
+				for (int i = 0; i < num_agents; ++i) {
+					const AgentLayout& al = layout.agents[i];
+					for (int j = 0; j < al.K; ++j) {
+						const int idx = al.tau_offset + j;
+						if (tau_matched[idx] || tau_disp_norm[idx] <= 1e-9) continue;
+						layout.x_init(idx) = std::clamp(
+							tau_disp_norm[idx] / avg_speed, kTauMin, kTauMax);
+					}
 				}
 			}
 		}
@@ -416,18 +576,37 @@ ProblemLayout BuildProblemLayout(
 		(*wps_list_out)[i] = wps_i;
 	}
 
-	return BuildProblemLayoutCore(
+	// Which blocks each resolved node actually pins -> which knots the timing
+	// solve merges past (and, via layout.agent_block_active, which knots the
+	// output spline bridges). cols_cache dedupes constrained_columns across
+	// agents that both visit a node.
+	std::vector<Eigen::MatrixXi> agent_block_active(num_agents);
+	{
+		std::map<int, Eigen::VectorXi> cols_cache;
+		for (int i = 0; i < num_agents; ++i) {
+			if ((*agent_nodes_list_out)[i].empty()) continue;
+			agent_block_active[i] = AgentBlockActiveMask(
+				graph, var_assignments, splines.at(i), i,
+				(*agent_nodes_list_out)[i], cols_cache);
+		}
+	}
+
+	ProblemLayout layout = BuildProblemLayoutCore(
 		splines, *agent_nodes_list_out, agent_wps, agent_interactions,
-		graph.edge_to_min_tau_map, x0, v0,
+		agent_block_active, graph.edge_to_min_tau_map, x0, v0,
 		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
 		prev_agent_spline_length_map);
+	layout.agent_block_active = std::move(agent_block_active);
+	return layout;
 }
 
 ProblemLayout BuildDenseProblemLayout(
+		const GraphOfConstraints& graph,
 		const std::vector<CubicConfigurationSpline>& splines,
 		const std::vector<Eigen::MatrixXd>& agent_dense_wps,
 		const std::vector<std::vector<int>>& agent_dense_node_ids,
 		const std::vector<AgentInteraction>& agent_interactions,
+		const Eigen::VectorXi& var_assignments,
 		const std::map<std::pair<int, int>, double>& edge_to_min_tau_map,
 		const Eigen::VectorXd& x0,
 		const Eigen::VectorXd& v0,
@@ -441,11 +620,28 @@ ProblemLayout BuildDenseProblemLayout(
 	*wps_list_out = agent_dense_wps;
 	*agent_nodes_list_out = agent_dense_node_ids;
 
-	return BuildProblemLayoutCore(
+	const int num_agents = static_cast<int>(splines.size());
+	// Same per-agent active-knot mask as the sparse path -- only the real
+	// (id >= 0) rows of the dense sequence hit constrained_columns; synthetic
+	// interior rows inherit from their bracketing real knots (AgentBlockActiveMask).
+	std::vector<Eigen::MatrixXi> agent_block_active(num_agents);
+	{
+		std::map<int, Eigen::VectorXi> cols_cache;
+		for (int i = 0; i < num_agents; ++i) {
+			if (agent_dense_node_ids[i].empty()) continue;
+			agent_block_active[i] = AgentBlockActiveMask(
+				graph, var_assignments, splines.at(i), i,
+				agent_dense_node_ids[i], cols_cache);
+		}
+	}
+
+	ProblemLayout layout = BuildProblemLayoutCore(
 		splines, agent_dense_node_ids, agent_dense_wps, agent_interactions,
-		edge_to_min_tau_map, x0, v0,
+		agent_block_active, edge_to_min_tau_map, x0, v0,
 		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
 		prev_agent_spline_length_map);
+	layout.agent_block_active = std::move(agent_block_active);
+	return layout;
 }
 
 }  // namespace gn_timing

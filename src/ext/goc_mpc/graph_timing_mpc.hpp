@@ -160,6 +160,15 @@ struct GraphTimingMPC {
 	// caller passed nothing (a graph with no assignable-agent constraints).
 	Eigen::VectorXi _last_var_assignments;
 
+	// Per-agent (K+1) x num_blocks active-knot mask from the last
+	// solve()/solve_dense() layout build (ProblemLayout::agent_block_active).
+	// fill_cubic_splines feeds it straight to
+	// CubicConfigurationSpline::set_block_active_mask -- so the output
+	// spline's bridged knots are exactly the ones the timing solve merged
+	// its BlockSegments across, with no second constrained_columns pass.
+	// Empty entry == that agent had no active spline that cycle.
+	std::vector<Eigen::MatrixXi> _agent_block_active_list;
+
 	double _time_cost;
 	double _time_cost2;
 	double _acceleration_cost;

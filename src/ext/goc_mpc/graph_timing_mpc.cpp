@@ -258,9 +258,11 @@ SqpResult RunTrustRegionSqp(
 	// its own to clamp a step against -- see this file's header comment).
 	Eigen::VectorXd var_lb = Eigen::VectorXd::Constant(n_smooth, -kInf);
 	Eigen::VectorXd var_ub = Eigen::VectorXd::Constant(n_smooth, kInf);
-	for (const auto& seg : layout.segments) {
-		var_lb(seg.tau_idx) = kTauMin;
-		var_ub(seg.tau_idx) = kTauMax;
+	for (const auto& al : layout.agents) {
+		for (int j = 0; j < al.K; ++j) {
+			var_lb(al.tau_offset + j) = kTauMin;
+			var_ub(al.tau_offset + j) = kTauMax;
+		}
 	}
 
 	double trust_radius = initial_trust_radius;
@@ -467,11 +469,20 @@ void StoreResult(
 		for (int j = 0; j < K; ++j) {
 			(*time_deltas_list)[i](j) = result.x(al.tau_offset + j);
 		}
+		// Interior-knot velocities are packed per block and only for knots
+		// the block treats as real (a bridged block has no variable at a
+		// skipped knot). Write each BlockSegment's k_hi endpoint velocity
+		// (every interior active knot is exactly one block-segment's k_hi);
+		// knots a block bridged stay 0 -- fill_cubic_splines' spline set()
+		// ignores them for that block anyway.
 		(*vs_list)[i] = Eigen::MatrixXd::Zero(std::max(K - 1, 0), tangent_dim);
 		if (K > 1) {
-			for (int row = 0; row < K - 1; ++row) {
-				for (int c = 0; c < tangent_dim; ++c) {
-					(*vs_list)[i](row, c) = result.x(al.v_offset + row * tangent_dim + c);
+			for (const auto& bs : layout.block_segments) {
+				if (bs.agent != i || bs.v1_idx < 0) continue;
+				const auto& off = bs.spline->block_offsets_[bs.block_idx];
+				for (int c = 0; c < off.tangent_size; ++c) {
+					(*vs_list)[i](bs.k_hi - 1, off.tangent_offset + c) =
+						result.x(bs.v1_idx + c);
 				}
 			}
 		}
@@ -520,6 +531,9 @@ bool GraphTimingMPC::solve(
 
 	_wps_list = wps_list;
 	_agent_nodes_list = agent_nodes_list;
+	// Single source of truth for the per-block bridged knots -- fill_cubic_splines
+	// reads this instead of recomputing the mask from constrained_columns.
+	_agent_block_active_list = layout.agent_block_active;
 
 	const SqpResult result = RunTrustRegionSqp(
 		layout, _acceleration_cost, _time_cost, _time_cost2, _interaction_penalty_weight,
@@ -567,7 +581,8 @@ bool GraphTimingMPC::solve_dense(
 	std::vector<std::vector<int>> agent_nodes_list;
 	try {
 		layout = BuildDenseProblemLayout(
-			*_splines, agent_dense_wps, agent_dense_node_ids, agent_interactions,
+			*_graph, *_splines, agent_dense_wps, agent_dense_node_ids,
+			agent_interactions, _last_var_assignments,
 			_graph->edge_to_min_tau_map, x0, v0, &wps_list, &agent_nodes_list,
 			prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
 			prev_agent_spline_length_map);
@@ -579,6 +594,9 @@ bool GraphTimingMPC::solve_dense(
 
 	_wps_list = wps_list;
 	_agent_nodes_list = agent_nodes_list;
+	// Single source of truth for the per-block bridged knots -- fill_cubic_splines
+	// reads this instead of recomputing the mask from constrained_columns.
+	_agent_block_active_list = layout.agent_block_active;
 
 	const SqpResult result = RunTrustRegionSqp(
 		layout, _acceleration_cost, _time_cost, _time_cost2, _interaction_penalty_weight,
@@ -659,19 +677,6 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 		}
 	}
 
-	// Which ambient columns each real node in any agent's sequence pins --
-	// queried ONCE per distinct node here (constrained_columns scans the
-	// whole state row across every agent, so a node two agents both visit
-	// costs nothing extra), then folded per agent/block below.
-	std::map<int, Eigen::VectorXi> cols_by_node;
-	for (int i = 0; i < _graph->num_agents; ++i) {
-		if (get_agent_spline_length(i) <= 1) continue;
-		for (int node : _agent_nodes_list[i]) {
-			if (node >= 0 && !cols_by_node.contains(node))
-				cols_by_node[node] = _graph->constrained_columns(node, _last_var_assignments);
-		}
-	}
-
 	for (int i = 0; i < _graph->num_agents; ++i) {
 		const int a_d = splines[i]->ambient_dim();
 		const int t_d = splines[i]->tangent_dim();
@@ -691,62 +696,25 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 
 			Eigen::VectorXd times_i = CumsumWithZero(_time_deltas_list[i], spline_length_i - 1);
 
-			// Per-(knot, block) knot mask (1 == knot, 0 == bridge past it):
-			// row 0 is x0 (the measured current state -- always a real
-			// knot), rows 1.. are this agent's resolved node sequence (real
-			// graph ids, or -1 for a synthetic traced interior point from
-			// solve_dense). CubicConfigurationSpline::set() bridges any
-			// block a row marks 0 straight across that row with one longer
-			// Hermite piece, and force-activates rows 0 and N-1 regardless.
-			const auto& offs = splines[i]->block_offsets_;
-			const int NB = static_cast<int>(offs.size());
-			const int abase = _graph->agent_col_offset(i);
-			Eigen::MatrixXi mask = Eigen::MatrixXi::Ones(spline_length_i, NB);
-			const std::vector<int>& nodes = _agent_nodes_list[i];
-			const int nn = std::min<int>(spline_length_i - 1,
-						     static_cast<int>(nodes.size()));
-
-			// Pass 1: real nodes. A block is a knot iff >= 1 of its ambient
-			// components is pinned by a constraint there; entirely free
-			// (0) -> bridge. A partial pin still counts as a knot but is
-			// worth flagging (a rotation block can't honor a partial pin,
-			// yet bridging past a node the user did partially constrain is
-			// worse).
-			for (int r = 1; r <= nn; ++r) {
-				const int node = nodes[r - 1];
-				if (node < 0) continue;
-				const Eigen::VectorXi& cols = cols_by_node.at(node);
-				for (int b = 0; b < NB; ++b) {
-					const int cnt = cols.segment(abase + offs[b].ambient_offset,
-								     offs[b].ambient_size).sum();
-					if (cnt == 0) {
-						mask(r, b) = 0;
-					} else if (cnt < offs[b].ambient_size) {
-						std::cout << "GraphTimingMPC::fill_cubic_splines: agent "
-							  << i << " block " << b << " only partially "
-							  << "constrained (" << cnt << "/"
-							  << offs[b].ambient_size << ") at node " << node
-							  << " -- keeping it as a full knot.\n";
-					}
-				}
-			}
-
-			// Pass 2: a synthetic traced node is a knot for block b only
-			// where BOTH bracketing real knots are. Otherwise it sits
-			// inside a span the block is bridging, and pinning the trace's
-			// (merely interpolated) value for that block there would defeat
-			// the bridge. The dense sequence always ends on a real node, so
-			// the forward scan for `q` always terminates.
-			for (int r = 1; r <= nn; ++r) {
-				if (nodes[r - 1] >= 0) continue;
-				int p = r - 1;
-				while (p >= 1 && nodes[p - 1] < 0) --p;   // prev real knot (0 == x0)
-				int q = r + 1;
-				while (q <= nn && nodes[q - 1] < 0) ++q;  // next real knot
-				for (int b = 0; b < NB; ++b)
-					mask(r, b) = mask(p, b) & mask(q, b);
-			}
-			splines[i]->set_block_active_mask(mask);
+			// Per-(knot, block) active mask (1 == real knot, 0 == bridge the
+			// block past it) -- computed once during the last solve()/
+			// solve_dense() layout build (gn_timing::AgentBlockActiveMask,
+			// stored on ProblemLayout::agent_block_active), so the output
+			// spline bridges exactly the knots the timing solve merged its
+			// BlockSegments across. Row 0 is x0, rows 1.. this agent's
+			// resolved node sequence; shape is (spline_length_i x NB).
+			// CubicConfigurationSpline::set() force-activates rows 0 and N-1
+			// regardless. An empty/stale-shaped entry (agent had no active
+			// spline that cycle, or a size skew) falls back to all-knot.
+			const int NB = static_cast<int>(splines[i]->block_offsets_.size());
+			static const Eigen::MatrixXi kNoMask;
+			const Eigen::MatrixXi& mask =
+				(i < static_cast<int>(_agent_block_active_list.size()))
+					? _agent_block_active_list[i] : kNoMask;
+			if (mask.rows() == spline_length_i && mask.cols() == NB)
+				splines[i]->set_block_active_mask(mask);
+			else
+				splines[i]->set_block_active_mask(Eigen::MatrixXi());
 
 			splines[i]->set(wps_i, vs_i, times_i);
 		} else {
