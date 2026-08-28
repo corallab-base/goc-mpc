@@ -180,7 +180,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("get_phi_ids", &GraphOfConstraints::get_phi_ids)
 		.def("get_next_edge_phis", &GraphOfConstraints::get_next_edge_phis)
 		.def("get_agent_paths", &GraphOfConstraints::get_agent_paths,
-		     py::arg("remaining_vertices"), py::arg("assignments"), py::arg("t_by_node"))
+		     py::arg("remaining_vertices"), py::arg("var_assignments"), py::arg("t_by_node"))
 		.def_static("reindex_agent_interactions", &GraphOfConstraints::reindex_agent_interactions,
 		     py::arg("agent_interactions"), py::arg("agent_node_ids"))
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
@@ -405,7 +405,7 @@ void init_submodule_goc_mpc(py::module_& m) {
                      py::arg("interaction_penalty_weight") = 1.0e3)
 		.def("solve", &GraphTimingMPC::solve,
 		     py::arg("x0"), py::arg("v0"), py::arg("remaining_vertices"),
-		     py::arg("waypoints"), py::arg("assignments"),
+		     py::arg("waypoints"), py::arg("var_assignments"),
 		     py::arg("t_by_node") = Eigen::VectorXd())
 		.def("solve_dense", &GraphTimingMPC::solve_dense,
 		     py::arg("x0"), py::arg("v0"), py::arg("agent_dense_wps"),

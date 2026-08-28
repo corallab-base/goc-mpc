@@ -485,7 +485,7 @@ bool GraphTimingMPC::solve(
 		const Eigen::VectorXd& v0,
 		const std::vector<int>& remaining_vertices,
 		const Eigen::MatrixXd& waypoints,
-		const Eigen::VectorXi& assignments,
+		const Eigen::VectorXi& var_assignments,
 		const Eigen::VectorXd& t_by_node) {
 
 	_timer.Start();
@@ -503,7 +503,7 @@ bool GraphTimingMPC::solve(
 	std::vector<std::vector<int>> agent_nodes_list;
 	try {
 		layout = BuildProblemLayout(
-			*_graph, *_splines, remaining_vertices, waypoints, assignments, x0, v0,
+			*_graph, *_splines, remaining_vertices, waypoints, var_assignments, x0, v0,
 			t_by_node, &wps_list, &agent_nodes_list,
 			prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
 			prev_agent_spline_length_map);

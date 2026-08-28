@@ -188,13 +188,13 @@ def main():
             return
 
         waypoints = waypoint_mpc.view_waypoints()
-        assignments = waypoint_mpc.view_assignments()
+        var_assignments = waypoint_mpc.view_var_assignments()
         t_by_node = waypoint_mpc.view_t_by_node()
 
         timing_splines = [CubicConfigurationSpline([Block.R(DIM)]) for _ in range(N_AGENTS)]
         timing_mpc = GraphTimingMPC(
             graph, timing_splines, time_cost=1.0, time_cost2=0.0, acceleration_cost=1.0)
-        if not timing_mpc.solve(x0_flat, V0, remaining, waypoints, assignments, t_by_node):
+        if not timing_mpc.solve(x0_flat, V0, remaining, waypoints, var_assignments, t_by_node):
             status_text.value = "GraphTimingMPC FAILED"
             return
 

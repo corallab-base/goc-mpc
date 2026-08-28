@@ -275,7 +275,7 @@ class TracedTimingMPC:
 
         return np.asarray(dense_positions), dense_ids
 
-    def solve(self, x0, v0, remaining_vertices, waypoints, assignments, t_by_node=None):
+    def solve(self, x0, v0, remaining_vertices, waypoints, var_assignments, t_by_node=None):
         if t_by_node is None:
             t_by_node = np.array([])
 
@@ -284,7 +284,7 @@ class TracedTimingMPC:
         # instead of running a full separate coarse GraphTimingMPC.solve()
         # first (this class's original design; see module docstring).
         _parents, agent_nodes, agent_interactions = self.graph.get_agent_paths(
-            remaining_vertices, assignments, t_by_node)
+            remaining_vertices, var_assignments, t_by_node)
 
         agent_dense_wps = []
         agent_dense_node_ids = []

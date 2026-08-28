@@ -349,9 +349,10 @@ namespace {
 // phi (a real opinion) at once, and the object-only one must not drown
 // the real one out.
 std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
-                              const Eigen::VectorXi& assignments) {
+                              const Eigen::VectorXi& var_assignments) {
 	if (graph.phi_to_variable_map.contains(phi_id)) {
-		const int a = assignments(phi_id);
+		const int var = graph.phi_to_variable_map.at(phi_id);
+		const int a = (var < var_assignments.size()) ? var_assignments(var) : -1;
 		if (a != -1) return {a};
 		return {};
 	}
@@ -375,12 +376,12 @@ std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
 // node (add_edge_constraint) -- that's real, specific ownership, not "no
 // opinion".
 //
-// Node phi ids and edge phi ids are separate counters (num_phis vs.
-// num_edge_phis, see graph_of_constraints.hpp), so an edge phi id can't be
-// looked up in the node-indexed `assignments` vector `PhiOwningAgents`
-// takes -- an assignable edge constraint (edge_phi_to_variable_map) would
-// need its own resolved-assignment vector, which get_agent_paths doesn't
-// currently receive. This only covers constraints actually routed through
+// PhiOwningAgents resolves an assignable NODE phi through
+// phi_to_variable_map + the var-indexed var_assignments; an assignable
+// EDGE constraint (edge_phi_to_variable_map) has its own separate phi-id
+// space and isn't covered here at all (its ownership would need
+// get_edge_phi_agent, which get_agent_paths doesn't consult). This only
+// covers constraints actually routed through
 // `_add_edge_op` (add_edge_constraint and friends); the canonical hold
 // registry (add_hold/add_assignable_hold) bypasses that machinery entirely
 // -- see HoldOwningAgents below for its ownership resolution.
@@ -419,9 +420,9 @@ std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_
 //
 // A statically-assigned hold (add_hold, robot_ag set) resolves
 // immediately. An assignable hold (add_assignable_hold, var_id set)
-// resolves through `var_to_agent` -- THIS solve's own variable assignment
-// (see get_agent_paths, which builds it fresh from assignments/
-// phi_to_variable_map every call), not `committed_assignments` (which only
+// resolves through `var_assignments` -- THIS solve's own variable
+// assignment (the waypoint solver's view_var_assignments(), threaded
+// straight through get_agent_paths), not `committed_assignments` (which only
 // gets an entry once the hold's u_node -- Pick -- has actually COMPLETED
 // at runtime; see add_variable_commit/GraphOfConstraintsMPC._maybe_commit).
 // get_agent_paths runs every cycle to route the WHOLE remaining graph
@@ -434,12 +435,12 @@ std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_
 // business visiting (confirmed on po_goc_mpc's pick_place_task: stray
 // waypoint circles at room corners nowhere near any surface, and the
 // second robot deadlocked in place, never reaching its own Pick). The
-// solver's own `assignments` already resolves every declared variable as
+// solver's own assignment already resolves every declared variable as
 // soon as a solve succeeds -- no need to wait for the physical Pick.
-// Returns {} if `var_to_agent` has no entry for the hold's var (defensive;
+// Returns {} if the hold's var is unassigned/out of range (defensive;
 // same "no opinion yet" contract as EdgePhiOwningAgents/PhiOwningAgents).
 std::set<int> HoldOwningAgents(const GraphOfConstraints& graph, int u, int v,
-                               const std::map<int, int>& var_to_agent) {
+                               const Eigen::VectorXi& var_assignments) {
 	std::set<int> owners;
 	for (const auto& [hold_id, hold] : graph.hold_ops) {
 		if (hold.u_node != u || hold.v_node != v) continue;
@@ -448,8 +449,9 @@ std::set<int> HoldOwningAgents(const GraphOfConstraints& graph, int u, int v,
 			continue;
 		}
 		if (!hold.var_id.has_value()) continue;  // defensive; HoldDeclaration always sets one
-		const auto it = var_to_agent.find(*hold.var_id);
-		if (it != var_to_agent.end()) owners.insert(it->second);
+		const int var = *hold.var_id;
+		if (var < var_assignments.size() && var_assignments(var) >= 0)
+			owners.insert(var_assignments(var));
 	}
 	return owners;
 }
@@ -614,7 +616,7 @@ std::tuple<std::vector<std::optional<int>>,
 	   std::vector<std::vector<int>>,
 	   std::vector<struct AgentInteraction>> GraphOfConstraints::get_agent_paths(
 		   const std::vector<int>& remaining_vertices,
-		   const Eigen::VectorXi& assignments,
+		   const Eigen::VectorXi& var_assignments,
 		   const Eigen::VectorXd& t_by_node) const {
 	const InducedSubgraphView<py::object> sg = InducedSubgraphView<py::object>(
 		structure, remaining_vertices);
@@ -635,19 +637,12 @@ std::tuple<std::vector<std::optional<int>>,
 	std::map<int, std::set<int>> node_to_agents_map;
 	std::vector<struct AgentInteraction> agent_interactions;
 
-	// var_id -> its resolved agent, from THIS solve's own `assignments`
-	// (indexed by phi_id -- see PhiOwningAgents) via phi_to_variable_map --
-	// built once here, rather than re-derived per hold lookup, since
-	// several phis can share one var_id (e.g. Pick's x/y/yaw equalities are
-	// 3 separate phis all tied to the same Robot variable) and they always
-	// agree once assigned. Feeds HoldOwningAgents below; see its own
-	// docstring for why this replaces committed_assignments as that
-	// function's source of truth.
-	std::map<int, int> var_to_agent;
-	for (const auto& [phi_id, var_id] : phi_to_variable_map) {
-		const int a = assignments(phi_id);
-		if (a != -1) var_to_agent[var_id] = a;
-	}
+	// `var_assignments` (the waypoint solver's view_var_assignments(),
+	// var id -> resolved agent, -1 == unassigned) feeds both
+	// PhiOwningAgents (an assignable node phi, via phi_to_variable_map)
+	// and HoldOwningAgents (an assignable hold's own var_id) below -- this
+	// replaces committed_assignments as their source of truth; see
+	// HoldOwningAgents' docstring for why.
 
 	// Cross-agent-ness for an edge (or co-ownership of a single node) is
 	// "no agent is common to both owner sets" -- not "some pair of agents
@@ -674,7 +669,7 @@ std::tuple<std::vector<std::optional<int>>,
 		std::set<int> owners;
 		if (node_to_phis_map.contains(node)) {
 			for (int phi_id : node_to_phis_map.at(node)) {
-				const std::set<int> phi_owners = PhiOwningAgents(*this, phi_id, assignments);
+				const std::set<int> phi_owners = PhiOwningAgents(*this, phi_id, var_assignments);
 				owners.insert(phi_owners.begin(), phi_owners.end());
 			}
 		}
@@ -715,7 +710,7 @@ std::tuple<std::vector<std::optional<int>>,
 			// well-scaled remaining-path costs to another agent's
 			// already-arrived, near-zero ones in the same shared QP).
 			for (const auto& e : full_sg.neighbors(node)) {
-				const std::set<int> hold_owners = HoldOwningAgents(*this, node, e.to, var_to_agent);
+				const std::set<int> hold_owners = HoldOwningAgents(*this, node, e.to, var_assignments);
 				owners.insert(hold_owners.begin(), hold_owners.end());
 				const auto phis_it = edge_to_phis_map.find({node, e.to});
 				if (phis_it == edge_to_phis_map.end()) continue;
@@ -725,7 +720,7 @@ std::tuple<std::vector<std::optional<int>>,
 				}
 			}
 			for (const auto& in : full_sg.incoming_neighbors(node)) {
-				const std::set<int> hold_owners = HoldOwningAgents(*this, in.from, node, var_to_agent);
+				const std::set<int> hold_owners = HoldOwningAgents(*this, in.from, node, var_assignments);
 				owners.insert(hold_owners.begin(), hold_owners.end());
 				const auto phis_it = edge_to_phis_map.find({in.from, node});
 				if (phis_it == edge_to_phis_map.end()) continue;

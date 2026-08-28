@@ -112,7 +112,7 @@ ProblemLayout BuildProblemLayout(
 	const std::vector<CubicConfigurationSpline>& splines,
 	const std::vector<int>& remaining_vertices,
 	const Eigen::MatrixXd& waypoints,
-	const Eigen::VectorXi& assignments,
+	const Eigen::VectorXi& var_assignments,
 	const Eigen::VectorXd& x0,
 	const Eigen::VectorXd& v0,
 	const Eigen::VectorXd& t_by_node,

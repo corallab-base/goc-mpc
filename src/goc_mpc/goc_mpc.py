@@ -558,7 +558,6 @@ class GraphOfConstraintsMPC():
 
         # get references to the stored waypoints and assignments solutions from waypoint_mpc
         waypoints = self.waypoint_mpc.view_waypoints()
-        assignments = self.waypoint_mpc.view_assignments()
         var_assignments = self.waypoint_mpc.view_var_assignments()
         self.last_cycle_var_assignments = var_assignments
 
@@ -580,7 +579,7 @@ class GraphOfConstraintsMPC():
             # fix) did not resolve the oscillation this exists to fix, this
             # second call site was the missing half.
             v0_for_spline = self._blend_velocity_for_spline_fit(x_dot)
-            success = self.timing_mpc.solve(x, v0_for_spline, self.remaining_phases, waypoints, assignments, t_by_node)
+            success = self.timing_mpc.solve(x, v0_for_spline, self.remaining_phases, waypoints, var_assignments, t_by_node)
             if success:
                 self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, v0_for_spline)
                 self._prev_spline_time = self.last_cycle_time

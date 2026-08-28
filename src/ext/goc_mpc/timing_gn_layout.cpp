@@ -373,7 +373,7 @@ ProblemLayout BuildProblemLayout(
 		const std::vector<CubicConfigurationSpline>& splines,
 		const std::vector<int>& remaining_vertices,
 		const Eigen::MatrixXd& waypoints,
-		const Eigen::VectorXi& assignments,
+		const Eigen::VectorXi& var_assignments,
 		const Eigen::VectorXd& x0,
 		const Eigen::VectorXd& v0,
 		const Eigen::VectorXd& t_by_node,
@@ -387,7 +387,7 @@ ProblemLayout BuildProblemLayout(
 	const int num_agents = graph.num_agents;
 
 	auto [parents, agent_nodes, agent_interactions] =
-		graph.get_agent_paths(remaining_vertices, assignments, t_by_node);
+		graph.get_agent_paths(remaining_vertices, var_assignments, t_by_node);
 
 	wps_list_out->resize(num_agents);
 	agent_nodes_list_out->resize(num_agents);

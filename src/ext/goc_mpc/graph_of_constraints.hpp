@@ -780,15 +780,18 @@ struct GraphOfConstraints {
 	// references), NOT assumed from the node alone; see get_agent_paths's
 	// definition for why "no phi at this node resolves to a specific
 	// agent" (a pure object-only node) is the only case that still falls
-	// back to "every agent". `t_by_node` (the waypoint MPC's resolved
-	// per-node arrival-time estimate) orders each agent's own node list;
-	// pass an empty vector to fall back to BFS/topological order (e.g.
-	// before any waypoint solve has produced timings yet).
+	// back to "every agent". `var_assignments` is the waypoint solver's
+	// view_var_assignments() (var id -> resolved agent, -1 == unassigned),
+	// used to resolve assignable node phis and assignable holds.
+	// `t_by_node` (the waypoint MPC's resolved per-node arrival-time
+	// estimate) orders each agent's own node list; pass an empty vector to
+	// fall back to BFS/topological order (e.g. before any waypoint solve
+	// has produced timings yet).
 	std::tuple<std::vector<std::optional<int>>,
 		   std::vector<std::vector<int>>,
 		   std::vector<struct AgentInteraction>> get_agent_paths(
 			   const std::vector<int>& remaining_vertices,
-			   const Eigen::VectorXi& assignments,
+			   const Eigen::VectorXi& var_assignments,
 			   const Eigen::VectorXd& t_by_node) const;
 
 	std::map<std::pair<int, int>, int> get_next_edge_phis(const std::vector<int> completed_vertices) const;

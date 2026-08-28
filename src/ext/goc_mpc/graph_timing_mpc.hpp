@@ -244,7 +244,7 @@ struct GraphTimingMPC {
 		   const Eigen::VectorXd& v0,
 		   const std::vector<int>& remaining_vertices,
 		   const Eigen::MatrixXd& waypoints,
-		   const Eigen::VectorXi& assignments,
+		   const Eigen::VectorXi& var_assignments,
 		   const Eigen::VectorXd& t_by_node = Eigen::VectorXd());
 
 	// Dense-waypoint counterpart to solve(): the caller has already
