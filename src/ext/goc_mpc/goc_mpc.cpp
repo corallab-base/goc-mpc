@@ -409,7 +409,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("t_by_node") = Eigen::VectorXd())
 		.def("solve_dense", &GraphTimingMPC::solve_dense,
 		     py::arg("x0"), py::arg("v0"), py::arg("agent_dense_wps"),
-		     py::arg("agent_dense_node_ids"), py::arg("agent_interactions"))
+		     py::arg("agent_dense_node_ids"), py::arg("agent_interactions"),
+		     py::arg("var_assignments") = Eigen::VectorXi())
 		.def("get_agent_spline_length", &GraphTimingMPC::get_agent_spline_length)
 		.def("get_agent_spline_nodes", &GraphTimingMPC::get_agent_spline_nodes)
 		.def("set_progressed_time", &GraphTimingMPC::set_progressed_time)

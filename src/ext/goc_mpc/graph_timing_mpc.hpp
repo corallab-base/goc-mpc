@@ -152,6 +152,14 @@ struct GraphTimingMPC {
 	std::vector<std::vector<int>> _agent_nodes_list;
 	std::map<int, int> _agent_spline_length_map;
 
+	// The var-indexed assignment vector (var id -> resolved agent, -1 ==
+	// unassigned) the last solve()/solve_dense() was handed -- kept for
+	// fill_cubic_splines, which runs right after and asks the graph
+	// (constrained_columns) which config blocks each node pins;
+	// var_agent_q(...) references resolve through this. Empty only if the
+	// caller passed nothing (a graph with no assignable-agent constraints).
+	Eigen::VectorXi _last_var_assignments;
+
 	double _time_cost;
 	double _time_cost2;
 	double _acceleration_cost;
@@ -268,7 +276,8 @@ struct GraphTimingMPC {
 			  const Eigen::VectorXd& v0,
 			  const std::vector<Eigen::MatrixXd>& agent_dense_wps,
 			  const std::vector<std::vector<int>>& agent_dense_node_ids,
-			  const std::vector<AgentInteraction>& agent_interactions);
+			  const std::vector<AgentInteraction>& agent_interactions,
+			  const Eigen::VectorXi& var_assignments = Eigen::VectorXi());
 
 	int get_agent_spline_length(int agent) const;
 	std::vector<int> get_agent_spline_nodes(int agent) const;

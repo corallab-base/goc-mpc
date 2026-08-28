@@ -490,6 +490,11 @@ bool GraphTimingMPC::solve(
 
 	_timer.Start();
 
+	// Kept for fill_cubic_splines, which runs right after this and asks the
+	// graph (constrained_columns) which config blocks each node pins --
+	// var_agent_q(...) references there resolve through this.
+	_last_var_assignments = var_assignments;
+
 	// Snapshotted before this cycle's own values overwrite them below --
 	// lets BuildProblemLayout's warm start seed this cycle's initial guess
 	// from the last cycle's converged solution.
@@ -535,9 +540,18 @@ bool GraphTimingMPC::solve_dense(
 		const Eigen::VectorXd& v0,
 		const std::vector<Eigen::MatrixXd>& agent_dense_wps,
 		const std::vector<std::vector<int>>& agent_dense_node_ids,
-		const std::vector<AgentInteraction>& agent_interactions) {
+		const std::vector<AgentInteraction>& agent_interactions,
+		const Eigen::VectorXi& var_assignments) {
 
 	_timer.Start();
+
+	// Kept for fill_cubic_splines' per-node knot mask, which asks the graph
+	// (constrained_columns) which config blocks each real node pins --
+	// var_agent_q(...) references resolve through this. The caller
+	// (TracedTimingMPC) already handed the same vector to get_agent_paths
+	// when resolving the dense sequence. Plain copy, not left stale from an
+	// earlier solve().
+	_last_var_assignments = var_assignments;
 
 	// Same warm-start purpose as solve()'s. Unlike solve()'s node-id
 	// matching (skips synthetic -1 rows -- see BuildProblemLayoutCore's own
@@ -645,6 +659,19 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 		}
 	}
 
+	// Which ambient columns each real node in any agent's sequence pins --
+	// queried ONCE per distinct node here (constrained_columns scans the
+	// whole state row across every agent, so a node two agents both visit
+	// costs nothing extra), then folded per agent/block below.
+	std::map<int, Eigen::VectorXi> cols_by_node;
+	for (int i = 0; i < _graph->num_agents; ++i) {
+		if (get_agent_spline_length(i) <= 1) continue;
+		for (int node : _agent_nodes_list[i]) {
+			if (node >= 0 && !cols_by_node.contains(node))
+				cols_by_node[node] = _graph->constrained_columns(node, _last_var_assignments);
+		}
+	}
+
 	for (int i = 0; i < _graph->num_agents; ++i) {
 		const int a_d = splines[i]->ambient_dim();
 		const int t_d = splines[i]->tangent_dim();
@@ -664,6 +691,63 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 
 			Eigen::VectorXd times_i = CumsumWithZero(_time_deltas_list[i], spline_length_i - 1);
 
+			// Per-(knot, block) knot mask (1 == knot, 0 == bridge past it):
+			// row 0 is x0 (the measured current state -- always a real
+			// knot), rows 1.. are this agent's resolved node sequence (real
+			// graph ids, or -1 for a synthetic traced interior point from
+			// solve_dense). CubicConfigurationSpline::set() bridges any
+			// block a row marks 0 straight across that row with one longer
+			// Hermite piece, and force-activates rows 0 and N-1 regardless.
+			const auto& offs = splines[i]->block_offsets_;
+			const int NB = static_cast<int>(offs.size());
+			const int abase = _graph->agent_col_offset(i);
+			Eigen::MatrixXi mask = Eigen::MatrixXi::Ones(spline_length_i, NB);
+			const std::vector<int>& nodes = _agent_nodes_list[i];
+			const int nn = std::min<int>(spline_length_i - 1,
+						     static_cast<int>(nodes.size()));
+
+			// Pass 1: real nodes. A block is a knot iff >= 1 of its ambient
+			// components is pinned by a constraint there; entirely free
+			// (0) -> bridge. A partial pin still counts as a knot but is
+			// worth flagging (a rotation block can't honor a partial pin,
+			// yet bridging past a node the user did partially constrain is
+			// worse).
+			for (int r = 1; r <= nn; ++r) {
+				const int node = nodes[r - 1];
+				if (node < 0) continue;
+				const Eigen::VectorXi& cols = cols_by_node.at(node);
+				for (int b = 0; b < NB; ++b) {
+					const int cnt = cols.segment(abase + offs[b].ambient_offset,
+								     offs[b].ambient_size).sum();
+					if (cnt == 0) {
+						mask(r, b) = 0;
+					} else if (cnt < offs[b].ambient_size) {
+						std::cout << "GraphTimingMPC::fill_cubic_splines: agent "
+							  << i << " block " << b << " only partially "
+							  << "constrained (" << cnt << "/"
+							  << offs[b].ambient_size << ") at node " << node
+							  << " -- keeping it as a full knot.\n";
+					}
+				}
+			}
+
+			// Pass 2: a synthetic traced node is a knot for block b only
+			// where BOTH bracketing real knots are. Otherwise it sits
+			// inside a span the block is bridging, and pinning the trace's
+			// (merely interpolated) value for that block there would defeat
+			// the bridge. The dense sequence always ends on a real node, so
+			// the forward scan for `q` always terminates.
+			for (int r = 1; r <= nn; ++r) {
+				if (nodes[r - 1] >= 0) continue;
+				int p = r - 1;
+				while (p >= 1 && nodes[p - 1] < 0) --p;   // prev real knot (0 == x0)
+				int q = r + 1;
+				while (q <= nn && nodes[q - 1] < 0) ++q;  // next real knot
+				for (int b = 0; b < NB; ++b)
+					mask(r, b) = mask(p, b) & mask(q, b);
+			}
+			splines[i]->set_block_active_mask(mask);
+
 			splines[i]->set(wps_i, vs_i, times_i);
 		} else {
 			// Dummy spline that stays at x0, and comes to a stop after 1 second.
@@ -680,6 +764,9 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 			Eigen::VectorXd times_i(2);
 			times_i << 0.0, 1.0;
 
+			// Drop any mask left over from an earlier, longer cycle -- its
+			// row count no longer matches and set() would throw.
+			splines[i]->set_block_active_mask(Eigen::MatrixXi());
 			splines[i]->set(wps_i, vs_i, times_i);
 		}
 	}

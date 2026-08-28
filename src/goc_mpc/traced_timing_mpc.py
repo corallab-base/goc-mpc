@@ -315,8 +315,14 @@ class TracedTimingMPC:
         agent_interactions = GraphOfConstraints.reindex_agent_interactions(
             agent_interactions, agent_dense_node_ids)
 
+        # var_assignments is forwarded (not just used above for
+        # get_agent_paths) so fill_cubic_splines' per-node knot mask can
+        # resolve var_agent_q(...) constraints -- otherwise a real node
+        # pinned only by an assignable-agent constraint looks unconstrained
+        # and the spline wrongly bridges past it.
         success = self._timing.solve_dense(
-            x0, v0, agent_dense_wps, agent_dense_node_ids, agent_interactions)
+            x0, v0, agent_dense_wps, agent_dense_node_ids, agent_interactions,
+            var_assignments)
         return success
 
     # GraphTimingMPC-compatible duck-typed surface -- delegates straight to
