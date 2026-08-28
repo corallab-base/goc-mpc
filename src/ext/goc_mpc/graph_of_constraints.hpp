@@ -674,6 +674,30 @@ struct GraphOfConstraints {
 
 	int object_ambient_dim(int ob) const;
 
+	// Per-column mask over a full waypoint/state row (length `total_dim`):
+	// entry `c` is 1 iff some constraint attached to `node` references
+	// ambient column `c` -- i.e. that component of some agent's/object's
+	// config is pinned at `node`. Covers node constraints (`symbolic_ops`)
+	// and symbolic edge constraints incident to `node` -- both the "along
+	// the edge" invariant form (plain agent_q/object_q/var_agent_q,
+	// applied at the endpoint) and the relational u_/v_ form (u-side refs
+	// bind node u, v-side refs bind node v). `var_assignments` (a waypoint
+	// solver's `view_var_assignments()`, indexed by var id, -1 ==
+	// unassigned) resolves var_agent_q(var) references to a concrete
+	// agent's columns; a reference to a var that is unassigned or out of
+	// range for the passed vector is skipped (so an empty vector simply
+	// ignores every assignable-constraint reference). "References" is
+	// literal Formula membership -- an inequality or a one-sided bound
+	// counts, not only an equality. A legacy non-symbolic DeferredOp is
+	// not introspectable and contributes nothing.
+	//
+	// The spline builder uses this to decide, per block, whether `node` is
+	// a genuine knot for that block or a pass-through the interpolation
+	// should bridge (every column of the block reading back 0 == that
+	// block was left free at this node).
+	Eigen::VectorXi constrained_columns(
+		int node, const Eigen::VectorXi& var_assignments = Eigen::VectorXi()) const;
+
 	// See `_agent_col_offsets`/`_object_col_offsets`'s own doc comment.
 	// `ag`/`ob` may equal num_agents/num_objects (one past the last real
 	// entry) to get that block's total width.

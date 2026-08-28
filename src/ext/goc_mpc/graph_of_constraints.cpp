@@ -183,6 +183,90 @@ int GraphOfConstraints::object_ambient_dim(int ob) const {
 	return d;
 }
 
+Eigen::VectorXi GraphOfConstraints::constrained_columns(
+		int node, const Eigen::VectorXi& var_assignments) const {
+	Eigen::VectorXi mask = Eigen::VectorXi::Zero(total_dim);
+
+	// Set mask[base_col + j] for every component j of `fam`'s placeholder
+	// for `key` that appears in `fv`. `key` must already exist in `fam`
+	// (it does -- every call site feeds keys straight from
+	// KeysReferencedBy, which only ever reports existing keys).
+	auto mark = [&](const PlaceholderVarFamily<int>& fam, int key,
+			int base_col, int width_cap, const drake::symbolic::Variables& fv) {
+		const auto& vars = fam.Vars(key);
+		const int w = std::min<int>(static_cast<int>(vars.size()), width_cap);
+		for (int j = 0; j < w; ++j)
+			if (fv.include(vars[j])) mask(base_col + j) = 1;
+	};
+
+	// Resolve every agent_q / object_q / var_agent_q reference in `fv` to
+	// its flat columns. `u_side`/`v_side` additionally pull the relational
+	// u_/v_ families (a two-sided edge formula referencing "node u" vs.
+	// "node v"); a plain node/along-edge formula references none of those,
+	// so passing both false there costs nothing.
+	auto resolve = [&](const drake::symbolic::Variables& fv, bool u_side, bool v_side) {
+		for (int ag : _agent_q.KeysReferencedBy(fv))
+			mark(_agent_q, ag, agent_col_offset(ag), robot_ambient_dim(ag), fv);
+		for (int ob : _object_q.KeysReferencedBy(fv))
+			mark(_object_q, ob, object_col_offset(ob), object_ambient_dim(ob), fv);
+		for (int var : _var_agent_q.KeysReferencedBy(fv)) {
+			if (var >= var_assignments.size()) continue;
+			const int ag = var_assignments(var);
+			if (ag < 0 || ag >= num_agents) continue;
+			mark(_var_agent_q, var, agent_col_offset(ag), robot_ambient_dim(ag), fv);
+		}
+		if (u_side) {
+			for (int ag : _agent_q_u.KeysReferencedBy(fv))
+				mark(_agent_q_u, ag, agent_col_offset(ag), robot_ambient_dim(ag), fv);
+			for (int ob : _object_q_u.KeysReferencedBy(fv))
+				mark(_object_q_u, ob, object_col_offset(ob), object_ambient_dim(ob), fv);
+			for (int var : _var_agent_q_u.KeysReferencedBy(fv)) {
+				if (var >= var_assignments.size()) continue;
+				const int ag = var_assignments(var);
+				if (ag < 0 || ag >= num_agents) continue;
+				mark(_var_agent_q_u, var, agent_col_offset(ag), robot_ambient_dim(ag), fv);
+			}
+		}
+		if (v_side) {
+			for (int ag : _agent_q_v.KeysReferencedBy(fv))
+				mark(_agent_q_v, ag, agent_col_offset(ag), robot_ambient_dim(ag), fv);
+			for (int ob : _object_q_v.KeysReferencedBy(fv))
+				mark(_object_q_v, ob, object_col_offset(ob), object_ambient_dim(ob), fv);
+			for (int var : _var_agent_q_v.KeysReferencedBy(fv)) {
+				if (var >= var_assignments.size()) continue;
+				const int ag = var_assignments(var);
+				if (ag < 0 || ag >= num_agents) continue;
+				mark(_var_agent_q_v, var, agent_col_offset(ag), robot_ambient_dim(ag), fv);
+			}
+		}
+	};
+
+	// Node constraints attached directly to `node`.
+	if (node_to_phis_map.contains(node)) {
+		for (int phi_id : node_to_phis_map.at(node)) {
+			auto it = symbolic_ops.find(phi_id);
+			if (it == symbolic_ops.end()) continue;  // legacy DeferredOp: opaque
+			resolve(it->second.formula.GetFreeVariables(), false, false);
+		}
+	}
+
+	// Symbolic edge constraints incident to `node`: an "along the edge"
+	// invariant constrains its endpoints; a relational u_/v_ formula binds
+	// whichever side equals `node`.
+	for (const auto& [edge, phi_ids] : edge_to_phis_map) {
+		const bool at_u = (edge.first == node);
+		const bool at_v = (edge.second == node);
+		if (!at_u && !at_v) continue;
+		for (int phi_id : phi_ids) {
+			auto it = symbolic_edge_ops.find(phi_id);
+			if (it == symbolic_edge_ops.end()) continue;
+			resolve(it->second.formula.GetFreeVariables(), at_u, at_v);
+		}
+	}
+
+	return mask;
+}
+
 void GraphOfConstraints::set_robot_fk(int agent_id, const std::string& link_name, py::function fk_fn) {
 	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
 	robot_fk_registry[{agent_id, link_name}] = std::move(fk_fn);

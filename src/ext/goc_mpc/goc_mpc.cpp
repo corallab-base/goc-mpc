@@ -87,6 +87,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("robot_ambient_dim", &GraphOfConstraints::robot_ambient_dim, py::arg("agent_id"))
 		.def("robot_tangent_dim", &GraphOfConstraints::robot_tangent_dim, py::arg("agent_id"))
 		.def("object_ambient_dim", &GraphOfConstraints::object_ambient_dim, py::arg("object_id"))
+		.def("constrained_columns", &GraphOfConstraints::constrained_columns,
+		     py::arg("node"), py::arg("var_assignments") = Eigen::VectorXi())
 		.def("agent_col_offset", &GraphOfConstraints::agent_col_offset, py::arg("agent_id"))
 		.def("object_col_offset", &GraphOfConstraints::object_col_offset, py::arg("object_id"))
 		// Whole-array form of the above (agent_col_offset(i) for i in
