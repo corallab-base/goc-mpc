@@ -264,6 +264,42 @@ Eigen::VectorXi GraphOfConstraints::constrained_columns(
 		}
 	}
 
+	// Rigid-carry holds incident to `node` (add_hold / add_assignable_hold).
+	// A hold is pure bookkeeping (hold_ops) -- never routed through
+	// _add_edge_op, so it carries no symbolic formula the loops above could
+	// see -- but it DOES pin geometry at both its endpoints: the held
+	// object's world position moves exactly as the holding agent's
+	// end-effector does (see the JAX solver's _resolve_holds / MILP's
+	// Constraint 14a). Without this, an INTERIOR node whose only claim on an
+	// agent/object is a transport hold (e.g. a Place node before a later
+	// handoff -- its own node constraint pins just the object band, leaving
+	// the arm's position to the hold back to Pick) reads as unconstrained
+	// for that agent, and the timing solve's active-knot mask bridges the
+	// spline straight past it. Mark the held object's leading position
+	// columns and the holding agent's leading position columns (what the
+	// rigid-carry relation actually couples -- position only, workspace_dim
+	// wide, matching _resolve_holds).
+	for (const auto& [hold_id, hold] : hold_ops) {
+		if (hold.u_node != node && hold.v_node != node) continue;
+		for (int oid : hold.held_point_ids) {
+			if (oid < 0 || oid >= num_objects) continue;
+			const int base = object_col_offset(oid);
+			const int w = std::min(workspace_dim, object_ambient_dim(oid));
+			for (int j = 0; j < w; ++j) mask(base + j) = 1;
+		}
+		int ag = -1;
+		if (hold.robot_ag.has_value()) {
+			ag = *hold.robot_ag;
+		} else if (hold.var_id.has_value() && *hold.var_id < var_assignments.size()) {
+			ag = var_assignments(*hold.var_id);
+		}
+		if (ag >= 0 && ag < num_agents) {
+			const int base = agent_col_offset(ag);
+			const int w = std::min(workspace_dim, robot_ambient_dim(ag));
+			for (int j = 0; j < w; ++j) mask(base + j) = 1;
+		}
+	}
+
 	return mask;
 }
 
