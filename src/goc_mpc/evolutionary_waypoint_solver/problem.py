@@ -202,6 +202,15 @@ class GraphOrderingRelaxed:
         self.ordering_edges = list(ordering_edges)
         self.hard_edges = [(u, v) for u, v, gate in self.ordering_edges if gate is None]
 
+        # edge_cost_fn may be one shared callable (priced against every
+        # agent's route) or a per-agent list/tuple, one entry per agent --
+        # see make_graph_kernel's docstring. Validate the per-agent length
+        # here so the error names the mismatch rather than surfacing deep in
+        # a traced kernel.
+        if isinstance(edge_cost_fn, (list, tuple)) and len(edge_cost_fn) != self.n_agents:
+            raise ValueError(
+                f"per-agent edge_cost_fn has {len(edge_cost_fn)} entries but the "
+                f"graph has {self.n_agents} agents")
         kernel_kwargs = {} if edge_cost_fn is None else {"edge_cost_fn": edge_cost_fn}
         self._decode_and_cost, self._batched, self._decode_node_rank = make_graph_kernel(
             self.instance_sources, self.n_variables, self.ordering_edges,

@@ -232,6 +232,19 @@ def make_graph_kernel(instance_sources, n_variables, ordering_edges, instance_no
     the decision variables/routing-instance/ordering-edge design this
     implements.
 
+    edge_cost_fn: either ONE callable `(a, b) -> scalar` priced against every
+        agent's route (the default, an unchanged `jax.vmap` over agent ids),
+        OR a list/tuple of them, one per agent (indexed by agent id) -- each
+        agent's route cost is then priced by ITS OWN edge cost (its own
+        trained field / reachable free space). A shared field misprices the
+        routing/assignment objective (`mean`/`max` of per-agent route costs,
+        see module docstring) whenever two agents' free space differs. The
+        per-agent list makes the agent loop in `decode_and_cost` a Python
+        loop over the static agent count so `edge_cost_fns[k]` is plain
+        indexing on a concrete `k` -- selecting it inside the `jax.vmap`
+        instead would need `jax.lax.switch`, which under `vmap` evaluates
+        EVERY branch (`n_agents**2` field evals per route segment).
+
     instance_sources: (n_instances,) list of ("fixed", agent_id) or
         ("var", var_slot) -- one entry per routing instance. var_slot
         indexes into `assign`'s rows (0..n_variables-1).
@@ -267,6 +280,9 @@ def make_graph_kernel(instance_sources, n_variables, ordering_edges, instance_no
 
     decode_node_rank = build_decode_node_rank(ordering_edges, n_nodes)
 
+    per_agent_edge_cost_fns = (list(edge_cost_fn)
+                               if isinstance(edge_cost_fn, (list, tuple)) else None)
+
     def decode_and_cost(assign, cond_binary, t, wp, x0, node_active):
         n_agents = x0.shape[0]
         instance_active = node_active[instance_node]              # (n_instances,)
@@ -297,11 +313,29 @@ def make_graph_kernel(instance_sources, n_variables, ordering_edges, instance_no
         gather_idx = col[:, None] + jnp.arange(dim)[None, :]           # (n_instances, dim)
         wp = jnp.take_along_axis(node_rows, gather_idx, axis=1)        # (n_instances, dim)
 
-        agent_ids = jnp.arange(n_agents)
-        per_agent_costs, _per_agent_arrival = jax.vmap(
-            functools.partial(_one_agent_route, edge_cost_fn=edge_cost_fn),
-            in_axes=(0, None, None, None, 0, None)
-        )(agent_ids, owner_instance, rank_per_instance, wp, x0, instance_active)
+        if per_agent_edge_cost_fns is not None:
+            # Per-agent edge costs -- unrolled over the static agent count
+            # (see make_graph_kernel's docstring) so `k` is a concrete
+            # Python int and `per_agent_edge_cost_fns[k]` is plain indexing,
+            # no jax.lax.switch (which under the agent vmap would evaluate
+            # every branch). Measured ~1.2x the batched floor on CPU, 2x
+            # faster than the vmap+switch alternative; GPU parallelizes the
+            # independent per-agent branches.
+            if len(per_agent_edge_cost_fns) != n_agents:
+                raise ValueError(
+                    f"edge_cost_fn list has {len(per_agent_edge_cost_fns)} entries "
+                    f"but the graph has {n_agents} agents")
+            per_agent_costs = jnp.stack([
+                _one_agent_route(k, owner_instance, rank_per_instance, wp, x0[k],
+                                 instance_active, edge_cost_fn=per_agent_edge_cost_fns[k])[0]
+                for k in range(n_agents)
+            ])
+        else:
+            agent_ids = jnp.arange(n_agents)
+            per_agent_costs, _per_agent_arrival = jax.vmap(
+                functools.partial(_one_agent_route, edge_cost_fn=edge_cost_fn),
+                in_axes=(0, None, None, None, 0, None)
+            )(agent_ids, owner_instance, rank_per_instance, wp, x0, instance_active)
         route_cost = jnp.max(per_agent_costs) if objective == "minmax" else jnp.mean(per_agent_costs)
 
         g = jnp.abs(jnp.sum(assign, axis=-1) - 1.0) - 1e-6   # (n_variables,)

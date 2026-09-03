@@ -134,6 +134,9 @@ class EvolutionaryWaypointSolver:
         self._graph = graph
         self._splines = splines
         self._objective = objective
+        # One shared callable (a, b) -> scalar, or a per-agent list/tuple of
+        # them (one entry per graph agent) for per-agent obstacle costs --
+        # see kernel.make_graph_kernel's docstring.
         self._edge_cost_fn = edge_cost_fn
         self._wp_bounds = wp_bounds
         self._pop_size = pop_size
