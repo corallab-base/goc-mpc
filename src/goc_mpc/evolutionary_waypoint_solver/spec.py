@@ -302,6 +302,30 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
     link_pos_map = _make_link_pos_map(graph)  # var_id -> (agent_id, link_name, fk_fn, j)
     link_rot_map = _make_link_rot_map(graph)  # var_id -> (agent_id, link_name, fk_fn, flat_j)
 
+    # Shared FK-result cache. Every agent_link_pos(a, link) / agent_link_rot(
+    # a, link) COMPONENT placeholder resolves to its own closure, and each
+    # would otherwise call the full fk_fn(q) itself -- so a node with a
+    # position+orientation EE target evaluates fk_fn ~12x per residual pass
+    # (and XLA does NOT reliably CSE a non-trivial articulated FK across
+    # those separately-built closures: a 6-DOF UR5e FK measured ~linear in
+    # the placeholder count, ~4x slower for pos+rot vs pos-only, plus a much
+    # larger HLO -> long compile). Compute fk_fn(q) ONCE per (agent, link)
+    # per row and share. Keyed by id() of the row array, with the array
+    # itself pinned in the entry so its id can't be recycled while the
+    # entry is live; entries accumulate only across (rare) retraces.
+    _fk_cache: dict = {}
+
+    def _link_fk(row, agent_id, link_name, col0, w, fk_fn):
+        entry = _fk_cache.get(id(row))
+        if entry is None or entry[0] is not row:
+            entry = (row, {})
+            _fk_cache[id(row)] = entry
+        got = entry[1].get((agent_id, link_name))
+        if got is None:
+            got = fk_fn(row[col0:col0 + w])
+            entry[1][(agent_id, link_name)] = got
+        return got
+
     # param(id) -- runtime-editable scalar placeholders (GraphOfConstraints.
     # add_param/param/set_param). Every compiled residual fn is called as
     # fn(*rows, owner_variable, params) (see _batch_symbolic_constraint_fn et
@@ -342,23 +366,21 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
             idx = param_map[vid]
             return lambda *args, idx=idx: args[-1][idx]
         if vid in link_pos_map:
-            agent_id, _link_name, fk_fn, j = link_pos_map[vid]
+            agent_id, link_name, fk_fn, j = link_pos_map[vid]
             col0 = agent_id * slot_width
             w = agent_widths[agent_id]
 
-            def fn(*args, col0=col0, w=w, fk_fn=fk_fn, j=j):
-                q = args[0][col0:col0 + w]
-                pos, _rot = fk_fn(q)
+            def fn(*args, agent_id=agent_id, link_name=link_name, col0=col0, w=w, fk_fn=fk_fn, j=j):
+                pos, _rot = _link_fk(args[0], agent_id, link_name, col0, w, fk_fn)
                 return pos[j]
             return fn
         if vid in link_rot_map:
-            agent_id, _link_name, fk_fn, j = link_rot_map[vid]
+            agent_id, link_name, fk_fn, j = link_rot_map[vid]
             col0 = agent_id * slot_width
             w = agent_widths[agent_id]
 
-            def fn(*args, col0=col0, w=w, fk_fn=fk_fn, j=j):
-                q = args[0][col0:col0 + w]
-                _pos, rot = fk_fn(q)
+            def fn(*args, agent_id=agent_id, link_name=link_name, col0=col0, w=w, fk_fn=fk_fn, j=j):
+                _pos, rot = _link_fk(args[0], agent_id, link_name, col0, w, fk_fn)
                 return jnp.reshape(rot, (-1,))[j]
             return fn
         _unsupported_placeholder(var)
