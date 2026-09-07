@@ -100,6 +100,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("backtrack_map", &GraphOfConstraints::backtrack_map)
 		.def_readonly("phi_to_variable_map", &GraphOfConstraints::phi_to_variable_map)
 		.def_readonly("phi_to_static_assignment_map", &GraphOfConstraints::_phi_to_static_assignment_map)
+		// Node phi ids flagged add_constraint(..., routes=False) -- excluded
+		// from get_agent_paths' agent-node ownership resolution.
+		.def_readonly("phi_routing_exempt", &GraphOfConstraints::_phi_routing_exempt)
 		.def_readonly("node_to_phis_map", &GraphOfConstraints::node_to_phis_map)
 		.def_readonly("edge_to_phis_map", &GraphOfConstraints::edge_to_phis_map)
 		// Edge phi ids registered via add_edge_constraint(..., live=True) --
@@ -266,8 +269,13 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// proj: optional ProjOperator (see phi_to_projection's doc comment) --
 		// stashed opaquely against the returned phi id for the evolutionary
 		// solver to pick up later; this binding never inspects it.
+		// routes: pass false for a constraint that bounds where an agent may
+		// be without implying it must route through this node (a global
+		// validity bound -- e.g. a joint-limit box stamped on every node);
+		// get_agent_paths then won't treat it as agent-node ownership. See
+		// GraphOfConstraints::_phi_routing_exempt.
 		.def("add_constraint", [](GraphOfConstraints& self, int node,
-		                          py::object formula_obj, py::object proj) -> int {
+		                          py::object formula_obj, py::object proj, bool routes) -> int {
 			drake::symbolic::Formula f;
 			try {
 				f = py::cast<drake::symbolic::Formula>(formula_obj);
@@ -281,8 +289,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 			}
 			int phi_id = self.add_constraint(node, f);
 			if (!proj.is_none()) self.phi_to_projection[phi_id] = proj;
+			if (!routes) self._phi_routing_exempt.insert(phi_id);
 			return phi_id;
-		}, py::arg("node"), py::arg("formula"), py::arg("proj") = py::none())
+		}, py::arg("node"), py::arg("formula"), py::arg("proj") = py::none(),
+		   py::arg("routes") = true)
 		.def("add_edge_constraint", [](GraphOfConstraints& self, int u, int v,
 					       py::object formula_obj, bool live, py::object proj) -> int {
 			drake::symbolic::Formula f;

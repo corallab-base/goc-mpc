@@ -463,6 +463,18 @@ struct GraphOfConstraints {
 	std::map<int, py::object> phi_to_projection;
 	std::map<int, py::object> edge_phi_to_projection;
 
+	// Node phi ids the caller flagged as NOT implying the referenced agent
+	// must route through / be assigned to the node
+	// (add_constraint(..., routes=false)) -- a global validity bound, e.g. a
+	// joint-limit box stamped identically on every node, as opposed to a
+	// node-specific pin (a Cartesian EE target, or a 2-D region an agent
+	// must enter AT this node). Consulted only by PhiOwningAgents /
+	// get_agent_paths's ownership resolution; the constraint is still
+	// compiled and enforced normally everywhere else. Populated by the
+	// add_constraint pybind wrapper in goc_mpc.cpp, alongside the phi id it
+	// returns, the same way phi_to_projection above is.
+	std::set<int> _phi_routing_exempt;
+
 	// backtracking map
 	std::map<int, std::vector<int>> backtrack_map;
 

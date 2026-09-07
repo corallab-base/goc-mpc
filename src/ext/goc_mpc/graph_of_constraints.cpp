@@ -370,22 +370,30 @@ Eigen::VectorXd GraphOfConstraints::point_position(int point_id, const Eigen::Ve
 namespace {
 
 // Resolves the specific agent(s) that own phi_id, in priority order:
+//   0. nobody, if the caller flagged this phi routes=false
+//      (_phi_routing_exempt) -- a global validity bound (e.g. a joint-limit
+//      box stamped on every node), which says where an agent MAY be, not
+//      that it must pass through this node.
 //   1. an assignable var (var_agent_q) with a resolved MILP assignment,
 //   2. a legacy static grasp assignment (add_grasp_change),
-//   3. (only when neither above applies) which of the graph's literal
-//      agent_q_vars[i] the phi's own Formula actually references -- the
-//      case for a plain add_constraint(node, eq(q0[...], ...)) formula,
-//      which was never routed through the assignable machinery and so
-//      has no entry in phi_to_variable_map at all.
+//   3. (only when neither above applies) which agent(s) the phi's own
+//      Formula actually pins -- a literal agent_q reference (a Cartesian EE
+//      pin, or a plain add_constraint(node, eq(q0[...], ...))), or an
+//      agent_link_pos/agent_link_rot FK constraint (the configuration-space
+//      analogue -- pins the named agent's link pose). Neither was routed
+//      through the assignable machinery, so neither has a phi_to_variable_map
+//      entry.
 // Returns an empty set when none of the above resolves anything (a pure
-// object-only phi, or a legacy DeferredOp with no Formula to introspect
-// and no assignment) -- callers must treat that as "this phi has no
-// opinion about agent ownership", not "belongs to every agent": a node
-// can have both an object-only phi (no opinion) and an agent-specific
-// phi (a real opinion) at once, and the object-only one must not drown
-// the real one out.
+// object-only phi, a routing-exempt bound, or a legacy DeferredOp with no
+// Formula to introspect and no assignment) -- callers must treat that as
+// "this phi has no opinion about agent ownership", not "belongs to every
+// agent": a node can have both an object-only phi (no opinion) and an
+// agent-specific phi (a real opinion) at once, and the object-only one
+// must not drown the real one out.
 std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
                               const Eigen::VectorXi& var_assignments) {
+	if (graph._phi_routing_exempt.count(phi_id)) return {};
+
 	if (graph.phi_to_variable_map.contains(phi_id)) {
 		const int var = graph.phi_to_variable_map.at(phi_id);
 		const int a = (var < var_assignments.size()) ? var_assignments(var) : -1;
@@ -398,8 +406,19 @@ std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
 	if (graph.symbolic_ops.contains(phi_id)) {
 		const drake::symbolic::Variables free_vars =
 			graph.symbolic_ops.at(phi_id).formula.GetFreeVariables();
-		const std::vector<int> owners = graph._agent_q.KeysReferencedBy(free_vars);
-		return std::set<int>(owners.begin(), owners.end());
+		std::set<int> owners;
+		// Direct agent_q reference: a Cartesian EE pin, or any plain
+		// add_constraint(node, eq(q[...], ...)).
+		for (int ag : graph._agent_q.KeysReferencedBy(free_vars)) owners.insert(ag);
+		// FK node constraint: agent_link_pos/agent_link_rot pin the named
+		// agent's link pose -- the configuration-space analogue of a direct
+		// agent_q pin (the EE target in joint-space planning), and just as
+		// much real ownership evidence. Keyed by (agent_id, link_name).
+		for (const auto& key : graph._agent_link_pos.KeysReferencedBy(free_vars))
+			owners.insert(key.first);
+		for (const auto& key : graph._agent_link_rot.KeysReferencedBy(free_vars))
+			owners.insert(key.first);
+		return owners;
 	}
 	return {};
 }
