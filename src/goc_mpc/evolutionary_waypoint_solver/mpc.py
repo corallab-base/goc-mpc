@@ -1,8 +1,19 @@
 """EvolutionaryWaypointSolver: a GraphWaypointMPC-compatible (duck-typed)
-wrapper around spec.build_graph_ordering_problem + solver.run_lamarckian_al.
+wrapper around spec.build_graph_ordering_problem + evosax_ga.build_evosax_ga.
 `GraphOfConstraintsMPC` (goc_mpc.py) accepts any object satisfying this
 protocol via its `waypoint_mpc=` constructor argument, with no isinstance
 check, so no changes are needed there.
+
+The underlying algorithm is a constructor choice, not a fixed
+implementation: `algorithm="lamarckian_al"` (default, lamarckian_ga.
+LamarckianGA -- reproduces solver.py's original GA+AL algorithm exactly)
+or `algorithm="small_continuous_vrp"` (small_continuous_vrp.
+SmallContinuousVRPSolver -- additionally replaces analytic-projection
+branch selection with an exact per-generation DP; see that module's own
+docstring for what it fixes and its scope limits). Both are evosax
+`PopulationBasedAlgorithm` subclasses, built through the SAME generic
+evosax_ga.py driver (`build_evosax_ga`/`build_initial_carry_fn`) -- see
+this module's `_ALGORITHMS`/`_ensure_built`.
 
 Output buffer shapes/conventions match GraphWaypointMPC's exactly:
   _waypoints:       (num_nodes, graph.total_dim) -- agent columns followed by
@@ -92,13 +103,15 @@ Because AnchorState is a fixed-shape pytree (n_nodes/n_variables never
 change), passing a different `anchor` value on each call -- like `x0` -- adds
 no retracing, only a cheap-in-Python `_compute_anchor` call. Population reuse
 (`_carry`) is therefore unconditional after the first build too: `solve()`
-always resumes from the previous call's population/AL-state via
-`self._resume_fn` (built once per problem by `_ensure_built`, see
-solver.py's `build_resume_carry_fn`), which re-evaluates F/CV/best fresh
-under the *current* x0 and anchor before continuing (a single cheap, jitted
-batched forward pass, not a full n_gen search). Call `warmup()` once up
-front to pay the first trace/compile outside of a timed run and seed
-`_carry` from that run's own result.
+always resumes from the previous call's population by handing `_carry`
+straight back into `self._step_fn` (built once per problem by
+`_ensure_built`, see `evosax_ga.build_evosax_ga`) -- unlike solver.py's old
+carry, evosax's own State stores no raw per-individual F/CV that could go
+stale across an x0/anchor change (its `_ask`/`_tell` recompute those fresh
+from whatever x0/anchor `self._step_fn` is called with, every call -- see
+evosax_ga.py's own module docstring), so there's no separate resume-refresh
+step to call first. Call `warmup()` once up front to pay the first trace/
+compile outside of a timed run and seed `_carry` from that run's own result.
 """
 
 import time
@@ -112,25 +125,56 @@ from .spec import (
     _object_widths, _object_slot_width,
 )
 from .problem import AnchorState, apply_projections
-from .solver import (
-    run_lamarckian_al,
-    build_lamarckian_ga,
-    build_initial_carry_fn,
-    build_resume_carry_fn,
-)
+from .evosax_ga import build_evosax_ga, build_initial_carry_fn as _build_evosax_initial_carry_fn
+from .lamarckian_ga import LamarckianGA
+from .small_continuous_vrp import SmallContinuousVRPSolver
+
+# `algorithm=` constructor choices -- both evosax PopulationBasedAlgorithm
+# subclasses (lamarckian_ga.py/small_continuous_vrp.py), built through the
+# SAME generic evosax_ga.py driver (build_evosax_ga/build_initial_carry_fn)
+# below, so switching between them is exactly this one constructor kwarg,
+# not a different code path. "lamarckian_al" (the default) reproduces the
+# original algorithm exactly (see LamarckianGA's own module docstring);
+# "small_continuous_vrp" additionally replaces `proj_branch`'s GA search
+# with an exact per-generation DP (see SmallContinuousVRPSolver's own
+# module docstring for what that fixes and its scope limits).
+_ALGORITHMS = {
+    "lamarckian_al": LamarckianGA,
+    "small_continuous_vrp": SmallContinuousVRPSolver,
+}
 
 # Params that only affect *building the initial carry* (a fresh random
-# population, or re-wrapping a reused one) -- as opposed to the GA stepper
-# built by build_lamarckian_ga, which no longer takes them. Split out of
-# **lamarckian_kwargs in __init__ so each downstream call only ever receives
-# the subset of kwargs the function it's calling actually accepts.
+# population, or re-wrapping a reused one) -- as opposed to the algorithm
+# itself. Split out of **lamarckian_kwargs in __init__ so each downstream
+# call only ever receives the subset of kwargs it actually accepts.
 _CARRY_KWARGS = ("rho0", "n_seed_individuals", "seed_jitter_t", "seed_jitter_wp_frac")
+# LamarckianGA/SmallContinuousVRPSolver constructor kwargs (both share the
+# same __init__ signature -- SmallContinuousVRPSolver only adds its own
+# static-chain setup on top, see that module).
+_ALGO_KWARGS = ("tournament_k", "wp_mut_scale", "outer_iters", "inner_maxiter",
+                "rho_growth", "lbfgs_history", "ls_max_trials",
+                "n_2opt_trials", "or_opt_prob", "max_or_opt_seg_len")
+# build_evosax_ga's own top-level annealed-schedule kwargs.
+_SCHEDULE_KWARGS = ("w", "cv_tol", "w_frac", "cv_tol_frac", "w_growth", "cv_tol_floor_frac")
+# LamarckianGA.Params fields with no constructor-kwarg home -- applied via
+# Params.replace(...) once the algorithm's own default_params exist (see
+# _ensure_built). `rho_max` is deliberately in NEITHER bucket above: it's a
+# genuine constructor kwarg (LamarckianGA.__init__) AND a build_evosax_ga
+# top-level kwarg (genome bounds) at once, so it's read once and passed to
+# both explicitly instead of living in one list and silently missing the
+# other.
+_PARAMS_KWARGS = ("mut_sigma", "cx_prob", "ox_prob")
 
 
 class EvolutionaryWaypointSolver:
     def __init__(self, graph, splines, objective="avg", edge_cost_fn=None,
                  wp_bounds=(-10.0, 10.0), pop_size=30, n_gen=60,
-                 **lamarckian_kwargs):
+                 algorithm="lamarckian_al", **lamarckian_kwargs):
+        if algorithm not in _ALGORITHMS:
+            raise ValueError(
+                f"algorithm must be one of {sorted(_ALGORITHMS)}, got {algorithm!r}")
+        self._algo_cls = _ALGORITHMS[algorithm]
+
         self._graph = graph
         self._splines = splines
         self._objective = objective
@@ -146,7 +190,27 @@ class EvolutionaryWaypointSolver:
         self._seed = lamarckian_kwargs.pop("seed", 1)
         self._carry_kwargs = {k: lamarckian_kwargs.pop(k) for k in _CARRY_KWARGS
                                if k in lamarckian_kwargs}
-        self._lamarckian_kwargs = lamarckian_kwargs
+        # rho_max is a genuine kwarg of BOTH the algorithm's own constructor
+        # and build_evosax_ga's top-level genome-bounds argument -- read
+        # once, applied to both explicitly in _ensure_built (see
+        # _PARAMS_KWARGS' own comment above for why it lives in neither
+        # bucket list).
+        self._rho_max = lamarckian_kwargs.pop("rho_max", 1e6)
+        self._algo_kwargs = {k: lamarckian_kwargs.pop(k) for k in _ALGO_KWARGS
+                              if k in lamarckian_kwargs}
+        self._schedule_kwargs = {k: lamarckian_kwargs.pop(k) for k in _SCHEDULE_KWARGS
+                                  if k in lamarckian_kwargs}
+        self._params_kwargs = {k: lamarckian_kwargs.pop(k) for k in _PARAMS_KWARGS
+                                if k in lamarckian_kwargs}
+        if lamarckian_kwargs:
+            raise TypeError(
+                f"unrecognized keyword argument(s) for EvolutionaryWaypointSolver: "
+                f"{sorted(lamarckian_kwargs)}")
+        # Kept for backward compatibility with callers/scripts that read
+        # this attribute directly (e.g. to rebuild an equivalent evosax call
+        # elsewhere) -- the algorithm-constructor bucket specifically, since
+        # that's the one such callers have actually wanted so far.
+        self._lamarckian_kwargs = dict(self._algo_kwargs)
         self._python_constraints = []  # (node, fn, kind, name)
 
         num_nodes = graph.structure.num_nodes
@@ -167,7 +231,9 @@ class EvolutionaryWaypointSolver:
         # Built once, on the first solve()/warmup() call -- see module
         # docstring -- and never rebuilt again.
         self._problem = None
-        self._ga_fn = None
+        self._algo = None
+        self._algo_params = None
+        self._step_fn = None
         self._carry = None
         self._last_solve_was_warm = False
         self._last_population_reused = False
@@ -246,12 +312,21 @@ class EvolutionaryWaypointSolver:
             python_constraints=self._python_constraints)
 
         self._problem = problem
-        self._ga_fn = build_lamarckian_ga(problem, self._pop_size, self._n_gen, **self._lamarckian_kwargs)
-        # Compiled once per problem/pop_size, reused by every solve() call's
-        # warm-resume branch below (see build_resume_carry_fn's docstring for
-        # why the un-jitted, generic carry_from_population is the wrong
-        # thing to call there every cycle).
-        self._resume_fn = build_resume_carry_fn(problem, self._pop_size)
+        # build_evosax_ga's own step(carry, x0, params, anchor) -> carry IS
+        # the warm-resume path too (unlike solver.py's old carry, evosax's
+        # State carries only the population + a combined `fitness`/
+        # `best_fitness` -- no raw per-individual F/CV that could go stale
+        # across an x0/anchor change -- _ask/_tell recompute those fresh
+        # from the CURRENT x0/params/anchor every single call, see
+        # evosax_ga.py's own module docstring), so there's no separate
+        # resume-carry function to build/warm here the way solver.py's
+        # build_resume_carry_fn used to be.
+        self._algo, self._algo_params, self._step_fn = build_evosax_ga(
+            problem, self._algo_cls, self._pop_size, self._n_gen,
+            algo_kwargs=dict(problem=problem, rho_max=self._rho_max, **self._algo_kwargs),
+            rho_max=self._rho_max, **self._schedule_kwargs)
+        if self._params_kwargs:
+            self._algo_params = self._algo_params.replace(**self._params_kwargs)
 
     def _to_padded_row(self, packed_row):
         """Expands a (graph.total_dim,) packed row -- graph.agent_col_offsets/
@@ -337,31 +412,20 @@ class EvolutionaryWaypointSolver:
         )
 
     def warmup(self, remaining_vertices, x0):
-        """Builds (on the first call) and JIT-compiles the GA (against the
-        given x0/remaining_vertices, though the compiled GA remains valid
-        for any x0/remaining_vertices afterwards -- see module docstring)
-        and seeds `_carry` with the resulting (already optimized)
-        population, so this cost is paid once up front instead of on the
-        first timed solve() -- which then also starts from a genuinely warm
-        population rather than a random one.
+        """Builds (on the first call) and JIT-compiles the algorithm
+        (against the given x0/remaining_vertices, though the compiled step
+        remains valid for any x0/remaining_vertices afterwards -- see
+        module docstring) and seeds `_carry` with the resulting (already
+        optimized) population, so this cost is paid once up front instead
+        of on the first timed solve() -- which then also starts from a
+        genuinely warm population rather than a random one.
 
-        Also exercises two jitted functions solve() alone reaches but this
-        cold-start build above never does, so a real solve() call right
-        after this one doesn't still pay their first-call compile:
-          - `problem._decode_node_rank`: called only by solve()'s own
-            write-back, to report the visiting-order rank.
-          - `self._resume_fn` (see `_ensure_built`/`build_resume_carry_fn`):
-            the WARM-resume path solve() takes on every call once `_carry`
-            is already set (i.e. every real call after the first). Unlike
-            the generic, un-jitted `carry_from_population` this used to
-            call (see build_resume_carry_fn's docstring for why that was
-            the actual dominant cost of solve() on a real problem -- NOT a
-            one-time compile artifact but genuine per-call eager-dispatched
-            constraint-evaluation compute, paid on every solve(), warmed
-            here or not, until `self._resume_fn` existed to actually
-            compile it), `self._resume_fn` IS a real jitted function, so
-            warming it here does eliminate its first-call compile the same
-            way as `_decode_node_rank`'s.
+        Also exercises `problem._decode_node_rank` (called only by solve()'s
+        own write-back, to report the visiting-order rank) so a real
+        solve() call right after this one doesn't still pay its first-call
+        compile. Unlike solver.py's old carry, `self._step_fn` itself IS
+        the warm-resume path (see _ensure_built's own comment) -- there is
+        no separate resume function left to warm here.
 
         Returns the compile time."""
         x0 = self._check_x0(x0)
@@ -370,27 +434,23 @@ class EvolutionaryWaypointSolver:
         params_arr = jnp.asarray(self._graph.view_param_values())
         anchor = self._compute_anchor(remaining_vertices)
 
-        init_fn = build_initial_carry_fn(
-            self._problem, self._pop_size, anchor, **self._carry_kwargs)
+        init_fn = _build_evosax_initial_carry_fn(
+            self._problem, self._algo, self._algo_params, self._pop_size, anchor,
+            **self._carry_kwargs)
 
         start = time.perf_counter()
         carry_in = init_fn(jax.random.PRNGKey(self._seed))
-        carry_out = self._ga_fn(carry_in, x0_arr, params_arr, anchor)
+        carry_out = self._step_fn(carry_in, x0_arr, params_arr, anchor)
         jax.block_until_ready(carry_out)
 
-        best_X = np.asarray(carry_out[-3])
+        state_out, _key_out = carry_out
+        best_X = np.asarray(state_out.best_solution[:self._problem.n_var])
         assign, cond_binary, _proj_branch, t, _wp, _psi = self._problem._extract_single(best_X)
         owner_variable = (np.argmax(assign, axis=-1) if self._problem.n_variables > 0
                           else np.zeros(0, dtype=int))
         node_rank = self._problem._decode_node_rank(
             owner_variable, np.asarray(cond_binary), t, np.asarray(anchor.node_active))
         jax.block_until_ready(node_rank)
-
-        prev_X, prev_mu, prev_lam, prev_rho, prev_key = (
-            carry_out[0], carry_out[1], carry_out[2], carry_out[3], carry_out[6])
-        warm_carry = self._resume_fn(prev_X, x0_arr, prev_key, anchor, params_arr,
-                                      prev_mu, prev_lam, prev_rho)
-        jax.block_until_ready(warm_carry)
 
         compile_time = time.perf_counter() - start
 
@@ -404,7 +464,7 @@ class EvolutionaryWaypointSolver:
         x0 = self._check_x0(x0)
         was_already_built = self._problem is not None
         self._ensure_built(x0)
-        problem, ga_fn = self._problem, self._ga_fn
+        problem = self._problem
         x0_arr = jnp.asarray(self._to_padded_row(x0))
         params_arr = jnp.asarray(self._graph.view_param_values())
         remaining_set = set(remaining_vertices)
@@ -418,32 +478,28 @@ class EvolutionaryWaypointSolver:
         self._last_solve_was_warm = was_already_built
 
         if self._carry is not None:
-            # Resume the previous solve's population *and* AL multiplier
-            # state (mu/lam/rho) instead of cold-random-initializing and
-            # resetting the constraint penalty from scratch -- see
-            # build_resume_carry_fn's docstring for why this goes through
-            # the jitted `self._resume_fn` (compiled once in _ensure_built)
-            # rather than the generic, un-jitted `carry_from_population`.
-            # F/CV/best are always freshly re-evaluated under the *current*
-            # x0/anchor, since the cached carry's own were scored under
-            # whatever was current on the call that produced them.
-            prev_X, prev_mu, prev_lam, prev_rho, prev_key = (
-                self._carry[0], self._carry[1], self._carry[2], self._carry[3], self._carry[6])
-            init_carry = self._resume_fn(prev_X, x0_arr, prev_key, anchor, params_arr,
-                                          prev_mu, prev_lam, prev_rho)
+            # Resume the previous solve's population directly -- unlike
+            # solver.py's old carry, evosax's State stores no raw per-
+            # individual F/CV that could go stale across an x0/anchor
+            # change: self._step_fn's own _ask/_tell recompute those fresh
+            # from the CURRENT x0/anchor every call (see _ensure_built's own
+            # comment), so there's no separate resume-refresh step needed
+            # here the way build_resume_carry_fn used to be.
+            carry_in = self._carry
             self._last_population_reused = True
         else:
-            init_carry = None
+            init_fn = _build_evosax_initial_carry_fn(
+                problem, self._algo, self._algo_params, self._pop_size, anchor,
+                **self._carry_kwargs)
+            carry_in = init_fn(jax.random.PRNGKey(self._seed))
             self._last_population_reused = False
 
-        result = run_lamarckian_al(problem, anchor, pop_size=self._pop_size, n_gen=self._n_gen,
-                                    seed=self._seed, _ga_fn=ga_fn, _init_carry=init_carry,
-                                    x0=x0_arr, params=params_arr,
-                                    **self._lamarckian_kwargs, **self._carry_kwargs)
+        carry_out = self._step_fn(carry_in, x0_arr, params_arr, anchor)
+        self._carry = carry_out
+        state_out, _key_out = carry_out
+        best_X = np.asarray(state_out.best_solution[:problem.n_var])
 
-        self._carry = result.pop
-
-        assign, _cond_binary, proj_branch, t, wp, psi = problem._extract_single(np.asarray(result.X))
+        assign, _cond_binary, proj_branch, t, wp, psi = problem._extract_single(best_X)
         # A projected node's own pinned columns are never actually driven
         # anywhere by local refinement (apply_projections overwrites them
         # before anything reads them, every solve -- see its own docstring)
@@ -539,8 +595,8 @@ class EvolutionaryWaypointSolver:
 
     def was_last_population_reused(self):
         """True if the last solve() started from a previous carry's
-        population (refreshed under the current x0/anchor via
-        self._resume_fn) rather than a cold random one."""
+        population (its own _ask/_tell re-score it fresh under the current
+        x0/anchor, see module docstring) rather than a cold random one."""
         return self._last_population_reused
 
     def get_last_compile_time(self):
