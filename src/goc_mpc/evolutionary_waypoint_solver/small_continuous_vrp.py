@@ -31,22 +31,23 @@ implemented vs. still GA-searched):
 
 (`A`: assign, `B`: proj_branch, `Z`: per-agent routing/edge-selection,
 `t`: node timing/precedence, `delta_{ab}(B(a), B(b))`: the branch-dependent
-edge cost -- e.g. joint-space distance between node a's and node b's own
-chosen IK solution, `s_{ab}`: a fixed per-edge service/setup time. `t` here
-plays the same MTZ subtour-elimination role solver.py's own MILP baseline
-uses.)
+edge cost -- `problem.edge_cost_fn` between node a's and node b's own chosen
+IK solution (the agent's obstacle-aware field, the SAME one kernel.py's
+routing objective is built from), `s_{ab}`: a fixed per-edge service/setup
+time. `t` here plays the same MTZ subtour-elimination role solver.py's own
+MILP baseline uses.)
 
 Current status -- what's exact vs. still GA-searched:
-  - B (BRANCH, `proj_branch`): EXACT, `_solve_branch_dp` -- a shortest-path
-    DP over the static node chain, one layer per chain node, one state per
-    combined branch candidate (the Cartesian product over every projection
-    writing to that node, see `_node_candidates` -- correct because
-    different projections at one node write to disjoint `pinned_cols`,
-    problem.apply_projections applies each independently). This is exactly
-    `min sum delta_{ab}(B(a), B(b))` along the fixed chain, given `Z`/`A`
-    fixed to their current (this individual's) values -- `s_{ab}` (a fixed
-    per-edge constant, not yet modeled) and `A`'s own choice are the two
-    remaining gaps between this and the true joint objective above.
+  - B (BRANCH, `proj_branch`): EXACT, `_solve_branch_dp` -- one independent
+    shortest-path per "track" (an agent, or an object; see
+    `_build_static_chain`'s `track_plan`) over that track's own ordered
+    projection nodes, from the real depot state, each hop priced by that
+    track's `problem.edge_cost_fn`. The tracks are separable (disjoint
+    columns, per-agent cost fns), so summing the per-track minima is exactly
+    `min sum delta_{ab}(B(a), B(b))` given `Z`/`A` fixed to this
+    individual's values -- `s_{ab}` (a fixed per-edge constant, not yet
+    modeled) and `A`'s own choice are the two remaining gaps between this
+    and the true joint objective above.
   - A (ASSIGNMENT, `assign`): EXACT ENUMERATION + Boltzmann sampling,
     `_sample_assign` -- every one of the `n_agents ** n_variables` discrete
     combinations (typically single-digit, per this class' own scope) is
@@ -78,10 +79,10 @@ node (a genuinely single-chain, e.g. single-agent, graph); no projection
 may pin a `var_agent_q(...)` row (`ProjectionEntry.owner_var_slot` --
 ambient-space Part C's dynamic write target is a different axis entirely,
 not combined with either DP here yet); the assignment axis must enumerate
-to at most `max_assign_combos` combinations. A node MAY carry several
-projections at once (e.g. a two-arm handoff node pinning both agents' own
-analytic-IK branch) -- `_node_candidates` handles this via the Cartesian-
-product generalization described above.
+to at most `max_assign_combos` combinations; a given track's projections
+must all pin the same column set. A node MAY carry several projections at
+once (e.g. a two-arm handoff node pinning both agents' own analytic-IK
+branch) -- each is simply its own track in the per-track DP.
 """
 
 import itertools
@@ -91,6 +92,7 @@ import jax.numpy as jnp
 
 from .lamarckian_ga import LamarckianGA
 from .evosax_ga import _split_genome, _join_genome
+from .kernel import _euclidean_edge_cost
 from .problem import apply_anchor, apply_projections
 from .solver import (
     _routing_local_search_batched,
@@ -109,12 +111,11 @@ jax.config.update("jax_enable_x64", True)
 
 
 def _build_static_chain(problem):
-    """(chain_order, node_entries, relevant_cols): `chain_order` is a
+    """(chain_order, node_entries, track_plan): `chain_order` is a
     topological sort of `problem.hard_edges` over every node -- raises if
     it doesn't cover all `problem.n_nodes` (a genuinely branching/multi-
     agent graph, out of scope for now -- see this module's docstring). Same
     plain Kahn's-algorithm-over-a-possibly-redundant/transitive edge set
-    this module's own diag_path_length.py validation script uses
     (ur5e_block_stacking's real `hard_edges` include transitive pairs like
     (2,0) AND (2,3) AND (0,3), not just adjacent-node pairs, so a stricter
     "every node has at most one successor" check would incorrectly reject
@@ -125,28 +126,30 @@ def _build_static_chain(problem):
     least one -- raises if any projection pins a var_agent_q(...) row
     (ProjectionEntry.owner_var_slot -- ambient-space Part C's dynamic write
     target is a different axis entirely from this class' branch-selection
-    DP, and combining them isn't supported yet). Several entries at the
-    same node (e.g. a two-arm handoff node pinning both agents' own
-    analytic-IK branch) are fine -- see _node_candidates.
+    DP, and combining them isn't supported yet).
 
-    `relevant_cols`: the sorted union of every registered projection's own
-    `pinned_cols` -- the DP's distance metric (_solve_branch_dp) is
-    restricted to exactly these columns, both between consecutive chain
-    nodes AND from the real depot/start state (`params.x0`) to the first
-    chain node. This matters for two reasons: (1) it's what makes the DP's
-    answer match diag_path_length.py's own ground truth EXACTLY (that
-    script's metric is `norm(q - q_home)` over just the 6 joint columns,
-    never the whole row); (2) using the WHOLE row instead would let a
-    node's other, genuinely-free wp columns (this scene has 9 of them per
-    node alongside the 6 pinned ones -- see Part A's wp-shrink) inject
-    unrelated GA-search noise into the branch decision, and skipping the
-    depot term entirely (an earlier, now-fixed bug in this class) silently
-    ignores the real cost of the FIRST move away from the actual start
-    state. Assumes every projected node's pins describe the SAME physical
-    quantity (true for every validated scene so far -- always
-    `agent_q[0:6]`, one range per agent at a multi-projection node); a
-    future scene mixing position/orientation-only pins across different
-    nodes would need a more careful per-node relevant-columns notion."""
+    `track_plan`: one entry per "track" -- an agent (its config columns) or
+    an object -- that any projection pins, as
+    `(cost_fn, cols, [ProjectionEntry, ...])`:
+
+    - `cols`: the ABSOLUTE columns this track's projections write (identical
+      across a track's own entries -- raises otherwise; a multi-arm handoff
+      node just contributes one entry per arm, each its own track).
+    - `[ProjectionEntry, ...]`: this track's entries, ordered by their
+      node's position in `chain_order` -- the ordered stops on this track's
+      own path.
+    - `cost_fn`: how a step on this track is priced. For an agent track,
+      `problem.edge_cost_fn` for that agent (its own obstacle-aware field,
+      the SAME one kernel.py's routing objective uses) -- so branch
+      selection agrees with the continuous objective instead of using a
+      plain-Euclidean surrogate. Euclidean for an object track, or whenever
+      `problem.edge_cost_fn` is `None`.
+
+    `_solve_branch_dp` then runs one independent shortest-path per track
+    over its own stops (from the real depot state `params.x0`), which is
+    exact: the per-track costs are separable (disjoint columns, per-agent
+    cost fns), so the joint minimum is the sum of the per-track minima, and
+    it needs no assumption about how the tracks interleave in `chain_order`."""
     n_nodes = problem.n_nodes
     adj = {i: [] for i in range(n_nodes)}
     indeg = {i: 0 for i in range(n_nodes)}
@@ -180,9 +183,34 @@ def _build_static_chain(problem):
                 "selection DP (WHAT value gets written)")
         node_entries.setdefault(entry.write_node, []).append(entry)
 
-    relevant_cols = sorted({int(c) for entries in node_entries.values()
-                             for entry in entries for c in entry.pinned_cols})
-    return order, node_entries, relevant_cols
+    order_index = {nid: i for i, nid in enumerate(order)}
+    n_agents, dim = problem.n_agents, problem.dim
+    ecf = getattr(problem, "edge_cost_fn", None)
+
+    by_track = {}  # track key -> list of ProjectionEntry
+    for entry in problem.projections:
+        cols = tuple(int(c) for c in entry.pinned_cols)
+        c0 = min(cols)
+        key = ("agent", c0 // dim) if c0 < n_agents * dim else ("object", c0)
+        by_track.setdefault(key, []).append(entry)
+
+    track_plan = []
+    for key, entries in by_track.items():
+        entries = sorted(entries, key=lambda e: order_index[e.write_node])
+        cols = tuple(int(c) for c in entries[0].pinned_cols)
+        if any(tuple(int(c) for c in e.pinned_cols) != cols for e in entries):
+            raise NotImplementedError(
+                f"SmallContinuousVRPSolver branch DP: track {key} has projections "
+                "pinning different column sets across nodes; the per-track path "
+                "cost needs one fixed column set per track")
+        if key[0] == "agent" and isinstance(ecf, (list, tuple)):
+            cost_fn = ecf[key[1]]
+        elif key[0] == "agent" and callable(ecf):
+            cost_fn = ecf
+        else:
+            cost_fn = _euclidean_edge_cost
+        track_plan.append((cost_fn, jnp.asarray(cols, dtype=jnp.int32), tuple(entries)))
+    return order, node_entries, track_plan
 
 
 def _one_entry_candidates(problem, entry, wp0, params_arr):
@@ -216,117 +244,77 @@ def _one_entry_candidates(problem, entry, wp0, params_arr):
     return rows.at[:, :, col_idx].set(values)
 
 
-def _node_candidates(problem, nid, entries, wp0, params_arr):
-    """`(pop, K, state_dim)` candidate rows for one chain node, plus the
-    per-entry branch-count tuple `dims` used to decode a chosen flat index
-    back into each entry's own branch (_solve_branch_dp). `entries` is the
-    (possibly empty) list of every ProjectionEntry that writes to `nid`:
-      - no entries -> K=1, just wp0's own current row (no discrete choice).
-      - one entry -> exactly the original single-projection behaviour,
-        K = entry.discrete_params.
-      - several entries -> the CARTESIAN PRODUCT of every entry's own
-        branch candidates, K = prod(discrete_params) -- correct because
-        every projection writes to its OWN disjoint pinned_cols
-        (apply_projections applies each entry independently; see its own
-        docstring), so any combination of branch choices across different
-        projections at the same node composes without conflict. K stays
-        small in practice (e.g. two 8-branch analytic-IK pins at a handoff
-        node -> 64), and is a static Python int (discrete_params is fixed
-        at spec-build time), so this is a plain unrolled Python loop, not a
-        traced shape."""
+def _apply_edge_cost(cost_fn, a, b):
+    """`cost_fn(a, b) -> scalar` broadcast over the leading dims of `a`/`b`
+    (each `(..., w)`); returns an array of the broadcast leading shape. Same
+    `jax.vmap(cost_fn)` contract kernel.py's `_one_agent_route` uses, so a
+    per-agent NTField closure priced here costs exactly what it does there."""
+    lead = jnp.broadcast_shapes(jnp.shape(a)[:-1], jnp.shape(b)[:-1])
+    w = jnp.shape(a)[-1]
+    a = jnp.broadcast_to(a, lead + (w,)).reshape(-1, w)
+    b = jnp.broadcast_to(b, lead + (w,)).reshape(-1, w)
+    return jax.vmap(cost_fn)(a, b).reshape(lead)
+
+
+def _solve_branch_dp(problem, track_plan, wp0, x0, params_arr):
+    """Exact per-individual branch selection: for every projection with a
+    discrete branch choice (e.g. UR5e analytic IK's 8 solutions), pick the
+    branch minimizing this individual's total routed path cost -- run once
+    per generation inside `_ask`, BEFORE local_refine, so local_refine's own
+    AL/routing passes see the right branch throughout rather than a stale
+    one patched in after.
+
+    One INDEPENDENT shortest-path per track (`_build_static_chain`'s
+    `track_plan`): a track's stops are its own ordered projection nodes, its
+    path starts at the real depot state `x0`, and each hop is priced by that
+    track's `cost_fn` -- an agent track's own obstacle-aware field, the SAME
+    one kernel.py's routing objective uses, so branch selection agrees with
+    the continuous objective instead of a plain-Euclidean surrogate;
+    Euclidean for an object track or when `problem.edge_cost_fn` is `None`.
+    The tracks are separable (disjoint columns, per-agent cost fns), so
+    solving each in isolation and summing is exactly `min sum delta_{ab}`
+    over the joint branch choice -- no assumption about how tracks interleave
+    in the chain, and (unlike the earlier union-column L2 metric) no free
+    wp column from an unrelated node leaking GA-search noise into the
+    decision, since each hop reads only this track's own pinned columns.
+
+    Including the `x0 -> first-stop` hop matters: omitting it (a real, fixed
+    bug in an earlier version) ignored the cost of the first move away from
+    the actual start state, so the DP optimized a path good in isolation but
+    not the shortest one INCLUDING getting there from `x0`.
+
+    Returns `(pop, n_branch)`: a one-hot per projection's own `branch_slice`
+    (apply_projections' argmax decode recovers the chosen branch); a
+    projection with no real choice (`discrete_params == 1`) gets an all-zero
+    width-1 slice, whose argmax is 0 regardless -- already correct."""
     pop = wp0.shape[0]
-    base_row = wp0[:, nid, :]
-    if not entries:
-        return base_row[:, None, :], ()
-    per_entry_rows = [_one_entry_candidates(problem, entry, wp0, params_arr) for entry in entries]
-    dims = tuple(entry.discrete_params for entry in entries)
-    if len(entries) == 1:
-        return per_entry_rows[0], dims
-
-    combined = []
-    for combo in itertools.product(*[range(d) for d in dims]):
-        row = base_row
-        for entry, entry_rows, b in zip(entries, per_entry_rows, combo):
-            cols = jnp.asarray(entry.pinned_cols)
-            row = row.at[:, cols].set(entry_rows[:, b, :][:, cols])
-        combined.append(row)
-    return jnp.stack(combined, axis=1), dims
-
-
-def _solve_branch_dp(problem, chain_order, chain_node_entries, relevant_cols, wp0, x0, params_arr):
-    """Exact per-individual DP over `chain_order`'s static node chain: picks
-    the branch index at every discrete-choice projection minimizing total
-    L2 path length through the chain's candidate rows -- a plain
-    shortest-path-over-a-layered-graph, the same algorithm diag_path_
-    length.py's own ground truth uses, just run once per generation inside
-    `_ask` instead of after the fact in numpy. A plain Python loop over
-    `chain_order` (a small, spec-build-time-fixed list) unrolls this at
-    trace time -- no jax.lax.scan/backtrack bookkeeping needed, since
-    successive steps' candidate counts (`K`) can differ freely.
-
-    Every distance -- including the FIRST chain node's cost, from the real
-    depot/start state `x0` -- is computed over `relevant_cols` only (see
-    _build_static_chain's own docstring for why: matching diag_path_
-    length.py's metric exactly, and not letting unrelated free wp columns'
-    GA-search noise leak into the branch decision). Omitting the `x0` term
-    entirely was a real, confirmed bug in an earlier version of this
-    function -- it silently ignored the cost of the first move away from
-    the actual start state, and the DP would then optimize a path that
-    looked good in isolation but wasn't actually the globally shortest one
-    INCLUDING getting there from `x0`.
-
-    Returns `(pop, n_branch)`: a plain one-hot per projection's own
-    `branch_slice` (apply_projections' argmax decode then exactly recovers
-    the chosen branch); a node with no real choice (discrete_params == 1)
-    gets an all-zero row of width 1 -- argmax of a length-1 slice is
-    always index 0 regardless of its value, so this is already correct.
-    A node with SEVERAL projections decodes its combined flat choice back
-    into each entry's own branch via `jnp.unravel_index` (the inverse of
-    `_node_candidates`' `itertools.product` enumeration -- both use
-    default C/row-major order, so they agree)."""
-    pop = wp0.shape[0]
-    # dtype=int32 explicitly: relevant_cols is empty for a scene with no
-    # projections at all (e.g. pick_place_task, whose Pick/Place targets
-    # are plain FK-residual equality constraints, not analytic-IK
-    # ProjOperators) -- jnp.asarray([]) defaults to float64 with nothing
-    # else to infer a dtype from, and float-indexing x0[cols] below raises.
-    # An empty int array here is correct either way: every node then has
-    # entries=[] too (no projection anywhere in the problem), so
-    # _node_candidates' own K=1 trivial-candidate path is what actually
-    # makes the whole DP a no-op, not this array's shape.
-    cols = jnp.asarray(relevant_cols, dtype=jnp.int32)
-    rows_by_node = []
-    for nid in chain_order:
-        entries = chain_node_entries.get(nid, [])
-        rows, dims = _node_candidates(problem, nid, entries, wp0, params_arr)
-        rows_by_node.append((entries, dims, rows))
-
-    x0_rel = x0[cols]  # (len(relevant_cols),)
-    first_rel = rows_by_node[0][2][:, :, cols]  # (pop, k0, len(relevant_cols))
-    costs = [jnp.linalg.norm(first_rel - x0_rel[None, None, :], axis=-1)]  # (pop, k0)
-    backptrs = []
-    for i in range(1, len(rows_by_node)):
-        prev_rows = rows_by_node[i - 1][2][:, :, cols]
-        cur_rows = rows_by_node[i][2][:, :, cols]
-        diff = prev_rows[:, :, None, :] - cur_rows[:, None, :, :]
-        dist = jnp.linalg.norm(diff, axis=-1)  # (pop, k_prev, k_cur)
-        total = costs[-1][:, :, None] + dist
-        costs.append(jnp.min(total, axis=1))
-        backptrs.append(jnp.argmin(total, axis=1))  # (pop, k_cur)
-
-    choices = [None] * len(rows_by_node)
-    choices[-1] = jnp.argmin(costs[-1], axis=1)  # (pop,)
-    for i in range(len(rows_by_node) - 2, -1, -1):
-        choices[i] = jnp.take_along_axis(backptrs[i], choices[i + 1][:, None], axis=1)[:, 0]
-
     proj_branch = jnp.zeros((pop, problem.n_branch))
-    for i, (entries, dims, _rows) in enumerate(rows_by_node):
-        if not entries:
-            continue
-        per_entry_idx = (choices[i],) if len(entries) == 1 else jnp.unravel_index(choices[i], dims)
-        for entry, branch_idx in zip(entries, per_entry_idx):
-            onehot = jax.nn.one_hot(branch_idx, entry.discrete_params)
-            proj_branch = proj_branch.at[:, entry.branch_slice].set(onehot)
+
+    for cost_fn, cols, entries in track_plan:
+        # (pop, k_j, w) candidate positions for this track at each of its
+        # ordered stops -- k_j = entries[j].discrete_params.
+        stops = [_one_entry_candidates(problem, e, wp0, params_arr)[:, :, cols]
+                 for e in entries]
+
+        depot = x0[cols]  # (w,)
+        cost = _apply_edge_cost(cost_fn, depot[None, None, :], stops[0])  # (pop, k0)
+        backptrs = []
+        for j in range(1, len(stops)):
+            a = stops[j - 1][:, :, None, :]  # (pop, k_prev, 1, w)
+            b = stops[j][:, None, :, :]      # (pop, 1, k_cur, w)
+            total = cost[:, :, None] + _apply_edge_cost(cost_fn, a, b)  # (pop, k_prev, k_cur)
+            cost = jnp.min(total, axis=1)
+            backptrs.append(jnp.argmin(total, axis=1))  # (pop, k_cur)
+
+        choices = [None] * len(stops)
+        choices[-1] = jnp.argmin(cost, axis=1)  # (pop,)
+        for j in range(len(stops) - 2, -1, -1):
+            choices[j] = jnp.take_along_axis(backptrs[j], choices[j + 1][:, None], axis=1)[:, 0]
+
+        for entry, branch_idx in zip(entries, choices):
+            proj_branch = proj_branch.at[:, entry.branch_slice].set(
+                jax.nn.one_hot(branch_idx, entry.discrete_params))
+
     return proj_branch
 
 
@@ -402,7 +390,7 @@ class SmallContinuousVRPSolver(LamarckianGA):
     def __init__(self, population_size, solution, problem, assign_temperature=1.0,
                  max_assign_combos=4096, **kwargs):
         super().__init__(population_size, solution, problem, **kwargs)
-        self._chain_order, self._chain_node_entries, self._chain_relevant_cols = _build_static_chain(problem)
+        self._chain_order, self._chain_node_entries, self._chain_track_plan = _build_static_chain(problem)
         self._assign_combos = _build_assign_combos(problem, max_assign_combos)
         self._assign_temperature = assign_temperature
 
@@ -478,8 +466,8 @@ class SmallContinuousVRPSolver(LamarckianGA):
         # -- computed BEFORE local_refine runs, so local_refine's own AL
         # residual/routing computations use the correct branch throughout,
         # not a stale one patched in after the fact.
-        proj_branch = _solve_branch_dp(problem, self._chain_order, self._chain_node_entries,
-                                        self._chain_relevant_cols, wp0, params.x0, params.problem_params)
+        proj_branch = _solve_branch_dp(problem, self._chain_track_plan, wp0,
+                                        params.x0, params.problem_params)
 
         wp_star, psi_star, off_mu, off_lam, off_rho = self.local_refine(
             wp0, psi0, assign, cond_binary, proj_branch, t, child_mu, child_lam, child_rho,

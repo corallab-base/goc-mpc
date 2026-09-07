@@ -457,6 +457,12 @@ class GraphOrderingRelaxed:
             raise ValueError(
                 f"per-agent edge_cost_fn has {len(edge_cost_fn)} entries but the "
                 f"graph has {self.n_agents} agents")
+        # Kept alongside the built kernel so a consumer with only `problem` in
+        # hand (SmallContinuousVRPSolver's branch-selection DP) can price its
+        # own transitions with the SAME field kernel.py's routing objective
+        # uses, instead of a plain Euclidean surrogate. `None` (Euclidean),
+        # one shared callable, or a per-agent list -- see make_graph_kernel.
+        self.edge_cost_fn = edge_cost_fn
         kernel_kwargs = {} if edge_cost_fn is None else {"edge_cost_fn": edge_cost_fn}
         self._decode_and_cost, self._batched, self._decode_node_rank = make_graph_kernel(
             self.instance_sources, self.n_variables, self.ordering_edges,
