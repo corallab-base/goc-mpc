@@ -363,6 +363,10 @@ def _write_t_batch_jax(problem, X, t):
     return X.at[:, problem.t_offset:problem.wp_offset].set(t)
 
 
+def _write_proj_branch_batch_jax(problem, X, proj_branch):
+    return X.at[:, problem.branch_offset:problem.t_offset].set(proj_branch)
+
+
 # ---------------------------------------------------------------------------
 # Precedence-respecting construction heuristic
 # ---------------------------------------------------------------------------
