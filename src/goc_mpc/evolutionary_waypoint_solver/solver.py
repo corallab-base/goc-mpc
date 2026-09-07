@@ -48,7 +48,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .problem import apply_anchor, agent_depot, pad_to_state_dim
+from .problem import (
+    apply_anchor, apply_projections, agent_depot, pad_to_state_dim,
+    gather_free_wp, scatter_free_wp, precompute_static_projections,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -59,11 +62,41 @@ jax.config.update("jax_enable_x64", True)
 
 def _make_merit_batched(problem, wp_shape):
     n_nodes, state_dim = wp_shape
+    # wp_psi_flat's own wp block only ever carries the columns no
+    # projection pins (problem.n_wp_free/wp_free_idx) -- a pinned column is
+    # always overwritten by apply_projections below regardless of what
+    # value it's fed, so it's not a real degree of freedom for this
+    # function's own gradient to search (see gather_free_wp/scatter_free_wp,
+    # problem.py). Reduces to the ordinary n_nodes*state_dim whenever
+    # problem has no projections at all.
+    d_wp = problem.n_wp_free
     batched_kernel = problem._batched
     eq_fns, ineq_fns = problem._eq_constraints, problem._ineq_constraints
 
-    def merit(wp_flat, assign, cond_binary, t, mu, lam, rho, x0, params, anchor):
-        wp = wp_flat.reshape(-1, n_nodes, state_dim)
+    def merit(wp_psi_flat, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
+              static_cache=None):
+        # wp_psi_flat is wp's FREE columns (flattened) ++ psi -- local
+        # refinement gradient-descends the two together (psi is a genuine
+        # continuous free parameter of whatever projection(s) declared it,
+        # exactly like an ordinary free wp column -- see problem.
+        # apply_projections' docstring), while proj_branch (a projection's
+        # discrete branch choice) is a plain passthrough here, GA-searched
+        # only, same as assign/cond_binary/t below.
+        pop = wp_psi_flat.shape[0]
+        wp_free = wp_psi_flat[:, :d_wp]
+        psi = wp_psi_flat[:, d_wp:]
+        wp = scatter_free_wp(problem, wp_free, jnp.zeros((pop, n_nodes, state_dim)))
+        # Splices every registered analytic-elimination substitution in
+        # BEFORE apply_anchor -- see apply_projections' own docstring for
+        # why that order (an already-passed node's frozen anchor always
+        # wins over whatever a projection would recompute). static_cache
+        # (from problem.precompute_static_projections, computed once per
+        # generation by make_batched_local_refine below) lets a
+        # "generation-static" projection's value be reused here instead of
+        # recomputed on every one of this function's own ~1000s-per-
+        # generation calls.
+        wp = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
+                                static_cache=static_cache)
         # anchor splices remaining_vertices state in once here: a node/
         # variable no longer in remaining_vertices reads back as either its
         # last-committed planned constant (wp_eff_frozen) or the current call's
@@ -91,9 +124,12 @@ def _make_merit_batched(problem, wp_shape):
             total = total + (jnp.sum(z * z, axis=1) - jnp.sum(lam * lam, axis=1)) / (2.0 * rho)
         return total
 
-    def merit_and_grad(wp_flat, assign, cond_binary, t, mu, lam, rho, x0, params, anchor):
+    def merit_and_grad(wp_psi_flat, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
+                       static_cache=None):
         value, vjp_fn = jax.vjp(
-            lambda w: merit(w, assign, cond_binary, t, mu, lam, rho, x0, params, anchor), wp_flat)
+            lambda w: merit(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
+                             static_cache),
+            wp_psi_flat)
         (grad,) = vjp_fn(jnp.ones_like(value))
         return value, grad
 
@@ -203,13 +239,26 @@ def _lbfgs_solve(merit_and_grad_fixed, wp_flat0, m, inner_maxiter, max_ls_trials
 def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, rho_max,
                                 lbfgs_history=10, ls_max_trials=10):
     n_nodes, state_dim = problem.n_nodes, problem.state_dim
+    # wp_psi_flat only ever carries wp's FREE columns (problem.n_wp_free) --
+    # see gather_free_wp/scatter_free_wp (problem.py) and _make_merit_
+    # batched's own comment -- so this function's own d_wp must match.
+    d_wp = problem.n_wp_free
     eq_fns, ineq_fns = problem._eq_constraints, problem._ineq_constraints
     merit_and_grad = _make_merit_batched(problem, (n_nodes, state_dim))
 
-    lo = jnp.asarray(problem.xl[problem.wp_offset:])
-    hi = jnp.asarray(problem.xu[problem.wp_offset:])
+    # problem.xl/xu lay the FULL wp block then psi out contiguously
+    # (psi_offset == wp_offset + n_nodes*state_dim, n_var == psi_offset +
+    # n_psi -- see GraphOrderingRelaxed.__init__), but wp_psi_flat now only
+    # carries wp's free columns -- gather the same wp_free_idx subset out
+    # of the full wp bound block, then append psi's own bounds unchanged,
+    # to get wp_psi_flat's own layout exactly.
+    xl_wp_free = jnp.asarray(problem.xl[problem.wp_offset:problem.psi_offset])[problem.wp_free_idx]
+    xu_wp_free = jnp.asarray(problem.xu[problem.wp_offset:problem.psi_offset])[problem.wp_free_idx]
+    lo = jnp.concatenate([xl_wp_free, jnp.asarray(problem.xl[problem.psi_offset:])])
+    hi = jnp.concatenate([xu_wp_free, jnp.asarray(problem.xu[problem.psi_offset:])])
 
-    def batched_local_refine(wp0, assign, cond_binary, t, mu, lam, rho, x0, params, anchor, cv_tol):
+    def batched_local_refine(wp0, psi0, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params,
+                              anchor, cv_tol):
         """`cv_tol` (per-generation-annealed, from _score_schedule/
         _calibrate_score_scale -- the SAME absolute yardstick the GA's own
         selection score already penalizes violation against) is what grows
@@ -225,19 +274,57 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
         one that resets every call. Uses _calc_cv_jax (the same summed
         violation _evaluate_population_jax computes CV0/cv_tol's own
         calibration from), not a max-norm, so the comparison is scale-
-        consistent with what `cv_tol` was actually calibrated against."""
-        pop = wp0.shape[0]
-        wp_flat = wp0.reshape(pop, -1)
+        consistent with what `cv_tol` was actually calibrated against.
 
-        def merit_and_grad_fixed(w):
-            return merit_and_grad(w, assign, cond_binary, t, mu, lam, rho, x0, params, anchor)
+        `psi0` (any projections' continuous self-motion parameters) is
+        gradient-refined together with `wp0`, as one combined flat vector --
+        it's a genuine continuous free parameter of whatever projection
+        declared it, exactly like an ordinary free wp column (see problem.
+        apply_projections' docstring). `proj_branch` (a projection's
+        discrete branch choice) is a plain passthrough instead, unaffected
+        by this function -- it's GA-searched only, same as assign/
+        cond_binary/t.
+
+        `wp0` is the FULL `(pop, n_nodes, state_dim)` array (same shape
+        every other caller in this module uses), but only its
+        projection-free columns (gather_free_wp) ever enter wp_psi_flat --
+        a pinned column is always overwritten by apply_projections below
+        regardless of what value `wp0` held there, so there's no real
+        gradient to descend along it. `wp_final` is scattered back out to
+        that same full shape (scatter_free_wp) before returning, so callers
+        see no difference from before this reduction existed.
+
+        `static_cache` (problem.precompute_static_projections) is computed
+        ONCE here, before the outer AL loop even starts, since a
+        "generation-static" projection's value only ever depends on
+        `proj_branch`/`params` -- both already fixed for this whole call
+        (proj_branch is GA-searched once per generation upstream, not
+        touched by anything in this function; params is a plain runtime
+        constant) -- so recomputing it again per outer_iter (let alone per
+        L-BFGS iteration/backtracking trial) would just recompute the
+        identical value. `wp0` only supplies whatever placeholder a static
+        entry's documented-unused reads need (see precompute_static_
+        projections' own docstring) -- never a real dependency."""
+        pop = wp0.shape[0]
+        static_cache = precompute_static_projections(problem, wp0, proj_branch, params)
+        wp_psi_flat = jnp.concatenate([gather_free_wp(problem, wp0), psi0], axis=1)
+
+        def merit_and_grad_fixed(w, assign=assign, cond_binary=cond_binary, proj_branch=proj_branch, t=t,
+                                  mu=mu, lam=lam, rho=rho, x0=x0, params=params, anchor=anchor,
+                                  static_cache=static_cache):
+            return merit_and_grad(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
+                                   static_cache)
 
         for _ in range(outer_iters):
-            wp_flat = _lbfgs_solve(merit_and_grad_fixed, wp_flat, lbfgs_history, inner_maxiter, ls_max_trials)
-            wp_flat = jnp.clip(wp_flat, lo, hi)
+            wp_psi_flat = _lbfgs_solve(merit_and_grad_fixed, wp_psi_flat, lbfgs_history, inner_maxiter, ls_max_trials)
+            wp_psi_flat = jnp.clip(wp_psi_flat, lo, hi)
 
-            wp = wp_flat.reshape(pop, n_nodes, state_dim)
-            assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
+            wp_free = wp_psi_flat[:, :d_wp]
+            psi = wp_psi_flat[:, d_wp:]
+            wp = scatter_free_wp(problem, wp_free, jnp.zeros((pop, n_nodes, state_dim)))
+            wp_proj = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
+                                         static_cache=static_cache)
+            assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp_proj, anchor, x0)
             h1 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
                                           anchor.node_active, x0, params)
             g1 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
@@ -250,18 +337,26 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
                 lam = jnp.maximum(0.0, lam + rho[:, None] * g1)
             rho = jnp.where(v1 <= cv_tol, rho, jnp.minimum(rho * rho_growth, rho_max))
 
-            def merit_and_grad_fixed(w, assign=assign, cond_binary=cond_binary, t=t, mu=mu, lam=lam, rho=rho,
-                                      x0=x0, params=params, anchor=anchor):
-                return merit_and_grad(w, assign, cond_binary, t, mu, lam, rho, x0, params, anchor)
+            def merit_and_grad_fixed(w, assign=assign, cond_binary=cond_binary, proj_branch=proj_branch, t=t,
+                                      mu=mu, lam=lam, rho=rho, x0=x0, params=params, anchor=anchor,
+                                      static_cache=static_cache):
+                return merit_and_grad(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
+                                       static_cache)
 
-        return wp_flat.reshape(pop, n_nodes, state_dim), mu, lam, rho
+        wp_final = scatter_free_wp(problem, wp_psi_flat[:, :d_wp], jnp.zeros((pop, n_nodes, state_dim)))
+        psi_final = wp_psi_flat[:, d_wp:]
+        return wp_final, psi_final, mu, lam, rho
 
     return batched_local_refine
 
 
 def _write_wp_batch_jax(problem, X, wp):
     pop = X.shape[0]
-    return X.at[:, problem.wp_offset:].set(wp.reshape(pop, -1))
+    return X.at[:, problem.wp_offset:problem.psi_offset].set(wp.reshape(pop, -1))
+
+
+def _write_psi_batch_jax(problem, X, psi):
+    return X.at[:, problem.psi_offset:].set(psi)
 
 
 def _write_t_batch_jax(problem, X, t):
@@ -453,7 +548,8 @@ def _calc_cv_jax(pop, G, H, eq_eps=1e-4):
 
 def _evaluate_population_jax(problem, X, x0, params, anchor):
     pop = X.shape[0]
-    assign, cond_binary, t, wp = problem._extract_batch(X)
+    assign, cond_binary, proj_branch, t, wp, psi = problem._extract_batch(X)
+    wp = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor)
     assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
     F, _G_kernel = problem._batched(assign_eff, cond_binary, t, wp_eff_frozen, agent_depot(problem, x0),
                                      anchor.node_active)
@@ -578,26 +674,30 @@ def _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob
             child_X = child_X.at[:, wp_offset:].set(
                 parent_wp + wp_mut_scale * (child_X[:, wp_offset:] - parent_wp))
 
-        _, _, t_p1, _ = problem._extract_batch(X[p1])
-        _, _, t_p2, _ = problem._extract_batch(X[p2])
+        _, _, _, t_p1, _, _ = problem._extract_batch(X[p1])
+        _, _, _, t_p2, _, _ = problem._extract_batch(X[p2])
         perm1, perm2 = jnp.argsort(t_p1, axis=1), jnp.argsort(t_p2, axis=1)
         child_perm_ox = _ox_crossover_batched(k_ox, perm1, perm2)
         row_idx = jnp.arange(pop_size)[:, None]
         rank = jnp.broadcast_to(jnp.arange(n_nodes), (pop_size, n_nodes))
         t_ox = jnp.zeros((pop_size, n_nodes)).at[row_idx, child_perm_ox].set(rank)
         do_ox = jax.random.uniform(k_ox_mask, (pop_size,)) < ox_prob
-        _, _, t_blx, _ = problem._extract_batch(child_X)
+        _, _, _, t_blx, _, _ = problem._extract_batch(child_X)
         child_X = _write_t_batch_jax(problem, child_X, jnp.where(do_ox[:, None], t_ox, t_blx))
 
         child_mu, child_lam, child_rho = mu[parent], lam[parent], rho[parent]
 
-        child_assign, child_cond_binary, child_t, child_wp0 = problem._extract_batch(child_X)
-        child_wp_star, off_mu, off_lam, off_rho = local_refine(
-            child_wp0, child_assign, child_cond_binary, child_t, child_mu, child_lam, child_rho, x0, params, anchor,
-            cv_tol)
+        (child_assign, child_cond_binary, child_proj_branch, child_t, child_wp0,
+         child_psi0) = problem._extract_batch(child_X)
+        child_wp_star, child_psi_star, off_mu, off_lam, off_rho = local_refine(
+            child_wp0, child_psi0, child_assign, child_cond_binary, child_proj_branch, child_t,
+            child_mu, child_lam, child_rho, x0, params, anchor, cv_tol)
         off_X = _write_wp_batch_jax(problem, child_X, child_wp_star)
+        off_X = _write_psi_batch_jax(problem, off_X, child_psi_star)
 
-        off_assign, off_cond_binary, off_t, off_wp = problem._extract_batch(off_X)
+        off_assign, off_cond_binary, off_proj_branch, off_t, off_wp, off_psi = problem._extract_batch(off_X)
+        off_wp = apply_projections(problem, off_wp, off_psi, off_proj_branch, params,
+                                    assign=off_assign, anchor=anchor)
         # Routing local search never reads a passed row's value either way
         # (masked out via node_active regardless -- see kernel.py), so
         # off_wp_eff_frozen is handed to it arbitrarily; off_wp_eff_live is
@@ -654,8 +754,8 @@ def _seed_initial_population(problem, key, X0, n_seed, seed_jitter_t, seed_jitte
         # existing behavior, unrelated to the wp row layout below). Kept
         # dimensionally consistent with it regardless, in case that's fixed.
         n_nodes, state_dim = problem.n_nodes, problem.state_dim
-        wp_lo = jnp.asarray(problem.xl[problem.wp_offset:].reshape(n_nodes, state_dim))
-        wp_hi = jnp.asarray(problem.xu[problem.wp_offset:].reshape(n_nodes, state_dim))
+        wp_lo = jnp.asarray(problem.xl[problem.wp_offset:problem.psi_offset].reshape(n_nodes, state_dim))
+        wp_hi = jnp.asarray(problem.xu[problem.wp_offset:problem.psi_offset].reshape(n_nodes, state_dim))
         key, k_seed_wp = jax.random.split(key)
         jitter_wp = jax.random.normal(k_seed_wp, (n_seed, n_nodes, state_dim), dtype=X0.dtype) * (seed_jitter_wp_frac * (wp_hi - wp_lo))
         seed_wp = jnp.asarray(seed_wp_np, dtype=X0.dtype)

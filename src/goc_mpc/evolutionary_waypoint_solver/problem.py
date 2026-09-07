@@ -37,6 +37,77 @@ import numpy as np
 from .kernel import make_graph_kernel
 
 
+# One analytic-elimination substitution (projection.ProjOperator, resolved
+# by spec.py's _resolve_projections) -- see apply_projections' docstring for
+# how a list of these gets applied.
+#   write_node: node id whose row gets written.
+#   pinned_cols: (w,) int array -- ABSOLUTE column indices within
+#       write_node's row to overwrite. Only meaningful when
+#       owner_var_slot is None (a plain agent_q(k)/object_q(k) pin, static
+#       columns known at spec-build time); ignored otherwise.
+#   owner_var_slot / owner_cols_per_agent: the var_agent_q(var_id) pin case
+#       (spec.py's _resolve_pin_columns "dynamic" branch) -- None/None for
+#       an ordinary static pin. `owner_var_slot` indexes `assign`'s own
+#       `n_variables` axis: which assignable variable's own GA-searched
+#       choice decides WHICH agent's columns actually get written, decoded
+#       via argmax exactly like every other var_agent_q consumer in this
+#       solver (spec.py's _make_row_resolver/_resolve_holds), respecting
+#       anchor.var_committed/var_anchor once that variable's owner has been
+#       committed. `owner_cols_per_agent` is a spec-build-time-precomputed
+#       `(n_agents, w)` int array -- row k lists the ABSOLUTE columns this
+#       pin would write if agent k turned out to be the owner (k*slot_width
+#       + each local offset) -- apply_projections gathers row `owner` out
+#       of it per population member, so no `slot_width` arithmetic is
+#       needed at runtime. Unlike a static pin's fixed `pinned_cols`, WHICH
+#       columns get written varies per individual/generation (whichever
+#       agent that individual's own assign currently favors) -- this is
+#       exactly why these columns can never join wp_free_idx's static
+#       shrink (see gather_free_wp's docstring): no single column is ever
+#       unconditionally dead.
+#   node_locals: node id(s) whose rows read_fn is called with (len 1 for a
+#       node constraint, 2 (u, v) for a relational edge constraint).
+#   read_fn: UNBATCHED callable(*rows) -> tuple of arrays, one per the
+#       ProjOperator's own `reads` entries, in order (empty tuple if
+#       `reads=()`) -- built by spec.py from the same per-placeholder
+#       resolution every other compiled constraint in this module uses,
+#       restricted to the static/FK cases (see spec.py's
+#       _resolve_read_component).
+#   func: UNBATCHED callable(*read_values, psi, branch) -> value (see
+#       projection.ProjOperator's own docstring) -- None when `table` is
+#       set instead (the reads=() and continuous_params=0 case: spec.py
+#       precomputes every branch's value once, in plain numpy, rather than
+#       calling this on every batched pass).
+#   continuous_params: width of this projection's own slice of the global
+#       `psi` block.
+#   psi_bounds: (lo, hi) box for this projection's own psi slice (copied
+#       from ProjOperator.psi_bounds; ignored when continuous_params == 0).
+#   psi_slice / branch_slice: this projection's own slice of the global
+#       flat `psi` / `proj_branch` blocks (GraphOrderingRelaxed below).
+#   discrete_params: cardinality of this projection's own branch selector.
+#   table: (discrete_params, len(pinned_cols)) numpy array, or None -- see
+#       `func` above.
+#   is_static: True iff this projection's value cannot change across any of
+#       one local_refine call's L-BFGS iterations/backtracking trials or
+#       outer AL rounds -- continuous_params == 0 (no psi to gradient-
+#       refine) and every read `func` actually consumes (an underscore-
+#       prefixed func parameter name is the documented "kept only for the
+#       constraint's free-variable-coverage check, never truly read"
+#       convention -- see spec.py's _classify_static_projection) resolves to
+#       a param(id) placeholder, itself runtime-constant for the whole
+#       step() call. Always False when `table` is set -- a tabled entry is
+#       already an O(1) gather, precompute_static_projections has nothing
+#       to add for it. See precompute_static_projections/apply_projections'
+#       own docstrings for how this is used to avoid recomputing a
+#       potentially expensive analytic elimination (e.g. an 8-branch
+#       closed-form IK) on every one of a generation's many merit calls.
+ProjectionEntry = namedtuple(
+    "ProjectionEntry",
+    ["write_node", "pinned_cols", "node_locals", "read_fn", "func",
+     "continuous_params", "psi_slice", "psi_bounds", "branch_slice",
+     "discrete_params", "table", "is_static",
+     "owner_var_slot", "owner_cols_per_agent"])
+
+
 # Bundles remaining_vertices' runtime effect on an otherwise-fixed-size
 # problem (see spec.py's module docstring) into one pytree,
 # threaded alongside x0 through decode_and_cost/_batched/merit/local_refine/
@@ -129,6 +200,181 @@ def apply_anchor(problem, assign, wp, anchor, x0):
     return assign_eff, wp_eff_frozen, wp_eff_live
 
 
+def gather_free_wp(problem, wp):
+    """Drops every projection-pinned column out of `(pop, n_nodes,
+    state_dim)` wp, returning `(pop, n_wp_free)` -- the columns no
+    projection ever writes (problem.wp_free_idx, GraphOrderingRelaxed.
+    __init__). A pinned column's incoming value is always overwritten by
+    apply_projections before anything else ever reads it (see that
+    function's docstring), so it carries no real degree of freedom;
+    local_refine gradient-descends only this reduced vector instead of
+    wastefully carrying those dead columns through every L-BFGS iteration.
+    Identity (mod reshape) when problem has no projections at all
+    (wp_free_idx == arange(n_nodes*state_dim))."""
+    pop = wp.shape[0]
+    return wp.reshape(pop, -1)[:, problem.wp_free_idx]
+
+
+def scatter_free_wp(problem, wp_free, base):
+    """Inverse of gather_free_wp: splices `(pop, n_wp_free)` free-column
+    values into `base`'s `(pop, n_nodes, state_dim)` shape at their
+    original positions, leaving every pinned column exactly as `base`
+    already held it there -- irrelevant regardless, since apply_projections
+    always overwrites a pinned column right after (see gather_free_wp) --
+    so callers reconstructing a fresh full wp from scratch may pass
+    `base=jnp.zeros((pop, n_nodes, state_dim))` and rely on that overwrite
+    rather than tracking a real placeholder value."""
+    pop = wp_free.shape[0]
+    flat = base.reshape(pop, -1).at[:, problem.wp_free_idx].set(wp_free)
+    return flat.reshape(pop, problem.n_nodes, problem.state_dim)
+
+
+def precompute_static_projections(problem, wp0, proj_branch, params):
+    """Evaluates every "generation-static" projection's value ONCE
+    (ProjectionEntry.is_static -- continuous_params == 0 and every read
+    `func` actually consumes is a param(id) placeholder), rather than
+    letting apply_projections recompute it from scratch on every one of a
+    single local_refine call's many merit_and_grad calls (~1000s per
+    generation for a tuned outer_iters/inner_maxiter/ls_max_trials budget --
+    see the profiling this followed from). Safe because a static entry's
+    value provably cannot change across any of those calls: `proj_branch`/
+    `params` are themselves fixed for local_refine's whole call (proj_branch
+    is GA-searched once per generation, not L-BFGS-refined; params is a
+    plain runtime constant), and continuous_params == 0 means there's no
+    psi for L-BFGS to move underneath it either.
+
+    `wp0` supplies whatever `rows` a static entry's read_fn needs for its
+    documented-unused (underscore-prefixed func parameter) reads -- e.g.
+    UR5e's analytic-IK projection reads its own about-to-be-pinned FK
+    placeholders only to satisfy the constraint's free-variable-coverage
+    check, then discards them (see spec.py's _classify_static_projection) --
+    so ANY value works there, including wp0's own pre-refinement one; a
+    real param(id) read (the only kind that can affect an is_static entry's
+    actual value) never touches `rows` at all.
+
+    Returns a `{id(entry): value}` cache for apply_projections' own
+    `static_cache` argument -- keyed by identity since `problem.projections`
+    is a plain fixed-length Python list, walked identically (in the same
+    order) by both functions."""
+    cache = {}
+    for entry in problem.projections:
+        if not entry.is_static:
+            continue
+        branch_scores = proj_branch[:, entry.branch_slice]
+        branch = jnp.argmax(branch_scores, axis=-1)  # (pop,)
+        rows = tuple(wp0[:, node, :] for node in entry.node_locals)
+        psi_i = jnp.zeros((branch.shape[0], entry.continuous_params))  # always 0-width: is_static implies continuous_params == 0
+
+        def _one(rows_1, psi_1, branch_1, entry=entry, params=params):
+            read_vals = entry.read_fn(rows_1, params)
+            return jnp.asarray(entry.func(*read_vals, psi_1, branch_1))
+
+        cache[id(entry)] = jax.vmap(_one, in_axes=(0, 0, 0))(rows, psi_i, branch)
+    return cache
+
+
+def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor=None, static_cache=None):
+    """Splices every registered analytic-elimination substitution
+    (spec.py's _resolve_projections, projection.ProjOperator) into batched
+    `(pop, n_nodes, state_dim)` wp, reading batched `psi`
+    `(pop, n_psi)`/`proj_branch` `(pop, n_branch)` for whatever continuous/
+    discrete parameters each one needs, and the POPULATION-INVARIANT
+    `params` array (GraphOfConstraints.view_param_values(), same value
+    every other compiled constraint reads a param(id) placeholder from) for
+    any projection whose `reads` includes one -- set_param overwrites it in
+    place between solves, so a param-reading projection always reflects the
+    CURRENT value, never a stale one baked in at spec-build time.
+
+    `assign`/`anchor` (batched `(pop, n_variables, n_agents)` / problem.
+    AnchorState): only needed when some projection pins a var_agent_q(...)
+    row instead of a plain agent_q(k)/object_q(k) one (ProjectionEntry.
+    owner_var_slot is not None -- see its own docstring) -- such a pin's
+    WRITE TARGET, not just its value, is dynamic: which agent's columns
+    actually get overwritten is that variable's own GA-searched choice,
+    decoded via `jnp.argmax(assign[:, owner_var_slot, :], axis=-1)` exactly
+    like every other var_agent_q consumer in this solver (spec.py's
+    _make_row_resolver/_resolve_holds), honoring `anchor.var_committed`/
+    `var_anchor` once that variable has been committed -- this function
+    runs BEFORE apply_anchor (see below), so it can't just read an
+    already-computed assign_eff and must apply that same substitution
+    itself. Omit both (the default) for any problem with no var_agent_q
+    pin at all -- every existing caller that never touches this feature is
+    unaffected; passing an entry that needs them without providing them
+    raises rather than silently writing into the wrong (or every) agent's
+    row.
+
+    `static_cache` (optional, from precompute_static_projections): when an
+    entry's value is already cached there (its own `is_static` says it's
+    safe to -- see that function's docstring), this reuses the cached value
+    instead of recomputing it, so a caller invoking apply_projections
+    repeatedly within one local_refine call (make_batched_local_refine, the
+    ~1000s-of-merit_and_grad-calls hot path) pays for each static
+    projection's real work exactly once per generation rather than on every
+    call. Omitted entirely (the default), every entry is recomputed from
+    scratch every time -- the original, always-correct behavior every
+    other caller (mpc.py's write-back, this function's own doctests) keeps
+    using unchanged.
+
+    Call this FIRST, on the free GA-searched wp, and feed its return value
+    as apply_anchor's own `wp` argument (every call site in solver.py does
+    exactly this) -- an already-passed node's frozen anchor is always the
+    true ground truth regardless of whether it was ever projected, so
+    apply_anchor's substitution must win where the two overlap. mpc.py's
+    write-back applies this same function (pop=1) to the WINNING
+    individual before persisting a node's row, for the identical reason: a
+    pinned column is never actually driven anywhere by local refinement --
+    apply_projections overwrites it before any constraint/kernel/gradient
+    ever reads it, so its gradient there is exactly zero (see
+    _resolve_projections' docstring) -- so the raw searched wp value
+    sitting in that column is not the real answer; this substitution is.
+
+    Each projection's own branch is decoded via argmax over its
+    `branch_slice` of proj_branch, exactly like `assign`'s one-hot-over-
+    agents decode elsewhere in this module. A tabled projection (`entry.
+    table` set -- see ProjectionEntry's docstring) is a plain gather, no
+    grad needed since it never depends on a traced value; an untabled one
+    vmaps its (read_fn, func) pair over the population axis, matching how
+    every other compiled constraint in this module is built for a single
+    example and vmapped by its caller."""
+    for entry in problem.projections:
+        if static_cache is not None and id(entry) in static_cache:
+            value = static_cache[id(entry)]
+        elif entry.table is not None:
+            branch_scores = proj_branch[:, entry.branch_slice]
+            branch = jnp.argmax(branch_scores, axis=-1)  # (pop,)
+            value = jnp.asarray(entry.table)[branch]  # (pop, w)
+        else:
+            branch_scores = proj_branch[:, entry.branch_slice]
+            branch = jnp.argmax(branch_scores, axis=-1)  # (pop,)
+            rows = tuple(wp[:, node, :] for node in entry.node_locals)  # each (pop, state_dim)
+            psi_i = psi[:, entry.psi_slice]  # (pop, continuous_params)
+
+            def _one(rows_1, psi_1, branch_1, entry=entry, params=params):
+                read_vals = entry.read_fn(rows_1, params)
+                return jnp.asarray(entry.func(*read_vals, psi_1, branch_1))
+
+            value = jax.vmap(_one, in_axes=(0, 0, 0))(rows, psi_i, branch)
+
+        if entry.owner_var_slot is None:
+            wp = wp.at[:, entry.write_node, entry.pinned_cols].set(value)
+        else:
+            if assign is None:
+                raise ValueError(
+                    "a var_agent_q(...)-pinned projection (ProjectionEntry."
+                    "owner_var_slot is not None) needs apply_projections' own "
+                    "`assign` argument to resolve which agent's row to write "
+                    "into -- see this function's docstring")
+            owner = jnp.argmax(assign[:, entry.owner_var_slot, :], axis=-1)  # (pop,)
+            if anchor is not None:
+                committed = anchor.var_committed[entry.owner_var_slot]
+                owner = jnp.where(committed, anchor.var_anchor[entry.owner_var_slot], owner)
+            cols = jnp.asarray(entry.owner_cols_per_agent)[owner]  # (pop, w) -- per-individual ABSOLUTE cols
+            row = wp[:, entry.write_node, :]
+            new_row = jax.vmap(lambda r, c, v: r.at[c].set(v))(row, cols, value)
+            wp = wp.at[:, entry.write_node, :].set(new_row)
+    return wp
+
+
 def full_active_anchor(problem):
     """AnchorState with every node "active" (free, not yet passed) and no
     committed variable assignments -- the correct anchor for the very first
@@ -162,7 +408,7 @@ class GraphOrderingRelaxed:
                  instance_node, n_nodes, state_dim,
                  n_cond_vars=0, objective="avg", edge_cost_fn=None,
                  eq_constraints=(), ineq_constraints=(), params=None,
-                 instance_list=(), var_id_to_slot=None):
+                 instance_list=(), var_id_to_slot=None, projections=()):
         self.instance_sources = list(instance_sources)
         # Raw (node, (kind, val)) routing-instance pairs and the GA-slot
         # assignment for each assignable variable id -- unlike
@@ -228,20 +474,81 @@ class GraphOrderingRelaxed:
         self.n_eq_constr = self.n_eq_extra
         self.n_ieq_constr = self.n_ineq_extra
 
+        # Analytic-elimination substitutions (problem.ProjectionEntry, from
+        # spec.py's _resolve_projections) -- each one claims a slice of two
+        # new flat blocks, `proj_branch` (grouped with assign/cond_binary:
+        # real-relaxed, GA-searched-only, decoded via argmax, never
+        # gradient-refined) and `psi` (grouped with wp: gradient-refined by
+        # local_refine, since it's a genuine continuous free parameter --
+        # see apply_projections' docstring). Both are 0-width when there
+        # are no projections, so an unprojected graph's layout/n_var is
+        # completely unchanged from before this feature existed.
+        self.projections = list(projections)
+        self.n_branch = sum(p.discrete_params for p in self.projections)
+        self.n_psi = sum(p.continuous_params for p in self.projections)
+
+        # Which (node, column) wp entries are fully determined by some
+        # STATIC projection (problem.ProjectionEntry.write_node/pinned_cols,
+        # owner_var_slot is None) -- a pinned column's raw value is always
+        # thrown away by apply_projections before anything reads it (see
+        # its docstring), regardless of whether that projection also
+        # carries a psi/branch, so it's never a real degree of freedom for
+        # local_refine's L-BFGS to search. spec.py's own registration
+        # already guarantees at most one projection claims any given
+        # column (see _resolve_projections' docstring), so a plain union
+        # here is exact -- no column is ever double-counted. wp_free_idx
+        # indexes into a flattened (n_nodes*state_dim,) row; empty
+        # `projections` (the common case) makes it exactly
+        # arange(n_nodes*state_dim), i.e. every column free, identical to
+        # this feature not existing.
+        #
+        # A DYNAMIC (var_agent_q-pinned, owner_var_slot is not None) entry
+        # is deliberately excluded here -- see ProjectionEntry's own
+        # docstring: which agent's columns it actually writes varies per
+        # population member/generation (whichever that individual's own
+        # assign currently favors), so no single column at that node is
+        # EVER unconditionally dead the way a static pin's columns are --
+        # every candidate agent's slot there stays a genuine, searched
+        # decision variable for the individuals that don't currently
+        # select it. JAX/XLA need one fixed shape per compiled function, so
+        # there is no way to shrink this per-individual.
+        wp_pinned_mask = np.zeros((n_nodes, state_dim), dtype=bool)
+        for p in self.projections:
+            if p.owner_var_slot is not None:
+                continue
+            wp_pinned_mask[p.write_node, p.pinned_cols] = True
+        self.wp_pinned_mask = wp_pinned_mask
+        self.wp_free_idx = np.flatnonzero(~wp_pinned_mask.reshape(-1))
+        self.n_wp_free = int(self.wp_free_idx.shape[0])
+
         self.n_assign_vars = self.n_variables * self.n_agents
         self.cond_offset = self.n_assign_vars
-        self.t_offset = self.cond_offset + self.n_cond_vars
+        self.branch_offset = self.cond_offset + self.n_cond_vars
+        self.t_offset = self.branch_offset + self.n_branch
         self.wp_offset = self.t_offset + self.n_nodes
-        n_var = self.wp_offset + self.n_nodes * self.state_dim
+        self.psi_offset = self.wp_offset + self.n_nodes * self.state_dim
+        n_var = self.psi_offset + self.n_psi
         self.n_var = n_var
 
         xl = np.zeros(n_var)
         xu = np.ones(n_var)
         wp_lo, wp_hi = wp_bounds
-        xl[self.wp_offset:] = wp_lo
-        xu[self.wp_offset:] = wp_hi
+        xl[self.wp_offset:self.psi_offset] = wp_lo
+        xu[self.wp_offset:self.psi_offset] = wp_hi
         xl[self.t_offset:self.wp_offset] = 0.0
         xu[self.t_offset:self.wp_offset] = float(self.n_nodes - 1)
+        # proj_branch (branch_offset:t_offset) keeps the [0, 1] default,
+        # same convention assign/cond_binary already use -- a real-relaxed
+        # per-branch score, decoded via argmax, not a bounded physical
+        # quantity.
+        for p in self.projections:
+            if p.continuous_params == 0:
+                continue
+            lo, hi = p.psi_bounds
+            start = self.psi_offset + p.psi_slice.start
+            stop = self.psi_offset + p.psi_slice.stop
+            xl[start:stop] = lo
+            xu[start:stop] = hi
 
         # Statically-fixed instances no longer occupy any position in x at
         # all (no synthetic vagent/one-hot row to pin) -- their real agent
@@ -251,15 +558,19 @@ class GraphOrderingRelaxed:
 
     def _extract_single(self, x):
         assign = x[:self.n_assign_vars].reshape(self.n_variables, self.n_agents)
-        cond_binary = x[self.cond_offset:self.t_offset]
+        cond_binary = x[self.cond_offset:self.branch_offset]
+        proj_branch = x[self.branch_offset:self.t_offset]
         t = x[self.t_offset:self.wp_offset]
-        wp = x[self.wp_offset:].reshape(self.n_nodes, self.state_dim)
-        return assign, cond_binary, t, wp
+        wp = x[self.wp_offset:self.psi_offset].reshape(self.n_nodes, self.state_dim)
+        psi = x[self.psi_offset:]
+        return assign, cond_binary, proj_branch, t, wp, psi
 
     def _extract_batch(self, X):
         pop = len(X)
         assign = X[:, :self.n_assign_vars].reshape(pop, self.n_variables, self.n_agents)
-        cond_binary = X[:, self.cond_offset:self.t_offset]
+        cond_binary = X[:, self.cond_offset:self.branch_offset]
+        proj_branch = X[:, self.branch_offset:self.t_offset]
         t = X[:, self.t_offset:self.wp_offset]
-        wp = X[:, self.wp_offset:].reshape(pop, self.n_nodes, self.state_dim)
-        return assign, cond_binary, t, wp
+        wp = X[:, self.wp_offset:self.psi_offset].reshape(pop, self.n_nodes, self.state_dim)
+        psi = X[:, self.psi_offset:]
+        return assign, cond_binary, proj_branch, t, wp, psi

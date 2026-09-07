@@ -134,6 +134,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 			for (const auto& [id, rec] : self.symbolic_edge_ops) out[id] = rec.formula;
 			return out;
 		})
+		// Optional analytic-projection hint per phi id (add_constraint/
+		// add_edge_constraint's proj= kwarg below) -- see
+		// GraphOfConstraints::phi_to_projection's own doc comment.
+		// Read-only, and only ever as large as the subset of phi ids that
+		// actually passed proj=; absent entries mean "no projection,
+		// compile the formula as an ordinary residual" everywhere.
+		.def_readonly("phi_to_projection_map", &GraphOfConstraints::phi_to_projection)
+		.def_readonly("edge_phi_to_projection_map", &GraphOfConstraints::edge_phi_to_projection)
 		// Which compiled form each edge_phi_to_formula_map entry is: True
 		// for an "along the edge" formula (plain agent_q/object_q/
 		// var_agent_q placeholders, an invariant applied at both endpoints),
@@ -255,8 +263,11 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("v_var_agent_q", &GraphOfConstraints::v_var_agent_q, py::arg("var"))
 		// accept either a single Formula or a numpy array of Formulas (from
 		// element-wise == on object arrays) and reduce with conjunction.
+		// proj: optional ProjOperator (see phi_to_projection's doc comment) --
+		// stashed opaquely against the returned phi id for the evolutionary
+		// solver to pick up later; this binding never inspects it.
 		.def("add_constraint", [](GraphOfConstraints& self, int node,
-		                          py::object formula_obj) -> int {
+		                          py::object formula_obj, py::object proj) -> int {
 			drake::symbolic::Formula f;
 			try {
 				f = py::cast<drake::symbolic::Formula>(formula_obj);
@@ -268,10 +279,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 					else        f = f && fh;
 				}
 			}
-			return self.add_constraint(node, f);
-		}, py::arg("node"), py::arg("formula"))
+			int phi_id = self.add_constraint(node, f);
+			if (!proj.is_none()) self.phi_to_projection[phi_id] = proj;
+			return phi_id;
+		}, py::arg("node"), py::arg("formula"), py::arg("proj") = py::none())
 		.def("add_edge_constraint", [](GraphOfConstraints& self, int u, int v,
-					       py::object formula_obj, bool live) -> int {
+					       py::object formula_obj, bool live, py::object proj) -> int {
 			drake::symbolic::Formula f;
 			try {
 				f = py::cast<drake::symbolic::Formula>(formula_obj);
@@ -283,8 +296,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 					else        f = f && fh;
 				}
 			}
-			return self.add_edge_constraint(u, v, f, live);
-		}, py::arg("u"), py::arg("v"), py::arg("formula"), py::arg("live") = false)
+			int phi_id = self.add_edge_constraint(u, v, f, live);
+			if (!proj.is_none()) self.edge_phi_to_projection[phi_id] = proj;
+			return phi_id;
+		}, py::arg("u"), py::arg("v"), py::arg("formula"), py::arg("live") = false, py::arg("proj") = py::none())
 		// CONDITIONAL ORDERING API ////////////////////////////
 		.def("assignment_sym", &GraphOfConstraints::assignment_sym, py::arg("var"))
 		.def("add_binary_cond_var", &GraphOfConstraints::add_binary_cond_var)

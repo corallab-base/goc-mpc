@@ -111,7 +111,7 @@ from .spec import (
     build_graph_ordering_problem, _agent_widths, _slot_width,
     _object_widths, _object_slot_width,
 )
-from .problem import AnchorState
+from .problem import AnchorState, apply_projections
 from .solver import (
     run_lamarckian_al,
     build_lamarckian_ga,
@@ -379,7 +379,7 @@ class EvolutionaryWaypointSolver:
         jax.block_until_ready(carry_out)
 
         best_X = np.asarray(carry_out[-3])
-        assign, cond_binary, t, _wp = self._problem._extract_single(best_X)
+        assign, cond_binary, _proj_branch, t, _wp, _psi = self._problem._extract_single(best_X)
         owner_variable = (np.argmax(assign, axis=-1) if self._problem.n_variables > 0
                           else np.zeros(0, dtype=int))
         node_rank = self._problem._decode_node_rank(
@@ -443,7 +443,16 @@ class EvolutionaryWaypointSolver:
 
         self._carry = result.pop
 
-        assign, _cond_binary, t, wp = problem._extract_single(np.asarray(result.X))
+        assign, _cond_binary, proj_branch, t, wp, psi = problem._extract_single(np.asarray(result.X))
+        # A projected node's own pinned columns are never actually driven
+        # anywhere by local refinement (apply_projections overwrites them
+        # before anything reads them, every solve -- see its own docstring)
+        # -- so the raw wp value extracted above is not the real answer for
+        # those columns; substitute it in now, once, on the winning
+        # individual, before persisting anything to self._waypoints.
+        wp = apply_projections(problem, jnp.asarray(wp)[None, :, :], jnp.asarray(psi)[None, :],
+                                jnp.asarray(proj_branch)[None, :], params_arr,
+                                assign=jnp.asarray(assign)[None, :, :], anchor=anchor)[0]
         wp = np.asarray(wp)
         owner_variable = (np.argmax(np.asarray(assign), axis=-1) if problem.n_variables > 0
                           else np.zeros(0, dtype=int))

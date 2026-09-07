@@ -72,6 +72,8 @@ entirely (e.g. a non-symbolic/black-box cost), add_python_constraint remains
 available as an escape hatch, scoped to a single node's whole row (no
 routing instance required there -- see add_python_constraint's docstring)."""
 
+import inspect
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -79,7 +81,7 @@ import numpy as np
 from .default_fk import resolve_link_fk
 from .formula_compiler import as_variable, compile_condition, compile_relational_formula
 from .kernel import build_decode_node_rank
-from .problem import GraphOrderingRelaxed
+from .problem import GraphOrderingRelaxed, ProjectionEntry
 
 
 def target_eq_constraint(target):
@@ -207,6 +209,291 @@ def _make_link_rot_map(graph):
     return out
 
 
+def _build_static_map(graph, slot_width, object_slot_width):
+    """{Variable.get_id(): (side, col)} for every plain, static
+    agent_q(k)/object_q(k)/u_agent_q(k)/u_object_q(k) (side 0) or
+    v_agent_q(k)/v_object_q(k) (side 1) placeholder -- the STATIC subset of
+    _make_row_resolver's own resolution (var_agent_q/agent_link_pos/
+    agent_link_rot/param are all dynamic or FK-backed, not plain column
+    reads, so they have no entry here). Shared by _make_row_resolver (which
+    additionally handles those dynamic/FK/param cases) and
+    _resolve_projections (which only ever needs this static subset, to
+    resolve a ProjOperator's `pins` -- a projection can only WRITE to a
+    plain decision-variable column, never to an FK result or a var_agent_q
+    dynamic selection)."""
+    num_agents = graph.num_agents
+    num_objects = graph.num_objects
+    agents_width = num_agents * slot_width
+
+    static_map = {}  # var_id -> (side, col)
+    for k in range(num_agents):
+        for j, expr in enumerate(graph.agent_q(k)):
+            v = as_variable(expr)
+            if v is not None:
+                static_map[v.get_id()] = (0, k * slot_width + j)
+        for j, expr in enumerate(graph.u_agent_q(k)):
+            v = as_variable(expr)
+            if v is not None:
+                static_map[v.get_id()] = (0, k * slot_width + j)
+    for k in range(num_objects):
+        for j, expr in enumerate(graph.object_q(k)):
+            v = as_variable(expr)
+            if v is not None:
+                static_map[v.get_id()] = (0, agents_width + k * object_slot_width + j)
+        for j, expr in enumerate(graph.u_object_q(k)):
+            v = as_variable(expr)
+            if v is not None:
+                static_map[v.get_id()] = (0, agents_width + k * object_slot_width + j)
+    for k in range(num_agents):
+        for j, expr in enumerate(graph.v_agent_q(k)):
+            v = as_variable(expr)
+            if v is not None:
+                static_map[v.get_id()] = (1, k * slot_width + j)
+    for k in range(num_objects):
+        for j, expr in enumerate(graph.v_object_q(k)):
+            v = as_variable(expr)
+            if v is not None:
+                static_map[v.get_id()] = (1, agents_width + k * object_slot_width + j)
+    return static_map
+
+
+def _build_param_map(graph):
+    """{Variable.get_id(): component index into the runtime `params` array}
+    for every GraphOfConstraints.add_param(...)-declared placeholder --
+    shared by _make_row_resolver (which additionally handles the static/
+    var_agent_q/FK cases) and _resolve_read_component (ProjOperator.reads
+    resolution, spec.py's _resolve_projections)."""
+    param_map = {}
+    for i in range(graph.num_params()):
+        v = as_variable(graph.param(i))
+        if v is not None:
+            param_map[v.get_id()] = i
+    return param_map
+
+
+def _resolve_pin_columns(proj, static_map, var_map):
+    """ProjOperator.pins -> either `("static", side, [col, ...])` (a plain
+    agent_q/object_q(/u_/v_-prefixed) placeholder -- side/col known at
+    spec-build time) or `("dynamic", var_slot, [j, ...])` (var_agent_q(
+    var_id) components -- `var_slot` indexes `assign`'s own n_variables
+    axis; `j` is a LOCAL offset within whichever agent's slot the
+    variable's own GA-searched choice ends up selecting at runtime, not an
+    absolute column -- see problem.ProjectionEntry's owner_var_slot/
+    owner_cols_per_agent docstring for how that's resolved). Raises if any
+    component isn't one of these two kinds, or if `proj.pins` mixes them
+    (a static agent_q/object_q column with a var_agent_q one, or two
+    var_agent_q components from DIFFERENT variables) -- a single
+    projection must pin either a fixed agent/object's columns or exactly
+    one assignable variable's own row, never a blend of the two (there's
+    no single well-defined write target otherwise). All STATIC components
+    must additionally resolve to the SAME side (a single projection pins
+    one endpoint only, for an edge constraint's relational pin);
+    var_agent_q only ever binds side 0 (see _make_row_resolver's own
+    docstring), so a dynamic pin's side is fixed by the caller (_register),
+    not returned here."""
+    static_cols = []
+    dynamic_slot = None
+    dynamic_js = []
+    for expr in np.asarray(proj.pins).flat:
+        v = as_variable(expr)
+        vid = v.get_id() if v is not None else None
+        if vid is not None and vid in var_map:
+            slot, j = var_map[vid]
+            if static_cols or (dynamic_slot is not None and slot != dynamic_slot):
+                raise ValueError(
+                    f"ProjOperator.pins entry {expr!r} (var_agent_q(...)) can't "
+                    "be mixed with a plain agent_q/object_q pin or a DIFFERENT "
+                    "assignable variable's var_agent_q(...) in the same "
+                    "projection -- a projection pins either a fixed agent/"
+                    "object's columns or exactly one assignable variable's own "
+                    "row")
+            dynamic_slot = slot
+            dynamic_js.append(j)
+            continue
+        if dynamic_slot is not None or vid is None or vid not in static_map:
+            raise ValueError(
+                f"ProjOperator.pins entry {expr!r} isn't a plain, static "
+                "agent_q(k)/object_q(k) (or u_/v_-prefixed) placeholder, nor a "
+                "var_agent_q(...) component of the same assignable variable as "
+                "every other pins entry -- a projection can only assign a plain "
+                "decision-variable column or one assignable variable's whole "
+                "row, never an FK result")
+        static_cols.append(static_map[vid])
+    if dynamic_slot is not None:
+        return "dynamic", dynamic_slot, dynamic_js
+    sides = {side for side, _col in static_cols}
+    if len(sides) > 1:
+        raise ValueError(
+            f"ProjOperator.pins mixes columns from both sides of a relational "
+            f"edge constraint ({static_cols!r}) -- a single projection must pin "
+            "one endpoint only")
+    side = next(iter(sides)) if sides else 0
+    return "static", side, [col for _side, col in static_cols]
+
+
+def _resolve_read_component(var_id, static_map, link_pos_map, link_rot_map, param_map,
+                             agent_widths, slot_width):
+    """One ProjOperator.reads placeholder (a single scalar Variable id) ->
+    an UNBATCHED callable(rows, params) -> scalar -- `rows` is the same
+    node-rows tuple _batch_symbolic_constraint_fn's compiled residuals
+    receive, `params` the same runtime params array threaded there too
+    (GraphOfConstraints.add_param/set_param) -- every resolved closure
+    accepts both uniformly (even the ones that ignore one or the other) so
+    _read_array_fn/_read_array_fn_multi never need to special-case which
+    case matched. Restricted to the static (agent_q/object_q/u_/v_-
+    prefixed), FK (agent_link_pos/agent_link_rot), and param(id) cases; a
+    projection's reads may NOT depend on a var_agent_q(...) dynamic
+    selection in this version (raises otherwise) -- not needed by any
+    projection built so far, and supporting it means threading
+    owner_variable through apply_projections' vmap too (a real GA-searched,
+    per-population-member value, unlike params below, which is population-
+    invariant), which isn't worth the complexity until something actually
+    needs it.
+
+    `agent_widths`/`slot_width`: the FK branches must slice `rows[0]` down
+    to just this agent's own `agent_widths[agent_id]` columns (starting at
+    `agent_id * slot_width`) before calling `fk_fn` -- `rows[0]` here is the
+    WHOLE node row (every agent's and object's columns, apply_projections'
+    own `wp[:, node, :]`), not a pre-narrowed one, unlike what one might
+    assume from `_make_row_resolver`'s `_link_fk` cache helper (which takes
+    the already-whole row and does this same narrowing itself -- see its
+    own `col0`/`w` locals). Calling `fk_fn` on the whole row instead
+    silently shape-mismatches inside `fk_fn`'s own jacobian/jvp math for any
+    scene with more than one agent-width's worth of columns (an object, or
+    a second agent) -- caught via `dual_ur5e_table_joint_env`'s analytic-IK
+    Handoff/Place nodes, which reference `agent_link_pos`/`agent_link_rot`
+    in a projection's `reads` on a graph that also carries object columns.
+
+    Unlike _make_row_resolver's own link_pos_map/link_rot_map branches (which
+    share one fk-result cache across every placeholder component touching
+    the same (agent, link), since a position+orientation node target can
+    reference it ~12 times per residual pass), a projection's reads list is
+    always small -- no cache here; worst case is one duplicate fk_fn call
+    when both position and orientation are read for the same link."""
+    if var_id in static_map:
+        side, col = static_map[var_id]
+        return lambda rows, params, side=side, col=col: rows[side][col]
+    if var_id in link_pos_map:
+        agent_id, _link_name, fk_fn, j = link_pos_map[var_id]
+        col0 = agent_id * slot_width
+        w = agent_widths[agent_id]
+        return lambda rows, params, fk_fn=fk_fn, col0=col0, w=w, j=j: (
+            fk_fn(rows[0][col0:col0 + w])[0][j])
+    if var_id in link_rot_map:
+        agent_id, _link_name, fk_fn, j = link_rot_map[var_id]
+        col0 = agent_id * slot_width
+        w = agent_widths[agent_id]
+        return lambda rows, params, fk_fn=fk_fn, col0=col0, w=w, j=j: (
+            jnp.reshape(fk_fn(rows[0][col0:col0 + w])[1], (-1,))[j])
+    if var_id in param_map:
+        idx = param_map[var_id]
+        return lambda rows, params, idx=idx: params[idx]
+    raise ValueError(
+        f"ProjOperator.reads references a placeholder (var id {var_id}) that "
+        "isn't a plain static agent_q/object_q(/u_/v_-prefixed) placeholder, "
+        "an agent_link_pos/agent_link_rot FK placeholder, or a param(id) -- "
+        "var_agent_q(...) reads aren't supported inside a projection's reads")
+
+
+def _read_array_fn(exprs, static_map, link_pos_map, link_rot_map, param_map,
+                    agent_widths, slot_width):
+    """One ProjOperator.reads entry -> an UNBATCHED callable(rows, params)
+    -> an array shaped like `exprs` itself (NOT flattened to 1-D) --
+    resolving each component independently via _resolve_read_component, the
+    same kind of per-scalar resolution _make_row_resolver already does for
+    an ordinary constraint's placeholders, just collected into a whole
+    array `func` reads instead of a residual term. Preserving `exprs`' own
+    shape (rather than always returning a flat vector) means a bare scalar
+    placeholder -- e.g. a single `graph.param(pid)`, `np.asarray(...)`'s
+    shape `()` -- comes back as a genuine scalar `func` can use directly
+    (`lambda px, py, psi, branch: ...`), not a length-1 array."""
+    exprs_arr = np.asarray(exprs, dtype=object)
+    var_ids = []
+    for expr in exprs_arr.flat:
+        v = as_variable(expr)
+        if v is None:
+            raise ValueError(
+                f"ProjOperator.reads entry contains a non-placeholder element "
+                f"{expr!r} -- every component must be a plain placeholder; a "
+                "literal target belongs baked directly into func's own "
+                "closure instead")
+        var_ids.append(v.get_id())
+    fns = [_resolve_read_component(vid, static_map, link_pos_map, link_rot_map, param_map,
+                                    agent_widths, slot_width)
+           for vid in var_ids]
+    shape = exprs_arr.shape
+
+    def read(rows, params, fns=fns, shape=shape):
+        if not fns:
+            return jnp.zeros(shape)
+        return jnp.stack([fn(rows, params) for fn in fns]).reshape(shape)
+    return read
+
+
+def _classify_static_projection(proj, param_map):
+    """True iff `proj`'s value provably cannot change across any of one
+    local_refine call's L-BFGS iterations/backtracking trials or outer AL
+    rounds -- safe for problem.precompute_static_projections to evaluate
+    ONCE per generation instead of on every merit_and_grad call (see that
+    function's own docstring for why this matters -- e.g. UR5e's 8-branch
+    closed-form analytic IK, recomputed ~1000s of times per generation
+    otherwise).
+
+    Requires continuous_params == 0 (no psi for L-BFGS to move underneath
+    it) AND every func parameter `func` actually reads to resolve to a
+    param(id) placeholder -- itself a plain runtime constant for local_
+    refine's whole call (GraphOfConstraints.set_param only ever changes
+    between solves, never mid-call). `reads=()` (already handled by a
+    spec-build-time table -- see _resolve_projections) is trivially "every
+    actually-read parameter is a param" (there are none), but is_static is
+    still set False for those -- a tabled entry is already an O(1) gather,
+    precompute_static_projections has nothing left to add.
+
+    A func parameter name starting with "_" is this codebase's own
+    existing convention (see _ur5e_analytic_ik_proj's `_fk_pos, _fk_rot`)
+    for "kept only to satisfy add_constraint/add_edge_constraint's free-
+    variable-coverage check (every placeholder the Formula references must
+    appear in pins union reads), never actually read by func" -- such a
+    parameter may resolve to anything (an FK placeholder, even a different
+    node's column) without breaking staticness, since func provably
+    ignores whatever value it's given there. Falls back to treating every
+    read as "actually read" (the conservative, always-correct choice) if
+    proj.func's signature can't be introspected at all."""
+    if proj.continuous_params != 0:
+        return False
+    try:
+        param_names = list(inspect.signature(proj.func).parameters)
+    except (TypeError, ValueError):
+        param_names = []
+    for i, arr in enumerate(proj.reads):
+        # Positional index i is func's i-th parameter (ProjOperator.func:
+        # "(*read_values, psi, branch)") -- an out-of-range i (more reads
+        # than func declared positional params, e.g. a *args func) is
+        # conservatively treated as "actually read".
+        documented_unused = i < len(param_names) and param_names[i].startswith("_")
+        if documented_unused:
+            continue
+        for expr in np.asarray(arr).flat:
+            if as_variable(expr).get_id() not in param_map:
+                return False  # an actually-read, non-param placeholder -- may vary within a generation
+    return True
+
+
+def _read_array_fn_multi(reads, static_map, link_pos_map, link_rot_map, param_map,
+                          agent_widths, slot_width):
+    """ProjOperator.reads (a tuple of placeholder arrays) -> an UNBATCHED
+    callable(rows, params) -> tuple of stacked arrays, one per `reads`
+    entry, in order -- exactly the positional args ProjOperator.func
+    expects before its trailing (psi, branch)."""
+    per_entry_fns = [_read_array_fn(arr, static_map, link_pos_map, link_rot_map, param_map,
+                                     agent_widths, slot_width)
+                     for arr in reads]
+
+    def read_fn(rows, params, per_entry_fns=per_entry_fns):
+        return tuple(fn(rows, params) for fn in per_entry_fns)
+    return read_fn
+
+
 def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
                         object_widths, object_slot_width):
     """Builds resolve(var, n_row_slots) -> Callable[*rows, owner_variable,
@@ -258,39 +545,7 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
     own real width, so every static offset below is one of those plus `j`,
     never a packed cumulative offset.
     """
-    num_agents = graph.num_agents
-    num_objects = graph.num_objects
-    agents_width = num_agents * slot_width
-
-    static_map = {}  # var_id -> (side, col)
-    for k in range(num_agents):
-        for j, expr in enumerate(graph.agent_q(k)):
-            v = as_variable(expr)
-            if v is not None:
-                static_map[v.get_id()] = (0, k * slot_width + j)
-        for j, expr in enumerate(graph.u_agent_q(k)):
-            v = as_variable(expr)
-            if v is not None:
-                static_map[v.get_id()] = (0, k * slot_width + j)
-    for k in range(num_objects):
-        for j, expr in enumerate(graph.object_q(k)):
-            v = as_variable(expr)
-            if v is not None:
-                static_map[v.get_id()] = (0, agents_width + k * object_slot_width + j)
-        for j, expr in enumerate(graph.u_object_q(k)):
-            v = as_variable(expr)
-            if v is not None:
-                static_map[v.get_id()] = (0, agents_width + k * object_slot_width + j)
-    for k in range(num_agents):
-        for j, expr in enumerate(graph.v_agent_q(k)):
-            v = as_variable(expr)
-            if v is not None:
-                static_map[v.get_id()] = (1, k * slot_width + j)
-    for k in range(num_objects):
-        for j, expr in enumerate(graph.v_object_q(k)):
-            v = as_variable(expr)
-            if v is not None:
-                static_map[v.get_id()] = (1, agents_width + k * object_slot_width + j)
+    static_map = _build_static_map(graph, slot_width, object_slot_width)
 
     var_map = {}  # var_id -> (slot, component j)
     for var_id, slot in var_id_to_slot.items():
@@ -332,11 +587,7 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
     # al.) -- params is therefore always the LAST positional argument, a
     # genuine jax runtime array (not baked into the compiled closure), so
     # set_param never forces a retrace.
-    param_map = {}  # var_id -> component index into params
-    for i in range(graph.num_params()):
-        v = as_variable(graph.param(i))
-        if v is not None:
-            param_map[v.get_id()] = i
+    param_map = _build_param_map(graph)
 
     def resolve(var, n_row_slots):
         vid = var.get_id()
@@ -877,6 +1128,194 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
     row_resolver = _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
                                        object_widths, object_slot_width)
+    static_map = _build_static_map(graph, slot_width, object_slot_width)
+
+    # -- analytic-elimination projections ------------------------------------
+
+    def _resolve_projections():
+        """Auto-derives ProjectionEntry substitutions (problem.py) from
+        every symbolic node/edge constraint's `proj=` (graph.phi_to_
+        projection_map/edge_phi_to_projection_map -- projection.ProjOperator,
+        set via GraphOfConstraints.add_constraint/add_edge_constraint's proj
+        kwarg). Returns (entries, skip_node_phis, skip_edge_phis): `entries`
+        is problem.GraphOrderingRelaxed's `projections` list, in discovery
+        order (node loop then edge loop -- the same order _resolve_symbolic_
+        constraints below walks), which fixes each one's psi_slice/
+        branch_slice offsets into the flat psi/proj_branch decision blocks
+        for this problem's whole lifetime; the two skip sets tell
+        _resolve_symbolic_constraints which phi ids to exclude from the
+        ordinary residual pass -- a projected constraint is satisfied
+        EXACTLY by construction (apply_projections substitutes the pinned
+        columns before anything reads them), so it gets no AL residual/
+        multiplier at all, unlike every other constraint here.
+
+        "Along the edge" edge constraints (graph.edge_phi_to_along_edge_map)
+        aren't supported here yet -- raises NotImplementedError, since
+        applying one func independently at two different nodes' own rows
+        needs a double registration this function doesn't build. Register
+        the same ProjOperator as two ordinary add_constraint(..., proj=...)
+        NODE constraints instead (one per endpoint) until this is added.
+
+        Validates, per projection (raises otherwise -- see
+        _resolve_pin_columns/ProjOperator's own docstrings for the first
+        two):
+          * every proj.pins component resolves via static_map.
+          * proj.pins union every proj.reads array covers every free
+            variable the constraint's own Formula references -- otherwise
+            some placeholder the Formula used would go completely
+            unconstrained the instant its residual is dropped.
+          * no two projections pin overlapping columns at the same node.
+          * no projection's reads reference a column any OTHER projection
+            pins at the same node (chained projections aren't supported --
+            single-hop only, see this module's docstring)."""
+        link_pos_map = _make_link_pos_map(graph)
+        link_rot_map = _make_link_rot_map(graph)
+        param_map = _build_param_map(graph)
+        # var_id -> (slot, component j) -- same construction as
+        # _make_row_resolver's own var_map, needed here so a projection's
+        # `pins` may ALSO resolve a var_agent_q(var_id) component (a
+        # "dynamic" pin -- see _resolve_pin_columns/ProjectionEntry's own
+        # docstrings), not just a plain static agent_q/object_q one.
+        var_map = {}
+        for var_id, slot in var_id_to_slot.items():
+            for j, expr in enumerate(graph.var_agent_q(var_id)):
+                v = as_variable(expr)
+                if v is not None:
+                    var_map[v.get_id()] = (slot, j)
+
+        entries = []
+        skip_node_phis = set()
+        skip_edge_phis = set()
+        pinned_by_node = {}  # node -> set of claimed columns (int) -- for a
+        # dynamic pin, this is the UNION of every candidate agent's absolute
+        # columns (see _register below), so the existing overlap check below
+        # stays exact rather than blind to a possible-but-not-guaranteed
+        # collision.
+        totals = {"psi": 0, "branch": 0}
+
+        def _register(phi_id, node_locals, formula, proj):
+            kind, side_or_slot, cols_or_js = _resolve_pin_columns(proj, static_map, var_map)
+            owner_var_slot, owner_cols_per_agent = None, None
+            if kind == "static":
+                write_node = node_locals[side_or_slot]
+                cols = np.asarray(cols_or_js, dtype=int)
+                # The set this pin could ever possibly claim -- exactly its
+                # own fixed columns, since a static pin's write target never
+                # varies.
+                possible_cols = {int(c) for c in cols}
+            else:
+                # var_agent_q(var_id) only ever binds side 0 (see
+                # _make_row_resolver's own docstring) -- the NODE is static,
+                # only which agent's slot within it gets written is dynamic.
+                write_node = node_locals[0]
+                owner_var_slot = side_or_slot
+                cols = np.asarray([], dtype=int)  # unused for a dynamic pin -- see ProjectionEntry's docstring
+                owner_cols_per_agent = np.asarray(
+                    [[k * slot_width + j for j in cols_or_js] for k in range(graph.num_agents)], dtype=int)
+                # This pin could write ANY candidate agent's columns,
+                # depending on runtime GA search -- so, for the purposes of
+                # the overlap check below, it conservatively claims the
+                # UNION over every candidate (a genuine possible collision
+                # for whichever future/past static registration's columns
+                # happen to fall inside some candidate agent's slot -- see
+                # this function's own module-level comment above).
+                possible_cols = {int(c) for c in owner_cols_per_agent.reshape(-1)}
+
+            pin_var_ids = {as_variable(e).get_id() for e in np.asarray(proj.pins).flat}
+            read_var_ids = set()
+            for arr in proj.reads:
+                read_var_ids |= {as_variable(e).get_id() for e in np.asarray(arr).flat}
+            free_ids = {v.get_id() for v in formula.GetFreeVariables()}
+            if not free_ids <= (pin_var_ids | read_var_ids):
+                raise ValueError(
+                    f"proj for phi {phi_id} doesn't account for every placeholder "
+                    "its constraint Formula references -- proj.pins union "
+                    "proj.reads must cover formula.GetFreeVariables() exactly")
+
+            claimed = pinned_by_node.setdefault(write_node, set())
+            if claimed & possible_cols:
+                raise ValueError(
+                    f"proj for phi {phi_id} pins column(s) at node {write_node} "
+                    "already claimed by another projection there (for a "
+                    "var_agent_q(...) pin, \"claimed\" means ANY candidate "
+                    "agent's slot, since which one actually gets written is "
+                    "runtime-dynamic)")
+            claimed |= possible_cols
+
+            for arr in proj.reads:
+                for expr in np.asarray(arr).flat:
+                    vid = as_variable(expr).get_id()
+                    if vid not in static_map:
+                        continue
+                    r_side, r_col = static_map[vid]
+                    if r_side >= len(node_locals):
+                        continue
+                    r_node = node_locals[r_side]
+                    if int(r_col) in pinned_by_node.get(r_node, set()):
+                        raise ValueError(
+                            f"proj for phi {phi_id} reads a column at node "
+                            f"{r_node} that another projection pins there -- "
+                            "chained projections aren't supported (single-hop only)")
+
+            read_fn = _read_array_fn_multi(proj.reads, static_map, link_pos_map, link_rot_map, param_map,
+                                            agent_widths, slot_width)
+
+            psi_slice = slice(totals["psi"], totals["psi"] + proj.continuous_params)
+            branch_slice = slice(totals["branch"], totals["branch"] + proj.discrete_params)
+            totals["psi"] += proj.continuous_params
+            totals["branch"] += proj.discrete_params
+
+            table = None
+            func = proj.func
+            if proj.continuous_params == 0 and not proj.reads:
+                # Fully static: func needs no row input, and has no
+                # continuous freedom to sweep -- enumerate every branch
+                # ONCE, in plain numpy, at spec-build time (see
+                # ProjOperator.reads' docstring). apply_projections then
+                # never calls func at all for this entry, just gathers a
+                # row out of this table.
+                table = np.stack(
+                    [np.asarray(proj.func(np.zeros(0), k)) for k in range(proj.discrete_params)],
+                    axis=0)
+                func = None
+
+            # A tabled entry is already an O(1) gather -- precompute_static_
+            # projections' per-generation cache has nothing to add for it,
+            # so is_static is unconditionally False there (see
+            # _classify_static_projection's own docstring).
+            is_static = table is None and _classify_static_projection(proj, param_map)
+
+            entries.append(ProjectionEntry(
+                write_node=write_node, pinned_cols=cols, node_locals=tuple(node_locals),
+                read_fn=read_fn, func=func, continuous_params=proj.continuous_params,
+                psi_slice=psi_slice, psi_bounds=proj.psi_bounds, branch_slice=branch_slice,
+                discrete_params=proj.discrete_params, table=table, is_static=is_static,
+                owner_var_slot=owner_var_slot, owner_cols_per_agent=owner_cols_per_agent))
+
+        for node in node_list:
+            for phi_id in graph.node_to_phis_map.get(node, []):
+                proj = graph.phi_to_projection_map.get(phi_id)
+                if proj is None:
+                    continue
+                _register(phi_id, (node,), graph.phi_to_formula_map[phi_id], proj)
+                skip_node_phis.add(phi_id)
+
+        for (u, v), phi_ids in graph.edge_to_phis_map.items():
+            for phi_id in phi_ids:
+                proj = graph.edge_phi_to_projection_map.get(phi_id)
+                if proj is None:
+                    continue
+                if graph.edge_phi_to_along_edge_map.get(phi_id, False):
+                    raise NotImplementedError(
+                        f"edge phi {phi_id}'s proj is registered on an \"along "
+                        "the edge\" constraint -- not yet supported (see "
+                        "_resolve_projections' docstring)")
+                _register(phi_id, (u, v), graph.edge_phi_to_formula_map[phi_id], proj)
+                skip_edge_phis.add(phi_id)
+
+        return entries, skip_node_phis, skip_edge_phis
+
+    projections, skip_node_phis, skip_edge_phis = _resolve_projections()
 
     # -- symbolic constraints -----------------------------------------------
 
@@ -900,6 +1339,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             for phi_id in graph.node_to_phis_map.get(node, []):
                 if phi_id not in node_formulas:
                     continue  # not a Formula-based (symbolic) constraint
+                if phi_id in skip_node_phis:
+                    continue  # projected instead -- see _resolve_projections
                 formula = node_formulas[phi_id]
                 # Always frozen, never checked against live_phi_ids: a
                 # node constraint can only reference its own node's
@@ -921,6 +1362,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             for phi_id in phi_ids:
                 if phi_id not in edge_formulas:
                     continue  # not a Formula-based (symbolic) edge constraint
+                if phi_id in skip_edge_phis:
+                    continue  # projected instead -- see _resolve_projections
                 formula = edge_formulas[phi_id]
                 mode = "live" if phi_id in live_phi_ids else "frozen"
 
@@ -1249,4 +1692,5 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         # separate object past this call.
         instance_list=instance_list,
         var_id_to_slot=var_id_to_slot,
+        projections=projections,
     )

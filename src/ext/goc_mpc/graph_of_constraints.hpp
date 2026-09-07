@@ -443,6 +443,26 @@ struct GraphOfConstraints {
 	// (agent_id, link_name) -- see set_robot_fk/link_pose.
 	std::map<std::pair<int, std::string>, py::function> robot_fk_registry;
 
+	// Optional analytic-projection hint attached to a symbolic node/edge
+	// constraint (add_constraint(..., proj=...)/add_edge_constraint(...,
+	// proj=...)), keyed by phi id -- an opaque Python object (a
+	// goc_mpc.evolutionary_waypoint_solver.projection.ProjOperator, though
+	// this class has no need to know that) this solver's Python side never
+	// reads directly; only the JAX evolutionary solver
+	// (evolutionary_waypoint_solver/spec.py) consults it, to replace that
+	// constraint's soft AL residual with an exact substitution (analytic
+	// IK, a fixed grasp offset, etc.) instead of searching the pinned
+	// columns continuously. Not populated by this class itself -- set
+	// directly by the add_constraint/add_edge_constraint pybind wrappers
+	// in goc_mpc.cpp, alongside the phi id those calls already return, the
+	// same way robot_fk_registry above is populated by set_robot_fk rather
+	// than by any core add_* method. A phi with no entry here (the common
+	// case) is unaffected: MILPWaypointSolver and any other consumer never
+	// look at this map, and keep compiling phi_to_formula_map/edge_phi_to_
+	// formula_map's Formula as an ordinary residual.
+	std::map<int, py::object> phi_to_projection;
+	std::map<int, py::object> edge_phi_to_projection;
+
 	// backtracking map
 	std::map<int, std::vector<int>> backtrack_map;
 
