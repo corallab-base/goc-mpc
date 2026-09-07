@@ -128,7 +128,7 @@ class LamarckianGA(PopulationBasedAlgorithm):
 
     def __init__(self, population_size, solution, problem, tournament_k=2, wp_mut_scale=0.0,
                  outer_iters=1, inner_maxiter=20, rho_growth=10.0, rho_max=1e6,
-                 lbfgs_history=10, ls_max_trials=10,
+                 lbfgs_history=10, ls_max_trials=10, optimizer=None,
                  n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
                  fitness_shaping_fn=identity_fitness_shaping_fn, metrics_fn=metrics_fn):
         super().__init__(population_size, solution, fitness_shaping_fn, metrics_fn)
@@ -150,7 +150,7 @@ class LamarckianGA(PopulationBasedAlgorithm):
         self.local_refine = make_batched_local_refine(
             problem, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
             rho_growth=rho_growth, rho_max=rho_max,
-            lbfgs_history=lbfgs_history, ls_max_trials=ls_max_trials)
+            lbfgs_history=lbfgs_history, ls_max_trials=ls_max_trials, optimizer=optimizer)
 
     @property
     def _default_params(self):

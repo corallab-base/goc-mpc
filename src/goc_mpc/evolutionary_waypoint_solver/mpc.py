@@ -152,7 +152,7 @@ _CARRY_KWARGS = ("rho0", "n_seed_individuals", "seed_jitter_t", "seed_jitter_wp_
 # same __init__ signature -- SmallContinuousVRPSolver only adds its own
 # static-chain setup on top, see that module).
 _ALGO_KWARGS = ("tournament_k", "wp_mut_scale", "outer_iters", "inner_maxiter",
-                "rho_growth", "lbfgs_history", "ls_max_trials",
+                "rho_growth", "lbfgs_history", "ls_max_trials", "optimizer",
                 "n_2opt_trials", "or_opt_prob", "max_or_opt_seg_len")
 # build_evosax_ga's own top-level annealed-schedule kwargs.
 _SCHEDULE_KWARGS = ("w", "cv_tol", "w_frac", "cv_tol_frac", "w_growth", "cv_tol_floor_frac")

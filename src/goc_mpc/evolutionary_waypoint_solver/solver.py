@@ -43,10 +43,12 @@ distinct problem shape, never on the warm-started hot path.
 
 import time
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from .problem import (
     apply_anchor, apply_projections, agent_depot, pad_to_state_dim,
@@ -233,11 +235,77 @@ def _lbfgs_solve(merit_and_grad_fixed, wp_flat0, m, inner_maxiter, max_ls_trials
 
 
 # ---------------------------------------------------------------------------
-# Batched AL outer loop around the L-BFGS solve
+# Generic optax inner solve -- an alternative to _lbfgs_solve for whoever
+# wants to swap the inner update rule (plain SGD, Adam, Barzilai-Borwein,
+# ...) without hand-rolling a new scan for each one. No line search: each
+# optax.GradientTransformation is responsible for its own step size, so
+# unlike _lbfgs_solve/_backtrack this pays exactly one merit_and_grad
+# evaluation per inner_maxiter iteration, not max_ls_trials of them -- see
+# make_batched_local_refine's `optimizer` kwarg.
+# ---------------------------------------------------------------------------
+
+def _optax_inner_solve(merit_and_grad_fixed, wp_flat0, optimizer, inner_maxiter):
+    opt_state0 = optimizer.init(wp_flat0)
+
+    def body(carry, _):
+        w, opt_state = carry
+        _f, g = merit_and_grad_fixed(w)
+        updates, opt_state = optimizer.update(g, opt_state, w)
+        w = optax.apply_updates(w, updates)
+        return (w, opt_state), None
+
+    (x_final, _), _ = jax.lax.scan(body, (wp_flat0, opt_state0), xs=None, length=inner_maxiter)
+    return x_final
+
+
+class _BBState(NamedTuple):
+    prev_w: jax.Array
+    prev_g: jax.Array
+    step: jax.Array
+    warm: jax.Array
+
+
+def barzilai_borwein(init_step=1e-2, min_step=1e-6, max_step=1.0, variant="long"):
+    """Barzilai-Borwein spectral-step gradient transform, as an
+    `optax.GradientTransformation` -- a no-line-search alternative to
+    `_lbfgs_solve` that self-adapts its step size to local curvature (`s =
+    w - prev_w`, `y = g - prev_g`; `variant="long"` uses `s.s / s.y`,
+    `"short"` uses `s.y / y.y`) each of `w`'s rows (population members)
+    independently, matching how every other per-individual quantity in this
+    module (rho, the L-BFGS history, ...) is tracked. Falls back to
+    `init_step` on the very first call (no history yet) and whenever the
+    curvature estimate is degenerate (near-zero denominator), and clips the
+    magnitude to `[min_step, max_step]` to guard against a bad first
+    curvature estimate blowing up the very next step."""
+    def init_fn(params):
+        return _BBState(prev_w=params, prev_g=jnp.zeros_like(params),
+                         step=jnp.full(params.shape[0], init_step), warm=jnp.array(False))
+
+    def update_fn(grad, state, params):
+        s = params - state.prev_w
+        y = grad - state.prev_g
+        if variant == "long":
+            num, den = jnp.sum(s * s, axis=-1), jnp.sum(s * y, axis=-1)
+        elif variant == "short":
+            num, den = jnp.sum(s * y, axis=-1), jnp.sum(y * y, axis=-1)
+        else:
+            raise ValueError(f"variant must be 'long' or 'short', got {variant!r}")
+        safe = jnp.abs(den) > 1e-12
+        bb_step = jnp.clip(jnp.abs(jnp.where(safe, num / jnp.where(safe, den, 1.0), state.step)),
+                            min_step, max_step)
+        step = jnp.where(state.warm, bb_step, jnp.full_like(bb_step, init_step))
+        updates = -step[:, None] * grad
+        return updates, _BBState(prev_w=params, prev_g=grad, step=step, warm=jnp.array(True))
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+# ---------------------------------------------------------------------------
+# Batched AL outer loop around the inner (L-BFGS or optax) solve
 # ---------------------------------------------------------------------------
 
 def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, rho_max,
-                                lbfgs_history=10, ls_max_trials=10):
+                                lbfgs_history=10, ls_max_trials=10, optimizer=None):
     n_nodes, state_dim = problem.n_nodes, problem.state_dim
     # wp_psi_flat only ever carries wp's FREE columns (problem.n_wp_free) --
     # see gather_free_wp/scatter_free_wp (problem.py) and _make_merit_
@@ -294,6 +362,17 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
         that same full shape (scatter_free_wp) before returning, so callers
         see no difference from before this reduction existed.
 
+        `optimizer` (make_batched_local_refine's own kwarg, closed over
+        here): `None` (default) uses `_lbfgs_solve`, the original hand-
+        rolled batched L-BFGS+Armijo-backtracking inner solve, unchanged;
+        an `optax.GradientTransformation` (e.g. `optax.sgd(...)`,
+        `optax.adam(...)`, `barzilai_borwein(...)`, above) instead runs
+        `_optax_inner_solve` -- no line search, one merit_and_grad
+        evaluation per inner_maxiter iteration rather than up to
+        max_ls_trials of them, trading L-BFGS's per-iteration quality for a
+        much cheaper iteration (see the profiling that motivated this).
+        `lbfgs_history`/`ls_max_trials` are ignored in that branch.
+
         `static_cache` (problem.precompute_static_projections) is computed
         ONCE here, before the outer AL loop even starts, since a
         "generation-static" projection's value only ever depends on
@@ -316,7 +395,11 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
                                    static_cache)
 
         for _ in range(outer_iters):
-            wp_psi_flat = _lbfgs_solve(merit_and_grad_fixed, wp_psi_flat, lbfgs_history, inner_maxiter, ls_max_trials)
+            if optimizer is None:
+                wp_psi_flat = _lbfgs_solve(merit_and_grad_fixed, wp_psi_flat, lbfgs_history, inner_maxiter,
+                                            ls_max_trials)
+            else:
+                wp_psi_flat = _optax_inner_solve(merit_and_grad_fixed, wp_psi_flat, optimizer, inner_maxiter)
             wp_psi_flat = jnp.clip(wp_psi_flat, lo, hi)
 
             wp_free = wp_psi_flat[:, :d_wp]
@@ -908,7 +991,7 @@ def build_lamarckian_ga(problem, pop_size, n_gen, outer_iters=1, inner_maxiter=2
                          w=None, cv_tol=None, w_frac=1.0, cv_tol_frac=0.05,
                          w_growth=10.0, cv_tol_floor_frac=0.0,
                          ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
-                         wp_mut_scale=0.0):
+                         wp_mut_scale=0.0, optimizer=None):
     """Builds a jitted `step(carry_in, x0, params, anchor) -> carry_out`
     running `n_gen` generations of the Lamarckian GA+AL loop starting from an
     arbitrary carry (see `build_initial_carry_fn`/`carry_from_population`),
@@ -943,11 +1026,14 @@ def build_lamarckian_ga(problem, pop_size, n_gen, outer_iters=1, inner_maxiter=2
     refined) is the right default for a convex-given-fixed-(assign,
     cond_binary, t) `wp` subproblem (e.g. projecting onto one placement
     region), and when a caller might want to raise it instead.
+
+    `optimizer` -- see make_batched_local_refine's own docstring; forwarded
+    straight through.
     """
     local_refine = make_batched_local_refine(
         problem, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
         rho_growth=rho_growth, rho_max=rho_max,
-        lbfgs_history=lbfgs_history, ls_max_trials=ls_max_trials)
+        lbfgs_history=lbfgs_history, ls_max_trials=ls_max_trials, optimizer=optimizer)
 
     def step(carry_in, x0, params, anchor):
         X0, mu0, lam0, rho_arr0, F0, CV0, key, best_X0, best_F0, best_CV0 = carry_in
@@ -991,7 +1077,7 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
                        w_growth=10.0, cv_tol_floor_frac=0.0,
                        ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
                        n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05,
-                       wp_mut_scale=0.0,
+                       wp_mut_scale=0.0, optimizer=None,
                        _ga_fn=None, _init_carry=None, x0=None, params=None):
     """`x0` (the full configuration -- state_dim-wide, see problem.
     apply_anchor) defaults to `problem.x0` (zero-padded out from its
@@ -1020,7 +1106,7 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
         w=w, cv_tol=cv_tol, w_frac=w_frac, cv_tol_frac=cv_tol_frac,
         w_growth=w_growth, cv_tol_floor_frac=cv_tol_floor_frac,
         ox_prob=ox_prob, n_2opt_trials=n_2opt_trials, or_opt_prob=or_opt_prob,
-        max_or_opt_seg_len=max_or_opt_seg_len, wp_mut_scale=wp_mut_scale)
+        max_or_opt_seg_len=max_or_opt_seg_len, wp_mut_scale=wp_mut_scale, optimizer=optimizer)
 
     if _init_carry is not None:
         carry_in = _init_carry
@@ -1047,7 +1133,7 @@ def warmup_lamarckian_al(problem, anchor, pop_size, n_gen, outer_iters=1, inner_
                           w_growth=10.0, cv_tol_floor_frac=0.0,
                           ox_prob=0.5, n_2opt_trials=5, or_opt_prob=0.3, max_or_opt_seg_len=3,
                           n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05,
-                          wp_mut_scale=0.0,
+                          wp_mut_scale=0.0, optimizer=None,
                           x0=None, params=None):
     """`x0` (the full configuration) defaults to `problem.x0` (zero-padded,
     see run_lamarckian_al's docstring) when not given; `params` likewise
@@ -1062,7 +1148,7 @@ def warmup_lamarckian_al(problem, anchor, pop_size, n_gen, outer_iters=1, inner_
         w=w, cv_tol=cv_tol, w_frac=w_frac, cv_tol_frac=cv_tol_frac,
         w_growth=w_growth, cv_tol_floor_frac=cv_tol_floor_frac,
         ox_prob=ox_prob, n_2opt_trials=n_2opt_trials, or_opt_prob=or_opt_prob,
-        max_or_opt_seg_len=max_or_opt_seg_len, wp_mut_scale=wp_mut_scale)
+        max_or_opt_seg_len=max_or_opt_seg_len, wp_mut_scale=wp_mut_scale, optimizer=optimizer)
     init_fn = build_initial_carry_fn(
         problem, pop_size, anchor, rho0=rho0, n_seed_individuals=n_seed_individuals,
         seed_jitter_t=seed_jitter_t, seed_jitter_wp_frac=seed_jitter_wp_frac)
