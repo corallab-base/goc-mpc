@@ -433,6 +433,11 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
     return batched_local_refine
 
 
+def _write_assign_batch_jax(problem, X, assign):
+    pop = X.shape[0]
+    return X.at[:, :problem.n_assign_vars].set(assign.reshape(pop, -1))
+
+
 def _write_wp_batch_jax(problem, X, wp):
     pop = X.shape[0]
     return X.at[:, problem.wp_offset:problem.psi_offset].set(wp.reshape(pop, -1))
