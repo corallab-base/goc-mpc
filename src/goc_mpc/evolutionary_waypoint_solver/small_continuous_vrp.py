@@ -285,7 +285,16 @@ def _solve_branch_dp(problem, chain_order, chain_node_entries, relevant_cols, wp
     `_node_candidates`' `itertools.product` enumeration -- both use
     default C/row-major order, so they agree)."""
     pop = wp0.shape[0]
-    cols = jnp.asarray(relevant_cols)
+    # dtype=int32 explicitly: relevant_cols is empty for a scene with no
+    # projections at all (e.g. pick_place_task, whose Pick/Place targets
+    # are plain FK-residual equality constraints, not analytic-IK
+    # ProjOperators) -- jnp.asarray([]) defaults to float64 with nothing
+    # else to infer a dtype from, and float-indexing x0[cols] below raises.
+    # An empty int array here is correct either way: every node then has
+    # entries=[] too (no projection anywhere in the problem), so
+    # _node_candidates' own K=1 trivial-candidate path is what actually
+    # makes the whole DP a no-op, not this array's shape.
+    cols = jnp.asarray(relevant_cols, dtype=jnp.int32)
     rows_by_node = []
     for nid in chain_order:
         entries = chain_node_entries.get(nid, [])
