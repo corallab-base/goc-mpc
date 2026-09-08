@@ -185,6 +185,20 @@ def build_decode_node_rank(ordering_edges, n_nodes):
     return decode_node_rank
 
 
+def decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active):
+    """vmaps a decode_node_rank(owner_variable, cond_binary, t, node_active)
+    -> node_rank (build_decode_node_rank above) over the population axis of
+    assign/cond_binary/t -- node_active is shared across the whole population
+    (in_axes=None), exactly mirroring how make_graph_kernel's own `batched`
+    vmaps decode_and_cost. Returns (pop, n_nodes) int32 -- an EXACT,
+    per-individual topologically valid visiting-order rank, unlike raw `t`
+    (see build_decode_node_rank's docstring for why raw t alone is unsafe to
+    gate on). Shared by spec.py's gated edge-constraint residuals and
+    problem.apply_projections' gated-projection blend."""
+    owner_variable = jnp.argmax(assign, axis=-1)
+    return jax.vmap(decode_node_rank, in_axes=(0, 0, 0, None))(owner_variable, cond_binary, t, node_active)
+
+
 def _masked_sort_perm(agent_id, owner, order, active):
     """`active` (n,) bool -- excludes instances no longer in
     remaining_vertices (already passed) from this agent's route computation

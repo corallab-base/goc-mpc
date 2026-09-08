@@ -98,7 +98,8 @@ def _make_merit_batched(problem, wp_shape):
         # recomputed on every one of this function's own ~1000s-per-
         # generation calls.
         wp = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
-                                static_cache=static_cache)
+                                static_cache=static_cache,
+                                cond_binary=cond_binary, t=t, node_active=anchor.node_active, x0=x0)
         # anchor splices remaining_vertices state in once here: a node/
         # variable no longer in remaining_vertices reads back as either its
         # last-committed planned constant (wp_eff_frozen) or the current call's
@@ -406,7 +407,8 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             psi = wp_psi_flat[:, d_wp:]
             wp = scatter_free_wp(problem, wp_free, jnp.zeros((pop, n_nodes, state_dim)))
             wp_proj = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
-                                         static_cache=static_cache)
+                                         static_cache=static_cache,
+                                         cond_binary=cond_binary, t=t, node_active=anchor.node_active, x0=x0)
             assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp_proj, anchor, x0)
             h1 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
                                           anchor.node_active, x0, params)
@@ -428,6 +430,10 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
 
         wp_final = scatter_free_wp(problem, wp_psi_flat[:, :d_wp], jnp.zeros((pop, n_nodes, state_dim)))
         psi_final = wp_psi_flat[:, d_wp:]
+        # Returns the RAW refined wp -- a projection-pinned column's raw value
+        # is meaningless (never driven by L-BFGS), but every downstream reader
+        # re-applies the substitution: the merit/eval passes above, mpc.py's
+        # write-back, and run_lamarckian_al's final splice onto result.X.
         return wp_final, psi_final, mu, lam, rho
 
     return batched_local_refine
@@ -641,7 +647,8 @@ def _calc_cv_jax(pop, G, H, eq_eps=1e-4):
 def _evaluate_population_jax(problem, X, x0, params, anchor):
     pop = X.shape[0]
     assign, cond_binary, proj_branch, t, wp, psi = problem._extract_batch(X)
-    wp = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor)
+    wp = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
+                            cond_binary=cond_binary, t=t, node_active=anchor.node_active, x0=x0)
     assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
     F, _G_kernel = problem._batched(assign_eff, cond_binary, t, wp_eff_frozen, agent_depot(problem, x0),
                                      anchor.node_active)
@@ -789,7 +796,8 @@ def _make_gen_step_fn(problem, local_refine, pop_size, n_gen, mut_sigma, cx_prob
 
         off_assign, off_cond_binary, off_proj_branch, off_t, off_wp, off_psi = problem._extract_batch(off_X)
         off_wp = apply_projections(problem, off_wp, off_psi, off_proj_branch, params,
-                                    assign=off_assign, anchor=anchor)
+                                    assign=off_assign, anchor=anchor,
+                                    cond_binary=off_cond_binary, t=off_t, node_active=anchor.node_active)
         # Routing local search never reads a passed row's value either way
         # (masked out via node_active regardless -- see kernel.py), so
         # off_wp_eff_frozen is handed to it arbitrarily; off_wp_eff_live is
@@ -1126,6 +1134,17 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
     exec_time = time.perf_counter() - start
 
     best_X, best_F, best_CV = carry_out[-3], carry_out[-2], carry_out[-1]
+    if problem.projections:
+        # best_X may be a carried parent, not this generation's refined
+        # offspring, so its wp block isn't guaranteed to already hold the
+        # projection substitutions -- and a projection-pinned column is never
+        # driven by L-BFGS anyway (its gradient there is zero). Splice them
+        # in once here so result.X is directly usable without the caller
+        # re-projecting (mirrors mpc.py's own write-back).
+        a, cb, pbr, tt, wp_b, psi_b = problem._extract_batch(best_X[None])
+        wp_b = apply_projections(problem, wp_b, psi_b, pbr, params_arr, assign=a, anchor=anchor,
+                                  cond_binary=cb, t=tt, node_active=anchor.node_active, x0=x0_arr)
+        best_X = _write_wp_batch_jax(problem, best_X[None], wp_b)[0]
     return Result(F=np.array([float(best_F)]), CV=np.array([float(best_CV)]),
                   X=np.asarray(best_X), exec_time=exec_time, pop=carry_out)
 

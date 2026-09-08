@@ -499,7 +499,7 @@ class EvolutionaryWaypointSolver:
         state_out, _key_out = carry_out
         best_X = np.asarray(state_out.best_solution[:problem.n_var])
 
-        assign, _cond_binary, proj_branch, t, wp, psi = problem._extract_single(best_X)
+        assign, cond_binary, proj_branch, t, wp, psi = problem._extract_single(best_X)
         # A projected node's own pinned columns are never actually driven
         # anywhere by local refinement (apply_projections overwrites them
         # before anything reads them, every solve -- see its own docstring)
@@ -508,7 +508,10 @@ class EvolutionaryWaypointSolver:
         # individual, before persisting anything to self._waypoints.
         wp = apply_projections(problem, jnp.asarray(wp)[None, :, :], jnp.asarray(psi)[None, :],
                                 jnp.asarray(proj_branch)[None, :], params_arr,
-                                assign=jnp.asarray(assign)[None, :, :], anchor=anchor)[0]
+                                assign=jnp.asarray(assign)[None, :, :], anchor=anchor,
+                                cond_binary=jnp.asarray(cond_binary)[None, :],
+                                t=jnp.asarray(t)[None, :], node_active=anchor.node_active,
+                                x0=jnp.asarray(x0_arr))[0]
         wp = np.asarray(wp)
         owner_variable = (np.argmax(np.asarray(assign), axis=-1) if problem.n_variables > 0
                           else np.zeros(0, dtype=int))
@@ -540,7 +543,7 @@ class EvolutionaryWaypointSolver:
         # actually used). One value per node (kernel.py), so no
         # per-instance collapsing is needed here -- just index it directly.
         node_rank = np.asarray(problem._decode_node_rank(
-            owner_variable, np.asarray(_cond_binary), t, np.asarray(anchor.node_active)))
+            owner_variable, np.asarray(cond_binary), t, np.asarray(anchor.node_active)))
         for node in remaining_set:
             self._t_by_node_id[node] = float(node_rank[node])
 

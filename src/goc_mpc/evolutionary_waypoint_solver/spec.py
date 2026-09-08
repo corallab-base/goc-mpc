@@ -80,7 +80,7 @@ import numpy as np
 
 from .default_fk import resolve_link_fk
 from .formula_compiler import as_variable, compile_condition, compile_relational_formula
-from .kernel import build_decode_node_rank
+from .kernel import build_decode_node_rank, decode_rank_batched
 from .problem import GraphOrderingRelaxed, ProjectionEntry
 
 
@@ -323,13 +323,16 @@ def _resolve_pin_columns(proj, static_map, var_map):
 def _resolve_read_component(var_id, static_map, link_pos_map, link_rot_map, param_map,
                              agent_widths, slot_width):
     """One ProjOperator.reads placeholder (a single scalar Variable id) ->
-    an UNBATCHED callable(rows, params) -> scalar -- `rows` is the same
-    node-rows tuple _batch_symbolic_constraint_fn's compiled residuals
-    receive, `params` the same runtime params array threaded there too
-    (GraphOfConstraints.add_param/set_param) -- every resolved closure
-    accepts both uniformly (even the ones that ignore one or the other) so
-    _read_array_fn/_read_array_fn_multi never need to special-case which
-    case matched. Restricted to the static (agent_q/object_q/u_/v_-
+    an UNBATCHED callable(rows, params, owner_variable, x0) -> scalar --
+    `rows` the node-rows tuple _batch_symbolic_constraint_fn's residuals
+    receive, `params` the runtime params array (add_param/set_param), plus
+    two more apply_projections threads through for the hand-rolled read_fns
+    (_resolve_holds' rigid-carry, _resolve_stationary_objects' depot) that
+    genuinely need them: `owner_variable` the per-individual (n_variables,)
+    argmax(assign), `x0` the current full-configuration runtime state
+    (state_dim,). Every closure here ignores the last two (var_agent_q reads
+    still raise) but accepts all four uniformly so _read_array_fn/_read_
+    array_fn_multi never special-case which matched. Restricted to the static (agent_q/object_q/u_/v_-
     prefixed), FK (agent_link_pos/agent_link_rot), and param(id) cases; a
     projection's reads may NOT depend on a var_agent_q(...) dynamic
     selection in this version (raises otherwise) -- not needed by any
@@ -361,22 +364,22 @@ def _resolve_read_component(var_id, static_map, link_pos_map, link_rot_map, para
     when both position and orientation are read for the same link."""
     if var_id in static_map:
         side, col = static_map[var_id]
-        return lambda rows, params, side=side, col=col: rows[side][col]
+        return lambda rows, params, owner_variable, x0, side=side, col=col: rows[side][col]
     if var_id in link_pos_map:
         agent_id, _link_name, fk_fn, j = link_pos_map[var_id]
         col0 = agent_id * slot_width
         w = agent_widths[agent_id]
-        return lambda rows, params, fk_fn=fk_fn, col0=col0, w=w, j=j: (
+        return lambda rows, params, owner_variable, x0, fk_fn=fk_fn, col0=col0, w=w, j=j: (
             fk_fn(rows[0][col0:col0 + w])[0][j])
     if var_id in link_rot_map:
         agent_id, _link_name, fk_fn, j = link_rot_map[var_id]
         col0 = agent_id * slot_width
         w = agent_widths[agent_id]
-        return lambda rows, params, fk_fn=fk_fn, col0=col0, w=w, j=j: (
+        return lambda rows, params, owner_variable, x0, fk_fn=fk_fn, col0=col0, w=w, j=j: (
             jnp.reshape(fk_fn(rows[0][col0:col0 + w])[1], (-1,))[j])
     if var_id in param_map:
         idx = param_map[var_id]
-        return lambda rows, params, idx=idx: params[idx]
+        return lambda rows, params, owner_variable, x0, idx=idx: params[idx]
     raise ValueError(
         f"ProjOperator.reads references a placeholder (var id {var_id}) that "
         "isn't a plain static agent_q/object_q(/u_/v_-prefixed) placeholder, "
@@ -412,10 +415,10 @@ def _read_array_fn(exprs, static_map, link_pos_map, link_rot_map, param_map,
            for vid in var_ids]
     shape = exprs_arr.shape
 
-    def read(rows, params, fns=fns, shape=shape):
+    def read(rows, params, owner_variable, x0, fns=fns, shape=shape):
         if not fns:
             return jnp.zeros(shape)
-        return jnp.stack([fn(rows, params) for fn in fns]).reshape(shape)
+        return jnp.stack([fn(rows, params, owner_variable, x0) for fn in fns]).reshape(shape)
     return read
 
 
@@ -478,9 +481,71 @@ def _read_array_fn_multi(reads, static_map, link_pos_map, link_rot_map, param_ma
                                      agent_widths, slot_width)
                      for arr in reads]
 
-    def read_fn(rows, params, per_entry_fns=per_entry_fns):
-        return tuple(fn(rows, params) for fn in per_entry_fns)
+    def read_fn(rows, params, owner_variable, x0, per_entry_fns=per_entry_fns):
+        return tuple(fn(rows, params, owner_variable, x0) for fn in per_entry_fns)
     return read_fn
+
+
+def _order_projection_entries(pending):
+    """`pending`: list of {"phi_id", "entry": ProjectionEntry} records, in
+    discovery order (explicit `proj=` first, then the auto-derived
+    stationary/rigid-carry ones). Returns the ProjectionEntry list in
+    DATA-DEPENDENCY order -- apply_projections / precompute_static_
+    projections walk it threading wp through, so a proj that `reads` a
+    column another `pins` must come AFTER it. Edge a -> b iff a's possible
+    write columns meet b's read columns; Kahn's algorithm, discovery-order
+    tie-break (a no-op when nothing is chained). A dependency CYCLE (a reads
+    b's pin, b reads a's) has no valid order and raises -- an implicit
+    relation like that needs an ordinary residual, not a proj.
+
+    Then demotes any is_static entry that reads a column precompute_static_
+    projections can't itself reproduce -- one written by a non-static,
+    non-tabled projection, or by a var_agent_q(...) dynamic pin (whose write
+    TARGET needs `assign`, absent at precompute time). The demoted entry
+    just recomputes every merit call (correct, only slower); a
+    documented-unused ("_"-prefixed func param) read that happens to hit
+    such a column triggers this too -- conservative, never wrong."""
+    n = len(pending)
+    succ = [[] for _ in range(n)]
+    indeg = [0] * n
+    for a in range(n):
+        for b in range(n):
+            if a != b and pending[a]["entry"].write_cols & pending[b]["entry"].read_cols:
+                succ[a].append(b)
+                indeg[b] += 1
+    ready = sorted(i for i in range(n) if indeg[i] == 0)
+    order = []
+    while ready:
+        i = ready.pop(0)
+        order.append(i)
+        freed = []
+        for j in succ[i]:
+            indeg[j] -= 1
+            if indeg[j] == 0:
+                freed.append(j)
+        if freed:
+            ready = sorted(ready + freed)
+    if len(order) != n:
+        stuck = sorted(set(range(n)) - set(order))
+        raise ValueError(
+            "projection dependency cycle among "
+            f"{[pending[i]['phi_id'] for i in stuck]} -- a projection's `reads` "
+            "column is pinned by another projection whose own dependency chain "
+            "leads back to it; an implicit relation like that needs an ordinary "
+            "residual constraint, not a proj")
+
+    entries = []
+    unresolved_writes = set()
+    for i in order:
+        e = pending[i]["entry"]
+        if e.is_static and (e.read_cols & unresolved_writes):
+            e = e._replace(is_static=False)
+        precompute_can_splice = e.owner_var_slot is None and (
+            e.table is not None or e.is_static)
+        if not precompute_can_splice:
+            unresolved_writes |= e.write_cols
+        entries.append(e)
+    return entries
 
 
 def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
@@ -627,17 +692,9 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
     return resolve
 
 
-def _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active):
-    """vmaps a spec-level decode_node_rank(owner_variable, cond_binary, t,
-    node_active) -> node_rank (kernel.build_decode_node_rank) over the
-    population axis of assign/cond_binary/t -- node_active is shared across
-    the whole population (in_axes=None), exactly mirroring how kernel.py's
-    own `batched` vmaps decode_and_cost (in_axes=(0, 0, 0, 0, None, None)).
-    Returns (pop, n_nodes) int32 -- an EXACT, per-individual topologically
-    valid visiting-order rank, unlike raw `t` (see build_decode_node_rank's
-    docstring for why raw t alone is unsafe to gate on)."""
-    owner_variable = jnp.argmax(assign, axis=-1)
-    return jax.vmap(decode_node_rank, in_axes=(0, 0, 0, None))(owner_variable, cond_binary, t, node_active)
+# kernel.decode_rank_batched, re-exported under this module's historic
+# private name (used by every gated edge-constraint closure below).
+_decode_rank_batched = decode_rank_batched
 
 
 def _batch_symbolic_constraint_fn(fn, node_locals, mode="frozen"):
@@ -778,6 +835,45 @@ def _batch_relational_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
     return batched
 
 
+def _make_interval_overlap_gate(lo_node, hi_node, intervals):
+    """`gate_fn(rank) -> (pop,)` hard {0.0, 1.0}: 1.0 iff the decoded-rank
+    interval `[lo, hi]` -- `lo` = `rank[:, lo_node]`, or a constant -1 (a
+    depot's definitionally-earliest rank) when `lo_node` is None; `hi` =
+    `rank[:, hi_node]` -- does NOT strictly overlap ANY interval in
+    `intervals` (a list of (node_a, node_b) pairs, each a declared hold's
+    span). Strict test `a0 < b1 and b0 < a1` -- see _batch_stationary_edge_fn's
+    docstring for why strict, not MILP's inclusive reading.
+
+    The single source of truth for the stationary-object / rigid-carry gate:
+    _batch_stationary_edge_fn and _batch_depot_stationary_fn evaluate it for
+    their residuals, and _resolve_stationary_objects / _resolve_holds attach
+    the SAME gate_fn to the auto-derived gated ProjectionEntry for the same
+    (object, edge), so residual and projection agree pointwise."""
+    def gate_fn(rank, lo_node=lo_node, hi_node=hi_node, intervals=tuple(intervals)):
+        hi = rank[:, hi_node]
+        lo = -jnp.ones_like(hi) if lo_node is None else rank[:, lo_node]
+        edge_lo = jnp.minimum(lo, hi)
+        edge_hi = jnp.maximum(lo, hi)
+        overlap = jnp.zeros(rank.shape[0], dtype=bool)
+        for a, b in intervals:
+            ia = jnp.minimum(rank[:, a], rank[:, b])
+            ib = jnp.maximum(rank[:, a], rank[:, b])
+            overlap = overlap | ((edge_lo < ib) & (ia < edge_hi))
+        return jnp.where(overlap, 0.0, 1.0)
+    return gate_fn
+
+
+def _always_on_gate(rank):
+    """Trivial gate for an auto projection that always applies but should
+    still be treated as GATED -- its blended column stays a free decision
+    variable (GraphOrderingRelaxed skips gate_fn != None in wp_pinned_mask)
+    rather than being eliminated from the search. Used for the hold
+    rigid-carry, whose primary (u, v) edge is unconditional (v is the hold's
+    own endpoint) but which is still only a warm-start splice this phase, not
+    a hard determination."""
+    return jnp.ones(rank.shape[0])
+
+
 def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank, mode="live"):
     """Gated stationary-object residual for one (structural edge, object)
     pair -- the JAX analogue of MILP's Constraint 14b (milp_waypoint_mpc.cpp's
@@ -821,15 +917,7 @@ def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank
         viol = jnp.sum(residual ** 2, axis=-1, keepdims=True)  # (pop, 1)
 
         rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
-        edge_lo = jnp.minimum(rank[:, u], rank[:, v])
-        edge_hi = jnp.maximum(rank[:, u], rank[:, v])
-        overlap_any = jnp.zeros(rank.shape[0], dtype=bool)
-        for hu, hv in hold_node_pairs:
-            hold_lo = jnp.minimum(rank[:, hu], rank[:, hv])
-            hold_hi = jnp.maximum(rank[:, hu], rank[:, hv])
-            overlap_any = overlap_any | ((edge_lo < hold_hi) & (hold_lo < edge_hi))
-
-        gate = jnp.where(overlap_any, 0.0, 1.0)[:, None]  # (pop, 1)
+        gate = _make_interval_overlap_gate(u, v, hold_node_pairs)(rank)[:, None]  # (pop, 1)
         return viol * gate  # feasible at <=0: forces exact equality unless gated off
     return batched
 
@@ -862,15 +950,7 @@ def _batch_depot_stationary_fn(v, seg_slice, hold_node_pairs, decode_node_rank, 
         viol = jnp.sum(residual ** 2, axis=-1, keepdims=True)  # (pop, 1)
 
         rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
-        edge_lo = -jnp.ones_like(rank[:, v])
-        edge_hi = rank[:, v]
-        overlap_any = jnp.zeros(rank.shape[0], dtype=bool)
-        for hu, hv in hold_node_pairs:
-            hold_lo = jnp.minimum(rank[:, hu], rank[:, hv])
-            hold_hi = jnp.maximum(rank[:, hu], rank[:, hv])
-            overlap_any = overlap_any | ((edge_lo < hold_hi) & (hold_lo < edge_hi))
-
-        gate = jnp.where(overlap_any, 0.0, 1.0)[:, None]  # (pop, 1)
+        gate = _make_interval_overlap_gate(None, v, hold_node_pairs)(rank)[:, None]  # (pop, 1)
         return viol * gate  # feasible at <=0: forces exact equality unless gated off
     return batched
 
@@ -956,6 +1036,17 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
     symbolic_constraints = []  # (node_locals_tuple, fn, kind, mode, name)
     interior_constraints = []  # (batched_fn, name) -- see _batch_along_edge_interior_fn
     stationary_constraints = []  # (batched_fn, name) -- see _batch_stationary_edge_fn
+    # Projection substitutions, accumulated across _resolve_projections (the
+    # explicit `proj=` ones) then _resolve_holds / _resolve_stationary_objects
+    # (the auto-derived gated rigid-carry / stationary ones), and finally
+    # dependency-ordered by _order_projection_entries. `projection_claims`:
+    # node -> set of absolute columns some projection already pins there --
+    # the auto-derived emitters consult it so an explicit pin (a Stack/Place
+    # target) always wins over the gated invariant for that column (the
+    # residual still covers it).
+    projection_pending = []   # {"phi_id", "entry": ProjectionEntry}
+    projection_claims = {}
+    projection_totals = {"psi": 0, "branch": 0}  # running psi/proj_branch block widths
 
     # -- structure derivation ---------------------------------------------
 
@@ -1119,11 +1210,23 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         projection_map/edge_phi_to_projection_map -- projection.ProjOperator,
         set via GraphOfConstraints.add_constraint/add_edge_constraint's proj
         kwarg). Returns (entries, skip_node_phis, skip_edge_phis): `entries`
-        is problem.GraphOrderingRelaxed's `projections` list, in discovery
-        order (node loop then edge loop -- the same order _resolve_symbolic_
-        constraints below walks), which fixes each one's psi_slice/
-        branch_slice offsets into the flat psi/proj_branch decision blocks
-        for this problem's whole lifetime; the two skip sets tell
+        is problem.GraphOrderingRelaxed's `projections` list.
+
+        Each proj's psi_slice/branch_slice offsets into the flat psi/proj_
+        branch decision blocks are assigned in DISCOVERY order (node loop
+        then edge loop -- the same order _resolve_symbolic_constraints below
+        walks), fixed for this problem's whole lifetime. `entries` itself is
+        then reordered by DATA DEPENDENCY before returning: a proj whose
+        `reads` reference a column another proj `pins` (its write_cols meet
+        this one's read_cols) is placed after it, since apply_projections /
+        precompute_static_projections walk the list threading wp through, so
+        a reader must run after its writer. Every consumer indexes psi/branch
+        off the entry's own slice, so list order and slice layout are
+        independent. A dependency CYCLE (a reads b's pin, b reads a's) has no
+        valid order and raises -- an implicit relation like that needs an
+        ordinary residual, not a proj.
+
+        The two skip sets tell
         _resolve_symbolic_constraints which phi ids to exclude from the
         ordinary residual pass -- a projected constraint is satisfied
         EXACTLY by construction (apply_projections substitutes the pinned
@@ -1146,9 +1249,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             some placeholder the Formula used would go completely
             unconstrained the instant its residual is dropped.
           * no two projections pin overlapping columns at the same node.
-          * no projection's reads reference a column any OTHER projection
-            pins at the same node (chained projections aren't supported --
-            single-hop only, see this module's docstring)."""
+          * the read/pin dependency between projections is acyclic (see
+            above)."""
         link_pos_map = _make_link_pos_map(graph)
         link_rot_map = _make_link_rot_map(graph)
         param_map = _build_param_map(graph)
@@ -1164,15 +1266,16 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 if v is not None:
                     var_map[v.get_id()] = (slot, j)
 
-        entries = []
+        pending = projection_pending  # build-level; _resolve_holds /
+        # _resolve_stationary_objects append their auto-derived gated entries
+        # to the same list afterward, then _order_projection_entries sorts it.
         skip_node_phis = set()
         skip_edge_phis = set()
-        pinned_by_node = {}  # node -> set of claimed columns (int) -- for a
-        # dynamic pin, this is the UNION of every candidate agent's absolute
-        # columns (see _register below), so the existing overlap check below
-        # stays exact rather than blind to a possible-but-not-guaranteed
-        # collision.
-        totals = {"psi": 0, "branch": 0}
+        pinned_by_node = projection_claims  # build-level -- for a dynamic pin
+        # this is the UNION of every candidate agent's absolute columns (see
+        # _register below), so the overlap check stays exact rather than blind
+        # to a possible-but-not-guaranteed collision.
+        totals = projection_totals  # build-level (auto-derived entries below extend it)
 
         def _register(phi_id, node_locals, formula, proj):
             kind, side_or_slot, cols_or_js = _resolve_pin_columns(proj, static_map, var_map)
@@ -1223,20 +1326,28 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     "runtime-dynamic)")
             claimed |= possible_cols
 
+            # (node, col) wp entries this proj's `func` READS -- the other
+            # half (with `write_cols` below) of the data-dependency edges the
+            # topo sort after both loops uses to order `entries`. A static
+            # agent_q/object_q(/u_/v_) read resolves to one column at its
+            # endpoint node; an agent_link_pos/_rot FK read consumes that
+            # agent's whole config slice at node_locals[0] (that's what
+            # _resolve_read_component slices before calling fk_fn); a
+            # param(id) read is not a wp column at all, so contributes no
+            # edge.
+            read_cols = set()
             for arr in proj.reads:
                 for expr in np.asarray(arr).flat:
                     vid = as_variable(expr).get_id()
-                    if vid not in static_map:
-                        continue
-                    r_side, r_col = static_map[vid]
-                    if r_side >= len(node_locals):
-                        continue
-                    r_node = node_locals[r_side]
-                    if int(r_col) in pinned_by_node.get(r_node, set()):
-                        raise ValueError(
-                            f"proj for phi {phi_id} reads a column at node "
-                            f"{r_node} that another projection pins there -- "
-                            "chained projections aren't supported (single-hop only)")
+                    if vid in static_map:
+                        r_side, r_col = static_map[vid]
+                        if r_side < len(node_locals):
+                            read_cols.add((node_locals[r_side], int(r_col)))
+                    elif vid in link_pos_map or vid in link_rot_map:
+                        agent_id = (link_pos_map.get(vid) or link_rot_map[vid])[0]
+                        c0 = agent_id * slot_width
+                        for c in range(c0, c0 + agent_widths[agent_id]):
+                            read_cols.add((node_locals[0], c))
 
             read_fn = _read_array_fn_multi(proj.reads, static_map, link_pos_map, link_rot_map, param_map,
                                             agent_widths, slot_width)
@@ -1266,12 +1377,19 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             # _classify_static_projection's own docstring).
             is_static = table is None and _classify_static_projection(proj, param_map)
 
-            entries.append(ProjectionEntry(
+            # `write_cols`: every (node, col) this pin COULD claim -- exactly
+            # `possible_cols` at `write_node` (for a var_agent_q(...) dynamic
+            # pin that's the union over candidate agents, same conservative
+            # set the same-node overlap check above uses).
+            entry = ProjectionEntry(
                 write_node=write_node, pinned_cols=cols, node_locals=tuple(node_locals),
                 read_fn=read_fn, func=func, continuous_params=proj.continuous_params,
                 psi_slice=psi_slice, psi_bounds=proj.psi_bounds, branch_slice=branch_slice,
                 discrete_params=proj.discrete_params, table=table, is_static=is_static,
-                owner_var_slot=owner_var_slot, owner_cols_per_agent=owner_cols_per_agent))
+                owner_var_slot=owner_var_slot, owner_cols_per_agent=owner_cols_per_agent,
+                read_cols=frozenset(read_cols),
+                write_cols=frozenset((write_node, c) for c in possible_cols))
+            pending.append(dict(phi_id=phi_id, entry=entry))
 
         for node in node_list:
             for phi_id in graph.node_to_phis_map.get(node, []):
@@ -1294,9 +1412,36 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 _register(phi_id, (u, v), graph.edge_phi_to_formula_map[phi_id], proj)
                 skip_edge_phis.add(phi_id)
 
-        return entries, skip_node_phis, skip_edge_phis
+        return pending, skip_node_phis, skip_edge_phis
 
-    projections, skip_node_phis, skip_edge_phis = _resolve_projections()
+    projection_pending, skip_node_phis, skip_edge_phis = _resolve_projections()
+
+    def _emit_auto_projection(name, write_node, cols, node_locals, read_fn, func, gate_fn, read_cols):
+        """Append one auto-derived GATED ProjectionEntry (a stationary-object
+        or rigid-carry substitution) to projection_pending -- UNLESS an
+        explicit `proj=` or an earlier auto projection already claims any of
+        its target columns at write_node, in which case that pin wins and
+        only the (still-registered) gated residual covers the column.
+        continuous_params=0, discrete_params=1 (no branch choice), never
+        tabled, never is_static (its gate is per-individual)."""
+        claimed = projection_claims.setdefault(write_node, set())
+        cols = [int(c) for c in cols]
+        if claimed & set(cols):
+            return
+        claimed |= set(cols)
+        b = projection_totals["branch"]
+        projection_totals["branch"] += 1
+        entry = ProjectionEntry(
+            write_node=write_node, pinned_cols=np.asarray(cols, dtype=int),
+            node_locals=tuple(node_locals), read_fn=read_fn, func=func,
+            continuous_params=0,
+            psi_slice=slice(projection_totals["psi"], projection_totals["psi"]),
+            psi_bounds=(-1.0, 1.0), branch_slice=slice(b, b + 1), discrete_params=1,
+            table=None, is_static=False, owner_var_slot=None, owner_cols_per_agent=None,
+            read_cols=frozenset(read_cols),
+            write_cols=frozenset((write_node, c) for c in cols),
+            gate_fn=gate_fn)
+        projection_pending.append({"phi_id": name, "entry": entry})
 
     # -- symbolic constraints -----------------------------------------------
 
@@ -1522,6 +1667,51 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     fn, kind, u, v, decode_node_rank, mode=mode)
                 interior_constraints.append((interior_batched, f"{name}_interior"))
 
+                # PROJECTION form of the SAME relation on the hold's own
+                # (u, v) edge: pin v_object_q(oid)'s translation to
+                # `obj_u + (ee_v - ee_u)` so a downstream projection reading
+                # this object column (an analytic EE/IK pin at the Place
+                # node) sees a determined value rather than a mid-search
+                # guess. Hand-rolled read_fn -- there is no u_/v_ FK
+                # placeholder to go through _read_array_fn (same reason the
+                # residual `fn` above is hand-rolled). Yields to any explicit
+                # `proj=` pin on the column (a Stack/Place target); the
+                # residual + interior reinforcement above still cover it
+                # regardless. gate = _always_on_gate: unconditional at the
+                # hold's own endpoint, but kept a warm-start splice (column
+                # stays searched) this phase, not a hard elimination.
+                # Translation width actually shared by the object column and
+                # the FK position -- the residual above relies on Python
+                # slice-clamping for the same effect (object last in the row),
+                # made explicit here since pinned_cols must be exact.
+                wd = min(workspace_dim, object_widths[oid])
+                pin_cols = list(range(obj_col0, obj_col0 + wd))
+                if hold.robot_ag is not None:
+                    def rc_read(rows, params, ov, x0, fk_fn=fk_fn,
+                               ac0=agent_col0, aw=agent_w, oc0=obj_col0, wd=wd):
+                        obj_u = rows[0][oc0:oc0 + wd]
+                        ee_u = fk_fn(rows[0][ac0:ac0 + aw])[0][:wd]
+                        ee_v = fk_fn(rows[1][ac0:ac0 + aw])[0][:wd]
+                        return (obj_u + (ee_v - ee_u),)
+                    rc_reads = ([(u, c) for c in range(agent_col0, agent_col0 + agent_w)]
+                                + [(v, c) for c in range(agent_col0, agent_col0 + agent_w)]
+                                + [(u, c) for c in range(obj_col0, obj_col0 + wd)])
+                else:
+                    def rc_read(rows, params, ov, x0, bc=branch_cols, bw=branch_widths,
+                               bfk=branch_fks, slot=slot, oc0=obj_col0, wd=wd):
+                        deltas = jnp.stack([
+                            fk(rows[1][c:c + w])[0][:wd] - fk(rows[0][c:c + w])[0][:wd]
+                            for c, w, fk in zip(bc, bw, bfk)])
+                        delta = jax.lax.dynamic_index_in_dim(deltas, ov[slot], axis=0, keepdims=False)
+                        return (rows[0][oc0:oc0 + wd] + delta,)
+                    rc_reads = ([(nd, c) for nd in (u, v) for k in range(graph.num_agents)
+                                 for c in range(branch_cols[k], branch_cols[k] + branch_widths[k])]
+                                + [(u, c) for c in range(obj_col0, obj_col0 + wd)])
+                _emit_auto_projection(
+                    f"{name}_rigidcarry", v, pin_cols, (u, v),
+                    read_fn=rc_read, func=(lambda val, psi, b: val),
+                    gate_fn=_always_on_gate, read_cols=frozenset(rc_reads))
+
     def _resolve_stationary_objects():
         """Auto-derives the default "an object not currently being held must
         not move" invariant -- the JAX analogue of MILP's Constraint 14b
@@ -1609,9 +1799,18 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         edge_targets = {v for _u, v in hard_edges}
         source_nodes = [n for n in node_list if n not in edge_targets]
 
+        # Only objects that a hold touches somewhere get the gated
+        # PROJECTION treatment -- an object with no hold anywhere keeps just
+        # its (unconditional) residual, exactly as before, so this feature
+        # can't perturb any hold-free scene.
+        incoming = {}
+        for u, v in hard_edges:
+            incoming.setdefault(v, []).append(u)
+
         for oid in range(graph.num_objects):
             obj_col0 = agents_width + oid * object_slot_width
             seg_slice = slice(obj_col0, obj_col0 + object_widths[oid])
+            cols = list(range(obj_col0, obj_col0 + object_widths[oid]))
             hold_node_pairs = holds_by_object.get(oid, [])
             for u, v in hard_edges:
                 batched = _batch_stationary_edge_fn(
@@ -1622,9 +1821,41 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     v, seg_slice, hold_node_pairs, decode_node_rank, mode="live")
                 stationary_constraints.append((depot_batched, f"stationary_obj_{oid}_depot_{v}"))
 
+            if not hold_node_pairs:
+                continue
+            # Gated PROJECTIONS mirroring the residuals: they SPLICE the
+            # stationary value in (warm start where something refines, hard
+            # determination where nothing does) so a downstream projection --
+            # an analytic-IK pin reading this object column -- sees a real
+            # value. Same gate as the residual (identical
+            # _make_interval_overlap_gate), so the two agree pointwise. Depot
+            # pin per source node; edge pin only where the target node has
+            # exactly ONE incoming hard edge (a clean predecessor to chain
+            # from) -- multi-incoming nodes keep just the residual.
+            for v in source_nodes:
+                _emit_auto_projection(
+                    f"stationary_obj_{oid}_depot_{v}", v, cols, (v,),
+                    read_fn=(lambda rows, params, ov, x0, s=seg_slice: (x0[s],)),
+                    func=(lambda ox, psi, b: ox),
+                    gate_fn=_make_interval_overlap_gate(None, v, hold_node_pairs),
+                    read_cols=frozenset())
+            for v, us in incoming.items():
+                if len(us) != 1:
+                    continue
+                u = us[0]
+                _emit_auto_projection(
+                    f"stationary_obj_{oid}_{u}_{v}", v, cols, (u, v),
+                    read_fn=(lambda rows, params, ov, x0, s=seg_slice: (rows[0][s],)),
+                    func=(lambda ou, psi, b: ou),
+                    gate_fn=_make_interval_overlap_gate(u, v, hold_node_pairs),
+                    read_cols=frozenset((u, c) for c in cols))
+
     _resolve_symbolic_constraints()
     _resolve_holds()
     _resolve_stationary_objects()
+
+    # Explicit + auto-derived projection entries, now dependency-ordered.
+    projections = _order_projection_entries(projection_pending)
 
     # -- python constraints + build -----------------------------------------
 

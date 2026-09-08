@@ -37,6 +37,14 @@ class ProjOperator:
         constraint's Formula references; add_constraint/add_edge_constraint
         raise otherwise, so no placeholder is ever silently unaccounted for.
 
+        A `reads` array MAY reference a column another projection `pins`:
+        _resolve_projections orders the projections so the writer runs
+        first, and apply_projections threads the running wp through, so
+        `func` sees the already-substituted value (e.g. an analytic-IK
+        projection reading an object column a preceding grasp/stationary
+        projection just pinned). A dependency cycle between two projections
+        raises -- that is an implicit relation, not an elimination.
+
         Leave `reads=()` when `func` needs no row input at all -- e.g. a
         Pick target that's a literal, spec-build-time-fixed pose baked
         directly into `func`'s own closure. This is also the ONLY case

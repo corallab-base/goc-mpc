@@ -254,7 +254,8 @@ class LamarckianGA(PopulationBasedAlgorithm):
         # not a post-hoc evaluation step (see module docstring).
         off_assign, off_cond_binary, off_proj_branch, off_t, off_wp, off_psi = problem._extract_batch(off_X)
         off_wp = apply_projections(problem, off_wp, off_psi, off_proj_branch, params.problem_params,
-                                    assign=off_assign, anchor=params.anchor)
+                                    assign=off_assign, anchor=params.anchor,
+                                    cond_binary=off_cond_binary, t=off_t, node_active=params.anchor.node_active, x0=params.x0)
         off_assign_eff, off_wp_eff_frozen, _off_wp_eff_live = apply_anchor(
             problem, off_assign, off_wp, params.anchor, params.x0)
         off_t = _routing_local_search_batched(

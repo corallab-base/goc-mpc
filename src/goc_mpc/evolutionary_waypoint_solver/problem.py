@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .kernel import make_graph_kernel
+from .kernel import make_graph_kernel, decode_rank_batched
 
 
 # One analytic-elimination substitution (projection.ProjOperator, resolved
@@ -66,6 +66,18 @@ from .kernel import make_graph_kernel
 #       unconditionally dead.
 #   node_locals: node id(s) whose rows read_fn is called with (len 1 for a
 #       node constraint, 2 (u, v) for a relational edge constraint).
+#   read_cols / write_cols: frozensets of (node, col) this projection's
+#       `func` reads / its pin could ever write (a var_agent_q(...) dynamic
+#       pin's write_cols is the union over every candidate agent's slot).
+#       spec.py's _resolve_projections builds the projection list in an
+#       order where every entry follows the ones whose write_cols meet its
+#       read_cols (a data-dependency topo sort -- apply_projections threads
+#       wp through its walk, so a reader must come after its writer); these
+#       are kept on the entry so other consumers (small_continuous_vrp,
+#       future search-space analysis) can see the dependency structure
+#       without re-deriving it. A param(id) read is not a wp column and
+#       contributes nothing here; an FK (agent_link_pos/_rot) read
+#       contributes that agent's whole config slice at node_locals[0].
 #   read_fn: UNBATCHED callable(*rows) -> tuple of arrays, one per the
 #       ProjOperator's own `reads` entries, in order (empty tuple if
 #       `reads=()`) -- built by spec.py from the same per-placeholder
@@ -100,12 +112,29 @@ from .kernel import make_graph_kernel
 #       own docstrings for how this is used to avoid recomputing a
 #       potentially expensive analytic elimination (e.g. an 8-branch
 #       closed-form IK) on every one of a generation's many merit calls.
+#   gate_fn: None (unconditional -- the pin always applies) OR an UNBATCHED-
+#       over-nothing callable `gate_fn(rank) -> (pop,)` returning a hard
+#       {0.0, 1.0} mask, `rank` the decoded node-rank `(pop, n_nodes)` int
+#       array (spec.py's _decode_rank_batched). apply_projections then
+#       BLENDS -- `g*value + (1-g)*cur` -- so per individual the write is
+#       either exact (`value`, gradient zero, a real pin) or a no-op
+#       (`cur`, the column stays a free decision variable whatever residual
+#       still governs it drives). Used for the auto-derived stationary-object
+#       / rigid-carry substitutions (spec.py's _resolve_stationary_objects /
+#       _resolve_holds), whose applicability depends on where the solved
+#       schedule places a node relative to a hold's span. A gated entry is
+#       never `is_static` and its columns never join wp_pinned_mask's static
+#       shrink (they're live for the gate-off case, exactly like a dynamic
+#       pin's). Not supported together with a var_agent_q(...) dynamic pin
+#       (owner_var_slot is not None) yet -- apply_projections raises.
 ProjectionEntry = namedtuple(
     "ProjectionEntry",
     ["write_node", "pinned_cols", "node_locals", "read_fn", "func",
      "continuous_params", "psi_slice", "psi_bounds", "branch_slice",
      "discrete_params", "table", "is_static",
-     "owner_var_slot", "owner_cols_per_agent"])
+     "owner_var_slot", "owner_cols_per_agent",
+     "read_cols", "write_cols", "gate_fn"],
+    defaults=[None])  # gate_fn -- unconditional unless a caller sets it
 
 
 # Bundles remaining_vertices' runtime effect on an otherwise-fixed-size
@@ -255,25 +284,56 @@ def precompute_static_projections(problem, wp0, proj_branch, params):
     Returns a `{id(entry): value}` cache for apply_projections' own
     `static_cache` argument -- keyed by identity since `problem.projections`
     is a plain fixed-length Python list, walked identically (in the same
-    order) by both functions."""
+    order) by both functions.
+
+    `problem.projections` is dependency-ordered (spec.py's
+    _resolve_projections), so a chained static entry -- one reading a column
+    an earlier projection pins -- is handled by threading a working `wp`
+    through this walk: each static entry's value is spliced back in before a
+    later entry reads that column, exactly as apply_projections does. Tabled
+    entries (value known at build time) are spliced too. An entry whose
+    value this function CAN'T reproduce (non-static + non-tabled, or a
+    var_agent_q(...) dynamic pin needing `assign`) never has a static
+    descendant reading its columns -- _resolve_projections demotes any such
+    descendant to non-static up front."""
     cache = {}
+    wp = wp0
     for entry in problem.projections:
+        if entry.table is not None:
+            # Splice the branch's tabled value so a later chained static
+            # entry reads it -- only for a static write target; a
+            # var_agent_q(...) tabled pin's target needs `assign` (absent
+            # here), and _resolve_projections has already demoted any static
+            # entry downstream of it.
+            if entry.owner_var_slot is None:
+                branch = jnp.argmax(proj_branch[:, entry.branch_slice], axis=-1)  # (pop,)
+                value = jnp.asarray(entry.table)[branch]  # (pop, w)
+                wp = wp.at[:, entry.write_node, entry.pinned_cols].set(value)
+            continue
         if not entry.is_static:
             continue
-        branch_scores = proj_branch[:, entry.branch_slice]
-        branch = jnp.argmax(branch_scores, axis=-1)  # (pop,)
-        rows = tuple(wp0[:, node, :] for node in entry.node_locals)
+        branch = jnp.argmax(proj_branch[:, entry.branch_slice], axis=-1)  # (pop,)
+        rows = tuple(wp[:, node, :] for node in entry.node_locals)
         psi_i = jnp.zeros((branch.shape[0], entry.continuous_params))  # always 0-width: is_static implies continuous_params == 0
+        # is_static entries only ever read param(id) placeholders (see
+        # _classify_static_projection), so read_fn's owner_variable / x0 args
+        # are unused here -- zero placeholders are fine.
+        ov = jnp.zeros((branch.shape[0], problem.n_variables), dtype=jnp.int32)
+        x0z = jnp.zeros((problem.state_dim,))
 
-        def _one(rows_1, psi_1, branch_1, entry=entry, params=params):
-            read_vals = entry.read_fn(rows_1, params)
+        def _one(rows_1, psi_1, branch_1, ov_1, entry=entry, params=params, x0z=x0z):
+            read_vals = entry.read_fn(rows_1, params, ov_1, x0z)
             return jnp.asarray(entry.func(*read_vals, psi_1, branch_1))
 
-        cache[id(entry)] = jax.vmap(_one, in_axes=(0, 0, 0))(rows, psi_i, branch)
+        value = jax.vmap(_one, in_axes=(0, 0, 0, 0))(rows, psi_i, branch, ov)
+        cache[id(entry)] = value
+        if entry.owner_var_slot is None:
+            wp = wp.at[:, entry.write_node, entry.pinned_cols].set(value)
     return cache
 
 
-def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor=None, static_cache=None):
+def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor=None, static_cache=None,
+                      cond_binary=None, t=None, node_active=None, x0=None):
     """Splices every registered analytic-elimination substitution
     (spec.py's _resolve_projections, projection.ProjOperator) into batched
     `(pop, n_nodes, state_dim)` wp, reading batched `psi`
@@ -335,7 +395,42 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
     grad needed since it never depends on a traced value; an untabled one
     vmaps its (read_fn, func) pair over the population axis, matching how
     every other compiled constraint in this module is built for a single
-    example and vmapped by its caller."""
+    example and vmapped by its caller.
+
+    `problem.projections` is dependency-ordered (spec.py's
+    _resolve_projections): this loop threads `wp` through, so an entry whose
+    `reads` reference a column an earlier entry `pins` sees that pinned value
+    (its `rows` are sliced from the running `wp`, not the original).
+
+    `cond_binary`/`t`/`node_active`: needed only when some entry is GATED
+    (ProjectionEntry.gate_fn -- the auto-derived stationary/rigid-carry
+    substitutions). The decoded node-rank `(pop, n_nodes)` is computed ONCE
+    here (kernel.decode_rank_batched, via problem._decode_node_rank -- the
+    same decoder the gated residuals use) and each gate_fn maps it to a hard
+    {0,1} mask; the pin is then BLENDED in
+    (`g*value + (1-g)*cur`) rather than written unconditionally. `node_active`
+    falls back to `anchor.node_active`, then to all-True. A gated entry with
+    none of these available raises."""
+    pop = wp.shape[0]
+    if x0 is None:
+        x0 = jnp.zeros((problem.state_dim,))
+    if problem.n_variables > 0 and assign is not None:
+        owner_variable = jnp.argmax(assign, axis=-1)  # (pop, n_variables)
+    else:
+        owner_variable = jnp.zeros((pop, problem.n_variables), dtype=jnp.int32)
+
+    rank = None
+    if any(e.gate_fn is not None for e in problem.projections):
+        if cond_binary is None or t is None or assign is None:
+            raise ValueError(
+                "a gated projection (ProjectionEntry.gate_fn) needs "
+                "apply_projections' `assign`, `cond_binary` and `t` arguments to "
+                "decode the node-rank its gate is evaluated against")
+        na = node_active
+        if na is None:
+            na = anchor.node_active if anchor is not None else jnp.ones((problem.n_nodes,), dtype=bool)
+        rank = decode_rank_batched(problem._decode_node_rank, assign, cond_binary, t, na)  # (pop, n_nodes)
+
     for entry in problem.projections:
         if static_cache is not None and id(entry) in static_cache:
             value = static_cache[id(entry)]
@@ -349,11 +444,20 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
             rows = tuple(wp[:, node, :] for node in entry.node_locals)  # each (pop, state_dim)
             psi_i = psi[:, entry.psi_slice]  # (pop, continuous_params)
 
-            def _one(rows_1, psi_1, branch_1, entry=entry, params=params):
-                read_vals = entry.read_fn(rows_1, params)
+            def _one(rows_1, psi_1, branch_1, ov_1, entry=entry, params=params, x0=x0):
+                read_vals = entry.read_fn(rows_1, params, ov_1, x0)
                 return jnp.asarray(entry.func(*read_vals, psi_1, branch_1))
 
-            value = jax.vmap(_one, in_axes=(0, 0, 0))(rows, psi_i, branch)
+            value = jax.vmap(_one, in_axes=(0, 0, 0, 0))(rows, psi_i, branch, owner_variable)
+
+        if entry.gate_fn is not None:
+            if entry.owner_var_slot is not None:
+                raise NotImplementedError(
+                    "a gated projection combined with a var_agent_q(...) dynamic "
+                    "pin (ProjectionEntry.owner_var_slot) is not supported")
+            g = entry.gate_fn(rank)[:, None]  # (pop, 1) hard {0, 1}
+            cur = wp[:, entry.write_node, entry.pinned_cols]  # (pop, w)
+            value = g * value + (1.0 - g) * cur
 
         if entry.owner_var_slot is None:
             wp = wp.at[:, entry.write_node, entry.pinned_cols].set(value)
@@ -518,9 +622,14 @@ class GraphOrderingRelaxed:
         # decision variable for the individuals that don't currently
         # select it. JAX/XLA need one fixed shape per compiled function, so
         # there is no way to shrink this per-individual.
+        # A GATED entry (gate_fn is not None) is likewise excluded: its pin
+        # only fires for the individuals/generations whose decoded schedule
+        # satisfies the gate; for the rest the column is still governed by
+        # whatever residual the gated projection shadows, so it stays a real
+        # searched variable.
         wp_pinned_mask = np.zeros((n_nodes, state_dim), dtype=bool)
         for p in self.projections:
-            if p.owner_var_slot is not None:
+            if p.owner_var_slot is not None or p.gate_fn is not None:
                 continue
             wp_pinned_mask[p.write_node, p.pinned_cols] = True
         self.wp_pinned_mask = wp_pinned_mask

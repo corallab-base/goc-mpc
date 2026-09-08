@@ -173,6 +173,13 @@ def _build_static_chain(problem):
             "graph, which this class doesn't support yet (see its own docstring "
             "for the phased plan)")
 
+    if any(a.write_cols & b.read_cols
+           for a in problem.projections for b in problem.projections if a is not b):
+        raise NotImplementedError(
+            "SmallContinuousVRPSolver doesn't support chained projections (one "
+            "projection's `reads` column pinned by another) -- its per-track "
+            "shortest-path DP assumes the tracks are independent")
+
     node_entries = {}
     for entry in problem.projections:
         if entry.owner_var_slot is not None:
@@ -478,7 +485,8 @@ class SmallContinuousVRPSolver(LamarckianGA):
 
         off_assign, off_cond_binary, off_proj_branch, off_t, off_wp, off_psi = problem._extract_batch(off_X)
         off_wp = apply_projections(problem, off_wp, off_psi, off_proj_branch, params.problem_params,
-                                    assign=off_assign, anchor=params.anchor)
+                                    assign=off_assign, anchor=params.anchor,
+                                    cond_binary=off_cond_binary, t=off_t, node_active=params.anchor.node_active, x0=params.x0)
         off_assign_eff, off_wp_eff_frozen, _off_wp_eff_live = apply_anchor(
             problem, off_assign, off_wp, params.anchor, params.x0)
         off_t = _routing_local_search_batched(
