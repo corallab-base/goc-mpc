@@ -17,6 +17,7 @@ dependencies = [
     "viser>=1.1.0",
     "evosax>=0.3.1",
     "optax>=0.2.0",
+    "ortools>=9.10",
 ]
 
 [build-system]
