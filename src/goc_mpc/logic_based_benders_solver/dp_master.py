@@ -257,35 +257,68 @@ def _order_t(ext, n_nodes):
     return t
 
 
-def _resolve_schedule_wp(problem, wp_template, x0_full, owner_vagent, aux, proj_branch_vec, t_vec):
-    """Full `(n_nodes, state_dim)` wp for one enumerated schedule: every
-    projection (gated / chained / dynamic included) spliced in by
-    apply_projections against this assignment (`owner_vagent` one-hots),
-    aux, branch vector and order-derived `t`."""
+def _resolve_schedule_wp(problem, wp_pop, x0_full, owner_vagent, aux, proj_branch_pop, t_vec,
+                         only_entries=None):
+    """`(pop, n_nodes, state_dim)` wp for one enumerated schedule: the
+    (`only_entries` subset of) projections spliced in by apply_projections
+    against this assignment (`owner_vagent` one-hots), aux, per-member branch
+    vectors and the order-derived `t` (shared across the pop). jitted +
+    cached per (problem, only_entries). `wp_pop` and `proj_branch_pop` carry
+    the population axis; everything else is broadcast."""
     import jax.numpy as jnp
-    from ..evolutionary_waypoint_solver.problem import apply_projections
+    from ..evolutionary_waypoint_solver.problem import jit_apply_projections
+    pop = wp_pop.shape[0]
     n_var, n_agents = problem.n_variables, problem.n_agents
-    assign = np.zeros((1, n_var, n_agents))
+    assign = np.zeros((pop, n_var, n_agents))
     for s in range(n_var):
-        assign[0, s, int(owner_vagent[s])] = 1.0
-    cb = (np.asarray(aux, dtype=float).reshape(1, -1) if problem.n_cond_vars
-          else np.zeros((1, 0)))
-    out = apply_projections(
-        problem, jnp.asarray(wp_template[None]), jnp.zeros((1, problem.n_psi)),
-        jnp.asarray(proj_branch_vec[None]), jnp.asarray(problem.params),
-        assign=jnp.asarray(assign), cond_binary=jnp.asarray(cb),
-        t=jnp.asarray(t_vec[None]), node_active=jnp.ones((problem.n_nodes,), dtype=bool),
-        x0=jnp.asarray(x0_full))
-    return np.asarray(out)[0]
+        assign[:, s, int(owner_vagent[s])] = 1.0
+    cb = (np.broadcast_to(np.asarray(aux, dtype=float), (pop, problem.n_cond_vars))
+          if problem.n_cond_vars else np.zeros((pop, 0)))
+    out = jit_apply_projections(problem, only_entries=only_entries)(
+        jnp.asarray(wp_pop), jnp.zeros((pop, problem.n_psi)),
+        jnp.asarray(proj_branch_pop), jnp.asarray(problem.params),
+        jnp.asarray(assign), jnp.asarray(cb),
+        jnp.broadcast_to(jnp.asarray(t_vec, dtype=float), (pop, problem.n_nodes)),
+        jnp.ones((problem.n_nodes,), dtype=bool), jnp.asarray(x0_full))
+    return np.asarray(out)
 
 
-def _route_cost_wp(seq, wp_res, x0_row, sliced):
+def _branch_viterbi_wp(seq, rows_by_node, wp0, x0_row, sliced):
+    """Per-track branch DP: min routed-path cost + per-node branch argmin for
+    one agent's ordered stops `seq`, from the depot. `rows_by_node[n]` is a
+    `(k, state_dim)` array of branch candidates for node n (a node not in it
+    has a single candidate, `wp0[n]`). Exact for `avg` / `minmax` -- an
+    agent's route cost is separable from every other agent's."""
     if not seq:
-        return 0.0
-    c = float(sliced(x0_row, wp_res[seq[0]]))
+        return 0.0, {}
+
+    def cands(n):
+        return rows_by_node[n] if n in rows_by_node else wp0[n][None, :]
+
+    r0 = cands(seq[0])
+    cost = np.array([sliced(x0_row, row) for row in r0], dtype=float)
+    back = []
     for i in range(1, len(seq)):
-        c += float(sliced(wp_res[seq[i - 1]], wp_res[seq[i]]))
-    return c
+        ru, rv = cands(seq[i - 1]), cands(seq[i])
+        mat = np.array([[sliced(a, b) for b in rv] for a in ru])  # (k_u, k_v)
+        total = cost[:, None] + mat
+        back.append(np.argmin(total, axis=0))
+        cost = np.min(total, axis=0)
+    choice = [0] * len(seq)
+    choice[-1] = int(np.argmin(cost))
+    for i in range(len(seq) - 2, -1, -1):
+        choice[i] = int(back[i][choice[i + 1]])
+    return float(cost[choice[-1]]), {n: choice[i] for i, n in enumerate(seq)}
+
+
+def _select_wp(ext, rows_by_node, wp0, branch_of_node):
+    """Materialize `(n_nodes, state_dim)` for one branch choice: each
+    projected node's chosen candidate row, `wp0` elsewhere."""
+    wp = np.array(wp0, copy=True)
+    for n in ext:
+        if n in rows_by_node:
+            wp[n] = rows_by_node[n][branch_of_node.get(n, 0)]
+    return wp
 
 
 def _makespan_forward_wp(ext, P_pred, agent_of_node, wp_res, x0_of, sliced_of):
@@ -352,15 +385,34 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
     if full:
         sliced_of = {j: _agent_sliced_cost_fn(ecf, j, problem.dim) for j in range(n_agents)}
         proj_entries = list(problem.projections)
-        proj_ranges = [range(e.discrete_params) for e in proj_entries]
-        n_combos = int(np.prod([e.discrete_params for e in proj_entries], dtype=object)) if proj_entries else 1
-        if n_combos > max_branch_combos:
+        # Two layers: branch-FREE entries (gated stationary / rigid-carry /
+        # object pins -- resolved once per order) and BRANCHED ones (the
+        # analytic-IK ProjOperators -- one branch choice per node, resolved
+        # per branch against the branch-free layer's wp). A branched entry
+        # reading another branched entry's column would couple the branch DP
+        # -- not implemented (block stacking is a flat 2-layer chain).
+        layer0 = tuple(e for e in proj_entries if e.discrete_params == 1)
+        branched = [e for e in proj_entries if e.discrete_params > 1]
+        # A branched entry reading ANOTHER branched entry's pinned column
+        # would couple the per-track branch DP (its candidate rows depend on
+        # the upstream branch choice) -- not implemented. A self-read (an IK
+        # entry's own documented-unused FK placeholder) doesn't count.
+        for e in branched:
+            others = set().union(*(o.write_cols for o in branched if o is not e))
+            if e.read_cols & others:
+                raise NotImplementedError(
+                    "dp_master full-resolve: a multi-branch projection reads a "
+                    "column another multi-branch projection pins -- the coupled "
+                    "branch DP that needs is not implemented")
+        makespan_combo_cap = max(max_branch_combos, 100000)
+        n_makespan_combos = int(np.prod([e.discrete_params for e in branched], dtype=object)) if branched else 1
+        if objective == "makespan" and n_makespan_combos > makespan_combo_cap:
             raise NotImplementedError(
-                f"dp_master full-resolve: product of projection branch counts = "
-                f"{n_combos} > max_branch_combos={max_branch_combos} "
-                f"({[e.discrete_params for e in proj_entries if e.discrete_params > 1]} "
-                "the multi-branch ones) -- per-schedule apply_projections over all "
-                "combos is too many; needs a per-track branch DP inside the resolve")
+                f"dp_master full-resolve makespan: {n_makespan_combos} branch combos "
+                f"> {makespan_combo_cap} -- makespan couples branch choice with "
+                "cross-agent waiting, so it still enumerates combos (over CACHED "
+                "per-branch rows, but still exponential); avg/minmax use the "
+                "separable per-track DP")
 
     n_assign = n_agents ** n_var if n_var else 1
     if n_assign > max_assign_combos:
@@ -412,36 +464,76 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
                     agent_of_node.setdefault(n, []).append(j)
 
             if full:
-                # Per-schedule resolution: no precomputed cost tables -- for
-                # each (order, projection-branch combo) resolve the whole wp
-                # via apply_projections (gates see this order's `t`, chains
-                # are threaded) and price the routes directly off it.
+                # Per-schedule resolution, staged: (1) resolve the branch-
+                # free projection layer once per order (gates see this
+                # order's `t`); (2) resolve each branched (analytic-IK)
+                # entry's k candidate rows against that layer; (3) per-agent
+                # branch DP over those rows (avg/minmax) or a cached-row
+                # combo enumeration (makespan).
                 for ext in exts:
                     agent_seq = {j: [n for n in ext if n in owned.get(j, ())] for j in owned}
                     tvec = _order_t(ext, n_nodes)
-                    for combo in itertools.product(*proj_ranges):
-                        pb = np.zeros(problem.n_branch)
-                        for e, bi in zip(proj_entries, combo):
-                            pb[e.branch_slice.start + bi] = 1.0
-                        wp_res = _resolve_schedule_wp(
-                            problem, wp_template, x0_full, owner_vagent, aux, pb, tvec)
-                        per_agent = {j: _route_cost_wp(seq, wp_res, x0_of[j], sliced_of[j])
-                                     for j, seq in agent_seq.items()}
-                        if objective == "avg":
-                            score = sum(per_agent.values())
-                        elif objective == "minmax":
-                            score = max(per_agent.values(), default=0.0)
-                        else:
-                            arr = _makespan_forward_wp(ext, P_pred, agent_of_node, wp_res,
-                                                       x0_of, sliced_of)
-                            score = max(arr.values(), default=0.0)
+                    wp0 = _resolve_schedule_wp(
+                        problem, wp_template[None], x0_full, owner_vagent, aux,
+                        np.zeros((1, problem.n_branch)), tvec, only_entries=layer0)[0]
+
+                    rows_by_node = {}
+                    node_owner_of = {}          # projected node -> (entry, owner-agent)
+                    for e in branched:
+                        k = e.discrete_params
+                        pb = np.zeros((k, problem.n_branch))
+                        pb[np.arange(k), e.branch_slice.start + np.arange(k)] = 1.0
+                        res = _resolve_schedule_wp(
+                            problem, np.broadcast_to(wp0[None], (k,) + wp0.shape),
+                            x0_full, owner_vagent, aux, pb, tvec, only_entries=(e,))
+                        rows_by_node[int(e.write_node)] = res[:, int(e.write_node), :]
+                        node_owner_of[int(e.write_node)] = (e, static_entry_owner(problem, e))
+
+                    if objective in ("avg", "minmax"):
+                        per_agent, choice = {}, {}
+                        for j, seq in agent_seq.items():
+                            c, ch = _branch_viterbi_wp(seq, rows_by_node, wp0, x0_of[j], sliced_of[j])
+                            per_agent[j] = c
+                            choice.update(ch)
+                        score = (sum(per_agent.values()) if objective == "avg"
+                                 else max(per_agent.values(), default=0.0))
                         if score < best:
-                            if objective != "makespan":
-                                arr = _makespan_forward_wp(ext, P_pred, agent_of_node, wp_res,
-                                                           x0_of, sliced_of)
-                            br = {(int(e.write_node), static_entry_owner(problem, e)): int(bi)
-                                  for e, bi in zip(proj_entries, combo) if e.discrete_params > 1}
+                            wp_sel = _select_wp(ext, rows_by_node, wp0, choice)
+                            arr = _makespan_forward_wp(ext, P_pred, agent_of_node, wp_sel,
+                                                       x0_of, sliced_of)
+                            br = {(n, node_owner_of[n][1]): int(choice.get(n, 0))
+                                  for n in rows_by_node}
                             best = score
+                            best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
+                        continue
+
+                    # makespan: branch choice couples with cross-agent
+                    # waiting, so enumerate combos -- but over per-agent
+                    # (node-pair) cost MATRICES built once from the cached
+                    # rows (pure arithmetic per combo, reusing the fast
+                    # path's `_makespan_forward`), not a wp rebuild.
+                    et, dt, bc = {}, {}, {}
+                    for j, seq in agent_seq.items():
+                        rj = {n: (rows_by_node[n] if n in rows_by_node else wp0[n][None, :]) for n in seq}
+                        bc[j] = {n: rj[n].shape[0] for n in seq}
+                        dt[j] = {n: np.array([sliced_of[j](x0_of[j], r) for r in rj[n]]) for n in seq}
+                        et[j] = {(u, v): np.array([[sliced_of[j](a, b) for b in rj[v]] for a in rj[u]])
+                                 for u, v in zip(seq, seq[1:])}
+                    pnodes = [(n, j) for n in ext for j in agent_of_node.get(n, [])]
+                    for combo in itertools.product(*[range(bc[j][n]) for (n, j) in pnodes]):
+                        b_of = dict(zip(pnodes, combo))
+                        arr = _makespan_forward(ext, P_pred, agent_seq, agent_of_node, b_of, et, dt)
+                        ms = max(arr.values(), default=0.0)
+                        if ms < best:
+                            per_agent = {}
+                            for j, seq in agent_seq.items():
+                                pc = dt[j][seq[0]][b_of[(seq[0], j)]] if seq else 0.0
+                                for u, v in zip(seq, seq[1:]):
+                                    pc += et[j][(u, v)][b_of[(u, j)], b_of[(v, j)]]
+                                per_agent[j] = float(pc)
+                            br = {(n, node_owner_of[n][1]): int(b_of[(n, j)])
+                                  for (n, j) in pnodes if n in node_owner_of}
+                            best = ms
                             best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
                 continue
 

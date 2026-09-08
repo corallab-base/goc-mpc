@@ -28,6 +28,7 @@ docstring); `gate_fn=None` means an always-active hard edge, otherwise
 `gate_fn(owner_variable, cond_binary) -> bool`.
 """
 
+import weakref
 from collections import namedtuple
 
 import jax
@@ -333,7 +334,7 @@ def precompute_static_projections(problem, wp0, proj_branch, params):
 
 
 def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor=None, static_cache=None,
-                      cond_binary=None, t=None, node_active=None, x0=None):
+                      cond_binary=None, t=None, node_active=None, x0=None, only_entries=None):
     """Splices every registered analytic-elimination substitution
     (spec.py's _resolve_projections, projection.ProjOperator) into batched
     `(pop, n_nodes, state_dim)` wp, reading batched `psi`
@@ -410,7 +411,19 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
     {0,1} mask; the pin is then BLENDED in
     (`g*value + (1-g)*cur`) rather than written unconditionally. `node_active`
     falls back to `anchor.node_active`, then to all-True. A gated entry with
-    none of these available raises."""
+    none of these available raises.
+
+    `only_entries`: apply just this subsequence of `problem.projections`
+    instead of all of it -- structure.node_candidates uses it to resolve one
+    self-contained projection's candidate rows without running the rest of
+    the chain (and, when the subset carries no gate, without the rank
+    decode). The caller is responsible for passing a subset that is
+    self-contained (reads nothing another, un-included, entry pins)."""
+    # `only_entries`: apply just this subset (structure.node_candidates
+    # resolving ONE self-contained projection's row -- skips the rest of the
+    # chain and, when the subset is gate-free, the rank decode entirely).
+    entries = problem.projections if only_entries is None else list(only_entries)
+
     pop = wp.shape[0]
     if x0 is None:
         x0 = jnp.zeros((problem.state_dim,))
@@ -420,7 +433,7 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
         owner_variable = jnp.zeros((pop, problem.n_variables), dtype=jnp.int32)
 
     rank = None
-    if any(e.gate_fn is not None for e in problem.projections):
+    if any(e.gate_fn is not None for e in entries):
         if cond_binary is None or t is None or assign is None:
             raise ValueError(
                 "a gated projection (ProjectionEntry.gate_fn) needs "
@@ -431,7 +444,7 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
             na = anchor.node_active if anchor is not None else jnp.ones((problem.n_nodes,), dtype=bool)
         rank = decode_rank_batched(problem._decode_node_rank, assign, cond_binary, t, na)  # (pop, n_nodes)
 
-    for entry in problem.projections:
+    for entry in entries:
         if static_cache is not None and id(entry) in static_cache:
             value = static_cache[id(entry)]
         elif entry.table is not None:
@@ -477,6 +490,40 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
             new_row = jax.vmap(lambda r, c, v: r.at[c].set(v))(row, cols, value)
             wp = wp.at[:, entry.write_node, :].set(new_row)
     return wp
+
+
+_apply_projections_jit = weakref.WeakKeyDictionary()  # problem -> {only_key -> jitted fn}
+
+
+def jit_apply_projections(problem, only_entries=None):
+    """A `jax.jit`-compiled `apply_projections` bound to `problem` (and, if
+    given, `only_entries`) -- both closed over as static -- cached per
+    problem instance. The returned callable takes `(wp, psi, proj_branch,
+    params, assign, cond_binary, t, node_active, x0)`, all traced arrays,
+    every one required (no None defaults under jit).
+
+    For a caller hitting `apply_projections` repeatedly on ONE problem at
+    fixed array shapes but changing values -- structure.node_candidates
+    every MPC cycle, mpc.py's per-step write-back -- eager execution of the
+    projection chain (an 8-branch analytic IK vmapped over its branch
+    population, plus the topological-rank decode) costs ~hundreds of ms to
+    seconds per call; the jitted version pays that once as a compile and
+    then runs in milliseconds. `static_cache` / `anchor` aren't exposed
+    here (a jitted resolve is always fresh); splice a passed-node freeze
+    into `node_active` beforehand if needed."""
+    only_key = None if only_entries is None else tuple(id(e) for e in only_entries)
+    per_problem = _apply_projections_jit.setdefault(problem, {})
+    f = per_problem.get(only_key)
+    if f is None:
+        oe = None if only_entries is None else tuple(only_entries)
+
+        def _run(wp, psi, proj_branch, params, assign, cond_binary, t, node_active, x0):
+            return apply_projections(problem, wp, psi, proj_branch, params, assign=assign,
+                                     cond_binary=cond_binary, t=t, node_active=node_active,
+                                     x0=x0, only_entries=oe)
+        f = jax.jit(_run)
+        per_problem[only_key] = f
+    return f
 
 
 def full_active_anchor(problem):

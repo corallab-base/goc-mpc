@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import pydrake.symbolic as sym
 
-from ..evolutionary_waypoint_solver.problem import apply_projections
+from ..evolutionary_waypoint_solver.problem import jit_apply_projections
 from ..evolutionary_waypoint_solver.kernel import _euclidean_edge_cost
 from ..evolutionary_waypoint_solver.formula_compiler import as_variable
 
@@ -188,6 +188,15 @@ def node_candidates(problem, wp_template, params, allow_unresolved=False):
             "dependency belongs to the continuous subproblem (pass "
             "allow_unresolved=True to defer them to solve_dp_master)")
     out = {}
+    n_nodes = problem.n_nodes
+    # Reused across entries (all traced args are per-entry; these are not).
+    _dummy_assign1 = jnp.zeros((1, problem.n_variables, problem.n_agents))
+    _dummy_cb1 = jnp.zeros((1, problem.n_cond_vars))
+    _dummy_t1 = jnp.arange(n_nodes, dtype=float)[None]
+    _na_all = jnp.ones((n_nodes,), dtype=bool)
+    _x0_dummy = jnp.asarray(np.asarray(wp_template).reshape(-1)[:problem.state_dim])
+    _params = jnp.asarray(params)
+    _wp1 = jnp.asarray(wp_template)[None]
     for entry in problem.projections:
         deferred = (len(entry.node_locals) != 1 or entry.owner_var_slot is not None
                     or entry.gate_fn is not None or id(entry) in chained_readers)
@@ -205,29 +214,20 @@ def node_candidates(problem, wp_template, params, allow_unresolved=False):
                 f"node {node}: two projections pin owner {owner!r}'s band "
                 "(chained projections aren't supported)")
         k = entry.discrete_params
-        wp_pop = np.repeat(wp_template[None, :, :], k, axis=0)
-        psi_pop = np.zeros((k, problem.n_psi))
-        proj_branch_pop = np.zeros((k, problem.n_branch))
         branch_ids = np.arange(k)
-        proj_branch_pop[np.arange(k), entry.branch_slice.start + branch_ids] = 1.0
-        # apply_projections does a JAX `.at[...].set(...)` scatter internally
-        # -- it needs jnp arrays in, not plain numpy, even though every
-        # input here is a concrete (non-traced) value. Deferred (gated /
-        # chained) entries in problem.projections are still APPLIED by this
-        # call -- with dummy scheduling inputs, an arbitrary order -- but
-        # they only ever touch object columns / a different node's row, so
-        # the (node, owner) band read out below is unaffected.
-        n_nodes = problem.n_nodes
-        dummy_assign = np.zeros((k, problem.n_variables, problem.n_agents))
-        dummy_cb = np.zeros((k, problem.n_cond_vars))
-        dummy_t = np.tile(np.arange(n_nodes, dtype=float), (k, 1))
-        x0_dummy = np.asarray(wp_template).reshape(-1)[:problem.state_dim]
-        resolved = np.asarray(apply_projections(
-            problem, jnp.asarray(wp_pop), jnp.asarray(psi_pop),
-            jnp.asarray(proj_branch_pop), jnp.asarray(params),
-            assign=jnp.asarray(dummy_assign), cond_binary=jnp.asarray(dummy_cb),
-            t=jnp.asarray(dummy_t), node_active=jnp.ones((n_nodes,), dtype=bool),
-            x0=jnp.asarray(x0_dummy)))
+        proj_branch_pop = jnp.zeros((k, problem.n_branch)).at[
+            branch_ids, entry.branch_slice.start + branch_ids].set(1.0)
+        # Resolve ONLY this self-contained entry (only_entries) -- skips the
+        # rest of the projection chain and, since a tabulated entry is never
+        # gated, the topological-rank decode too; jitted + cached per
+        # (problem, entry) so the analytic-IK cost is a one-time compile.
+        resolve = jit_apply_projections(problem, only_entries=(entry,))
+        resolved = np.asarray(resolve(
+            jnp.broadcast_to(_wp1, (k, n_nodes, problem.state_dim)),
+            jnp.zeros((k, problem.n_psi)), proj_branch_pop, _params,
+            jnp.broadcast_to(_dummy_assign1, (k, problem.n_variables, problem.n_agents)),
+            jnp.broadcast_to(_dummy_cb1, (k, problem.n_cond_vars)),
+            jnp.broadcast_to(_dummy_t1, (k, n_nodes)), _na_all, _x0_dummy))
         rows = resolved[:, node, :]
         out.setdefault(node, {})[owner] = NodeCandidates(
             node=node, rows=rows, branch_ids=branch_ids)
