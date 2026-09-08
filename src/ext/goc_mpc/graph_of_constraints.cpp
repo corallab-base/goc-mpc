@@ -367,58 +367,74 @@ Eigen::VectorXd GraphOfConstraints::point_position(int point_id, const Eigen::Ve
 	return p_WC.head(workspace_dim);
 }
 
-namespace {
-
-// Resolves the specific agent(s) that own phi_id, in priority order:
-//   0. nobody, if the caller flagged this phi routes=false
+// The ONE authoritative dispatch for a node phi's routing/ordering agent
+// source, in priority order:
+//   0. kNone, if the caller flagged this phi routes=false
 //      (_phi_routing_exempt) -- a global validity bound (e.g. a joint-limit
 //      box stamped on every node), which says where an agent MAY be, not
 //      that it must pass through this node.
-//   1. an assignable var (var_agent_q) with a resolved MILP assignment,
-//   2. a legacy static grasp assignment (add_grasp_change),
-//   3. (only when neither above applies) which agent(s) the phi's own
-//      Formula actually pins -- a literal agent_q reference (a Cartesian EE
-//      pin, or a plain add_constraint(node, eq(q0[...], ...))), or an
-//      agent_link_pos/agent_link_rot FK constraint (the configuration-space
-//      analogue -- pins the named agent's link pose). Neither was routed
-//      through the assignable machinery, so neither has a phi_to_variable_map
-//      entry.
-// Returns an empty set when none of the above resolves anything (a pure
-// object-only phi, a routing-exempt bound, or a legacy DeferredOp with no
-// Formula to introspect and no assignment) -- callers must treat that as
-// "this phi has no opinion about agent ownership", not "belongs to every
-// agent": a node can have both an object-only phi (no opinion) and an
-// agent-specific phi (a real opinion) at once, and the object-only one
-// must not drown the real one out.
+//   1. kVar -- an assignable var (var_agent_q); left UNRESOLVED here.
+//   2. kFixed -- a legacy static grasp assignment (add_grasp_change).
+//   3. kFormula -- which agent(s) the phi's own Formula actually pins: a
+//      literal agent_q reference (a Cartesian EE pin, or a plain
+//      add_constraint(node, eq(q0[...], ...))), or an agent_link_pos/
+//      agent_link_rot FK constraint (the configuration-space analogue --
+//      the EE target in joint-space planning). Neither was routed through
+//      the assignable machinery, so neither has a phi_to_variable_map entry.
+//   otherwise kNone (a pure object-only phi, or a legacy DeferredOp with no
+//   Formula to introspect) -- callers must treat that as "this phi has no
+//   opinion", not "belongs to every agent".
+PhiAgentSource GraphOfConstraints::phi_agent_source(int phi_id) const {
+	PhiAgentSource src;
+	if (_phi_routing_exempt.count(phi_id)) return src;  // kNone
+
+	if (phi_to_variable_map.contains(phi_id)) {
+		src.kind = PhiAgentSource::kVar;
+		src.var_id = phi_to_variable_map.at(phi_id);
+		return src;
+	}
+	if (_phi_to_static_assignment_map.contains(phi_id)) {
+		src.kind = PhiAgentSource::kFixed;
+		src.agents = {_phi_to_static_assignment_map.at(phi_id)};
+		return src;
+	}
+	if (symbolic_ops.contains(phi_id)) {
+		const drake::symbolic::Variables free_vars =
+			symbolic_ops.at(phi_id).formula.GetFreeVariables();
+		std::set<int> owners;
+		for (int ag : _agent_q.KeysReferencedBy(free_vars)) owners.insert(ag);
+		for (const auto& key : _agent_link_pos.KeysReferencedBy(free_vars))
+			owners.insert(key.first);
+		for (const auto& key : _agent_link_rot.KeysReferencedBy(free_vars))
+			owners.insert(key.first);
+		if (!owners.empty()) {
+			src.kind = PhiAgentSource::kFormula;
+			src.agents = std::move(owners);
+		}
+	}
+	return src;
+}
+
+namespace {
+
+// Thin resolver over GraphOfConstraints::phi_agent_source: collapses kVar
+// to a concrete agent via `var_assignments` (empty set if still
+// unassigned), passes kFixed/kFormula's agent set straight through, kNone
+// -> {}. See PhiAgentSource for the dispatch this builds on.
 std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
                               const Eigen::VectorXi& var_assignments) {
-	if (graph._phi_routing_exempt.count(phi_id)) return {};
-
-	if (graph.phi_to_variable_map.contains(phi_id)) {
-		const int var = graph.phi_to_variable_map.at(phi_id);
-		const int a = (var < var_assignments.size()) ? var_assignments(var) : -1;
+	const PhiAgentSource src = graph.phi_agent_source(phi_id);
+	switch (src.kind) {
+	case PhiAgentSource::kNone:
+		return {};
+	case PhiAgentSource::kVar: {
+		const int a = (src.var_id < var_assignments.size()) ? var_assignments(src.var_id) : -1;
 		if (a != -1) return {a};
 		return {};
 	}
-	if (graph._phi_to_static_assignment_map.contains(phi_id)) {
-		return {graph._phi_to_static_assignment_map.at(phi_id)};
-	}
-	if (graph.symbolic_ops.contains(phi_id)) {
-		const drake::symbolic::Variables free_vars =
-			graph.symbolic_ops.at(phi_id).formula.GetFreeVariables();
-		std::set<int> owners;
-		// Direct agent_q reference: a Cartesian EE pin, or any plain
-		// add_constraint(node, eq(q[...], ...)).
-		for (int ag : graph._agent_q.KeysReferencedBy(free_vars)) owners.insert(ag);
-		// FK node constraint: agent_link_pos/agent_link_rot pin the named
-		// agent's link pose -- the configuration-space analogue of a direct
-		// agent_q pin (the EE target in joint-space planning), and just as
-		// much real ownership evidence. Keyed by (agent_id, link_name).
-		for (const auto& key : graph._agent_link_pos.KeysReferencedBy(free_vars))
-			owners.insert(key.first);
-		for (const auto& key : graph._agent_link_rot.KeysReferencedBy(free_vars))
-			owners.insert(key.first);
-		return owners;
+	case PhiAgentSource::kFixed:
+	case PhiAgentSource::kFormula:
+		return src.agents;
 	}
 	return {};
 }

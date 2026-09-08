@@ -53,6 +53,34 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.value("EQUAL", AgentInteraction::Type::EQUAL)
 		.export_values();
 
+	py::class_<PhiAgentSource>(goc_mpc, "PhiAgentSource")
+		// "none" | "var" | "fixed" | "formula" -- see the C++ PhiAgentSource
+		// doc comment.
+		.def_property_readonly("kind", [](const PhiAgentSource& s) -> const char* {
+			switch (s.kind) {
+				case PhiAgentSource::kNone:    return "none";
+				case PhiAgentSource::kVar:     return "var";
+				case PhiAgentSource::kFixed:   return "fixed";
+				case PhiAgentSource::kFormula: return "formula";
+			}
+			return "none";
+		})
+		.def_readonly("var_id", &PhiAgentSource::var_id)
+		.def_property_readonly("agents", [](const PhiAgentSource& s) {
+			return std::vector<int>(s.agents.begin(), s.agents.end());
+		})
+		.def("__repr__", [](const PhiAgentSource& s) {
+			const char* k = s.kind == PhiAgentSource::kNone ? "none"
+			              : s.kind == PhiAgentSource::kVar ? "var"
+			              : s.kind == PhiAgentSource::kFixed ? "fixed" : "formula";
+			std::string agents = "{";
+			bool first = true;
+			for (int a : s.agents) { if (!first) agents += ","; agents += std::to_string(a); first = false; }
+			agents += "}";
+			return "PhiAgentSource(kind=" + std::string(k) +
+			       ", var_id=" + std::to_string(s.var_id) + ", agents=" + agents + ")";
+		});
+
 	py::class_<GraphOfConstraints>(goc_mpc, "GraphOfConstraints")
 		.def(py::init<const std::vector<CubicConfigurationSpline::Spec>&,
 		              const std::vector<CubicConfigurationSpline::Spec>&,
@@ -89,6 +117,11 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("object_ambient_dim", &GraphOfConstraints::object_ambient_dim, py::arg("object_id"))
 		.def("constrained_columns", &GraphOfConstraints::constrained_columns,
 		     py::arg("node"), py::arg("var_assignments") = Eigen::VectorXi())
+		// The authoritative routing/ordering agent-ownership dispatch for one
+		// node phi (see the C++ PhiAgentSource doc). Both PhiOwningAgents
+		// (get_agent_paths) and evolutionary_waypoint_solver/spec.py build on
+		// this rather than re-implementing the exempt/var/static/formula chain.
+		.def("phi_agent_source", &GraphOfConstraints::phi_agent_source, py::arg("phi_id"))
 		.def("agent_col_offset", &GraphOfConstraints::agent_col_offset, py::arg("agent_id"))
 		.def("object_col_offset", &GraphOfConstraints::object_col_offset, py::arg("object_id"))
 		// Whole-array form of the above (agent_col_offset(i) for i in

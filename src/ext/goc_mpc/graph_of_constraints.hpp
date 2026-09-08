@@ -386,6 +386,28 @@ private:
 	mutable std::map<Key, drake::VectorX<drake::symbolic::Variable>> vars_;
 };
 
+// The agent-ownership source of a single node phi, for routing/ordering
+// purposes -- the ONE authoritative dispatch over the exempt set / the
+// assignable-var map / the static-grasp map / the phi's own Formula.
+// Computed by GraphOfConstraints::phi_agent_source; both PhiOwningAgents
+// (get_agent_paths, C++) and the JAX solver's spec.py derive their answer
+// from this rather than re-implementing the dispatch. Deliberately left
+// UNRESOLVED for the assignable case (`kVar` carries the var id, not a
+// concrete agent) so a caller that still has to search over assignments
+// keeps that freedom; PhiOwningAgents resolves it against a concrete
+// var_assignments vector.
+struct PhiAgentSource {
+	enum Kind {
+		kNone,     // no opinion: routing-exempt, object-only, or a non-introspectable legacy op
+		kVar,      // assignable: `var_id` indexes var_assignments / the assignment slot
+		kFixed,    // legacy static grasp assignment: `agents` has exactly one entry
+		kFormula,  // the phi's Formula pins agent_q(k) and/or agent_link_pos/rot(k, ...): `agents` >= 1
+	};
+	Kind kind = kNone;
+	int var_id = -1;
+	std::set<int> agents;
+};
+
 struct GraphOfConstraints {
 
 	const std::vector<CubicConfigurationSpline::Spec> _robot_specs;
@@ -801,6 +823,13 @@ struct GraphOfConstraints {
 	Eigen::VectorXd point_position(int point_id, const Eigen::VectorXd& x) const;
 
 	Graph<py::object> get_structure() const { return structure; }
+
+	// The routing/ordering agent-ownership source of one node phi -- see
+	// PhiAgentSource. The single authoritative dispatch (exempt set ->
+	// phi_to_variable_map -> _phi_to_static_assignment_map -> the phi's own
+	// Formula, scanning agent_q AND agent_link_pos/rot). PhiOwningAgents
+	// and evolutionary_waypoint_solver/spec.py both build on this.
+	PhiAgentSource phi_agent_source(int phi_id) const;
 
 	// Determines, for each agent, the ordered sequence of nodes it visits,
 	// and the cross-agent timing interactions (shared nodes -> EQUAL,

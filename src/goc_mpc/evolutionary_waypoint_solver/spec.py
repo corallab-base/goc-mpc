@@ -98,17 +98,6 @@ def target_eq_constraint(target):
     return fn
 
 
-def _placeholder_id_map(vec):
-    """vec: array of Expression (e.g. graph.agent_q(k) or
-    graph.var_agent_q(var)). Returns {Variable.get_id(): component_index}."""
-    out = {}
-    for j, expr in enumerate(vec):
-        v = as_variable(expr)
-        if v is not None:
-            out[v.get_id()] = j
-    return out
-
-
 def _agent_widths(graph):
     """Per-agent ambient config width, one entry per graph.num_agents,
     derived from graph._robot_specs (the actual declared Block sizes) --
@@ -998,36 +987,28 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
     def _resolve_phi_agent_source(phi_id):
         """Resolves ONE phi/constraint's own agent source -- ("fixed",
         agent_id), ("var", var_id), or None if it doesn't establish a
-        routing instance (e.g. an object-only formula) -- independently of
-        any other phi on the same node, purely for ROUTING/ordering purposes
-        (see module docstring; unrelated to whether the formula itself can
-        be compiled, which the waypoint row layout always supports)."""
-        if phi_id in graph.phi_to_variable_map:
-            return ("var", graph.phi_to_variable_map[phi_id])
-        if phi_id in graph.phi_to_static_assignment_map:
-            return ("fixed", graph.phi_to_static_assignment_map[phi_id])
-        formula = graph.phi_to_formula_map.get(phi_id)
-        if formula is None:
+        routing instance -- purely for ROUTING/ordering purposes (see module
+        docstring; unrelated to whether the formula itself can be compiled).
+
+        Thin wrapper over graph.phi_agent_source (graph_of_constraints.cpp's
+        PhiAgentSource dispatch -- the SAME authority PhiOwningAgents /
+        get_agent_paths use, so routes=False exemption and agent_link_pos/rot
+        FK recognition come for free rather than being re-implemented here).
+        The only spec-side policy: an ambiguous multi-agent formula is a hard
+        error here (PhiOwningAgents would union them) since the JAX kernel
+        needs one agent per routing instance."""
+        src = graph.phi_agent_source(phi_id)
+        if src.kind == "none":
             return None
-        # No entry in either map: either a plain literal-agent_q(k) node
-        # constraint (add_constraint's C++ side only records var_agent_q
-        # placeholders anywhere, never literal ones -- see add_constraint's
-        # own free-variable scan, graph_of_constraints.cpp), an object-only
-        # formula (no agent_q(k) reference at all -- correctly falls through
-        # to None, no routing instance), or a multi-variable-disjunction phi
-        # (references var_agent_q for >1 variable, matches nothing below,
-        # correctly falls through to None).
-        free_var_ids = {v.get_id() for v in formula.GetFreeVariables()}
-        matched = [k for k in range(graph.num_agents)
-                   if not _placeholder_id_map(graph.agent_q(k)).keys().isdisjoint(free_var_ids)]
-        if len(matched) == 1:
-            return ("fixed", matched[0])
-        if len(matched) > 1:
-            raise ValueError(
-                f"phi {phi_id}'s constraint formula references multiple distinct "
-                f"literal agent_q(k) placeholders {matched} -- not representable "
-                "as a single agent source for routing purposes")
-        return None
+        if src.kind == "var":
+            return ("var", src.var_id)
+        # "fixed" (legacy static grasp) or "formula" (agent_q / FK pin).
+        if len(src.agents) == 1:
+            return ("fixed", src.agents[0])
+        raise ValueError(
+            f"phi {phi_id}'s constraint formula references multiple distinct "
+            f"agent placeholders {src.agents} -- not representable as a single "
+            "agent source for routing purposes")
 
     # Routing instances: (node, resolved agent source) pairs -- purely a
     # routing/ordering concept (which real agent visits this node, and in
