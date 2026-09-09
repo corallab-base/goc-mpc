@@ -56,11 +56,17 @@ namespace py = pybind11;
 //      practice, and required here (accumulating a raw step across several
 //      iterations without retracting isn't meaningful once a Torus
 //      component is involved).
-//   3. fk fast path only (v1): `fk(q) = q[:workspace_dim]`, so an obstacle
-//      constraint's Jacobian w.r.t. the step is a constant 0/1 selection --
-//      no chain rule, no C++ autodiff (none exists anywhere in this repo
-//      today). General (articulated-robot) fk is explicitly out of scope,
-//      not attempted here -- see the project plan.
+//   3. Collision geometry is a per-agent AgentCollisionModel (v2 plan Stage
+//      3, agent_collision_model.hpp): each agent's configuration maps to a
+//      set of workspace spheres, each with its centre's tangent Jacobian,
+//      and every constraint row chains d(sdf)/d(centre) through that
+//      Jacobian. With nothing registered an agent gets the trivial model --
+//      one radius-0 sphere at `q[:workspace_dim]` with a constant [I|0]
+//      Jacobian -- so the rows reduce exactly to the old
+//      `fk(q) = q[:workspace_dim]` selection. Tier A (rigid multi-sphere
+//      body) is closed-form C++; Tier B (articulated arm) evaluates a Drake
+//      MultibodyPlant. The closed-form safety-projection passes run only
+//      for trivial agents (no IK analogue otherwise).
 //
 // Public interface: solve(x0, v0, var_assignments, remaining_vertices,
 // references) -> bool plus view_points/view_vels/view_times/view_obstacles/
@@ -110,6 +116,16 @@ struct GraphShortPathMPC {
 	std::vector<sqp_short_path::AxisLayout> _axes;
 	std::vector<int> _agent_axis_offsets;
 	std::vector<int> _agent_ambient_offsets;
+	// Per-agent configuration-dependent collision geometry (v2 plan Stage
+	// 3), one entry per agent, every entry non-null. Built all-trivial in
+	// the constructor (single radius-0 point sphere at q[:workspace_dim],
+	// constant [I|0] Jacobian -- exactly the old fk fast path); a caller
+	// replaces individual entries via set_agent_collision_* to give an
+	// agent a rigid multi-sphere body (Tier A) or a Drake-plant articulated
+	// FK (Tier B). Every constraint-row / violation path loops over each
+	// agent's model's spheres; the closed-form safety-projection passes run
+	// only for agents whose model `is_trivial()`.
+	sqp_short_path::AgentCollisionModels _agent_collision_models;
 	// The smooth (tracking + velocity-tracking + acceleration-smoothing)
 	// cost's normal-equations Hessian FOR EVERY R/TORUS AXIS -- block-
 	// diagonal across those axes, PROVABLY constant across every outer SQP

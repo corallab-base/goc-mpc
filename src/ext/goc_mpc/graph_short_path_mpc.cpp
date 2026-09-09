@@ -135,6 +135,16 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 	_axes = BuildAxisList(_agent_shapes);
 	_agent_axis_offsets = BuildAgentAxisOffsets(_agent_shapes);
 	_agent_ambient_offsets = BuildAgentAmbientOffsets(_agent_shapes);
+
+	// Every agent starts with the trivial (single radius-0 point sphere at
+	// q[:workspace_dim], constant [I|0] Jacobian) collision model -- the
+	// exact old fk fast path. A caller swaps in a real body via
+	// set_agent_collision_* (v2 plan Stage 3).
+	_agent_collision_models.reserve(num_agents);
+	for (unsigned int ag = 0; ag < num_agents; ++ag) {
+		_agent_collision_models.push_back(MakeTrivialCollisionModel(
+			graph.workspace_dim, _agent_shapes[ag].tangent_dim(), _agent_shapes[ag].ambient_dim()));
+	}
 	_smooth_hessian_normal = AssembleSmoothHessian(_agent_shapes, _agent_axis_offsets,
 							static_cast<int>(num_steps), time_per_step,
 							_smooth_cost_weights);
@@ -317,9 +327,17 @@ Eigen::VectorXd ProjectOutOfGrid(const Eigen::VectorXd& p, const AgentSdfGrid& g
 }
 
 void ApplySafetyProjection(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
-			    int workspace_dim, const ObstacleSet& obstacles, Eigen::MatrixXd* points) {
+			    int workspace_dim, const ObstacleSet& obstacles, const AgentCollisionModels& models,
+			    Eigen::MatrixXd* points) {
 	constexpr int kSafetyPassRounds = 10;
 	for (int ag = 0; ag < num_agents; ++ag) {
+		// Non-trivial (rigid multi-sphere / articulated) agents have no
+		// closed-form "project the config so fk(q) clears the obstacle"
+		// (that's IK) -- their hard feasibility rests on the exact-penalty
+		// QP rows plus (v2 plan Stage 3e, not yet implemented) a bounded
+		// Gauss-Newton tangent-space projection. Skip them here rather
+		// than corrupt their ambient columns with a point projection.
+		if (!models[ag]->is_trivial()) continue;
 		const AgentSdfGrid* grid = obstacles.agent_sdf_grid(ag);
 		const Eigen::MatrixXd agent_workspace_traj =
 			points->block(0, agent_ambient_offsets[ag], num_steps, workspace_dim);
@@ -387,7 +405,8 @@ void ApplySafetyProjection(int num_steps, int num_agents, const std::vector<int>
 // than a separate flag a caller has to keep in sync with which agents
 // have a registered FK.
 void ApplyAgentPairSafetyProjection(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
-				     int workspace_dim, const Eigen::VectorXd& agent_radii, Eigen::MatrixXd* points) {
+				     int workspace_dim, const Eigen::VectorXd& agent_radii,
+				     const AgentCollisionModels& models, Eigen::MatrixXd* points) {
 	if (num_agents < 2) {
 		return;
 	}
@@ -396,6 +415,11 @@ void ApplyAgentPairSafetyProjection(int num_steps, int num_agents, const std::ve
 		for (int i = 0; i < num_steps; ++i) {
 			for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
 				for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
+					// Bilateral point-push only makes sense when BOTH
+					// agents are trivial point agents (see
+					// ApplySafetyProjection's own gate); a non-trivial
+					// body's separation is left to the QP rows / Stage 3e.
+					if (!models[ag_a]->is_trivial() || !models[ag_b]->is_trivial()) continue;
 					Eigen::VectorXd p_a = points->row(i).segment(agent_ambient_offsets[ag_a], workspace_dim).transpose();
 					Eigen::VectorXd p_b = points->row(i).segment(agent_ambient_offsets[ag_b], workspace_dim).transpose();
 					const double R = agent_radii(ag_a) + agent_radii(ag_b);
@@ -433,6 +457,7 @@ SqpResult RunTrustRegionSqp(
 		const std::vector<AxisLayout>& axes,
 		const std::vector<int>& agent_axis_offsets,
 		const std::vector<int>& agent_ambient_offsets,
+		const AgentCollisionModels& models,
 		const Eigen::MatrixXd& smooth_hessian_normal,
 		const SmoothCostWeights& smooth_cost_weights,
 		int num_steps, int num_agents, int workspace_dim, double tau,
@@ -457,14 +482,25 @@ SqpResult RunTrustRegionSqp(
 	// etc.), which happens once before this function runs
 	// (GraphShortPathMPC::solve()) -- same "computed once per solve() call"
 	// discipline as everything else.
+	// Each active (agent, obstacle) / pair / (agent, grid) contributes one
+	// row PER BODY SPHERE (per pair of spheres for the inter-agent case) --
+	// num_spheres() == 1 for every trivial agent, so this reduces to the
+	// old per-step counts when nothing has a registered collision model.
 	int obstacle_rows = 0;
-	for (const auto& v : per_agent_obstacles)
-		for (const ActiveObstacle& ao : v) obstacle_rows += ao.step_hi - ao.step_lo;
+	for (int ag = 0; ag < num_agents; ++ag) {
+		const int ks = models[ag]->num_spheres();
+		for (const ActiveObstacle& ao : per_agent_obstacles[ag])
+			obstacle_rows += ks * (ao.step_hi - ao.step_lo);
+	}
 	int pair_rows = 0;
-	for (const ActivePair& ap : active_pairs) pair_rows += ap.step_hi - ap.step_lo;
+	for (const ActivePair& ap : active_pairs)
+		pair_rows += models[ap.ag_a]->num_spheres() * models[ap.ag_b]->num_spheres() *
+			     (ap.step_hi - ap.step_lo);
 	int grid_rows = 0;
-	for (const ActiveGrid& g : active_grids)
-		if (g.grid) grid_rows += g.step_hi - g.step_lo;
+	for (int ag = 0; ag < num_agents; ++ag)
+		if (active_grids[ag].grid)
+			grid_rows += models[ag]->num_spheres() *
+				     (active_grids[ag].step_hi - active_grids[ag].step_lo);
 	const int m = obstacle_rows + pair_rows + grid_rows;
 	// QP decision vector z = [dx_smooth (n_smooth) | slack (m)].
 	const int n = n_smooth + m;
@@ -485,11 +521,11 @@ SqpResult RunTrustRegionSqp(
 					    smooth_cost_weights, x0, v0, points, vels, ref_points, ref_velocities);
 	double violation_current =
 		EvaluateObstacleViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-					   per_agent_obstacles) +
+					   per_agent_obstacles, models) +
 		EvaluateAgentPairViolation(num_steps, agent_ambient_offsets, workspace_dim, points, agent_radii,
-					    active_pairs) +
+					    active_pairs, models) +
 		EvaluateAgentSdfGridViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-					       active_grids);
+					       active_grids, models);
 	double phi_current = f_current + penalty_weight * violation_current;
 
 	double trust_radius = initial_trust_radius;
@@ -550,15 +586,15 @@ SqpResult RunTrustRegionSqp(
 
 		std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
 			agent_axis_offsets, num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-			per_agent_obstacles);
+			per_agent_obstacles, models);
 		std::vector<ConstraintRow> pair_rows = LinearizeAgentPairConstraints(
 			agent_axis_offsets, num_steps, agent_ambient_offsets, workspace_dim, points, agent_radii,
-			active_pairs);
+			active_pairs, models);
 		rows.insert(rows.end(), std::make_move_iterator(pair_rows.begin()),
 			    std::make_move_iterator(pair_rows.end()));
 		std::vector<ConstraintRow> grid_row_list = LinearizeAgentSdfGridConstraints(
 			agent_axis_offsets, num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-			active_grids);
+			active_grids, models);
 		rows.insert(rows.end(), std::make_move_iterator(grid_row_list.begin()),
 			    std::make_move_iterator(grid_row_list.end()));
 
@@ -667,11 +703,11 @@ SqpResult RunTrustRegionSqp(
 						      ref_points, ref_velocities);
 		const double violation_new =
 			EvaluateObstacleViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim,
-						   candidate_points, per_agent_obstacles) +
+						   candidate_points, per_agent_obstacles, models) +
 			EvaluateAgentPairViolation(num_steps, agent_ambient_offsets, workspace_dim, candidate_points,
-						    agent_radii, active_pairs) +
+						    agent_radii, active_pairs, models) +
 			EvaluateAgentSdfGridViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim,
-						       candidate_points, active_grids);
+						       candidate_points, active_grids, models);
 		const double phi_new = f_new + penalty_weight * violation_new;
 
 		// Uses H_smooth_total (THIS iteration's smooth Hessian, including
@@ -715,9 +751,10 @@ SqpResult RunTrustRegionSqp(
 		// only trust_radius moved.
 	}
 
-	ApplySafetyProjection(num_steps, num_agents, agent_ambient_offsets, workspace_dim, obstacles, &points);
+	ApplySafetyProjection(num_steps, num_agents, agent_ambient_offsets, workspace_dim, obstacles, models,
+			       &points);
 	ApplyAgentPairSafetyProjection(num_steps, num_agents, agent_ambient_offsets, workspace_dim, agent_radii,
-					&points);
+					models, &points);
 
 	return SqpResult{points, vels, iter, trust_radius};
 }
@@ -778,7 +815,8 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 						      *_obstacles, _constraint_prune_margin);
 
 		SqpResult result = RunTrustRegionSqp(
-			_agent_shapes, _axes, _agent_axis_offsets, _agent_ambient_offsets, _smooth_hessian_normal,
+			_agent_shapes, _axes, _agent_axis_offsets, _agent_ambient_offsets, _agent_collision_models,
+			_smooth_hessian_normal,
 			_smooth_cost_weights, H, num_agents, workspace_dim, _time_per_step,
 			x0, v0, ref_points, ref_velocities, *_obstacles, per_agent_obstacles, active_pairs,
 			active_grids, _agent_radii, _penalty_weight, _max_iterations,

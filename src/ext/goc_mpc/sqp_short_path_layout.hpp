@@ -1,10 +1,12 @@
 #pragma once
 
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
 
+#include "agent_collision_model.hpp"
 #include "graph_of_constraints.hpp"
 #include "obstacle_projection.hpp"
 #include "obstacle_set.hpp"
@@ -17,9 +19,14 @@
 //
 // Scope: Block::R, Block::Torus, and (Stage 4) Block::SO3Quat
 // (BuildAgentShapes still throws on SO3Mat -- out of scope permanently,
-// matches CubicConfigurationSpline's own SO3Mat throw everywhere else) and
-// fk(q) = q[:workspace_dim] (a constant 0/1 selection Jacobian -- see
-// LinearizeObstacleConstraints). R/Torus tangent columns are independent
+// matches CubicConfigurationSpline's own SO3Mat throw everywhere else).
+// Collision geometry is a per-agent AgentCollisionModel (agent_collision_
+// model.hpp): the constraint-row / violation paths loop over each agent's
+// workspace spheres and chain d(sdf)/d(centre) through each sphere's
+// tangent Jacobian. A trivial model (nothing registered) yields one
+// radius-0 sphere at q[:workspace_dim] with a constant [I|0] Jacobian, so
+// those paths reduce exactly to the old fk(q) = q[:workspace_dim] fast
+// path. R/Torus tangent columns are independent
 // scalars with an ITERATION-CONSTANT Hessian (BuildAxisHessianBlock/
 // BuildAxisRhs, built once per solve() call, see AssembleSmoothHessian's
 // own comment); an SO3Quat block's 3 tangent columns are COUPLED (SO(3)
@@ -40,6 +47,12 @@
 // agent ag's own columns as `[offsets[ag], offsets[ag] + agent_shapes[ag].
 // tangent_dim()/.ambient_dim())` rather than `[ag*dim, (ag+1)*dim)`.
 namespace sqp_short_path {
+
+// Per-agent collision models, one entry per agent, index-aligned with
+// BuildAgentShapes / BuildAgentAxisOffsets. Every entry is non-null (a
+// trivial single-point model stands in when nothing was registered for an
+// agent -- see agent_collision_model.hpp / MakeTrivialCollisionModel).
+using AgentCollisionModels = std::vector<std::unique_ptr<AgentCollisionModel>>;
 
 // One scalar decision axis: a single tangent-space component of one
 // agent's configuration, repeated identically at every horizon step.
@@ -293,7 +306,8 @@ std::vector<ActivePair> PruneAgentPairsByDistance(
 // have entirely different specs/tangent widths from one another).
 double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				  int workspace_dim, const Eigen::MatrixXd& points,
-				  const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles);
+				  const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles,
+				  const AgentCollisionModels& models);
 
 // Every (step, agent, obstacle) row for `per_agent_obstacles[ag]` (see
 // PruneObstaclesByDistance's own comment), linearized at the current
@@ -309,7 +323,8 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vecto
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
-	const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles);
+	const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles,
+	const AgentCollisionModels& models);
 
 // Inter-agent avoidance: every (step, agent-pair) SURVIVING
 // PruneAgentPairsByDistance is treated as a sphere constraint on the
@@ -336,12 +351,12 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 // columns, no fk chain rule.
 double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_ambient_offsets, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-				   const std::vector<ActivePair>& active_pairs);
+				   const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models);
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, const std::vector<int>& agent_ambient_offsets,
 	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-	const std::vector<ActivePair>& active_pairs);
+	const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models);
 
 // Value + gradient of one AgentSdfGrid, multilinearly interpolated
 // (bilinear for workspace_dim=2, trilinear for workspace_dim=3) at world
@@ -397,7 +412,7 @@ std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
 // role as EvaluateObstacleViolation but for grid obstacles.
 double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				      int workspace_dim, const Eigen::MatrixXd& points,
-				      const std::vector<ActiveGrid>& active_grids);
+				      const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models);
 
 // One (step, agent) row per non-null `active_grids[ag].grid`, over its
 // `[step_lo, step_hi)` range, linearized at the current iterate `points` --
@@ -408,6 +423,6 @@ double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::v
 std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
-	const std::vector<ActiveGrid>& active_grids);
+	const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models);
 
 }  // namespace sqp_short_path
