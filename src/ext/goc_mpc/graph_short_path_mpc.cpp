@@ -50,6 +50,11 @@ struct GraphShortPathMPC::QpState {
 	QpState(int n_, int n_in_) : qp(n_, 0, n_in_), n(n_), n_in(n_in_) {
 		qp.settings.verbose = false;
 		qp.settings.compute_timings = false;
+		// 1e-7 absolute (proxqp's own default is 1e-5): loosening it to
+		// 1e-6 was measurably WORSE -- the noisier QP steps made the
+		// trust-region outer loop reject more and stop converging on the
+		// harder multi-agent scenes. eps_rel 0 keeps it a pure absolute
+		// criterion.
 		qp.settings.eps_abs = 1.0e-7;
 		qp.settings.eps_rel = 0.0;
 	}
