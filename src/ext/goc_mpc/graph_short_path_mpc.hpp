@@ -22,11 +22,16 @@ namespace py = pybind11;
 // the project plan ("Riemannian trust-region SQP short-path solver") for
 // the full design rationale; summarized here.
 //
-// Same template as GraphTimingMPC (trust-region Gauss-Newton SQP over
-// qpOASES::SQProblem, hot-started both across outer iterations and across
-// MPC cycles), generalized in the ways that template's own doc comment
-// says it would need for genuinely nonconvex, re-linearized-every-iteration
-// constraints (unlike timing's exactly-linear interaction rows):
+// Same template as GraphTimingMPC (trust-region Gauss-Newton SQP with the
+// QP subproblem hot-started both across outer iterations and across MPC
+// cycles), generalized in the ways that template's own doc comment says it
+// would need for genuinely nonconvex, re-linearized-every-iteration
+// constraints (unlike timing's exactly-linear interaction rows). The QP
+// subproblem is solved with proxqp's sparse backend (not qpOASES's dense
+// active-set method, which timing still uses): the smooth-cost Hessian is
+// block-diagonal per agent -- agents couple only through constraint rows --
+// and every row is sparse, so a sparse solve is what lets this scale to
+// many agents. See graph_short_path_mpc.cpp's QpState.
 //
 //   1. Every obstacle-avoidance inequality is a SLACK-RELAXED exact-penalty
 //      row (Sℓ1QP, Nocedal & Wright Sec. 18.5): `c(x) + a^T dx >= -s`,
@@ -125,10 +130,9 @@ struct GraphShortPathMPC {
 	Eigen::MatrixXd _vels;
 	bool _has_solved = false;
 
-	// Pimpl (like GraphTimingMPC::QpState) -- qpOASES::SQProblem is
-	// fixed-size once constructed and not cleanly move/resize-able, so a
-	// forward-declared incomplete type here, completed in the .cpp, keeps
-	// qpOASES.hpp out of every translation unit that includes this header.
+	// Pimpl (like GraphTimingMPC::QpState) -- a forward-declared incomplete
+	// type here, completed in the .cpp, keeps the proxqp headers (heavy,
+	// template-dense) out of every translation unit that includes this one.
 	struct QpState;
 	std::unique_ptr<QpState> _qp_state;
 

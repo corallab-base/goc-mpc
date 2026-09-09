@@ -38,6 +38,16 @@ find_package(nanoflann REQUIRED)
 # variables.
 find_package(qpOASES REQUIRED)
 
+# ProxQP (proxsuite, robotpkg/openrobots install, on CMAKE_PREFIX_PATH via
+# .envrc) -- GraphShortPathMPC's (graph_short_path_mpc.cpp) sparse QP
+# subproblem solver in its trust-region SQP outer loop. Replaces the dense
+# qpOASES::SQProblem path there: H is block-diagonal per agent (zero
+# cross-agent coupling) and every constraint row is sparse, so a sparse
+# solver is the scaling lever for many-agent scenes -- see the v2 plan.
+# Header-only (proxsuite::proxsuite is an INTERFACE target); needs simde,
+# which its own package config pulls in.
+find_package(proxsuite REQUIRED)
+
 #
 # _ext module stuff
 #
@@ -61,7 +71,7 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/sqp_short_path_layout.cpp"
     "src/ext/goc_mpc/graph_short_path_mpc.cpp"
 )
-target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann ${qpOASES_LIBRARY})
+target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann ${qpOASES_LIBRARY} proxsuite::proxsuite)
 target_include_directories(_ext PRIVATE ${qpOASES_INCLUDE_DIR})
 target_link_directories(_ext PRIVATE ${qpOASES_LIBRARY_DIR})
 target_compile_definitions(_ext PRIVATE

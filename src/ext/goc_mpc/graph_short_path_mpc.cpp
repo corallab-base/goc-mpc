@@ -5,27 +5,69 @@
 #include <limits>
 #include <stdexcept>
 
-#include <qpOASES.hpp>
+#include <Eigen/Sparse>
+#include <proxsuite/proxqp/sparse/sparse.hpp>
 
 #include "obstacle_projection.hpp"
 
 using namespace sqp_short_path;
 
 namespace {
-using RealMat = Eigen::Matrix<qpOASES::real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-using RealVec = Eigen::Matrix<qpOASES::real_t, Eigen::Dynamic, 1>;
-constexpr double kInf = 1.0e19;
+namespace psp = proxsuite::proxqp;
+using SpMat = Eigen::SparseMatrix<double, Eigen::ColMajor, long long>;
+using Trip = Eigen::Triplet<double, long long>;
+// proxqp treats any bound whose magnitude reaches helpers::infinite_bound
+// (sqrt(DBL_MAX)) as +/-infinity -- the sentinel for a one-sided row.
+const double kProxInf = proxsuite::helpers::infinite_bound<double>::value();
 }  // namespace
 
+// Sparse QP subproblem solver for the trust-region SQP outer loop (was
+// qpOASES::SQProblem, dense). The smooth-cost Hessian is block-diagonal
+// per agent (agents couple only through constraint ROWS, never H) and
+// every constraint row is sparse (workspace_dim / 2*workspace_dim nonzeros
+// + one slack column), so a sparse solve is the scaling lever as agent
+// count grows -- see the v2 plan. proxqp's proximal method is also robust
+// to the mildly-nonconvex, iterate-dependent H an SO3Quat block produces.
+//
+// Hot-started across outer iterations AND across solve() calls: proxqp's
+// update() (values only, keeps the symbolic factorization) + WARM_START_
+// WITH_PREVIOUS_RESULT while the H/C sparsity pattern is unchanged, falling
+// back to a full init() when it isn't. The pattern only moves when an
+// SO3Quat block's coupled Hessian entry crosses exactly zero, or a new
+// solve() call's distance-pruned obstacle/pair set changes shape -- both
+// rare -- so the common case is a cheap values-only update.
 struct GraphShortPathMPC::QpState {
-	qpOASES::SQProblem qp;
-	int n = 0, m_eff = 0;
+	psp::sparse::QP<double, long long> qp;
+	int n = 0;
+	int n_in = 0;
 	bool initialized = false;
+	// Sparsity-pattern signature (outer + inner index arrays concatenated)
+	// of the H and C matrices last passed to init(); update() only takes
+	// effect while these are unchanged.
+	std::vector<long long> h_pattern;
+	std::vector<long long> c_pattern;
 
-	QpState(int n_, int m_eff_) : qp(n_, m_eff_), n(n_), m_eff(m_eff_) {
-		qp.setPrintLevel(qpOASES::PL_NONE);
+	QpState(int n_, int n_in_) : qp(n_, 0, n_in_), n(n_), n_in(n_in_) {
+		qp.settings.verbose = false;
+		qp.settings.compute_timings = false;
+		qp.settings.eps_abs = 1.0e-7;
+		qp.settings.eps_rel = 0.0;
 	}
 };
+
+namespace {
+// Compressed sparsity-pattern signature for the update()-vs-init() decision
+// in RunTrustRegionSqp -- concatenated outerIndexPtr (outerSize+1 entries)
+// and innerIndexPtr (nnz entries).
+std::vector<long long> PatternKey(const SpMat& m) {
+	std::vector<long long> key;
+	const long long nnz = m.nonZeros();
+	key.reserve(static_cast<size_t>(m.outerSize()) + 1 + static_cast<size_t>(nnz));
+	for (int k = 0; k <= m.outerSize(); ++k) key.push_back(m.outerIndexPtr()[k]);
+	for (long long k = 0; k < nnz; ++k) key.push_back(m.innerIndexPtr()[k]);
+	return key;
+}
+}  // namespace
 
 GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 				  unsigned int num_steps,
@@ -405,26 +447,30 @@ SqpResult RunTrustRegionSqp(
 	const int n_smooth = static_cast<int>(axes.size()) * per_axis;
 	// Fixed for the whole solve() call (design decision 6): row COUNT
 	// never changes mid-call, only each row's coefficients/value do
-	// (re-linearized every outer iteration) -- so qpOASES::SQProblem can
-	// be reused (init once, hotstart thereafter) across every outer
-	// iteration, and across MPC cycles at a stable size. `m` now counts
-	// only the SURVIVING (distance-pruned, see PruneObstaclesByDistance/
-	// PruneAgentPairsByDistance) obstacle/pair rows -- pruning happens
-	// once, before this function runs (GraphShortPathMPC::solve()), same
-	// "computed once per solve() call" discipline as everything else this
-	// comment already covers.
+	// (re-linearized every outer iteration). `m` counts only the SURVIVING
+	// (distance-pruned, see PruneObstaclesByDistance/PruneAgentPairsByDistance)
+	// obstacle/pair/grid rows -- pruning happens once, before this function
+	// runs (GraphShortPathMPC::solve()), same "computed once per solve()
+	// call" discipline as everything else.
 	int obstacle_rows = 0;
 	for (const auto& v : per_agent_obstacles) obstacle_rows += static_cast<int>(v.size());
 	const int grid_rows = static_cast<int>(std::count_if(
 		active_grids.begin(), active_grids.end(), [](const AgentSdfGrid* g) { return g != nullptr; }));
 	const int m = num_steps * (obstacle_rows + static_cast<int>(active_pairs.size()) + grid_rows);
-	const int m_eff = std::max(m, 1);
-	const int n = n_smooth + m_eff;
+	// QP decision vector z = [dx_smooth (n_smooth) | slack (m)].
+	const int n = n_smooth + m;
+	// proxqp inequality rows: `m` slack-relaxed penalty rows (a^T dx + s >=
+	// -c(x)), then the trust-region box on dx_smooth (n_smooth identity
+	// rows, bounds move each outer iteration), then the slack lower bounds
+	// s >= 0 (m identity rows). proxqp's sparse backend has no separate box
+	// facility, so every bound is an explicit row -- each a single +/-1, so
+	// the extra rows barely touch the sparsity.
+	const int n_in = m + n_smooth + m;
 
-	if (!*qp_state || (*qp_state)->n != n || (*qp_state)->m_eff != m_eff) {
-		*qp_state = std::make_unique<GraphShortPathMPC::QpState>(n, m_eff);
+	if (!*qp_state || (*qp_state)->n != n || (*qp_state)->n_in != n_in) {
+		*qp_state = std::make_unique<GraphShortPathMPC::QpState>(n, n_in);
 	}
-	qpOASES::SQProblem& qp = (*qp_state)->qp;
+	GraphShortPathMPC::QpState& st = **qp_state;
 
 	double f_current = TotalSmoothCost(agent_shapes, agent_axis_offsets, agent_ambient_offsets, num_steps, tau,
 					    smooth_cost_weights, x0, v0, points, vels, ref_points, ref_velocities);
@@ -493,20 +539,6 @@ SqpResult RunTrustRegionSqp(
 		}
 		const Eigen::VectorXd grad_smooth = -2.0 * g_smooth;
 
-		// H_qp: the smooth block is `2 * H_smooth_total` (the factor of 2
-		// converts BuildAxisRhs/AssembleSmoothHessian/AccumulateSO3QuatBlock's
-		// shared normal-equations convention, `H_n s = g_n`, to qpOASES'
-		// `0.5 z'Hz + g'z` convention -- see this file's own top comment),
-		// the slack block is a pure Tikhonov floor (slack only ever appears
-		// LINEARLY in the true cost, `penalty_weight * s`). Rebuilt every
-		// outer iteration (unlike pre-Stage-4, when the whole smooth block
-		// was iteration-constant) since H_smooth_total now can be -- R/Torus
-		// -only agents pay only a cheap matrix copy for this, see
-		// H_smooth_total's own comment above.
-		RealMat H_qp = RealMat::Zero(n, n);
-		H_qp.topLeftCorner(n_smooth, n_smooth) = (2.0 * H_smooth_total).cast<qpOASES::real_t>();
-		for (int i = 0; i < n; ++i) H_qp(i, i) += qpOASES::real_t(1e-10);
-
 		std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
 			agent_axis_offsets, num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
 			per_agent_obstacles);
@@ -523,72 +555,95 @@ SqpResult RunTrustRegionSqp(
 
 		if (m == 0 && grad_smooth.norm() < grad_tol) break;
 
-		RealVec g_qp = RealVec::Zero(n);
-		g_qp.head(n_smooth) = grad_smooth.cast<qpOASES::real_t>();
-		for (int r = 0; r < m; ++r) g_qp(n_smooth + r) = qpOASES::real_t(penalty_weight);
-
-		RealMat A_qp = RealMat::Zero(m_eff, n);
-		RealVec lbA = RealVec::Constant(m_eff, qpOASES::real_t(-kInf));
-		RealVec ubA = RealVec::Constant(m_eff, qpOASES::real_t(kInf));
-		for (int r = 0; r < m; ++r) {
-			for (const auto& [idx, coeff] : rows[r].coeffs) {
-				A_qp(r, idx) += static_cast<qpOASES::real_t>(coeff);
+		// H: smooth block is `2 * H_smooth_total` (the factor of 2 converts
+		// BuildAxisRhs/AssembleSmoothHessian/AccumulateSO3QuatBlock's shared
+		// normal-equations convention `H_n s = g_n` to proxqp's
+		// `0.5 z'Hz + g'z`), block-diagonal per agent plus any SO3Quat
+		// coupling; slack block is a pure Tikhonov floor (slack appears only
+		// LINEARLY in the true cost, `penalty_weight * s`). proxqp reads the
+		// upper triangle. The n_smooth^2 scan is cheap relative to the solve
+		// (the smooth block is block-diagonal, so most entries are exact
+		// zeros and dropped).
+		std::vector<Trip> h_trips;
+		h_trips.reserve(static_cast<size_t>(n_smooth) * 6 + n);
+		for (int j = 0; j < n_smooth; ++j) {
+			for (int i = 0; i <= j; ++i) {
+				const double v = 2.0 * H_smooth_total(i, j);
+				if (v != 0.0) h_trips.emplace_back(i, j, v);
 			}
-			A_qp(r, n_smooth + r) = qpOASES::real_t(1.0);
-			lbA(r) = static_cast<qpOASES::real_t>(-rows[r].value);
 		}
+		for (int i = 0; i < n; ++i) h_trips.emplace_back(i, i, 1.0e-10);  // summed with the block diagonal
+		SpMat H_sp(n, n);
+		H_sp.setFromTriplets(h_trips.begin(), h_trips.end());
+		H_sp.makeCompressed();
 
-		RealVec dx_lb = RealVec::Constant(n, qpOASES::real_t(-kInf));
-		RealVec dx_ub = RealVec::Constant(n, qpOASES::real_t(kInf));
+		// g: smooth gradient on dx_smooth, `penalty_weight` on every slack.
+		Eigen::VectorXd g_full(n);
+		g_full.head(n_smooth) = grad_smooth;
+		if (m > 0) g_full.tail(m).setConstant(penalty_weight);
+
+		// C / l / u: the `m` slack-relaxed penalty rows `a^T dx + s >= -c(x)`
+		// (one slack column each), then the trust-region box on dx_smooth,
+		// then s >= 0. Every row here is structurally identical across outer
+		// iterations -- only coefficients / bounds move.
+		std::vector<Trip> c_trips;
+		c_trips.reserve(rows.size() * (2 * static_cast<size_t>(workspace_dim) + 1) + n_smooth + m);
+		Eigen::VectorXd cl(n_in), cu(n_in);
+		for (int r = 0; r < m; ++r) {
+			for (const auto& [idx, coeff] : rows[r].coeffs) c_trips.emplace_back(r, idx, coeff);
+			c_trips.emplace_back(r, n_smooth + r, 1.0);
+			cl(r) = -rows[r].value;
+			cu(r) = kProxInf;
+		}
 		for (int i = 0; i < n_smooth; ++i) {
-			dx_lb(i) = qpOASES::real_t(-trust_radius);
-			dx_ub(i) = qpOASES::real_t(trust_radius);
+			const int row = m + i;
+			c_trips.emplace_back(row, i, 1.0);
+			cl(row) = -trust_radius;
+			cu(row) = trust_radius;
 		}
-		for (int r = 0; r < m; ++r) dx_lb(n_smooth + r) = qpOASES::real_t(0.0);
+		for (int r = 0; r < m; ++r) {
+			const int row = m + n_smooth + r;
+			c_trips.emplace_back(row, n_smooth + r, 1.0);
+			cl(row) = 0.0;
+			cu(row) = kProxInf;
+		}
+		SpMat C_sp(n_in, n);
+		C_sp.setFromTriplets(c_trips.begin(), c_trips.end());
+		C_sp.makeCompressed();
 
-		// qpOASES's active-set homotopy needs roughly O(n) working-set
-		// recalculations for an n-variable dense QP even in the EASY case
-		// (a small budget like the previous 200 is fine for a single-agent
-		// problem but silently exhausts, returning RET_MAX_NWSR_REACHED,
-		// well before genuine infeasibility/nonconvexity as num_agents
-		// grows -- discovered via a multi-agent scaling investigation:
-		// a purely block-diagonal, exactly-quadratic, ZERO-constraint-row
-		// smooth-only QP (should solve in exactly one Newton step, rho=1)
-		// was instead failing on EVERY outer iteration at n~240 (4 R^3
-		// agents), each failure wrongly interpreted as "trust region too
-		// large" and burning a full trust-region shrink cycle for nothing
-		// -- not a convergence problem, a starved solver budget. 5000
-		// verified sufficient up to 8 agents (n~480) with room to spare;
-		// still cheap relative to the solve itself when NOT needed (a
-		// converged/already-optimal QP returns long before exhausting
-		// whatever budget it's given).
-		qpOASES::int_t nWSR = 5000;
-		qpOASES::returnValue status;
-		if (!(*qp_state)->initialized) {
-			status = qp.init(H_qp.data(), g_qp.data(), A_qp.data(),
-					  dx_lb.data(), dx_ub.data(), lbA.data(), ubA.data(), nWSR);
-			(*qp_state)->initialized = (status == qpOASES::SUCCESSFUL_RETURN);
+		// Values-only update() (keeps the symbolic factorization + the
+		// equilibration from init) while the H/C sparsity pattern is
+		// unchanged, warm-started from the previous solve; full init()
+		// otherwise (first solve, a rare SO3Quat Hessian entry crossing
+		// zero, or a changed pruned-obstacle/pair shape on a new solve()
+		// call). Every subproblem is feasible by construction (dz=0,
+		// s=max(0,-c(x))), so a non-SOLVED status is a numerical hiccup, not
+		// structural infeasibility -- shrink the trust region and retry
+		// cold, same as the qpOASES path did.
+		std::vector<long long> h_key = PatternKey(H_sp);
+		std::vector<long long> c_key = PatternKey(C_sp);
+		const bool reuse = st.initialized && h_key == st.h_pattern && c_key == st.c_pattern;
+		if (reuse) {
+			st.qp.settings.initial_guess =
+				psp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
+			st.qp.update(H_sp, g_full, proxsuite::nullopt, proxsuite::nullopt, C_sp, cl, cu,
+				     /*update_preconditioner=*/false);
 		} else {
-			status = qp.hotstart(H_qp.data(), g_qp.data(), A_qp.data(),
-					      dx_lb.data(), dx_ub.data(), lbA.data(), ubA.data(), nWSR);
+			st.qp.settings.initial_guess = psp::InitialGuessStatus::NO_INITIAL_GUESS;
+			st.qp.init(H_sp, g_full, proxsuite::nullopt, proxsuite::nullopt, C_sp, cl, cu);
+			st.h_pattern = std::move(h_key);
+			st.c_pattern = std::move(c_key);
 		}
+		st.initialized = true;
+		st.qp.solve();
 
-		if (status != qpOASES::SUCCESSFUL_RETURN) {
-			// Unlike GraphTimingMPC's comment for this same branch: here
-			// the QP subproblem being unsolvable really can only be a
-			// numerical/active-set-homotopy hiccup, not a structural
-			// impossibility -- it's LITERALLY always feasible by
-			// construction (dz=0, s=max(0,-value) satisfies every row --
-			// see this class's own header comment) regardless of how
-			// pathological the obstacle geometry is.
+		if (st.qp.results.info.status != psp::QPSolverOutput::PROXQP_SOLVED) {
 			trust_radius *= 0.25;
-			(*qp_state)->initialized = false;
+			st.initialized = false;
 			continue;
 		}
 
-		RealVec z_q(n);
-		qp.getPrimalSolution(z_q.data());
-		const Eigen::VectorXd z = z_q.cast<double>();
+		const Eigen::VectorXd z = st.qp.results.x;
 		const Eigen::VectorXd dx_smooth = z.head(n_smooth);
 		const double predicted_slack_sum = m > 0 ? z.tail(m).sum() : 0.0;
 
