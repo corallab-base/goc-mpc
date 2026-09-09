@@ -402,6 +402,23 @@ SdfResult BoxSdf(const Eigen::VectorXd& p, const Obstacle& obstacle, int workspa
 }  // namespace
 
 namespace {
+// The distance pruner works with the tighter of the caller's
+// `constraint_prune_margin` and the agent's own broadphase hint: a bounded
+// body (a fixed-base arm) reports a hint >= 0 so its rows don't balloon when
+// the caller left `constraint_prune_margin` at the free-particle default,
+// while the trivial point model reports < 0 ("no opinion").
+double EffectiveMargin(double prune_margin, double hint) {
+	return hint >= 0.0 ? std::min(prune_margin, hint) : prune_margin;
+}
+double EffectivePairMargin(double prune_margin, double hint_a, double hint_b) {
+	// max, not sum: each hint is already a generous per-body travel bound
+	// (~1/4 of reach), and a pair only survives to matter if the SQP would
+	// actually drive it -- which it only ever does in the SEPARATING
+	// direction. Summing just reinstates the free-particle blow-up.
+	return (hint_a >= 0.0 && hint_b >= 0.0) ? std::min(prune_margin, std::max(hint_a, hint_b))
+					       : prune_margin;
+}
+
 // obstacle's own extent proxy for the bounding-sphere prune test: sphere
 // radius+margin exactly; box half-extents' Euclidean norm+margin (the
 // circumscribing sphere -- conservative, never excludes a box that could
@@ -478,7 +495,7 @@ std::vector<AgentReferenceSpheres> BuildAgentReferenceSpheres(
 
 std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 	int num_steps, int num_agents, int workspace_dim,
-	const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const std::vector<AgentReferenceSpheres>& ref_spheres, const AgentCollisionModels& models,
 	const ObstacleSet& obstacles, double prune_margin) {
 	std::vector<std::vector<ActiveObstacle>> per_agent_obstacles(num_agents);
 	if (obstacles.obstacles().empty()) {
@@ -486,25 +503,31 @@ std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 	}
 	for (int ag = 0; ag < num_agents; ++ag) {
 		const AgentReferenceSpheres& rs = ref_spheres[ag];
+		const double margin =
+			EffectiveMargin(prune_margin, models[ag]->broadphase_margin_hint());
 		for (const Obstacle& obstacle : obstacles.obstacles()) {
 			const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
 			const double extent = ObstacleExtent(obstacle, workspace_dim);
 			if ((center - rs.bound.center).norm() >
-			    rs.bound.radius + rs.max_radius + extent + prune_margin) {
+			    rs.bound.radius + rs.max_radius + extent + margin) {
 				continue;  // coarse whole-trajectory filter
 			}
+			auto near_at = [&](int i, int k) {
+				return (rs.centers[i].row(k).transpose() - center).norm() - rs.radii(k) <=
+				       extent + margin;
+			};
+			const int K = static_cast<int>(rs.radii.size());
 			const auto [lo, hi] = StepRange(num_steps, [&](int i) {
-				const Eigen::MatrixXd& C = rs.centers[i];
-				for (int k = 0; k < C.rows(); ++k) {
-					if ((C.row(k).transpose() - center).norm() - rs.radii(k) <=
-					    extent + prune_margin)
-						return true;
-				}
+				for (int k = 0; k < K; ++k)
+					if (near_at(i, k)) return true;
 				return false;
 			});
-			if (lo < hi) {
-				per_agent_obstacles[ag].push_back(ActiveObstacle{&obstacle, lo, hi});
-			}
+			if (lo >= hi) continue;
+			std::vector<std::vector<int>> spheres(hi - lo);
+			for (int i = lo; i < hi; ++i)
+				for (int k = 0; k < K; ++k)
+					if (near_at(i, k)) spheres[i - lo].push_back(k);
+			per_agent_obstacles[ag].push_back(ActiveObstacle{&obstacle, lo, hi, std::move(spheres)});
 		}
 	}
 	return per_agent_obstacles;
@@ -530,25 +553,34 @@ std::vector<ActivePair> PruneAgentPairsByDistance(
 		for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
 			const AgentReferenceSpheres& ra = ref_spheres[ag_a];
 			const AgentReferenceSpheres& rb = ref_spheres[ag_b];
+			const double margin = EffectivePairMargin(prune_margin,
+								 models[ag_a]->broadphase_margin_hint(),
+								 models[ag_b]->broadphase_margin_hint());
 			if ((ra.bound.center - rb.bound.center).norm() >
-			    ra.bound.radius + rb.bound.radius + pad(ag_a) + pad(ag_b) + prune_margin) {
+			    ra.bound.radius + rb.bound.radius + pad(ag_a) + pad(ag_b) + margin) {
 				continue;  // coarse whole-trajectory filter
 			}
+			const int Ka = static_cast<int>(ra.radii.size());
+			const int Kb = static_cast<int>(rb.radii.size());
+			auto near_at = [&](int i, int ka, int kb) {
+				return (ra.centers[i].row(ka) - rb.centers[i].row(kb)).norm() -
+					   sphere_radius(ag_a, ka) - sphere_radius(ag_b, kb) <=
+				       margin;
+			};
 			const auto [lo, hi] = StepRange(num_steps, [&](int i) {
-				const Eigen::MatrixXd& Ca = ra.centers[i];
-				const Eigen::MatrixXd& Cb = rb.centers[i];
-				for (int ka = 0; ka < Ca.rows(); ++ka)
-					for (int kb = 0; kb < Cb.rows(); ++kb) {
-						if ((Ca.row(ka) - Cb.row(kb)).norm() -
-							sphere_radius(ag_a, ka) - sphere_radius(ag_b, kb) <=
-						    prune_margin)
-							return true;
-					}
+				for (int ka = 0; ka < Ka; ++ka)
+					for (int kb = 0; kb < Kb; ++kb)
+						if (near_at(i, ka, kb)) return true;
 				return false;
 			});
-			if (lo < hi) {
-				active_pairs.push_back(ActivePair{ag_a, ag_b, lo, hi});
-			}
+			if (lo >= hi) continue;
+			std::vector<std::vector<std::pair<int, int>>> sphere_pairs(hi - lo);
+			for (int i = lo; i < hi; ++i)
+				for (int ka = 0; ka < Ka; ++ka)
+					for (int kb = 0; kb < Kb; ++kb)
+						if (near_at(i, ka, kb))
+							sphere_pairs[i - lo].emplace_back(ka, kb);
+			active_pairs.push_back(ActivePair{ag_a, ag_b, lo, hi, std::move(sphere_pairs)});
 		}
 	}
 	return active_pairs;
@@ -600,7 +632,8 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vecto
 			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
 			for (const ActiveObstacle& ao : per_agent_obstacles[ag]) {
 				if (i < ao.step_lo || i >= ao.step_hi) continue;
-				for (const WorkspaceSphere& sph : spheres) {
+				for (int k : ao.spheres[i - ao.step_lo]) {
+					const WorkspaceSphere& sph = spheres[k];
 					const Eigen::VectorXd c = sph.center.head(workspace_dim);
 					const double value =
 						((ao.obstacle->kind == ObstacleKind::kSphere)
@@ -630,7 +663,8 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
 			for (const ActiveObstacle& ao : per_agent_obstacles[ag]) {
 				if (i < ao.step_lo || i >= ao.step_hi) continue;
-				for (const WorkspaceSphere& sph : spheres) {
+				for (int k : ao.spheres[i - ao.step_lo]) {
+					const WorkspaceSphere& sph = spheres[k];
 					const Eigen::VectorXd c = sph.center.head(workspace_dim);
 					const SdfResult sdf = (ao.obstacle->kind == ObstacleKind::kSphere)
 						? SphereSdf(c, *ao.obstacle, workspace_dim)
@@ -673,15 +707,15 @@ double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_a
 				models[ag_a]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_a], *models[ag_a]));
 			const std::vector<WorkspaceSphere> sph_b =
 				models[ag_b]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_b], *models[ag_b]));
-			for (const WorkspaceSphere& sa : sph_a) {
+			for (const auto& [ka, kb] : ap.sphere_pairs[i - ap.step_lo]) {
+				const WorkspaceSphere& sa = sph_a[ka];
+				const WorkspaceSphere& sb = sph_b[kb];
 				const Eigen::VectorXd c_a = sa.center.head(workspace_dim);
+				const Eigen::VectorXd c_b = sb.center.head(workspace_dim);
 				const double r_a = PairRadius(*models[ag_a], sa, ag_a, agent_radii);
-				for (const WorkspaceSphere& sb : sph_b) {
-					const Eigen::VectorXd c_b = sb.center.head(workspace_dim);
-					const double r_b = PairRadius(*models[ag_b], sb, ag_b, agent_radii);
-					const double value = SphereSdfCore(c_b, c_a, r_a + r_b).value;
-					violation += std::max(0.0, -value);
-				}
+				const double r_b = PairRadius(*models[ag_b], sb, ag_b, agent_radii);
+				const double value = SphereSdfCore(c_b, c_a, r_a + r_b).value;
+				violation += std::max(0.0, -value);
 			}
 		}
 	}
@@ -701,30 +735,30 @@ std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 				models[ag_a]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_a], *models[ag_a]));
 			const std::vector<WorkspaceSphere> sph_b =
 				models[ag_b]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_b], *models[ag_b]));
-			for (const WorkspaceSphere& sa : sph_a) {
+			for (const auto& [ka, kb] : ap.sphere_pairs[i - ap.step_lo]) {
+				const WorkspaceSphere& sa = sph_a[ka];
+				const WorkspaceSphere& sb = sph_b[kb];
 				const Eigen::VectorXd c_a = sa.center.head(workspace_dim);
+				const Eigen::VectorXd c_b = sb.center.head(workspace_dim);
 				const double r_a = PairRadius(*models[ag_a], sa, ag_a, agent_radii);
-				for (const WorkspaceSphere& sb : sph_b) {
-					const Eigen::VectorXd c_b = sb.center.head(workspace_dim);
-					const double r_b = PairRadius(*models[ag_b], sb, ag_b, agent_radii);
+				const double r_b = PairRadius(*models[ag_b], sb, ag_b, agent_radii);
 
-					// Treat sphere b's centre as sphere a's "obstacle
-					// center" (SphereSdfCore's math is symmetric in
-					// shape; only the sign of the chain rule differs
-					// per side). value = ||c_b - c_a|| - (r_a + r_b),
-					// so d(value)/d(c_a) = -grad, d(value)/d(c_b) = +grad,
-					// each chained through that agent's sphere Jacobian.
-					const SdfResult sdf = SphereSdfCore(c_b, c_a, r_a + r_b);
+				// Treat sphere b's centre as sphere a's "obstacle center"
+				// (SphereSdfCore's math is symmetric in shape; only the
+				// sign of the chain rule differs per side). value =
+				// ||c_b - c_a|| - (r_a + r_b), so d(value)/d(c_a) = -grad,
+				// d(value)/d(c_b) = +grad, each chained through that
+				// agent's sphere Jacobian.
+				const SdfResult sdf = SphereSdfCore(c_b, c_a, r_a + r_b);
 
-					ConstraintRow row;
-					row.value = sdf.value;
-					row.coeffs.reserve(2 * workspace_dim);
-					AppendSphereJacobianRow(&row, sdf.grad, sa.jac, agent_axis_offsets[ag_a], i,
-								num_steps, -1.0);
-					AppendSphereJacobianRow(&row, sdf.grad, sb.jac, agent_axis_offsets[ag_b], i,
-								num_steps, 1.0);
-					rows.push_back(std::move(row));
-				}
+				ConstraintRow row;
+				row.value = sdf.value;
+				row.coeffs.reserve(2 * workspace_dim);
+				AppendSphereJacobianRow(&row, sdf.grad, sa.jac, agent_axis_offsets[ag_a], i,
+							num_steps, -1.0);
+				AppendSphereJacobianRow(&row, sdf.grad, sb.jac, agent_axis_offsets[ag_b], i,
+							num_steps, 1.0);
+				rows.push_back(std::move(row));
 			}
 		}
 	}
@@ -846,27 +880,35 @@ bool SphereOverlapsAabb(const Eigen::VectorXd& center, double radius, const Aabb
 
 std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
 	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
-	const ObstacleSet& obstacles, double prune_margin) {
+	const AgentCollisionModels& models, const ObstacleSet& obstacles, double prune_margin) {
 	std::vector<ActiveGrid> active_grids(num_agents);
 	for (int ag = 0; ag < num_agents; ++ag) {
 		const AgentSdfGrid* grid = obstacles.agent_sdf_grid(ag);
 		if (!grid) continue;
 		const AgentReferenceSpheres& rs = ref_spheres[ag];
+		const double margin =
+			EffectiveMargin(prune_margin, models[ag]->broadphase_margin_hint());
 		const Aabb aabb = GridAabb(*grid);
-		if (!SphereOverlapsAabb(rs.bound.center, rs.bound.radius + rs.max_radius + prune_margin,
+		if (!SphereOverlapsAabb(rs.bound.center, rs.bound.radius + rs.max_radius + margin,
 					aabb)) {
 			continue;  // coarse whole-trajectory filter
 		}
+		const int K = static_cast<int>(rs.radii.size());
+		auto near_at = [&](int i, int k) {
+			return SphereOverlapsAabb(rs.centers[i].row(k).transpose(),
+						  rs.radii(k) + margin, aabb);
+		};
 		const auto [lo, hi] = StepRange(num_steps, [&](int i) {
-			const Eigen::MatrixXd& C = rs.centers[i];
-			for (int k = 0; k < C.rows(); ++k)
-				if (SphereOverlapsAabb(C.row(k).transpose(), rs.radii(k) + prune_margin, aabb))
-					return true;
+			for (int k = 0; k < K; ++k)
+				if (near_at(i, k)) return true;
 			return false;
 		});
-		if (lo < hi) {
-			active_grids[ag] = ActiveGrid{grid, lo, hi};
-		}
+		if (lo >= hi) continue;
+		std::vector<std::vector<int>> spheres(hi - lo);
+		for (int i = lo; i < hi; ++i)
+			for (int k = 0; k < K; ++k)
+				if (near_at(i, k)) spheres[i - lo].push_back(k);
+		active_grids[ag] = ActiveGrid{grid, lo, hi, std::move(spheres)};
 	}
 	return active_grids;
 }
@@ -881,7 +923,9 @@ double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::v
 		for (int i = ag_grid.step_lo; i < ag_grid.step_hi; ++i) {
 			const Eigen::VectorXd q_ag =
 				AgentConfigRow(points, i, agent_ambient_offsets[ag], *models[ag]);
-			for (const WorkspaceSphere& sph : models[ag]->Eval(q_ag)) {
+			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
+			for (int k : ag_grid.spheres[i - ag_grid.step_lo]) {
+				const WorkspaceSphere& sph = spheres[k];
 				const Eigen::VectorXd c = sph.center.head(workspace_dim);
 				const double value =
 					QueryAgentSdfGrid(*ag_grid.grid, c, workspace_dim).value - sph.radius;
@@ -904,7 +948,9 @@ std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
 			const int axis_off = agent_axis_offsets[ag];
 			const Eigen::VectorXd q_ag =
 				AgentConfigRow(points, i, agent_ambient_offsets[ag], *models[ag]);
-			for (const WorkspaceSphere& sph : models[ag]->Eval(q_ag)) {
+			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
+			for (int k : ag_grid.spheres[i - ag_grid.step_lo]) {
+				const WorkspaceSphere& sph = spheres[k];
 				const Eigen::VectorXd c = sph.center.head(workspace_dim);
 				const SdfSample sdf = QueryAgentSdfGrid(*ag_grid.grid, c, workspace_dim);
 

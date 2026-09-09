@@ -1,5 +1,6 @@
 #include "agent_collision_model.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -71,23 +72,33 @@ class DrakePlantCollisionModel : public AgentCollisionModel {
 		if (spec.base_link.empty()) {
 			throw std::runtime_error(
 				"MakeDrakePlantCollisionModel: spec.base_link is empty -- name the "
-				"root link to weld to the world (e.g. \"base_link\").");
+				"model's root link (e.g. \"base_link\" for a ur_description URDF, "
+				"\"base\" for a menagerie MJCF).");
 		}
-		const drake::math::RigidTransformd X_WBase(
-			drake::math::RotationMatrixd(Eigen::Quaterniond(
-				spec.base_quaternion_wxyz(0), spec.base_quaternion_wxyz(1),
-				spec.base_quaternion_wxyz(2), spec.base_quaternion_wxyz(3))),
-			spec.base_translation);
-		plant_.WeldFrames(plant_.world_frame(),
-				  plant_.GetFrameByName(spec.base_link), X_WBase);
+		// A ur_description URDF leaves its root link un-jointed (weld it
+		// here); a menagerie MJCF's parser already welds `base` to the
+		// world at the model's own mount pose. Either way the root ends up
+		// welded -- possibly NOT where the caller wants it -- so the actual
+		// alignment is done by X_correction_ below, applied to every sphere
+		// centre/Jacobian in Eval. That makes base_translation /
+		// base_quaternion_wxyz mean "where the root link frame sits in the
+		// world", independent of any mount baked into the model file.
+		try {
+			plant_.WeldFrames(plant_.world_frame(),
+					  plant_.GetFrameByName(spec.base_link),
+					  drake::math::RigidTransformd::Identity());
+		} catch (const std::exception&) {
+			// Already welded by the (MJCF) parser -- fine, X_correction_
+			// absorbs wherever it put the root.
+		}
 		plant_.Finalize();
 
 		if (plant_.num_positions() != tangent_dim) {
 			throw std::runtime_error(
 				"MakeDrakePlantCollisionModel: model \"" + spec.model_path +
 				"\" has " + std::to_string(plant_.num_positions()) +
-				" position DOFs after welding \"" + spec.base_link + "\" but the agent's "
-				"tangent_dim is " + std::to_string(tangent_dim) +
+				" position DOFs but the agent's tangent_dim is " +
+				std::to_string(tangent_dim) +
 				" -- Tier B is scoped to fixed-base all-revolute arms registered as one "
 				"Block::R(n_joints); a floating base or mismatched joint count is not "
 				"supported yet.");
@@ -95,10 +106,35 @@ class DrakePlantCollisionModel : public AgentCollisionModel {
 		ambient_dim_ = plant_.num_positions();
 		context_ = plant_.CreateDefaultContext();
 
+		// X_correction_ = X_WBase_wanted * X_WBase_asParsed^{-1}: the rigid
+		// transform that moves the root link from wherever the parser
+		// welded it to where the caller asked (identity rotation + the
+		// given translation, i.e. this matches a JAX FK that zeroes the
+		// model's own base mount and applies its own base placement).
+		const drake::math::RigidTransformd X_WBase_wanted(
+			drake::math::RotationMatrixd(Eigen::Quaterniond(
+				spec.base_quaternion_wxyz(0), spec.base_quaternion_wxyz(1),
+				spec.base_quaternion_wxyz(2), spec.base_quaternion_wxyz(3))),
+			spec.base_translation);
+		const drake::math::RigidTransformd X_WBase_asParsed =
+			plant_.EvalBodyPoseInWorld(*context_, plant_.GetBodyByName(spec.base_link));
+		X_correction_ = X_WBase_wanted * X_WBase_asParsed.inverse();
+
 		spheres_.reserve(spec.spheres.size());
 		for (const CollisionSphereSpec& s : spec.spheres) {
 			spheres_.push_back(Sphere{plant_.GetBodyByName(s.body).index(),
 						  s.offset.cast<double>(), s.radius});
+		}
+
+		// reach_: farthest body-sphere centre from the base at the zero
+		// configuration (the default context) -- the arm's kinematic
+		// footprint radius. broadphase_margin_hint() scales this down to an
+		// estimate of the sphere travel a single solve can produce.
+		const Eigen::Vector3d p_WBase = X_WBase_asParsed.translation();
+		for (const Sphere& s : spheres_) {
+			const drake::math::RigidTransformd& X_WB =
+				plant_.EvalBodyPoseInWorld(*context_, plant_.get_body(s.body));
+			reach_ = std::max(reach_, ((X_WB * s.offset) - p_WBase).norm() + s.radius);
 		}
 	}
 
@@ -106,6 +142,7 @@ class DrakePlantCollisionModel : public AgentCollisionModel {
 		const Eigen::Ref<const Eigen::VectorXd>& q_ambient) const override {
 		plant_.SetPositions(context_.get(), q_ambient);
 		const int nq = plant_.num_positions();
+		const Eigen::Matrix3d R_corr = X_correction_.rotation().matrix();
 
 		std::vector<WorkspaceSphere> out;
 		out.reserve(spheres_.size());
@@ -116,7 +153,7 @@ class DrakePlantCollisionModel : public AgentCollisionModel {
 				plant_.EvalBodyPoseInWorld(*context_, body);
 
 			WorkspaceSphere ws;
-			ws.center = X_WB * s.offset;  // p_WoSk_W = X_WB * p_BoSk_B
+			ws.center = X_correction_ * (X_WB * s.offset);  // p_WoSk_W then aligned
 			ws.radius = s.radius;
 
 			plant_.CalcJacobianTranslationalVelocity(
@@ -125,10 +162,9 @@ class DrakePlantCollisionModel : public AgentCollisionModel {
 				&Jq);
 			// Solver tangent columns are the joint velocities (Block::R),
 			// which for an all-revolute fixed-base arm are q̇ -- so Jq maps
-			// straight in. Only the leading workspace_dim rows are used
-			// downstream, but keep all 3 (WorkspaceSphere.jac is
-			// workspace_dim x tangent_dim; slice here).
-			ws.jac = Jq.topRows(workspace_dim_);
+			// straight in, after the constant frame correction (d(R*p)/dq =
+			// R * dp/dq). Only the leading workspace_dim rows are used.
+			ws.jac = (R_corr * Jq).topRows(workspace_dim_);
 			out.push_back(std::move(ws));
 		}
 		return out;
@@ -137,6 +173,16 @@ class DrakePlantCollisionModel : public AgentCollisionModel {
 	int ambient_dim() const override { return ambient_dim_; }
 	bool is_trivial() const override { return false; }
 	int num_spheres() const override { return static_cast<int>(spheres_.size()); }
+
+	// ~1/4 of the arm's reach: a fixed-base arm sweeping a distal joint
+	// through the few tenths of a radian a single short-horizon solve
+	// typically asks for moves its far spheres by roughly that much, and
+	// the pruner only needs an upper bound on that travel (too large just
+	// keeps extra inactive rows and -- past ~0.3 for a UR5e-scale arm --
+	// balloons ProxQP's cold factorization; too small could drop a contact
+	// the solve would have smoothed). Callers whose reference is much
+	// farther from the solution can still raise constraint_prune_margin.
+	double broadphase_margin_hint() const override { return 0.25 * reach_; }
 
    private:
 	struct Sphere {
@@ -149,8 +195,10 @@ class DrakePlantCollisionModel : public AgentCollisionModel {
 	drake::multibody::MultibodyPlant<double> plant_{0.0};
 	std::unique_ptr<drake::systems::Context<double>> context_;
 	std::vector<Sphere> spheres_;
+	drake::math::RigidTransformd X_correction_;
 	int workspace_dim_;
 	int ambient_dim_ = 0;
+	double reach_ = 0.0;
 };
 
 }  // namespace

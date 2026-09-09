@@ -63,6 +63,17 @@ class AgentCollisionModel {
 	// Exact sphere count (fixed for the model's lifetime) -- used for QP
 	// row-count reservations and the per-solve pattern signature.
 	virtual int num_spheres() const = 0;
+
+	// Broadphase margin hint (metres): an upper bound on how far this agent's
+	// body spheres can travel between the distance-pruning reference and the
+	// converged trajectory, i.e. the slack the pruner needs so it doesn't
+	// drop geometry the solve would later swing into. The pruners take the
+	// tighter of this and the caller's `constraint_prune_margin`. A negative
+	// value means "no opinion -- use `constraint_prune_margin` as-is": the
+	// trivial point model returns -1 because its single sphere is a free
+	// particle that can cross the whole workspace in one solve, whereas a
+	// fixed-base arm's spheres are bounded by its reach.
+	virtual double broadphase_margin_hint() const { return -1.0; }
 };
 
 // Single point sphere at q[:workspace_dim], Jacobian [I_wd | 0], radius 0.

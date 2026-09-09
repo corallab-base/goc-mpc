@@ -252,16 +252,28 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 // EVERY step regardless, so a wrongly-excluded (step, obstacle) degrades
 // only the SMOOTHNESS of the SQP's avoidance there (handled by the
 // closed-form fallback instead), never correctness/feasibility.
+// `spheres` / `sphere_pairs` is the PER-STEP per-sphere broadphase (v2 plan
+// Stage 3d): entry `s` (for step `step_lo + s`, length `step_hi - step_lo`)
+// lists only the agent body spheres (obstacle/grid) -- or ordered sphere
+// pairs (a_k, b_k) (inter-agent) -- that come within the effective prune
+// margin of the other geometry AT THAT STEP, instead of all K (or K_a*K_b)
+// of them. Per-step (not once for the whole `[step_lo, step_hi)` window) so
+// two articulated arms grazing past each other don't pay a K_a*K_b row for
+// every step of the crossing -- only the few sphere pairs actually close at
+// each one. A trivial agent has exactly one radius-0 sphere, so every entry
+// is `{0}` / `{{0,0}}` and the row set is unchanged.
 struct ActiveObstacle {
 	const Obstacle* obstacle;
 	int step_lo = 0;
 	int step_hi = 0;
+	std::vector<std::vector<int>> spheres;  // [step - step_lo]
 };
 struct ActivePair {
 	int ag_a = 0;
 	int ag_b = 0;
 	int step_lo = 0;
 	int step_hi = 0;
+	std::vector<std::vector<std::pair<int, int>>> sphere_pairs;  // [step - step_lo]
 };
 
 // The workspace spheres agent `ag`'s collision model occupies at every
@@ -299,7 +311,7 @@ std::vector<AgentReferenceSpheres> BuildAgentReferenceSpheres(
 // omitted from `per_agent_obstacles[ag]` entirely.
 std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 	int num_steps, int num_agents, int workspace_dim,
-	const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const std::vector<AgentReferenceSpheres>& ref_spheres, const AgentCollisionModels& models,
 	const ObstacleSet& obstacles, double prune_margin);
 
 // Same idea for inter-agent pairs, over each agent's swept collision
@@ -309,7 +321,10 @@ std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 // step_hi)`. A trivial agent contributes its scalar `agent_radii(ag)` as
 // its (single) sphere radius here; a non-trivial one contributes its body
 // spheres' own radii. This is the more consequential of the prunings:
-// unpruned pair count grows as `num_agents*(num_agents-1)/2`.
+// unpruned pair count grows as `num_agents*(num_agents-1)/2`. When both
+// agents report a broadphase margin hint (a bounded body such as an arm)
+// the pruner uses min(prune_margin, hint_a + hint_b) instead of the raw
+// `prune_margin`, so an arm pair doesn't inherit the free-particle default.
 std::vector<ActivePair> PruneAgentPairsByDistance(
 	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
 	const AgentCollisionModels& models, const Eigen::VectorXd& agent_radii, double prune_margin);
@@ -427,10 +442,11 @@ struct ActiveGrid {
 	const AgentSdfGrid* grid = nullptr;
 	int step_lo = 0;
 	int step_hi = 0;
+	std::vector<std::vector<int>> spheres;  // [step - step_lo], per-step broadphase, see ActiveObstacle
 };
 std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
 	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
-	const ObstacleSet& obstacles, double prune_margin);
+	const AgentCollisionModels& models, const ObstacleSet& obstacles, double prune_margin);
 
 // Total grid-constraint violation (sum of max(0, -value) over every (step,
 // agent) with a non-null `active_grids[ag].grid` and step in its range) at

@@ -531,24 +531,25 @@ SqpResult RunTrustRegionSqp(
 	// (GraphShortPathMPC::solve()) -- same "computed once per solve() call"
 	// discipline as everything else.
 	// Each active (agent, obstacle) / pair / (agent, grid) contributes one
-	// row PER BODY SPHERE (per pair of spheres for the inter-agent case) --
-	// num_spheres() == 1 for every trivial agent, so this reduces to the
-	// old per-step counts when nothing has a registered collision model.
+	// row per broadphased body sphere (per ordered sphere pair for the
+	// inter-agent case) AT EACH STEP -- `spheres`/`sphere_pairs` is a
+	// per-step list (entry s -> step step_lo + s), so this is just the sum
+	// of those per-step sizes. A trivial agent's single sphere survives the
+	// broadphase at every step, so this reduces to the old per-step counts.
 	int obstacle_rows = 0;
-	for (int ag = 0; ag < num_agents; ++ag) {
-		const int ks = models[ag]->num_spheres();
+	for (int ag = 0; ag < num_agents; ++ag)
 		for (const ActiveObstacle& ao : per_agent_obstacles[ag])
-			obstacle_rows += ks * (ao.step_hi - ao.step_lo);
-	}
+			for (const auto& per_step : ao.spheres)
+				obstacle_rows += static_cast<int>(per_step.size());
 	int pair_rows = 0;
 	for (const ActivePair& ap : active_pairs)
-		pair_rows += models[ap.ag_a]->num_spheres() * models[ap.ag_b]->num_spheres() *
-			     (ap.step_hi - ap.step_lo);
+		for (const auto& per_step : ap.sphere_pairs)
+			pair_rows += static_cast<int>(per_step.size());
 	int grid_rows = 0;
 	for (int ag = 0; ag < num_agents; ++ag)
 		if (active_grids[ag].grid)
-			grid_rows += models[ag]->num_spheres() *
-				     (active_grids[ag].step_hi - active_grids[ag].step_lo);
+			for (const auto& per_step : active_grids[ag].spheres)
+				grid_rows += static_cast<int>(per_step.size());
 	const int m = obstacle_rows + pair_rows + grid_rows;
 	// QP decision vector z = [dx_smooth (n_smooth) | slack (m)].
 	const int n = n_smooth + m;
@@ -856,14 +857,15 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 		const std::vector<AgentReferenceSpheres> ref_spheres = BuildAgentReferenceSpheres(
 			ref_points, num_agents, _agent_ambient_offsets, workspace_dim, _agent_collision_models);
 		const std::vector<std::vector<ActiveObstacle>> per_agent_obstacles =
-			PruneObstaclesByDistance(H, num_agents, workspace_dim, ref_spheres, *_obstacles,
+			PruneObstaclesByDistance(H, num_agents, workspace_dim, ref_spheres,
+						  _agent_collision_models, *_obstacles,
 						  _constraint_prune_margin);
 		const std::vector<ActivePair> active_pairs =
 			PruneAgentPairsByDistance(H, num_agents, ref_spheres, _agent_collision_models,
 						   _agent_radii, _constraint_prune_margin);
 		const std::vector<ActiveGrid> active_grids =
-			PruneAgentSdfGridsByDistance(H, num_agents, ref_spheres, *_obstacles,
-						      _constraint_prune_margin);
+			PruneAgentSdfGridsByDistance(H, num_agents, ref_spheres, _agent_collision_models,
+						      *_obstacles, _constraint_prune_margin);
 
 		SqpResult result = RunTrustRegionSqp(
 			_agent_shapes, _axes, _agent_axis_offsets, _agent_ambient_offsets, _agent_collision_models,

@@ -101,6 +101,14 @@ struct GraphShortPathMPC {
 	// check every registered obstacle/pair regardless, so this never
 	// affects correctness, only how much the SQP loop itself gets to
 	// smoothly plan around vs. leaving to that closed-form fallback.
+	//
+	// The 1.0 default suits a free point agent, which can traverse the
+	// whole workspace in one solve. An agent with a registered articulated
+	// collision model reports a geometry-derived hint
+	// (AgentCollisionModel::broadphase_margin_hint, ~1/3 of its reach) and
+	// the pruners silently use the tighter of the two for that agent -- an
+	// arm's body spheres can't teleport, so the flat 1.0 would otherwise
+	// keep nearly every sphere/pair row live and balloon the QP.
 	double _constraint_prune_margin;
 
 	// Fixed for this instance's whole lifetime (depend only on `graph`/
