@@ -23,7 +23,9 @@ Call order for a fresh solve:
 """
 
 from collections import namedtuple
+import weakref
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pydrake.symbolic as sym
@@ -263,23 +265,61 @@ def node_candidates(problem, wp_template, params, allow_unresolved=False):
     return out
 
 
+# cost_fn -> jax.jit(jax.vmap(cost_fn)), weakref-keyed so it evicts once
+# `cost_fn` (and whatever problem/edge_cost_fn holds it) is gone.
+# `build_edge_cost_table`/`build_depot_cost_table` used to call `cost_fn`
+# once per (a, b) pair in a python loop and force each result to a python
+# float -- for a jax-traceable `cost_fn` (e.g. an NTField's `travel_time`,
+# objectives/ntfield.py) that's one eager JAX dispatch per pair, hundreds of
+# ms to seconds for a graph with any real branch fan-out. Batching every
+# pair a table needs into one vmapped call amortizes that to a single
+# dispatch (a one-time compile per distinct batch size, milliseconds after).
+# Relies on `cost_fn` being the SAME object across calls at a fixed
+# (agent_id, dim) -- see cpsat_model._agent_sliced_cost_fn's own cache.
+_batched_cost_fn_jit = weakref.WeakKeyDictionary()
+
+
+def _batched_cost_fn(cost_fn):
+    f = _batched_cost_fn_jit.get(cost_fn)
+    if f is None:
+        f = jax.jit(jax.vmap(cost_fn))
+        _batched_cost_fn_jit[cost_fn] = f
+    return f
+
+
 def build_edge_cost_table(rows_by_node, wp_template, pairs, edge_cost_fn=None):
     """dict[(u, v)] -> (n_cand_u, n_cand_v) numpy cost matrix, one per
     `pairs`. `rows_by_node`: dict[node] -> (n_cand, state_dim) already
     resolved for ONE agent (its own instance's candidate rows at that
     node); a node absent from it is treated as its single wp_template row.
     `edge_cost_fn` is the already-agent-sliced callable(a, b) -> scalar
-    (cpsat_model._agent_sliced_cost_fn); default kernel._euclidean_edge_cost."""
+    (cpsat_model._agent_sliced_cost_fn); default kernel._euclidean_edge_cost.
+
+    Every (a, b) pair across every entry in `pairs` is gathered into one
+    flat batch and run through `cost_fn` in a SINGLE `jax.vmap`+`jax.jit`
+    call (cached per `cost_fn`, see `_batched_cost_fn`) rather than one
+    eager call per pair."""
     cost_fn = edge_cost_fn if edge_cost_fn is not None else _euclidean_edge_cost
-    table = {}
+    if not pairs:
+        return {}
+    shapes = []
+    a_chunks, b_chunks = [], []
     for u, v in pairs:
         rows_u = rows_by_node[u] if u in rows_by_node else wp_template[u][None, :]
         rows_v = rows_by_node[v] if v in rows_by_node else wp_template[v][None, :]
-        mat = np.zeros((rows_u.shape[0], rows_v.shape[0]))
-        for i, a in enumerate(rows_u):
-            for j, b in enumerate(rows_v):
-                mat[i, j] = float(cost_fn(a, b))
-        table[(u, v)] = mat
+        nu, nv = rows_u.shape[0], rows_v.shape[0]
+        a_chunks.append(np.repeat(np.asarray(rows_u), nv, axis=0))
+        b_chunks.append(np.tile(np.asarray(rows_v), (nu, 1)))
+        shapes.append((u, v, nu, nv))
+    costs = np.asarray(_batched_cost_fn(cost_fn)(
+        jnp.asarray(np.concatenate(a_chunks, axis=0)),
+        jnp.asarray(np.concatenate(b_chunks, axis=0))))
+    table = {}
+    offset = 0
+    for u, v, nu, nv in shapes:
+        n = nu * nv
+        table[(u, v)] = costs[offset:offset + n].reshape(nu, nv)
+        offset += n
     return table
 
 
@@ -288,13 +328,28 @@ def build_depot_cost_table(rows_by_node, wp_template, x0_row, nodes, edge_cost_f
     current state `x0_row` (state_dim,) to each of `node`'s candidate rows
     (the depot-to-first-stop leg). `rows_by_node` as in
     build_edge_cost_table; needed for every node in `nodes` (any of the
-    agent's own nodes could be first in the solved order)."""
+    agent's own nodes could be first in the solved order). Batched into one
+    `cost_fn` call the same way build_edge_cost_table is."""
     cost_fn = edge_cost_fn if edge_cost_fn is not None else _euclidean_edge_cost
+    if not nodes:
+        return {}
     x0_row = np.asarray(x0_row)
-    out = {}
+    shapes = []
+    a_chunks, b_chunks = [], []
     for node in nodes:
-        rows = rows_by_node[node] if node in rows_by_node else wp_template[node][None, :]
-        out[node] = np.array([float(cost_fn(x0_row, row)) for row in rows])
+        rows = np.asarray(rows_by_node[node] if node in rows_by_node else wp_template[node][None, :])
+        n = rows.shape[0]
+        a_chunks.append(np.broadcast_to(x0_row, (n,) + x0_row.shape))
+        b_chunks.append(rows)
+        shapes.append((node, n))
+    costs = np.asarray(_batched_cost_fn(cost_fn)(
+        jnp.asarray(np.concatenate(a_chunks, axis=0)),
+        jnp.asarray(np.concatenate(b_chunks, axis=0))))
+    out = {}
+    offset = 0
+    for node, n in shapes:
+        out[node] = costs[offset:offset + n]
+        offset += n
     return out
 
 

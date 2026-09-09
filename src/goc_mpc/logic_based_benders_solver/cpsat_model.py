@@ -77,6 +77,7 @@ per-instance, vertex expansion); raises otherwise.
 """
 
 import time as _time
+import weakref
 
 from ortools.sat.python import cp_model
 import numpy as np
@@ -92,23 +93,43 @@ def _all_pairs(nodes):
     return [(u, v) for u in nodes for v in nodes if u != v]
 
 
+# fn -> {(agent_id, dim): sliced closure}, weakref-keyed on the underlying
+# edge_cost_fn so it evicts itself once that fn (and the problem holding it)
+# is gone. `_agent_sliced_cost_fn` is called fresh every MPC cycle with the
+# SAME `fn`; returning the SAME `sliced` object each time (rather than a
+# fresh closure) lets `structure.build_edge_cost_table`/`build_depot_cost_
+# table` cache the vmapped+jitted version of it across cycles too -- see
+# their own `_batched_cost_fn`.
+_sliced_cost_fn_cache = weakref.WeakKeyDictionary()
+
+
 def _agent_sliced_cost_fn(edge_cost_fn, agent_id, dim):
     """Wraps `edge_cost_fn` (a single shared callable, or a per-agent
     list/tuple -- GraphOrderingRelaxed's edge_cost_fn contract) so it's
     called on just agent `agent_id`'s own `[agent_id*dim : (agent_id+1)*dim]`
     slice of each row. An agent's route cost only ever depends on its own
     columns; skipping this slice lets other agents'/objects' columns
-    contaminate the distance."""
+    contaminate the distance.
+
+    Plain array slicing (not `np.asarray(...)[...]`) so the result stays
+    traceable under `jax.vmap`/`jax.jit` when `a`/`b` are jax arrays --
+    `structure.py`'s cost-table builders batch every (a, b) pair across a
+    whole table into one vmapped call rather than one eager call per pair."""
     fn = edge_cost_fn
     if isinstance(fn, (list, tuple)):
         fn = fn[agent_id]
     if fn is None:
         fn = _euclidean_edge_cost
-    lo, hi = agent_id * dim, (agent_id + 1) * dim
+    per_fn = _sliced_cost_fn_cache.setdefault(fn, {})
+    key = (agent_id, dim)
+    sliced = per_fn.get(key)
+    if sliced is None:
+        lo, hi = agent_id * dim, (agent_id + 1) * dim
 
-    def sliced(a, b):
-        return fn(np.asarray(a)[lo:hi], np.asarray(b)[lo:hi])
+        def sliced(a, b, lo=lo, hi=hi, fn=fn):
+            return fn(a[lo:hi], b[lo:hi])
 
+        per_fn[key] = sliced
     return sliced
 
 
