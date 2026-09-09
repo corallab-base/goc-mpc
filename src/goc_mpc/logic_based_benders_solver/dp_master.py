@@ -52,7 +52,7 @@ import itertools
 
 import numpy as np
 
-from .structure import build_edge_cost_table, build_depot_cost_table, static_entry_owner
+from .structure import build_edge_cost_table, build_depot_cost_table, entry_owner
 from .cpsat_model import _agent_sliced_cost_fn
 
 
@@ -487,7 +487,12 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
                             problem, np.broadcast_to(wp0[None], (k,) + wp0.shape),
                             x0_full, owner_vagent, aux, pb, tvec, only_entries=(e,))
                         rows_by_node[int(e.write_node)] = res[:, int(e.write_node), :]
-                        node_owner_of[int(e.write_node)] = (e, static_entry_owner(problem, e))
+                        # For a DYNAMIC (var_agent_q) entry the owner is
+                        # whichever agent THIS assignment binds its variable
+                        # to -- fixed inside this `for A in assign_combos`
+                        # iteration, so the entry prices exactly like a
+                        # static multi-branch one from here on.
+                        node_owner_of[int(e.write_node)] = (e, entry_owner(problem, e, owner_vagent))
 
                     if objective in ("avg", "minmax"):
                         per_agent, choice = {}, {}

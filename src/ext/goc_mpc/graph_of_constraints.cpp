@@ -113,6 +113,14 @@ GraphOfConstraints::GraphOfConstraints(
 		workspace_dim * workspace_dim, [](const std::pair<int, std::string>& k) {
 			return fmt::format("agent_{}_link_{}_rot", k.first, k.second);
 		});
+	_var_agent_link_pos = PlaceholderVarFamily<std::pair<int, std::string>>(
+		workspace_dim, [](const std::pair<int, std::string>& k) {
+			return fmt::format("var_{}_link_{}_pos", k.first, k.second);
+		});
+	_var_agent_link_rot = PlaceholderVarFamily<std::pair<int, std::string>>(
+		workspace_dim * workspace_dim, [](const std::pair<int, std::string>& k) {
+			return fmt::format("var_{}_link_{}_rot", k.first, k.second);
+		});
 	_agent_q_u = PlaceholderVarFamily<int>(&_agent_widths, [](const int& i) { return fmt::format("agent_{}_q_u", i); });
 	_agent_q_v = PlaceholderVarFamily<int>(&_agent_widths, [](const int& i) { return fmt::format("agent_{}_q_v", i); });
 	_object_q_u = PlaceholderVarFamily<int>(&_object_widths, [](const int& o) { return fmt::format("object_{}_q_u", o); });
@@ -358,6 +366,18 @@ drake::VectorX<drake::symbolic::Expression>
 GraphOfConstraints::agent_link_rot(int agent_id, const std::string& link_name) {
 	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
 	return _agent_link_rot.Get({agent_id, link_name});
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::var_agent_link_pos(int var, const std::string& link_name) {
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	return _var_agent_link_pos.Get({var, link_name});
+}
+
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::var_agent_link_rot(int var, const std::string& link_name) {
+	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	return _var_agent_link_rot.Get({var, link_name});
 }
 
 Eigen::VectorXd GraphOfConstraints::point_position(int point_id, const Eigen::VectorXd& x) const {
@@ -1294,9 +1314,17 @@ GraphOfConstraints::v_var_agent_q(int var) {
 
 
 int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula& f) {
-	// Detect variable-agent placeholders in the formula.
+	// Detect variable-agent placeholders in the formula -- var_agent_q(var)
+	// directly, or its assignable-FK counterparts var_agent_link_pos(var,
+	// ...) / var_agent_link_rot(var, ...) (a joint-space EE target on an
+	// assignable arm -- see _var_agent_link_pos's doc comment). All route
+	// through the same assignable machinery.
 	const drake::symbolic::Variables free_vars = f.GetFreeVariables();
-	const std::vector<int> involved_var_ids = _var_agent_q.KeysReferencedBy(free_vars);
+	std::set<int> involved_var_id_set;
+	for (int v : _var_agent_q.KeysReferencedBy(free_vars)) involved_var_id_set.insert(v);
+	for (const auto& k : _var_agent_link_pos.KeysReferencedBy(free_vars)) involved_var_id_set.insert(k.first);
+	for (const auto& k : _var_agent_link_rot.KeysReferencedBy(free_vars)) involved_var_id_set.insert(k.first);
+	const std::vector<int> involved_var_ids(involved_var_id_set.begin(), involved_var_id_set.end());
 
 	if (involved_var_ids.size() == 1) {
 		return add_assignable_constraint(node, involved_var_ids[0], f);
@@ -1359,7 +1387,11 @@ int GraphOfConstraints::add_assignable_constraint(
 	int node, int var, const drake::symbolic::Formula& f) {
 
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
-	DRAKE_DEMAND(_var_agent_q.Contains(var));
+	// The formula must actually reference this variable through one of its
+	// placeholder families -- var_agent_q(var), or an assignable-FK
+	// var_agent_link_pos/_rot(var, ...) (see add_constraint).
+	DRAKE_DEMAND(_var_agent_q.Contains(var) ||
+		     _var_agent_link_pos.ContainsFirst(var) || _var_agent_link_rot.ContainsFirst(var));
 
 	_num_total_assignables++;
 	return _add_symbolic_assignable_op(node, var, f);

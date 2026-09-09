@@ -35,7 +35,7 @@ from ..evolutionary_waypoint_solver.spec import (
     _agent_widths, _object_slot_width, _object_widths, _slot_width,
     build_graph_ordering_problem)
 from .dp_master import solve_dp_master
-from .structure import node_candidates, node_instances, static_entry_owner, warm_start_wp
+from .structure import entry_owner, node_candidates, node_instances, warm_start_wp
 
 
 class DpMasterWaypointSolver:
@@ -178,11 +178,16 @@ class DpMasterWaypointSolver:
         aux = np.zeros((1, problem.n_cond_vars))
         for k, v in r.get("aux", {}).items():
             aux[0, k] = float(v)
+        owner_variable = np.array(
+            [int(r["assignment"].get(s, 0)) for s in range(problem.n_variables)], dtype=int)
         proj_branch = np.zeros(problem.n_branch)
         for e in problem.projections:
             if e.discrete_params <= 1:
                 continue
-            idx = int(r["branch"].get((int(e.write_node), static_entry_owner(problem, e)), 0))
+            # `branch` is keyed by (node, owner); for a dynamic (var_agent_q)
+            # entry the owner is the agent this result's assignment bound its
+            # variable to (owner_variable), matching how solve_dp_master wrote it.
+            idx = int(r["branch"].get((int(e.write_node), entry_owner(problem, e, owner_variable)), 0))
             proj_branch[e.branch_slice.start + idx] = 1.0
         t_vec = np.array([r["time"].get(n, 0.0) for n in range(problem.n_nodes)], dtype=float)
 
@@ -196,8 +201,6 @@ class DpMasterWaypointSolver:
                                        anchor, jnp.asarray(x0_full))
         W = np.asarray(wp_frozen)[0]
 
-        owner_variable = np.array(
-            [int(r["assignment"].get(s, 0)) for s in range(problem.n_variables)], dtype=int)
         node_rank = np.asarray(problem._decode_node_rank(
             owner_variable, aux[0], t_vec, np.asarray(anchor.node_active)))
 

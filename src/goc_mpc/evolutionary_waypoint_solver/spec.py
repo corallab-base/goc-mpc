@@ -1266,6 +1266,23 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 if v is not None:
                     var_map[v.get_id()] = (slot, j)
 
+        # {placeholder Variable id -> owning var slot} for every
+        # var_agent_link_pos/_rot(var_id, link) FK placeholder (one per
+        # registered link name). A projection that pins var_agent_q(var_id)'s
+        # columns transitively DETERMINES that arm's forward kinematics, so
+        # such a placeholder appearing in the accompanying (evaluate_phi-only)
+        # Formula counts toward that projection's free-variable coverage --
+        # it's never a free wp column, just a runtime FK read.
+        var_fk_slot = {}
+        _link_names = {ln for (_ag, ln) in graph.robot_fk_registry}
+        for var_id, slot in var_id_to_slot.items():
+            for ln in _link_names:
+                for expr in (list(graph.var_agent_link_pos(var_id, ln))
+                             + list(graph.var_agent_link_rot(var_id, ln))):
+                    v = as_variable(expr)
+                    if v is not None:
+                        var_fk_slot[v.get_id()] = slot
+
         pending = projection_pending  # build-level; _resolve_holds /
         # _resolve_stationary_objects append their auto-derived gated entries
         # to the same list afterward, then _order_projection_entries sorts it.
@@ -1279,6 +1296,12 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
         def _register(phi_id, node_locals, formula, proj):
             kind, side_or_slot, cols_or_js = _resolve_pin_columns(proj, static_map, var_map)
+            if proj.owner_aware and kind != "dynamic":
+                raise ValueError(
+                    f"proj for phi {phi_id} sets owner_aware=True but its `pins` "
+                    "isn't a var_agent_q(...) row -- owner_aware only means "
+                    "anything for a DYNAMIC pin (the owner it hands `func` is that "
+                    "pin's assignable variable's resolved agent)")
             owner_var_slot, owner_cols_per_agent = None, None
             if kind == "static":
                 write_node = node_locals[side_or_slot]
@@ -1309,8 +1332,15 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             read_var_ids = set()
             for arr in proj.reads:
                 read_var_ids |= {as_variable(e).get_id() for e in np.asarray(arr).flat}
+            # A var_agent_link_pos/_rot(var) placeholder in the Formula is
+            # "covered" when this projection pins that same variable's
+            # var_agent_q columns -- its FK is then a pure function of the
+            # pinned joint config (resolved only at evaluate_phi time; never a
+            # free wp column). See `var_fk_slot` above.
+            covered_fk_ids = ({fid for fid, s in var_fk_slot.items() if s == owner_var_slot}
+                              if owner_var_slot is not None else set())
             free_ids = {v.get_id() for v in formula.GetFreeVariables()}
-            if not free_ids <= (pin_var_ids | read_var_ids):
+            if not free_ids <= (pin_var_ids | read_var_ids | covered_fk_ids):
                 raise ValueError(
                     f"proj for phi {phi_id} doesn't account for every placeholder "
                     "its constraint Formula references -- proj.pins union "
@@ -1359,13 +1389,14 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
             table = None
             func = proj.func
-            if proj.continuous_params == 0 and not proj.reads:
+            if proj.continuous_params == 0 and not proj.reads and not proj.owner_aware:
                 # Fully static: func needs no row input, and has no
                 # continuous freedom to sweep -- enumerate every branch
                 # ONCE, in plain numpy, at spec-build time (see
                 # ProjOperator.reads' docstring). apply_projections then
                 # never calls func at all for this entry, just gathers a
-                # row out of this table.
+                # row out of this table. An owner_aware func can't be tabled
+                # -- its value depends on the runtime-decided owner.
                 table = np.stack(
                     [np.asarray(proj.func(np.zeros(0), k)) for k in range(proj.discrete_params)],
                     axis=0)
@@ -1374,8 +1405,10 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             # A tabled entry is already an O(1) gather -- precompute_static_
             # projections' per-generation cache has nothing to add for it,
             # so is_static is unconditionally False there (see
-            # _classify_static_projection's own docstring).
-            is_static = table is None and _classify_static_projection(proj, param_map)
+            # _classify_static_projection's own docstring). An owner_aware
+            # entry is likewise never static: precompute zeroes owner_variable.
+            is_static = (table is None and not proj.owner_aware
+                         and _classify_static_projection(proj, param_map))
 
             # `write_cols`: every (node, col) this pin COULD claim -- exactly
             # `possible_cols` at `write_node` (for a var_agent_q(...) dynamic
@@ -1388,7 +1421,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 discrete_params=proj.discrete_params, table=table, is_static=is_static,
                 owner_var_slot=owner_var_slot, owner_cols_per_agent=owner_cols_per_agent,
                 read_cols=frozenset(read_cols),
-                write_cols=frozenset((write_node, c) for c in possible_cols))
+                write_cols=frozenset((write_node, c) for c in possible_cols),
+                owner_aware=proj.owner_aware)
             pending.append(dict(phi_id=phi_id, entry=entry))
 
         for node in node_list:

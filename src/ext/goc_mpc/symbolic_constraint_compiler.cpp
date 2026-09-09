@@ -1,5 +1,6 @@
 #include "symbolic_constraint_compiler.hpp"
 
+#include <functional>
 #include <limits>
 
 using drake::symbolic::Expression;
@@ -139,27 +140,44 @@ double ComputeSignedViolation(const std::vector<BlockResidualGroup>& groups,
 void InsertAgentLinkPoseEnv(const GraphOfConstraints& graph,
                             const drake::symbolic::Formula& formula,
                             const Eigen::VectorXd& x,
-                            drake::symbolic::Environment* env) {
+                            drake::symbolic::Environment* env,
+                            const std::function<int(int)>& var_to_agent = {}) {
 	const drake::symbolic::Variables free_vars = formula.GetFreeVariables();
-	std::set<std::pair<int, std::string>> keys;
-	for (const auto& key : graph._agent_link_pos.KeysReferencedBy(free_vars)) keys.insert(key);
-	for (const auto& key : graph._agent_link_rot.KeysReferencedBy(free_vars)) keys.insert(key);
-	for (const auto& key : keys) {
-		const auto& [agent_id, link_name] = key;
-		const auto [p_we, R_we] = graph.link_pose(agent_id, x, link_name);
-		if (graph._agent_link_pos.Contains(key)) {
-			const auto& pos_vec = graph._agent_link_pos.Vars(key);
-			DRAKE_DEMAND(p_we.size() == pos_vec.size());
-			for (int j = 0; j < pos_vec.size(); ++j) env->insert(pos_vec[j], p_we[j]);
+
+	// (pos_family, rot_family, key, agent_id-to-run-FK-for) tuples -- the
+	// concrete families keyed on (agent_id, link) resolve agent_id straight
+	// off the key; the assignable var_agent_link_* families resolve it
+	// through `var_to_agent` (which agent the variable was assigned).
+	auto fill = [&](const PlaceholderVarFamily<std::pair<int, std::string>>& pos_fam,
+	                const PlaceholderVarFamily<std::pair<int, std::string>>& rot_fam,
+	                std::function<int(const std::pair<int, std::string>&)> key_agent) {
+		std::set<std::pair<int, std::string>> keys;
+		for (const auto& key : pos_fam.KeysReferencedBy(free_vars)) keys.insert(key);
+		for (const auto& key : rot_fam.KeysReferencedBy(free_vars)) keys.insert(key);
+		for (const auto& key : keys) {
+			const int agent_id = key_agent(key);
+			const auto [p_we, R_we] = graph.link_pose(agent_id, x, key.second);
+			if (pos_fam.Contains(key)) {
+				const auto& pos_vec = pos_fam.Vars(key);
+				DRAKE_DEMAND(p_we.size() == pos_vec.size());
+				for (int j = 0; j < pos_vec.size(); ++j) env->insert(pos_vec[j], p_we[j]);
+			}
+			if (rot_fam.Contains(key)) {
+				const auto& rot_vec = rot_fam.Vars(key);
+				DRAKE_DEMAND(R_we.size() == rot_vec.size());
+				// Row-major flatten (see _agent_link_rot's doc comment).
+				for (int i = 0; i < graph.workspace_dim; ++i)
+					for (int j = 0; j < graph.workspace_dim; ++j)
+						env->insert(rot_vec[i * graph.workspace_dim + j], R_we(i, j));
+			}
 		}
-		if (graph._agent_link_rot.Contains(key)) {
-			const auto& rot_vec = graph._agent_link_rot.Vars(key);
-			DRAKE_DEMAND(R_we.size() == rot_vec.size());
-			// Row-major flatten (see _agent_link_rot's doc comment).
-			for (int i = 0; i < graph.workspace_dim; ++i)
-				for (int j = 0; j < graph.workspace_dim; ++j)
-					env->insert(rot_vec[i * graph.workspace_dim + j], R_we(i, j));
-		}
+	};
+
+	fill(graph._agent_link_pos, graph._agent_link_rot,
+	     [](const std::pair<int, std::string>& k) { return k.first; });
+	if (var_to_agent) {
+		fill(graph._var_agent_link_pos, graph._var_agent_link_rot,
+		     [&](const std::pair<int, std::string>& k) { return var_to_agent(k.first); });
 	}
 }
 
@@ -223,11 +241,12 @@ void RequireFullySubstituted(const drake::symbolic::Formula& formula,
 		if (sub.contains(var)) continue;
 		throw std::runtime_error(fmt::format(
 			"MILPWaypointMPC cannot compile a constraint referencing placeholder "
-			"variable '{}' -- this is almost certainly an agent_link_pos(agent_id, "
-			"link_name) or agent_link_rot(agent_id, link_name) forward-kinematics "
-			"placeholder, which drake::symbolic::Formula has no way to represent. "
-			"Use the JAX evolutionary solver (EvolutionaryWaypointSolver) for a "
-			"graph with FK-based constraints instead.",
+			"variable '{}' -- this is almost certainly an agent_link_pos / "
+			"agent_link_rot (or its assignable var_agent_link_pos / "
+			"var_agent_link_rot) forward-kinematics placeholder, which "
+			"drake::symbolic::Formula has no way to represent. Use the JAX "
+			"evolutionary solver (EvolutionaryWaypointSolver) for a graph with "
+			"FK-based constraints instead.",
 			var.get_name()));
 	}
 }
@@ -468,7 +487,11 @@ double EvaluateSymbolicNodeConstraint(
 	graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
 		return x[graph.object_col_offset(o) + j]; });
 	graph._param.InsertRange(&env, graph.num_params(), [&](int p, int) { return graph.view_param_values()(p); });
-	InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
+	// A node assignable constraint has exactly one variable (rec.var_id), so
+	// every var_agent_link_*(var, ...) placeholder resolves to this phi's
+	// own assigned agent.
+	InsertAgentLinkPoseEnv(graph, rec.formula, x, &env,
+	                       [assigned_agent](int) { return assigned_agent; });
 	return ComputeViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 }
 
@@ -498,7 +521,8 @@ double EvaluateSymbolicEdgeConstraint(
 		graph._object_q.InsertRange(&env, n_objects, [&](int o, int j) {
 			return x[graph.object_col_offset(o) + j]; });
 		graph._param.InsertRange(&env, graph.num_params(), [&](int p, int) { return graph.view_param_values()(p); });
-		InsertAgentLinkPoseEnv(graph, rec.formula, x, &env);
+		InsertAgentLinkPoseEnv(graph, rec.formula, x, &env,
+		                       [&](int v) { return var_assignments(v); });
 		return ComputeSignedViolation(rec.block_residual_groups, rec.ungrouped_leaves, env);
 	}
 

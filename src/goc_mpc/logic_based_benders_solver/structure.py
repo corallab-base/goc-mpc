@@ -94,7 +94,10 @@ def warm_start_wp(problem, x0):
         # a plain zero-fill is enough here since node_candidates below
         # re-resolves every branch's actual row for the discrete search,
         # this call only needs to mark the node "known" for interpolation).
-        if entry.table is not None:
+        # A DYNAMIC (var_agent_q) entry is skipped for the write -- its
+        # `pinned_cols` is empty and which agent's columns it targets isn't
+        # known without an assignment -- but the node is still marked known.
+        if entry.table is not None and entry.owner_var_slot is None:
             wp[node, np.asarray(entry.pinned_cols)] = np.asarray(entry.table)[0]
         known[node] = True
 
@@ -132,11 +135,37 @@ def static_entry_owner(problem, entry):
     `pinned_cols` fall in: an agent id `c0 // problem.dim` for an
     agent-config band, or `("object", c0)` for an object band. This is the
     same column->track logic SmallContinuousVRPSolver._build_static_chain
-    uses (`by_track`)."""
+    uses (`by_track`).
+
+    Raises on a DYNAMIC (var_agent_q-pinned) entry -- its `pinned_cols` is
+    empty and its write target moves with the assignment; use
+    `entry_owner(problem, entry, owner_vagent)` there instead."""
+    if entry.owner_var_slot is not None:
+        raise ValueError(
+            "static_entry_owner called on a dynamic (var_agent_q-pinned) "
+            "projection entry -- use entry_owner(problem, entry, owner_vagent)")
     c0 = int(min(int(c) for c in entry.pinned_cols))
     if c0 < problem.n_agents * problem.dim:
         return c0 // problem.dim
     return ("object", c0)
+
+
+def entry_owner(problem, entry, owner_vagent=None):
+    """The routing-instance OWNER a projection entry writes into, for either
+    kind of pin. A STATIC entry (owner_var_slot is None) defers to
+    `static_entry_owner` (column-band derivation). A DYNAMIC (var_agent_q)
+    entry resolves to the agent the current assignment binds its variable to
+    -- `int(owner_vagent[entry.owner_var_slot])`; `owner_vagent` is the
+    `(n_variables,)` resolved-agent vector for the assignment being priced
+    (`dp_master`'s enumerated combo, or a solved result's `assignment`).
+    Raises if it's missing for a dynamic entry."""
+    if entry.owner_var_slot is None:
+        return static_entry_owner(problem, entry)
+    if owner_vagent is None:
+        raise ValueError(
+            "entry_owner needs owner_vagent for a dynamic (var_agent_q-pinned) "
+            "projection entry -- its write target moves with the assignment")
+    return int(np.asarray(owner_vagent)[entry.owner_var_slot])
 
 
 def node_candidates(problem, wp_template, params, allow_unresolved=False):

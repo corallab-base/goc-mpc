@@ -288,6 +288,17 @@ public:
 	// DRAKE_DEMAND).
 	bool Contains(const Key& key) const { return vars_.contains(key); }
 
+	// True iff any key currently in this family has `first == v` -- for the
+	// std::pair<int, std::string> families (agent/var id + link name), a
+	// "was this agent/variable's FK referenced at all, for any link" check
+	// without needing to know the link name. Instantiated only where called
+	// (the pair-keyed families), so `key.first` is well-formed there.
+	bool ContainsFirst(int v) const {
+		for (const auto& [key, vars] : vars_)
+			if (key.first == v) return true;
+		return false;
+	}
+
 	// Raw placeholder Variable vector for `key`, creating it (named via
 	// `namer_`) on first access. Needed (rather than Get()) wherever a
 	// caller indexes into a Substitution/Environment, both of which key on
@@ -622,6 +633,20 @@ struct GraphOfConstraints {
 	// i*workspace_dim + j, matching numpy/jax's default 'C'-order
 	// flatten()/reshape()) -- see agent_link_rot() below.
 	PlaceholderVarFamily<std::pair<int, std::string>> _agent_link_rot;
+
+	// _var_agent_link_pos / _var_agent_link_rot: the ASSIGNABLE-arm
+	// counterpart of _agent_link_pos/_rot, keyed by (var_id, link_name)
+	// instead of (agent_id, link_name). Which real agent's forward
+	// kinematics resolves them is decided by the variable's runtime
+	// assignment -- EvaluateSymbolicNodeConstraint's `assigned_agent` (the
+	// same value that resolves _var_agent_q's own columns) -- so a formula
+	// using one is legal only where that assignment is known: the runtime
+	// node-completion evaluator, and (via a projection that pins
+	// var_agent_q(var)'s columns, which transitively determine this FK) the
+	// evolutionary/dp_master waypoint solvers. MILPWaypointMPC raises
+	// (RequireFullySubstituted), same as the concrete FK placeholders.
+	PlaceholderVarFamily<std::pair<int, std::string>> _var_agent_link_pos;
+	PlaceholderVarFamily<std::pair<int, std::string>> _var_agent_link_rot;
 
 	// _agent_q_u/_v, _object_q_u/_v: the u (start) and v (end) side of a
 	// *relational* edge constraint (see add_edge_constraint) -- a formula
@@ -1128,6 +1153,17 @@ struct GraphOfConstraints {
 	// eq(graph.agent_link_rot(agent_id, link_name), R.flatten()) -- numpy's
 	// default flatten() order matches this placeholder's layout exactly.
 	drake::VectorX<drake::symbolic::Expression> agent_link_rot(int agent_id, const std::string& link_name);
+
+	// Assignable-arm forward-kinematics placeholders -- (var_id, link_name)
+	// keyed counterparts of agent_link_pos/agent_link_rot (see
+	// _var_agent_link_pos's doc comment). A formula referencing one routes
+	// through the same assignable machinery var_agent_q(var) does
+	// (add_constraint), and evaluate_phi resolves it against whichever agent
+	// the variable was assigned. Registering the underlying fk_fn is still
+	// per concrete (agent_id, link_name) via set_robot_fk -- there is no
+	// separate per-variable registration.
+	drake::VectorX<drake::symbolic::Expression> var_agent_link_pos(int var, const std::string& link_name);
+	drake::VectorX<drake::symbolic::Expression> var_agent_link_rot(int var, const std::string& link_name);
 
 	// Declares a new runtime-editable scalar parameter, initialized to
 	// `initial_value`, and returns its id (0, 1, 2, ... in declaration

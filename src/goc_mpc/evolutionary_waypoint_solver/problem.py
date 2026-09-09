@@ -128,14 +128,20 @@ from .kernel import make_graph_kernel, decode_rank_batched
 #       shrink (they're live for the gate-off case, exactly like a dynamic
 #       pin's). Not supported together with a var_agent_q(...) dynamic pin
 #       (owner_var_slot is not None) yet -- apply_projections raises.
+#   owner_aware: True iff `func` takes a trailing `owner` (resolved agent
+#       id) arg -- projection.ProjOperator.owner_aware, DYNAMIC pins only,
+#       for an elimination whose form differs per agent (e.g. per-arm
+#       analytic IK). apply_projections passes owner_variable[owner_var_slot]
+#       to `func`. Forces is_static/table off (the value depends on a
+#       runtime assignment).
 ProjectionEntry = namedtuple(
     "ProjectionEntry",
     ["write_node", "pinned_cols", "node_locals", "read_fn", "func",
      "continuous_params", "psi_slice", "psi_bounds", "branch_slice",
      "discrete_params", "table", "is_static",
      "owner_var_slot", "owner_cols_per_agent",
-     "read_cols", "write_cols", "gate_fn"],
-    defaults=[None])  # gate_fn -- unconditional unless a caller sets it
+     "read_cols", "write_cols", "gate_fn", "owner_aware"],
+    defaults=[None, False])  # gate_fn (unconditional), owner_aware
 
 
 # Bundles remaining_vertices' runtime effect on an otherwise-fixed-size
@@ -459,6 +465,11 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
 
             def _one(rows_1, psi_1, branch_1, ov_1, entry=entry, params=params, x0=x0):
                 read_vals = entry.read_fn(rows_1, params, ov_1, x0)
+                if entry.owner_aware:
+                    # DYNAMIC pin whose elimination differs per agent -- hand
+                    # `func` the resolved owner id (see ProjOperator.func).
+                    return jnp.asarray(entry.func(
+                        *read_vals, psi_1, branch_1, ov_1[entry.owner_var_slot]))
                 return jnp.asarray(entry.func(*read_vals, psi_1, branch_1))
 
             value = jax.vmap(_one, in_axes=(0, 0, 0, 0))(rows, psi_i, branch, owner_variable)

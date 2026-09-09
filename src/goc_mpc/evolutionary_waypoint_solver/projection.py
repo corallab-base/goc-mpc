@@ -21,13 +21,24 @@ from collections.abc import Callable
 class ProjOperator:
     """
     pins: the placeholder array this projection ASSIGNS -- e.g.
-        `graph.agent_q(0)[0:3]`, or the whole `graph.agent_q(0)`. Every
-        component must be a plain, static agent_q(k)/object_q(k) placeholder
-        (u_/v_-prefixed for an edge constraint's pin side) -- the same
-        static-column case _make_row_resolver already resolves for an
-        ordinary constraint's placeholders; an FK or var_agent_q(...)
-        placeholder can't be pinned this way (there's no decision-variable
-        column to write a value into).
+        `graph.agent_q(0)[0:3]`, or the whole `graph.agent_q(0)`. Two kinds
+        are accepted (spec.py's _resolve_pin_columns), never mixed in one
+        projection:
+          * STATIC -- plain agent_q(k)/object_q(k) placeholders (u_/v_-
+            prefixed for an edge constraint's pin side): the write column is
+            known at spec-build time, the same static-column case
+            _make_row_resolver already resolves for an ordinary constraint's
+            placeholders.
+          * DYNAMIC -- var_agent_q(var_id) components of ONE assignable
+            variable: the NODE is static but which agent's slot within it
+            gets written moves with the solved assignment (the GA's
+            `owner_variable`, or dp_master's enumerated combo). Only the
+            evolutionary and dp_master solvers honour this; every other
+            consumer ignores `proj` and keeps the residual, which is what
+            drives the column for them. Not combined with a `gate_fn` (an
+            auto-derived gated entry -- apply_projections raises).
+        An FK (agent_link_pos/_rot) placeholder still can't be pinned either
+        way -- there's no decision-variable column to write a value into.
 
     reads: placeholder arrays `func` reads, in call order -- e.g.
         `(graph.object_q(0)[0:3],)`. Each may be a static agent_q/object_q
@@ -77,6 +88,21 @@ class ProjOperator:
         continuous_params == 0, plain numpy -- see `reads`' docstring)
         array ops -- no side effects, since local refinement differentiates
         through it whenever it isn't tabled.
+
+        With `owner_aware` (DYNAMIC pins only), `func` takes ONE extra
+        trailing arg: `(*read_values, psi, branch, owner)`, `owner` a scalar
+        int32 agent id -- which real agent the pin's assignable variable
+        resolved to this pass. For a scene where the elimination itself
+        differs per agent (e.g. two arms with different bases -> different
+        analytic IK), branch on it, typically `jax.lax.switch(owner,
+        [per_agent_fn, ...], ...)`.
+
+    owner_aware: pass the resolved owner agent id to `func` as a trailing
+        arg (see `func`). Only valid on a DYNAMIC pin (`pins` a
+        var_agent_q(...) row) -- spec.py's _resolve_projections raises
+        otherwise. An owner_aware entry is never tabled or treated as
+        generation-static (its value depends on a runtime-decided
+        assignment).
     """
     pins: object
     reads: tuple = ()
@@ -84,6 +110,7 @@ class ProjOperator:
     discrete_params: int = 1
     psi_bounds: tuple = (-1.0, 1.0)
     func: Callable = None
+    owner_aware: bool = False
 
     def __post_init__(self):
         if self.continuous_params < 0:

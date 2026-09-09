@@ -291,6 +291,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("agent_id"), py::arg("link_name"))
 		.def("agent_link_rot", &GraphOfConstraints::agent_link_rot,
 		     py::arg("agent_id"), py::arg("link_name"))
+		.def("var_agent_link_pos", &GraphOfConstraints::var_agent_link_pos,
+		     py::arg("var"), py::arg("link_name"))
+		.def("var_agent_link_rot", &GraphOfConstraints::var_agent_link_rot,
+		     py::arg("var"), py::arg("link_name"))
 		.def("u_object_q", &GraphOfConstraints::u_object_q, py::arg("object_q"))
 		.def("u_agent_q", &GraphOfConstraints::u_agent_q, py::arg("agent_q"))
 		.def("v_object_q", &GraphOfConstraints::v_object_q, py::arg("object_q"))
