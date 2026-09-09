@@ -434,9 +434,9 @@ SqpResult RunTrustRegionSqp(
 		const Eigen::VectorXd& x0, const Eigen::VectorXd& v0,
 		const Eigen::MatrixXd& ref_points, const Eigen::MatrixXd& ref_velocities,
 		const ObstacleSet& obstacles,
-		const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles,
-		const std::vector<std::pair<int, int>>& active_pairs,
-		const std::vector<const AgentSdfGrid*>& active_grids,
+		const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles,
+		const std::vector<ActivePair>& active_pairs,
+		const std::vector<ActiveGrid>& active_grids,
 		const Eigen::VectorXd& agent_radii,
 		double penalty_weight, int max_iterations,
 		double initial_trust_radius, double max_trust_radius, double min_trust_radius, double grad_tol,
@@ -445,18 +445,22 @@ SqpResult RunTrustRegionSqp(
 
 	const int per_axis = 2 * num_steps;
 	const int n_smooth = static_cast<int>(axes.size()) * per_axis;
-	// Fixed for the whole solve() call (design decision 6): row COUNT
-	// never changes mid-call, only each row's coefficients/value do
-	// (re-linearized every outer iteration). `m` counts only the SURVIVING
-	// (distance-pruned, see PruneObstaclesByDistance/PruneAgentPairsByDistance)
-	// obstacle/pair/grid rows -- pruning happens once, before this function
-	// runs (GraphShortPathMPC::solve()), same "computed once per solve()
-	// call" discipline as everything else.
+	// Fixed for the whole solve() call (design decision 6): row COUNT never
+	// changes mid-call, only each row's coefficients/value do (re-linearized
+	// every outer iteration). `m` sums the per-(agent,obstacle)/pair/grid
+	// active-step ranges from the distance pruning (PruneObstaclesByDistance
+	// etc.), which happens once before this function runs
+	// (GraphShortPathMPC::solve()) -- same "computed once per solve() call"
+	// discipline as everything else.
 	int obstacle_rows = 0;
-	for (const auto& v : per_agent_obstacles) obstacle_rows += static_cast<int>(v.size());
-	const int grid_rows = static_cast<int>(std::count_if(
-		active_grids.begin(), active_grids.end(), [](const AgentSdfGrid* g) { return g != nullptr; }));
-	const int m = num_steps * (obstacle_rows + static_cast<int>(active_pairs.size()) + grid_rows);
+	for (const auto& v : per_agent_obstacles)
+		for (const ActiveObstacle& ao : v) obstacle_rows += ao.step_hi - ao.step_lo;
+	int pair_rows = 0;
+	for (const ActivePair& ap : active_pairs) pair_rows += ap.step_hi - ap.step_lo;
+	int grid_rows = 0;
+	for (const ActiveGrid& g : active_grids)
+		if (g.grid) grid_rows += g.step_hi - g.step_lo;
+	const int m = obstacle_rows + pair_rows + grid_rows;
 	// QP decision vector z = [dx_smooth (n_smooth) | slack (m)].
 	const int n = n_smooth + m;
 	// proxqp inequality rows: `m` slack-relaxed penalty rows (a^T dx + s >=
@@ -758,13 +762,13 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 		// ApplySafetyProjection/ApplyAgentPairSafetyProjection (inside
 		// RunTrustRegionSqp) still check every registered obstacle/pair
 		// regardless of what got pruned out here.
-		const std::vector<std::vector<const Obstacle*>> per_agent_obstacles =
+		const std::vector<std::vector<ActiveObstacle>> per_agent_obstacles =
 			PruneObstaclesByDistance(ref_points, num_agents, _agent_ambient_offsets, workspace_dim,
 						  *_obstacles, _constraint_prune_margin);
-		const std::vector<std::pair<int, int>> active_pairs =
+		const std::vector<ActivePair> active_pairs =
 			PruneAgentPairsByDistance(ref_points, num_agents, _agent_ambient_offsets, workspace_dim,
 						   _agent_radii, _constraint_prune_margin);
-		const std::vector<const AgentSdfGrid*> active_grids =
+		const std::vector<ActiveGrid> active_grids =
 			PruneAgentSdfGridsByDistance(ref_points, num_agents, _agent_ambient_offsets, workspace_dim,
 						      *_obstacles, _constraint_prune_margin);
 

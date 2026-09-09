@@ -219,42 +219,59 @@ double EvaluateSmoothCost(const CubicConfigurationSpline& agent_shape, int num_s
 			   const Eigen::MatrixXd& points_agent, const Eigen::MatrixXd& vels_agent,
 			   const Eigen::MatrixXd& ref_points_agent, const Eigen::MatrixXd& ref_velocities_agent);
 
-// Per-agent obstacle pointers "close enough to plausibly matter" over this
-// solve() call's horizon: agent ag's own REFERENCE-trajectory bounding
-// sphere (obstacle_projection.hpp's TrajectoryBoundingSphere) vs each
-// registered obstacle's own extent (sphere: radius+margin; box: half-
-// extents' norm+margin, a conservative circumscribing-sphere proxy) --
-// included if the two spheres could plausibly come within `prune_margin`
-// of touching. Computed ONCE per solve() call (GraphShortPathMPC::solve(),
-// alongside `ref_points`), reused for the whole call -- same "row COUNT
-// fixed for the whole solve() call" discipline design decision 6 already
-// established for the unpruned case (row COEFFICIENTS still get
-// relinearized every outer iteration; which rows EXIST does not, and
-// pruning is exactly one more thing computed once and held fixed).
+// A surviving (agent, obstacle) / agent-pair / (agent, grid), with the
+// half-open horizon-step range `[step_lo, step_hi)` over which the
+// REFERENCE trajectory actually comes within reach -- rows and merit terms
+// are emitted only for those steps. `step_lo >= step_hi` means "survived
+// the coarse whole-trajectory test but no individual step is close" and
+// contributes nothing. The range is contiguous by construction (a
+// short-horizon reference approaches a fixed obstacle -- or another agent's
+// reference -- at most once); a genuinely bimodal reference would just get
+// an over-wide range here, never a too-narrow one, so this can only
+// over-include rows, never drop a row that matters.
 //
-// PURELY a speed optimization on the SQP's own optimization path --
-// pointers into `obstacles`, valid only for the caller's own solve() call
-// (ObstacleSet isn't mutated mid-call). GraphShortPathMPC's own
-// ApplySafetyProjection final hard-feasibility pass (graph_short_path_mpc.cpp)
-// checks EVERY registered obstacle for every agent regardless of this
-// pruning, so an obstacle wrongly excluded here degrades solution
-// SMOOTHNESS around it (handled by that pass's less-smooth closed-form
-// fallback instead of the SQP loop optimizing around it), never
-// correctness/feasibility -- see that function's own comment for why this
-// asymmetry is safe to lean on.
-std::vector<std::vector<const Obstacle*>> PruneObstaclesByDistance(
+// Computed ONCE per solve() call (GraphShortPathMPC::solve(), alongside
+// `ref_points`) and held fixed for the whole call -- design decision 6: row
+// COEFFICIENTS relinearize every outer iteration, which rows EXIST does
+// not. PURELY a speed lever on the SQP's own optimization path:
+// GraphShortPathMPC's ApplySafetyProjection / ApplyAgentPairSafetyProjection
+// final hard-feasibility passes check EVERY registered obstacle / pair at
+// EVERY step regardless, so a wrongly-excluded (step, obstacle) degrades
+// only the SMOOTHNESS of the SQP's avoidance there (handled by the
+// closed-form fallback instead), never correctness/feasibility.
+struct ActiveObstacle {
+	const Obstacle* obstacle;
+	int step_lo = 0;
+	int step_hi = 0;
+};
+struct ActivePair {
+	int ag_a = 0;
+	int ag_b = 0;
+	int step_lo = 0;
+	int step_hi = 0;
+};
+
+// Per-agent obstacle list "close enough to plausibly matter" over this
+// solve() call's horizon: agent ag's REFERENCE-trajectory bounding sphere
+// (obstacle_projection.hpp's TrajectoryBoundingSphere) vs each registered
+// obstacle's extent (sphere: radius+margin; box: half-extents' norm+margin,
+// a conservative circumscribing-sphere proxy) as a cheap coarse filter,
+// then a per-step distance check narrowing to `[step_lo, step_hi)` (the
+// ActiveObstacle range above). An obstacle that clears neither filter is
+// omitted from `per_agent_obstacles[ag]` entirely.
+std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
 	int workspace_dim, const ObstacleSet& obstacles, double prune_margin);
 
-// Same idea for inter-agent pairs: (ag_a, ag_b) survives if their own
-// reference-trajectory bounding spheres could plausibly bring them within
-// `agent_radii(ag_a) + agent_radii(ag_b) + prune_margin` of each other.
-// ApplyAgentPairSafetyProjection's final pass checks EVERY pair
-// regardless -- same non-issue-for-correctness property as above. This is
-// the more consequential of the two prunings in practice: unpruned pair
-// count grows as `num_agents*(num_agents-1)/2`, quadratic in agent count,
-// while unpruned obstacle rows only grow linearly in obstacle count.
-std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
+// Same idea for inter-agent pairs: (ag_a, ag_b) survives the coarse filter
+// if their reference-trajectory bounding spheres could bring them within
+// `agent_radii(ag_a) + agent_radii(ag_b) + prune_margin`, then the per-step
+// separation check narrows to `[step_lo, step_hi)`. This is the more
+// consequential of the two prunings: unpruned pair count grows as
+// `num_agents*(num_agents-1)/2` AND crossing agents are typically only
+// close for a few mid-horizon steps, so per-step narrowing compounds with
+// the pair-level filter.
+std::vector<ActivePair> PruneAgentPairsByDistance(
 	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
 	int workspace_dim, const Eigen::VectorXd& agent_radii, double prune_margin);
 
@@ -276,7 +293,7 @@ std::vector<std::pair<int, int>> PruneAgentPairsByDistance(
 // have entirely different specs/tangent widths from one another).
 double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				  int workspace_dim, const Eigen::MatrixXd& points,
-				  const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles);
+				  const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles);
 
 // Every (step, agent, obstacle) row for `per_agent_obstacles[ag]` (see
 // PruneObstaclesByDistance's own comment), linearized at the current
@@ -292,7 +309,7 @@ double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vecto
 std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
-	const std::vector<std::vector<const Obstacle*>>& per_agent_obstacles);
+	const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles);
 
 // Inter-agent avoidance: every (step, agent-pair) SURVIVING
 // PruneAgentPairsByDistance is treated as a sphere constraint on the
@@ -319,12 +336,12 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 // columns, no fk chain rule.
 double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_ambient_offsets, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-				   const std::vector<std::pair<int, int>>& active_pairs);
+				   const std::vector<ActivePair>& active_pairs);
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, const std::vector<int>& agent_ambient_offsets,
 	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-	const std::vector<std::pair<int, int>>& active_pairs);
+	const std::vector<ActivePair>& active_pairs);
 
 // Value + gradient of one AgentSdfGrid, multilinearly interpolated
 // (bilinear for workspace_dim=2, trilinear for workspace_dim=3) at world
@@ -356,36 +373,41 @@ SdfSample QueryAgentSdfGrid(const AgentSdfGrid& grid, const Eigen::VectorXd& p, 
 // solve() call's horizon, same distance-pruning idea as
 // PruneObstaclesByDistance but singular per agent (a grid is registered
 // PER AGENT already, not shared/matched-by-proximity like spheres/boxes --
-// see AgentSdfGrid's own comment) and compared against the grid's own
-// AABB instead of a sphere/box's radius/half-extents. Returned vector is
-// `num_agents` long; entry `ag` is `nullptr` if agent `ag` has no
-// registered grid OR its grid's AABB can't plausibly come within
-// `prune_margin` of the agent's own reference-trajectory bounding sphere.
-// Same "purely a speed lever, computed once per solve() call, never
-// affects correctness" property as PruneObstaclesByDistance -- the final
-// safety-projection pass (graph_short_path_mpc.cpp) checks every agent's
-// registered grid regardless of this pruning.
-std::vector<const AgentSdfGrid*> PruneAgentSdfGridsByDistance(
+// see AgentSdfGrid's own comment) and compared against the grid's own AABB
+// instead of a sphere/box's radius/half-extents. Returned vector is
+// `num_agents` long; entry `ag` has a null `grid` if agent `ag` has no
+// registered grid OR its grid's AABB can't come within `prune_margin` of
+// the agent's reference-trajectory bounding sphere, and otherwise carries
+// the per-step range `[step_lo, step_hi)` the reference is actually within
+// range of the grid. Same "purely a speed lever, computed once per solve()
+// call, never affects correctness" property as PruneObstaclesByDistance --
+// the final safety-projection pass checks every agent's grid regardless.
+struct ActiveGrid {
+	const AgentSdfGrid* grid = nullptr;
+	int step_lo = 0;
+	int step_hi = 0;
+};
+std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
 	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
 	int workspace_dim, const ObstacleSet& obstacles, double prune_margin);
 
 // Total grid-constraint violation (sum of max(0, -value) over every (step,
-// agent) with a non-null `active_grids[ag]`) at the given absolute
-// `points` -- the merit function's penalty term, same role as
-// EvaluateObstacleViolation but for grid obstacles.
+// agent) with a non-null `active_grids[ag].grid` and step in its range) at
+// the given absolute `points` -- the merit function's penalty term, same
+// role as EvaluateObstacleViolation but for grid obstacles.
 double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				      int workspace_dim, const Eigen::MatrixXd& points,
-				      const std::vector<const AgentSdfGrid*>& active_grids);
+				      const std::vector<ActiveGrid>& active_grids);
 
-// One (step, agent) row per non-null `active_grids[ag]`, linearized at the
-// current iterate `points` -- same fk fast-path shape as
-// LinearizeObstacleConstraints (constant 0/1 selection Jacobian), row
-// count `O(steps*agents)` regardless of grid resolution (the whole point
-// of a field representation over Stage 3's reverted one-row-per-point
-// approach -- see the project plan).
+// One (step, agent) row per non-null `active_grids[ag].grid`, over its
+// `[step_lo, step_hi)` range, linearized at the current iterate `points` --
+// same fk fast-path shape as LinearizeObstacleConstraints (constant 0/1
+// selection Jacobian), row count `O(steps*agents)` regardless of grid
+// resolution (the whole point of a field representation over Stage 3's
+// reverted one-row-per-point approach -- see the project plan).
 std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
-	const std::vector<const AgentSdfGrid*>& active_grids);
+	const std::vector<ActiveGrid>& active_grids);
 
 }  // namespace sqp_short_path
