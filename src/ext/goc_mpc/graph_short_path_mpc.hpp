@@ -63,10 +63,10 @@ namespace py = pybind11;
 //      Jacobian. With nothing registered an agent gets the trivial model --
 //      one radius-0 sphere at `q[:workspace_dim]` with a constant [I|0]
 //      Jacobian -- so the rows reduce exactly to the old
-//      `fk(q) = q[:workspace_dim]` selection. Tier A (rigid multi-sphere
-//      body) is closed-form C++; Tier B (articulated arm) evaluates a Drake
-//      MultibodyPlant. The closed-form safety-projection passes run only
-//      for trivial agents (no IK analogue otherwise).
+//      `fk(q) = q[:workspace_dim]` selection. A registered model evaluates a
+//      Drake MultibodyPlant (articulated arm). The closed-form
+//      safety-projection passes run only for trivial agents (no IK analogue
+//      otherwise).
 //
 // Public interface: solve(x0, v0, var_assignments, remaining_vertices,
 // references) -> bool plus view_points/view_vels/view_times/view_obstacles/
@@ -128,9 +128,8 @@ struct GraphShortPathMPC {
 	// 3), one entry per agent, every entry non-null. Built all-trivial in
 	// the constructor (single radius-0 point sphere at q[:workspace_dim],
 	// constant [I|0] Jacobian -- exactly the old fk fast path); a caller
-	// replaces individual entries via set_agent_collision_* to give an
-	// agent a rigid multi-sphere body (Tier A) or a Drake-plant articulated
-	// FK (Tier B). Every constraint-row / violation path loops over each
+	// replaces individual entries via set_agent_collision_model to give an
+	// agent a Drake-plant articulated FK. Every constraint-row / violation path loops over each
 	// agent's model's spheres; the closed-form safety-projection passes run
 	// only for agents whose model `is_trivial()`.
 	sqp_short_path::AgentCollisionModels _agent_collision_models;

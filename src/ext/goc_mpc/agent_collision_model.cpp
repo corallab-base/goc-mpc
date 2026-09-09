@@ -56,12 +56,12 @@ std::unique_ptr<AgentCollisionModel> MakeTrivialCollisionModel(int workspace_dim
 
 namespace {
 
-// Tier B (v2 plan Stage 3c): the agent's configuration is a fixed-base,
-// all-revolute arm's joint vector; a Drake MultibodyPlant parsed once from a
-// URDF/MJCF supplies each body-sphere's world centre and its analytic
-// position Jacobian w.r.t. those joints. Kinematics only -- no dynamics, no
-// collision queries (the spheres are supplied by the caller, not read from
-// the model's own <collision> geometry).
+// v2 plan Stage 3c: the agent's configuration is a fixed-base, all-revolute
+// arm's joint vector; a Drake MultibodyPlant parsed once from a URDF/MJCF
+// supplies each body-sphere's world centre and its analytic position
+// Jacobian w.r.t. those joints. Kinematics only -- no dynamics, no collision
+// queries (the spheres are supplied by the caller, not read from the model's
+// own <collision> geometry).
 class DrakePlantCollisionModel : public AgentCollisionModel {
    public:
 	DrakePlantCollisionModel(const AgentCollisionSpec& spec, int workspace_dim, int tangent_dim)

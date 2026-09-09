@@ -89,26 +89,24 @@ std::unique_ptr<AgentCollisionModel> MakeTrivialCollisionModel(int workspace_dim
 // ---------------------------------------------------------------------------
 
 struct CollisionSphereSpec {
-	// Tier B (kArticulated): name of the plant body this sphere rides on.
+	// Name of the plant body this sphere rides on.
 	std::string body;
-	// Tier A (kRigidConstellation): index into graph._robot_specs[agent] of
-	// the block whose pose places this sphere. Ignored for Tier B.
-	int block = 0;
-	// Sphere centre in the body's / block's local frame.
+	// Sphere centre in that body's local frame.
 	Eigen::Vector3d offset = Eigen::Vector3d::Zero();
 	double radius = 0.0;
 };
 
+// A registered non-trivial collision body: a Drake MultibodyPlant parsed
+// once from a model file, with body-local spheres. Scoped to fixed-base
+// all-revolute arms (plant.num_positions() == agent tangent_dim). A rigid
+// multi-sphere constellation on a *moving* agent (mobile base / gripper as
+// spheres) would need a floating-base plant and the tangent-space mapping
+// for a non-q̇ base velocity -- deferred with the rest of that case, not a
+// separate model kind here.
 struct AgentCollisionSpec {
-	enum class Kind {
-		kArticulated,        // Tier B: Drake MultibodyPlant parsed from model_path
-		kRigidConstellation  // Tier A: closed-form on the agent's own blocks (not built yet)
-	};
-	Kind kind = Kind::kArticulated;
-
-	// Tier B: a URDF / MJCF / SDF file, parsed once into a MultibodyPlant.
+	// A URDF / MJCF / SDF file, parsed once into a MultibodyPlant.
 	std::string model_path;
-	// Tier B: the root link welded to the world, and its welded world pose
+	// The root link welded to the world, and its welded world pose
 	// (translation + wxyz quaternion). For the ur_description UR5e the root
 	// link is "base_link".
 	std::string base_link;
@@ -118,7 +116,7 @@ struct AgentCollisionSpec {
 	std::vector<CollisionSphereSpec> spheres;
 };
 
-// Tier B: Drake MultibodyPlant forward kinematics. `q_ambient` (the agent's
+// Drake MultibodyPlant forward kinematics. `q_ambient` (the agent's
 // own ambient configuration, which must equal plant.num_positions()) sets
 // the plant's positions; each sphere's centre is X_WB(q) * offset and its
 // Jacobian is the plant's translational-velocity Jacobian of that point

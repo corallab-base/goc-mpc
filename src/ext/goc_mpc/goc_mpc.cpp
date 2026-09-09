@@ -198,9 +198,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("set_robot_fk", &GraphOfConstraints::set_robot_fk,
 		     py::arg("agent_id"), py::arg("link_name"), py::arg("fk_fn"))
 		// Register a configuration-dependent workspace-sphere collision
-		// body for an agent of GraphShortPathMPC (v2 plan Stage 3). Tier B
-		// (kArticulated): `model_path` is a URDF/MJCF/SDF parsed once into
-		// a Drake MultibodyPlant, `base_link` is welded to the world at
+		// body for an agent of GraphShortPathMPC (v2 plan Stage 3):
+		// `model_path` is a URDF/MJCF/SDF parsed once into a Drake
+		// MultibodyPlant, `base_link` is welded to the world at
 		// `base_translation` + `base_quaternion_wxyz` (wxyz), and `spheres`
 		// is a list of `(body_name, offset_xyz, radius)` in that body's
 		// local frame. The agent must be a fixed-base all-revolute arm
@@ -213,7 +213,6 @@ void init_submodule_goc_mpc(py::module_& m) {
 			const Eigen::Vector4d& base_quaternion_wxyz,
 			const std::vector<std::tuple<std::string, Eigen::Vector3d, double>>& spheres) {
 			     sqp_short_path::AgentCollisionSpec spec;
-			     spec.kind = sqp_short_path::AgentCollisionSpec::Kind::kArticulated;
 			     spec.model_path = model_path;
 			     spec.base_link = base_link;
 			     spec.base_translation = base_translation;

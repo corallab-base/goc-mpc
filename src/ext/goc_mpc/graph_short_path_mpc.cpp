@@ -139,7 +139,8 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 	// Per-agent collision model: the trivial single-radius-0-point model
 	// (exact old fk fast path) unless the caller registered a body via
 	// graph.set_agent_collision_model (v2 plan Stage 3), in which case build
-	// the real model here (a Drake MultibodyPlant for kArticulated).
+	// the real model here -- a Drake MultibodyPlant parsed from the spec's
+	// model file.
 	_agent_collision_models.reserve(num_agents);
 	for (unsigned int ag = 0; ag < num_agents; ++ag) {
 		const int wd = graph.workspace_dim;
@@ -148,13 +149,8 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 		const auto it = graph.agent_collision_specs.find(static_cast<int>(ag));
 		if (it == graph.agent_collision_specs.end()) {
 			_agent_collision_models.push_back(MakeTrivialCollisionModel(wd, td, ad));
-		} else if (it->second.kind == AgentCollisionSpec::Kind::kArticulated) {
-			_agent_collision_models.push_back(MakeDrakePlantCollisionModel(it->second, wd, td));
 		} else {
-			throw std::runtime_error(
-				"GraphShortPathMPC: agent " + std::to_string(ag) + " registered a "
-				"kRigidConstellation collision model, which is not implemented yet "
-				"(v2 plan Stage 3b).");
+			_agent_collision_models.push_back(MakeDrakePlantCollisionModel(it->second, wd, td));
 		}
 	}
 	_smooth_hessian_normal = AssembleSmoothHessian(_agent_shapes, _agent_axis_offsets,
