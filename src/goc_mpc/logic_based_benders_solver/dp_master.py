@@ -391,6 +391,12 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
         # per branch against the branch-free layer's wp). A branched entry
         # reading another branched entry's column would couple the branch DP
         # -- not implemented (block stacking is a flat 2-layer chain).
+
+        # EXAMPLE: an analytic IK proj on one robot that constraints him to be
+        # in one of a few places, and then another analytic IK proj that
+        # constrains another robot to be next to the first robot. Maybe it is
+        # okay to keep it out of scope, but I would like to leave nothing missing
+
         layer0 = tuple(e for e in proj_entries if e.discrete_params == 1)
         branched = [e for e in proj_entries if e.discrete_params > 1]
         # A branched entry reading ANOTHER branched entry's pinned column
@@ -419,6 +425,7 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
         raise NotImplementedError(
             f"dp_master: {n_agents}**{n_var} = {n_assign} assignment combos "
             f"> max_assign_combos={max_assign_combos}")
+
     assign_combos = (list(itertools.product(range(n_agents), repeat=n_var))
                      if n_var else [()])
     aux_combos = list(itertools.product((0, 1), repeat=n_cond)) if n_cond else [()]
