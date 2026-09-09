@@ -30,7 +30,7 @@ import time
 import jax.numpy as jnp
 import numpy as np
 
-from ..evolutionary_waypoint_solver.problem import AnchorState, apply_anchor, apply_projections
+from ..evolutionary_waypoint_solver.problem import AnchorState, apply_anchor, jit_apply_projections
 from ..evolutionary_waypoint_solver.spec import (
     _agent_widths, _object_slot_width, _object_widths, _slot_width,
     build_graph_ordering_problem)
@@ -191,12 +191,12 @@ class DpMasterWaypointSolver:
             proj_branch[e.branch_slice.start + idx] = 1.0
         t_vec = np.array([r["time"].get(n, 0.0) for n in range(problem.n_nodes)], dtype=float)
 
-        W = np.asarray(apply_projections(
-            problem, jnp.asarray(wp_template[None]), jnp.zeros((1, problem.n_psi)),
+        W = np.asarray(jit_apply_projections(problem)(
+            jnp.asarray(wp_template[None]), jnp.zeros((1, problem.n_psi)),
             jnp.asarray(proj_branch[None]), jnp.asarray(params),
-            assign=jnp.asarray(assign), cond_binary=jnp.asarray(aux),
-            t=jnp.asarray(t_vec[None]), node_active=anchor.node_active,
-            x0=jnp.asarray(x0_full)))[0]
+            jnp.asarray(assign), jnp.asarray(aux),
+            jnp.asarray(t_vec[None]), anchor.node_active,
+            jnp.asarray(x0_full)))[0]
         _, wp_frozen, _ = apply_anchor(problem, jnp.asarray(assign), jnp.asarray(W[None]),
                                        anchor, jnp.asarray(x0_full))
         W = np.asarray(wp_frozen)[0]

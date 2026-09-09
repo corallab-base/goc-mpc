@@ -554,6 +554,12 @@ def full_active_anchor(problem):
 
 
 def _infer_constraint_size(fn, n_variables, n_agents, n_nodes, state_dim, n_cond_vars, n_params):
+    """Output width of `fn` on this problem's shapes, without ever running it:
+    `jax.eval_shape` traces `fn` abstractly from the dummy args' shape/dtype
+    alone. A real (eager) call here would dispatch every un-fused jnp
+    primitive inside `fn` (an eq/ineq constraint can embed a full FK/IK
+    chain) as its own tiny XLA program -- dozens of one-off compiles just to
+    learn a shape."""
     dummy_assign = np.zeros((1, n_variables, n_agents))
     dummy_cond_binary = np.zeros((1, n_cond_vars))
     dummy_t = np.zeros((1, n_nodes))
@@ -561,8 +567,9 @@ def _infer_constraint_size(fn, n_variables, n_agents, n_nodes, state_dim, n_cond
     dummy_node_active = np.ones((n_nodes,), dtype=bool)
     dummy_x0 = np.zeros((state_dim,))
     dummy_params = np.zeros((n_params,))
-    return np.asarray(fn(dummy_assign, dummy_cond_binary, dummy_t, dummy_wp, dummy_wp,
-                          dummy_node_active, dummy_x0, dummy_params)).shape[1]
+    out_shape = jax.eval_shape(fn, dummy_assign, dummy_cond_binary, dummy_t, dummy_wp, dummy_wp,
+                                dummy_node_active, dummy_x0, dummy_params)
+    return out_shape.shape[1]
 
 
 class GraphOrderingRelaxed:
