@@ -197,6 +197,41 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("make_node_unpassable", &GraphOfConstraints::make_node_unpassable)
 		.def("set_robot_fk", &GraphOfConstraints::set_robot_fk,
 		     py::arg("agent_id"), py::arg("link_name"), py::arg("fk_fn"))
+		// Register a configuration-dependent workspace-sphere collision
+		// body for an agent of GraphShortPathMPC (v2 plan Stage 3). Tier B
+		// (kArticulated): `model_path` is a URDF/MJCF/SDF parsed once into
+		// a Drake MultibodyPlant, `base_link` is welded to the world at
+		// `base_translation` + `base_quaternion_wxyz` (wxyz), and `spheres`
+		// is a list of `(body_name, offset_xyz, radius)` in that body's
+		// local frame. The agent must be a fixed-base all-revolute arm
+		// registered as one Block::R(n_joints) with n_joints ==
+		// plant.num_positions(). Consumed by GraphShortPathMPC's
+		// constructor, so register BEFORE constructing the solver.
+		.def("set_agent_collision_model",
+		     [](GraphOfConstraints& g, int agent_id, const std::string& model_path,
+			const std::string& base_link, const Eigen::Vector3d& base_translation,
+			const Eigen::Vector4d& base_quaternion_wxyz,
+			const std::vector<std::tuple<std::string, Eigen::Vector3d, double>>& spheres) {
+			     sqp_short_path::AgentCollisionSpec spec;
+			     spec.kind = sqp_short_path::AgentCollisionSpec::Kind::kArticulated;
+			     spec.model_path = model_path;
+			     spec.base_link = base_link;
+			     spec.base_translation = base_translation;
+			     spec.base_quaternion_wxyz = base_quaternion_wxyz;
+			     for (const auto& [body, offset, radius] : spheres) {
+				     sqp_short_path::CollisionSphereSpec s;
+				     s.body = body;
+				     s.offset = offset;
+				     s.radius = radius;
+				     spec.spheres.push_back(std::move(s));
+			     }
+			     g.agent_collision_specs[agent_id] = std::move(spec);
+		     },
+		     py::arg("agent_id"), py::arg("model_path"), py::arg("base_link"),
+		     py::arg("base_translation") = Eigen::Vector3d::Zero(),
+		     py::arg("base_quaternion_wxyz") = Eigen::Vector4d(1.0, 0.0, 0.0, 0.0),
+		     py::arg("spheres") =
+			     std::vector<std::tuple<std::string, Eigen::Vector3d, double>>{})
 		// Raw (agent_id, link_name) -> fk_fn registry (see set_robot_fk's
 		// doc comment) -- exposed read-only so the JAX evolutionary
 		// solver (src/goc_mpc/evolutionary_waypoint_solver/spec.py) can
@@ -579,5 +614,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_obstacles", &GraphShortPathMPC::view_obstacles, py::return_value_policy::reference_internal)
 		.def("get_last_solve_time", &GraphShortPathMPC::get_last_solve_time)
 		.def("get_last_iterations", &GraphShortPathMPC::get_last_iterations)
-		.def("get_last_trust_radius", &GraphShortPathMPC::get_last_trust_radius);
+		.def("get_last_trust_radius", &GraphShortPathMPC::get_last_trust_radius)
+		.def("eval_agent_collision_spheres", &GraphShortPathMPC::eval_agent_collision_spheres,
+		     py::arg("agent_id"), py::arg("q_agent"))
+		.def("eval_agent_collision_jacobians", &GraphShortPathMPC::eval_agent_collision_jacobians,
+		     py::arg("agent_id"), py::arg("q_agent"));
 }

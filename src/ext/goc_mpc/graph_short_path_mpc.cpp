@@ -136,14 +136,26 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 	_agent_axis_offsets = BuildAgentAxisOffsets(_agent_shapes);
 	_agent_ambient_offsets = BuildAgentAmbientOffsets(_agent_shapes);
 
-	// Every agent starts with the trivial (single radius-0 point sphere at
-	// q[:workspace_dim], constant [I|0] Jacobian) collision model -- the
-	// exact old fk fast path. A caller swaps in a real body via
-	// set_agent_collision_* (v2 plan Stage 3).
+	// Per-agent collision model: the trivial single-radius-0-point model
+	// (exact old fk fast path) unless the caller registered a body via
+	// graph.set_agent_collision_model (v2 plan Stage 3), in which case build
+	// the real model here (a Drake MultibodyPlant for kArticulated).
 	_agent_collision_models.reserve(num_agents);
 	for (unsigned int ag = 0; ag < num_agents; ++ag) {
-		_agent_collision_models.push_back(MakeTrivialCollisionModel(
-			graph.workspace_dim, _agent_shapes[ag].tangent_dim(), _agent_shapes[ag].ambient_dim()));
+		const int wd = graph.workspace_dim;
+		const int td = _agent_shapes[ag].tangent_dim();
+		const int ad = _agent_shapes[ag].ambient_dim();
+		const auto it = graph.agent_collision_specs.find(static_cast<int>(ag));
+		if (it == graph.agent_collision_specs.end()) {
+			_agent_collision_models.push_back(MakeTrivialCollisionModel(wd, td, ad));
+		} else if (it->second.kind == AgentCollisionSpec::Kind::kArticulated) {
+			_agent_collision_models.push_back(MakeDrakePlantCollisionModel(it->second, wd, td));
+		} else {
+			throw std::runtime_error(
+				"GraphShortPathMPC: agent " + std::to_string(ag) + " registered a "
+				"kRigidConstellation collision model, which is not implemented yet "
+				"(v2 plan Stage 3b).");
+		}
 	}
 	_smooth_hessian_normal = AssembleSmoothHessian(_agent_shapes, _agent_axis_offsets,
 							static_cast<int>(num_steps), time_per_step,
@@ -166,6 +178,42 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 	for (const auto& shape : _agent_shapes) total_ambient += shape.ambient_dim();
 	_points = Eigen::MatrixXd::Zero(_num_steps, total_ambient);
 	_vels = Eigen::MatrixXd::Zero(_num_steps, static_cast<int>(_axes.size()));
+}
+
+std::pair<Eigen::MatrixXd, Eigen::VectorXd> GraphShortPathMPC::eval_agent_collision_spheres(
+		int agent_id, const Eigen::VectorXd& q_agent) const {
+	const AgentCollisionModel& model = *_agent_collision_models.at(agent_id);
+	if (q_agent.size() != model.ambient_dim()) {
+		throw std::runtime_error(
+			"GraphShortPathMPC::eval_agent_collision_spheres: q_agent has " +
+			std::to_string(q_agent.size()) + " entries but agent " + std::to_string(agent_id) +
+			"'s collision model expects " + std::to_string(model.ambient_dim()) + ".");
+	}
+	const std::vector<sqp_short_path::WorkspaceSphere> spheres = model.Eval(q_agent);
+	const int wd = _graph->workspace_dim;
+	Eigen::MatrixXd centers(static_cast<int>(spheres.size()), wd);
+	Eigen::VectorXd radii(static_cast<int>(spheres.size()));
+	for (int k = 0; k < static_cast<int>(spheres.size()); ++k) {
+		centers.row(k) = spheres[k].center.head(wd).transpose();
+		radii(k) = spheres[k].radius;
+	}
+	return {centers, radii};
+}
+
+std::vector<Eigen::MatrixXd> GraphShortPathMPC::eval_agent_collision_jacobians(
+		int agent_id, const Eigen::VectorXd& q_agent) const {
+	const AgentCollisionModel& model = *_agent_collision_models.at(agent_id);
+	if (q_agent.size() != model.ambient_dim()) {
+		throw std::runtime_error(
+			"GraphShortPathMPC::eval_agent_collision_jacobians: q_agent has " +
+			std::to_string(q_agent.size()) + " entries but agent " + std::to_string(agent_id) +
+			"'s collision model expects " + std::to_string(model.ambient_dim()) + ".");
+	}
+	const std::vector<sqp_short_path::WorkspaceSphere> spheres = model.Eval(q_agent);
+	std::vector<Eigen::MatrixXd> jacs;
+	jacs.reserve(spheres.size());
+	for (const sqp_short_path::WorkspaceSphere& s : spheres) jacs.push_back(s.jac);
+	return jacs;
 }
 
 GraphShortPathMPC::~GraphShortPathMPC() = default;
@@ -800,19 +848,22 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 		// Distance-based row pruning (design decision 6: computed ONCE per
 		// solve() call, from the REFERENCE trajectory, held fixed for the
 		// whole call -- see PruneObstaclesByDistance/PruneAgentPairsByDistance's
-		// own comments). Purely a speed lever, not a feasibility one:
-		// ApplySafetyProjection/ApplyAgentPairSafetyProjection (inside
-		// RunTrustRegionSqp) still check every registered obstacle/pair
-		// regardless of what got pruned out here.
+		// own comments). Purely a speed lever, not a feasibility one for a
+		// TRIVIAL agent (ApplySafetyProjection/ApplyAgentPairSafetyProjection
+		// still check every registered obstacle/pair for those). Each agent's
+		// swept collision-sphere geometry along the reference is evaluated
+		// once here and drives all three prunings.
+		const std::vector<AgentReferenceSpheres> ref_spheres = BuildAgentReferenceSpheres(
+			ref_points, num_agents, _agent_ambient_offsets, workspace_dim, _agent_collision_models);
 		const std::vector<std::vector<ActiveObstacle>> per_agent_obstacles =
-			PruneObstaclesByDistance(ref_points, num_agents, _agent_ambient_offsets, workspace_dim,
-						  *_obstacles, _constraint_prune_margin);
+			PruneObstaclesByDistance(H, num_agents, workspace_dim, ref_spheres, *_obstacles,
+						  _constraint_prune_margin);
 		const std::vector<ActivePair> active_pairs =
-			PruneAgentPairsByDistance(ref_points, num_agents, _agent_ambient_offsets, workspace_dim,
+			PruneAgentPairsByDistance(H, num_agents, ref_spheres, _agent_collision_models,
 						   _agent_radii, _constraint_prune_margin);
 		const std::vector<ActiveGrid> active_grids =
-			PruneAgentSdfGridsByDistance(ref_points, num_agents, _agent_ambient_offsets, workspace_dim,
-						      *_obstacles, _constraint_prune_margin);
+			PruneAgentSdfGridsByDistance(H, num_agents, ref_spheres, *_obstacles,
+						      _constraint_prune_margin);
 
 		SqpResult result = RunTrustRegionSqp(
 			_agent_shapes, _axes, _agent_axis_offsets, _agent_ambient_offsets, _agent_collision_models,

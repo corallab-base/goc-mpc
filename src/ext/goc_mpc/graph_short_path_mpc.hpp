@@ -234,6 +234,21 @@ struct GraphShortPathMPC {
 		   const std::vector<int>& remaining_vertices,
 		   const std::vector<CubicConfigurationSpline>& references);
 
+	// Body-sphere centres (K x workspace_dim) and radii (K) of `agent_id`'s
+	// collision model at that agent's ambient configuration `q_agent` -- for
+	// visualization and for cross-checking a registered articulated FK
+	// against its source (e.g. a JAX sphere-FK). Not used by solve().
+	std::pair<Eigen::MatrixXd, Eigen::VectorXd> eval_agent_collision_spheres(
+		int agent_id, const Eigen::VectorXd& q_agent) const;
+
+	// The matching per-sphere centre Jacobians (K entries, each
+	// workspace_dim x agent_tangent_dim) at `q_agent` -- the exact linear
+	// model the QP rows are built from. For finite-difference checking the
+	// analytic Jacobian against eval_agent_collision_spheres. Not used by
+	// solve().
+	std::vector<Eigen::MatrixXd> eval_agent_collision_jacobians(
+		int agent_id, const Eigen::VectorXd& q_agent) const;
+
 	const Eigen::MatrixXd& view_points() { return _points; }
 	const Eigen::MatrixXd& view_vels() { return _vels; }
 	const Eigen::VectorXd& view_times() { return _times; }

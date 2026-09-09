@@ -432,26 +432,75 @@ std::pair<int, int> StepRange(int num_steps, F&& within) {
 }
 }  // namespace
 
-std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
-	int workspace_dim, const ObstacleSet& obstacles, double prune_margin) {
+std::vector<AgentReferenceSpheres> BuildAgentReferenceSpheres(
+	const Eigen::MatrixXd& ref_points, int num_agents,
+	const std::vector<int>& agent_ambient_offsets, int workspace_dim,
+	const AgentCollisionModels& models) {
 	const int num_steps = static_cast<int>(ref_points.rows());
+	std::vector<AgentReferenceSpheres> out(num_agents);
+	for (int ag = 0; ag < num_agents; ++ag) {
+		AgentReferenceSpheres& rs = out[ag];
+		const int K = models[ag]->num_spheres();
+		rs.centers.resize(num_steps);
+		rs.radii = Eigen::VectorXd::Zero(K);
+
+		Eigen::VectorXd sum = Eigen::VectorXd::Zero(workspace_dim);
+		long count = 0;
+		for (int i = 0; i < num_steps; ++i) {
+			const Eigen::VectorXd q_ag = ref_points.row(i)
+							     .segment(agent_ambient_offsets[ag],
+								      models[ag]->ambient_dim())
+							     .transpose();
+			const std::vector<WorkspaceSphere> sph = models[ag]->Eval(q_ag);
+			Eigen::MatrixXd C(K, workspace_dim);
+			for (int k = 0; k < K; ++k) {
+				C.row(k) = sph[k].center.head(workspace_dim).transpose();
+				if (i == 0) rs.radii(k) = sph[k].radius;
+				sum += sph[k].center.head(workspace_dim);
+				++count;
+			}
+			rs.centers[i] = std::move(C);
+		}
+		rs.max_radius = K > 0 ? rs.radii.maxCoeff() : 0.0;
+
+		const Eigen::VectorXd bcenter =
+			count > 0 ? (sum / static_cast<double>(count)).eval()
+				  : Eigen::VectorXd::Zero(workspace_dim);
+		double bradius = 0.0;
+		for (int i = 0; i < num_steps; ++i)
+			for (int k = 0; k < rs.centers[i].rows(); ++k)
+				bradius = std::max(bradius,
+						   (rs.centers[i].row(k).transpose() - bcenter).norm());
+		rs.bound = BoundingSphere{bcenter, bradius};
+	}
+	return out;
+}
+
+std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
+	int num_steps, int num_agents, int workspace_dim,
+	const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const ObstacleSet& obstacles, double prune_margin) {
 	std::vector<std::vector<ActiveObstacle>> per_agent_obstacles(num_agents);
 	if (obstacles.obstacles().empty()) {
 		return per_agent_obstacles;
 	}
 	for (int ag = 0; ag < num_agents; ++ag) {
-		const Eigen::MatrixXd traj =
-			ref_points.block(0, agent_ambient_offsets[ag], num_steps, workspace_dim);
-		const BoundingSphere sphere = TrajectoryBoundingSphere(traj);
+		const AgentReferenceSpheres& rs = ref_spheres[ag];
 		for (const Obstacle& obstacle : obstacles.obstacles()) {
 			const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
 			const double extent = ObstacleExtent(obstacle, workspace_dim);
-			if ((center - sphere.center).norm() > sphere.radius + extent + prune_margin) {
+			if ((center - rs.bound.center).norm() >
+			    rs.bound.radius + rs.max_radius + extent + prune_margin) {
 				continue;  // coarse whole-trajectory filter
 			}
 			const auto [lo, hi] = StepRange(num_steps, [&](int i) {
-				return (traj.row(i).transpose() - center).norm() <= extent + prune_margin;
+				const Eigen::MatrixXd& C = rs.centers[i];
+				for (int k = 0; k < C.rows(); ++k) {
+					if ((C.row(k).transpose() - center).norm() - rs.radii(k) <=
+					    extent + prune_margin)
+						return true;
+				}
+				return false;
 			});
 			if (lo < hi) {
 				per_agent_obstacles[ag].push_back(ActiveObstacle{&obstacle, lo, hi});
@@ -462,30 +511,40 @@ std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 }
 
 std::vector<ActivePair> PruneAgentPairsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
-	int workspace_dim, const Eigen::VectorXd& agent_radii, double prune_margin) {
+	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const AgentCollisionModels& models, const Eigen::VectorXd& agent_radii, double prune_margin) {
 	std::vector<ActivePair> active_pairs;
 	if (num_agents < 2) {
 		return active_pairs;
 	}
-	const int num_steps = static_cast<int>(ref_points.rows());
-	std::vector<Eigen::MatrixXd> trajs;
-	std::vector<BoundingSphere> spheres;
-	trajs.reserve(num_agents);
-	spheres.reserve(num_agents);
-	for (int ag = 0; ag < num_agents; ++ag) {
-		trajs.push_back(ref_points.block(0, agent_ambient_offsets[ag], num_steps, workspace_dim));
-		spheres.push_back(TrajectoryBoundingSphere(trajs.back()));
-	}
+	// A trivial agent contributes its scalar _agent_radii(ag) as its single
+	// sphere radius; a non-trivial one contributes its body spheres' own
+	// radii -- matching LinearizeAgentPairConstraints' PairRadius.
+	auto sphere_radius = [&](int ag, int k) {
+		return models[ag]->is_trivial() ? agent_radii(ag) : ref_spheres[ag].radii(k);
+	};
+	auto pad = [&](int ag) {
+		return models[ag]->is_trivial() ? agent_radii(ag) : ref_spheres[ag].max_radius;
+	};
 	for (int ag_a = 0; ag_a < num_agents; ++ag_a) {
 		for (int ag_b = ag_a + 1; ag_b < num_agents; ++ag_b) {
-			const double R = agent_radii(ag_a) + agent_radii(ag_b) + prune_margin;
-			if ((spheres[ag_a].center - spheres[ag_b].center).norm() >
-			    spheres[ag_a].radius + spheres[ag_b].radius + R) {
+			const AgentReferenceSpheres& ra = ref_spheres[ag_a];
+			const AgentReferenceSpheres& rb = ref_spheres[ag_b];
+			if ((ra.bound.center - rb.bound.center).norm() >
+			    ra.bound.radius + rb.bound.radius + pad(ag_a) + pad(ag_b) + prune_margin) {
 				continue;  // coarse whole-trajectory filter
 			}
 			const auto [lo, hi] = StepRange(num_steps, [&](int i) {
-				return (trajs[ag_a].row(i) - trajs[ag_b].row(i)).norm() <= R;
+				const Eigen::MatrixXd& Ca = ra.centers[i];
+				const Eigen::MatrixXd& Cb = rb.centers[i];
+				for (int ka = 0; ka < Ca.rows(); ++ka)
+					for (int kb = 0; kb < Cb.rows(); ++kb) {
+						if ((Ca.row(ka) - Cb.row(kb)).norm() -
+							sphere_radius(ag_a, ka) - sphere_radius(ag_b, kb) <=
+						    prune_margin)
+							return true;
+					}
+				return false;
 			});
 			if (lo < hi) {
 				active_pairs.push_back(ActivePair{ag_a, ag_b, lo, hi});
@@ -786,22 +845,24 @@ bool SphereOverlapsAabb(const Eigen::VectorXd& center, double radius, const Aabb
 }  // namespace
 
 std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
-	int workspace_dim, const ObstacleSet& obstacles, double prune_margin) {
-	const int num_steps = static_cast<int>(ref_points.rows());
+	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const ObstacleSet& obstacles, double prune_margin) {
 	std::vector<ActiveGrid> active_grids(num_agents);
 	for (int ag = 0; ag < num_agents; ++ag) {
 		const AgentSdfGrid* grid = obstacles.agent_sdf_grid(ag);
 		if (!grid) continue;
-		const Eigen::MatrixXd traj =
-			ref_points.block(0, agent_ambient_offsets[ag], num_steps, workspace_dim);
-		const BoundingSphere sphere = TrajectoryBoundingSphere(traj);
+		const AgentReferenceSpheres& rs = ref_spheres[ag];
 		const Aabb aabb = GridAabb(*grid);
-		if (!SphereOverlapsAabb(sphere.center, sphere.radius + prune_margin, aabb)) {
+		if (!SphereOverlapsAabb(rs.bound.center, rs.bound.radius + rs.max_radius + prune_margin,
+					aabb)) {
 			continue;  // coarse whole-trajectory filter
 		}
 		const auto [lo, hi] = StepRange(num_steps, [&](int i) {
-			return SphereOverlapsAabb(traj.row(i).transpose(), prune_margin, aabb);
+			const Eigen::MatrixXd& C = rs.centers[i];
+			for (int k = 0; k < C.rows(); ++k)
+				if (SphereOverlapsAabb(C.row(k).transpose(), rs.radii(k) + prune_margin, aabb))
+					return true;
+			return false;
 		});
 		if (lo < hi) {
 			active_grids[ag] = ActiveGrid{grid, lo, hi};

@@ -264,29 +264,55 @@ struct ActivePair {
 	int step_hi = 0;
 };
 
+// The workspace spheres agent `ag`'s collision model occupies at every
+// REFERENCE-trajectory step -- the geometry the distance pruning
+// (Prune*ByDistance) and, in future, the safety projections test against,
+// replacing the old "q[:workspace_dim] IS the world position" assumption
+// for a non-trivial (articulated / multi-sphere) agent. For a trivial agent
+// this is exactly one radius-0 sphere per step at q[:workspace_dim], so the
+// pruning reduces to its former behaviour byte-for-byte. Built ONCE per
+// solve() (GraphShortPathMPC::solve()) from the reference trajectory, same
+// discipline as the pruning it feeds.
+struct AgentReferenceSpheres {
+	// centers[i]: (num_spheres x workspace_dim), the agent's sphere centres
+	// at reference step i. radii: (num_spheres), step-invariant.
+	std::vector<Eigen::MatrixXd> centers;
+	Eigen::VectorXd radii;
+	double max_radius = 0.0;
+	// Bounding sphere over every centre at every step (radii NOT folded in
+	// -- callers add the relevant radius themselves).
+	BoundingSphere bound;
+};
+
+std::vector<AgentReferenceSpheres> BuildAgentReferenceSpheres(
+	const Eigen::MatrixXd& ref_points, int num_agents,
+	const std::vector<int>& agent_ambient_offsets, int workspace_dim,
+	const AgentCollisionModels& models);
+
 // Per-agent obstacle list "close enough to plausibly matter" over this
-// solve() call's horizon: agent ag's REFERENCE-trajectory bounding sphere
-// (obstacle_projection.hpp's TrajectoryBoundingSphere) vs each registered
-// obstacle's extent (sphere: radius+margin; box: half-extents' norm+margin,
-// a conservative circumscribing-sphere proxy) as a cheap coarse filter,
-// then a per-step distance check narrowing to `[step_lo, step_hi)` (the
+// solve() call's horizon: agent ag's swept-collision-sphere bounding sphere
+// (BuildAgentReferenceSpheres) vs each registered obstacle's extent (sphere:
+// radius+margin; box: half-extents' norm+margin, a conservative
+// circumscribing-sphere proxy) as a cheap coarse filter, then a per-step
+// per-sphere distance check narrowing to `[step_lo, step_hi)` (the
 // ActiveObstacle range above). An obstacle that clears neither filter is
 // omitted from `per_agent_obstacles[ag]` entirely.
 std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
-	int workspace_dim, const ObstacleSet& obstacles, double prune_margin);
+	int num_steps, int num_agents, int workspace_dim,
+	const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const ObstacleSet& obstacles, double prune_margin);
 
-// Same idea for inter-agent pairs: (ag_a, ag_b) survives the coarse filter
-// if their reference-trajectory bounding spheres could bring them within
-// `agent_radii(ag_a) + agent_radii(ag_b) + prune_margin`, then the per-step
-// separation check narrows to `[step_lo, step_hi)`. This is the more
-// consequential of the two prunings: unpruned pair count grows as
-// `num_agents*(num_agents-1)/2` AND crossing agents are typically only
-// close for a few mid-horizon steps, so per-step narrowing compounds with
-// the pair-level filter.
+// Same idea for inter-agent pairs, over each agent's swept collision
+// spheres: (ag_a, ag_b) survives the coarse filter if their bounding
+// spheres could bring any sphere pair within `prune_margin`, then a
+// per-step per-sphere-pair separation check narrows to `[step_lo,
+// step_hi)`. A trivial agent contributes its scalar `agent_radii(ag)` as
+// its (single) sphere radius here; a non-trivial one contributes its body
+// spheres' own radii. This is the more consequential of the prunings:
+// unpruned pair count grows as `num_agents*(num_agents-1)/2`.
 std::vector<ActivePair> PruneAgentPairsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
-	int workspace_dim, const Eigen::VectorXd& agent_radii, double prune_margin);
+	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const AgentCollisionModels& models, const Eigen::VectorXd& agent_radii, double prune_margin);
 
 // Total obstacle-constraint violation (Sum of max(0, -c(q)) over every
 // (step, agent, obstacle) SURVIVING PruneObstaclesByDistance) at the given
@@ -403,8 +429,8 @@ struct ActiveGrid {
 	int step_hi = 0;
 };
 std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
-	const Eigen::MatrixXd& ref_points, int num_agents, const std::vector<int>& agent_ambient_offsets,
-	int workspace_dim, const ObstacleSet& obstacles, double prune_margin);
+	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
+	const ObstacleSet& obstacles, double prune_margin);
 
 // Total grid-constraint violation (sum of max(0, -value) over every (step,
 // agent) with a non-null `active_grids[ag].grid` and step in its range) at

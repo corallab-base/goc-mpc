@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -68,5 +69,52 @@ class AgentCollisionModel {
 // `tangent_dim` / `ambient_dim` are the owning agent's own widths.
 std::unique_ptr<AgentCollisionModel> MakeTrivialCollisionModel(int workspace_dim, int tangent_dim,
 							       int ambient_dim);
+
+// ---------------------------------------------------------------------------
+// Non-trivial model registration -- PLAIN DATA. Stored on GraphOfConstraints
+// (agent_collision_specs) and turned into an actual AgentCollisionModel by
+// GraphShortPathMPC's constructor, so Drake's multibody headers stay out of
+// graph_of_constraints.hpp and every TU that includes it.
+// ---------------------------------------------------------------------------
+
+struct CollisionSphereSpec {
+	// Tier B (kArticulated): name of the plant body this sphere rides on.
+	std::string body;
+	// Tier A (kRigidConstellation): index into graph._robot_specs[agent] of
+	// the block whose pose places this sphere. Ignored for Tier B.
+	int block = 0;
+	// Sphere centre in the body's / block's local frame.
+	Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+	double radius = 0.0;
+};
+
+struct AgentCollisionSpec {
+	enum class Kind {
+		kArticulated,        // Tier B: Drake MultibodyPlant parsed from model_path
+		kRigidConstellation  // Tier A: closed-form on the agent's own blocks (not built yet)
+	};
+	Kind kind = Kind::kArticulated;
+
+	// Tier B: a URDF / MJCF / SDF file, parsed once into a MultibodyPlant.
+	std::string model_path;
+	// Tier B: the root link welded to the world, and its welded world pose
+	// (translation + wxyz quaternion). For the ur_description UR5e the root
+	// link is "base_link".
+	std::string base_link;
+	Eigen::Vector3d base_translation = Eigen::Vector3d::Zero();
+	Eigen::Vector4d base_quaternion_wxyz = Eigen::Vector4d(1.0, 0.0, 0.0, 0.0);
+
+	std::vector<CollisionSphereSpec> spheres;
+};
+
+// Tier B: Drake MultibodyPlant forward kinematics. `q_ambient` (the agent's
+// own ambient configuration, which must equal plant.num_positions()) sets
+// the plant's positions; each sphere's centre is X_WB(q) * offset and its
+// Jacobian is the plant's translational-velocity Jacobian of that point
+// w.r.t. q̇ -- which is exactly the solver's tangent step for a fixed-base,
+// all-revolute arm registered as one Block::R(n_joints). Construction throws
+// unless plant.num_positions() == tangent_dim.
+std::unique_ptr<AgentCollisionModel> MakeDrakePlantCollisionModel(
+	const AgentCollisionSpec& spec, int workspace_dim, int tangent_dim);
 
 }  // namespace sqp_short_path

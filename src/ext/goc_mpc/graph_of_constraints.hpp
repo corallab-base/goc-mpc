@@ -1,9 +1,13 @@
 #pragma once
 
 #include <iostream>
+#include <map>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
+
+#include "agent_collision_model.hpp"
 
 #include <fmt/format.h>
 
@@ -475,6 +479,16 @@ struct GraphOfConstraints {
 	// Python-registered forward-kinematics overrides, keyed by
 	// (agent_id, link_name) -- see set_robot_fk/link_pose.
 	std::map<std::pair<int, std::string>, py::function> robot_fk_registry;
+
+	// Per-agent non-trivial collision geometry (v2 plan Stage 3), keyed by
+	// agent_id. Plain data (agent_collision_model.hpp) -- GraphShortPathMPC's
+	// constructor turns each entry into an AgentCollisionModel (a Drake
+	// MultibodyPlant for kArticulated), keeping Drake's multibody headers
+	// out of this one. Populated by the set_agent_collision_model pybind
+	// wrapper (goc_mpc.cpp), not a core method -- same pattern as
+	// robot_fk_registry above. An agent with no entry gets the trivial
+	// single-point model.
+	std::map<int, sqp_short_path::AgentCollisionSpec> agent_collision_specs;
 
 	// Optional analytic-projection hint attached to a symbolic node/edge
 	// constraint (add_constraint(..., proj=...)/add_edge_constraint(...,
