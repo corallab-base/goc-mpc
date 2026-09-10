@@ -325,9 +325,20 @@ std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 // agents report a broadphase margin hint (a bounded body such as an arm)
 // the pruner uses min(prune_margin, hint_a + hint_b) instead of the raw
 // `prune_margin`, so an arm pair doesn't inherit the free-particle default.
+//
+// `max_pairs_per_step` (0 = unlimited): after the per-step distance filter,
+// keep only the this-many CLOSEST sphere pairs at each step (by reference-
+// trajectory surface separation). Two densely-sphered bodies deep in a
+// shared volume can put a hundred-plus pairs within the margin, but only a
+// handful are ever the binding contact -- this caps the QP row count (and
+// hence the proxqp factorization cost) at `max_pairs_per_step * horizon`
+// per agent pair regardless. Like every prune here it is recomputed once
+// per solve() from the reference, so pick it with headroom over the
+// genuinely-active contact count for the scene.
 std::vector<ActivePair> PruneAgentPairsByDistance(
 	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
-	const AgentCollisionModels& models, const Eigen::VectorXd& agent_radii, double prune_margin);
+	const AgentCollisionModels& models, const Eigen::VectorXd& agent_radii, double prune_margin,
+	int max_pairs_per_step = 0);
 
 // Total obstacle-constraint violation (Sum of max(0, -c(q)) over every
 // (step, agent, obstacle) SURVIVING PruneObstaclesByDistance) at the given

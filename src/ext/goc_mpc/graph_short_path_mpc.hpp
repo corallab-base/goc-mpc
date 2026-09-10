@@ -111,6 +111,13 @@ struct GraphShortPathMPC {
 	// keep nearly every sphere/pair row live and balloon the QP.
 	double _constraint_prune_margin;
 
+	// 0 = unlimited. When > 0, PruneAgentPairsByDistance keeps only this
+	// many closest inter-agent sphere pairs per step (see its own comment).
+	// Bounds the pair-row count -- and hence the proxqp factorization cost --
+	// for densely-sphered bodies (arms) that put many pairs within the
+	// broadphase margin while only a few are ever the binding contact.
+	int _max_collision_pairs_per_step;
+
 	// Fixed for this instance's whole lifetime (depend only on `graph`/
 	// `time_per_step`, never on a particular solve() call's
 	// references/obstacles) -- built once in the constructor. Agents are
@@ -219,7 +226,8 @@ struct GraphShortPathMPC {
 			 double max_trust_radius = 5.0,
 			 double min_trust_radius = 1.0e-6,
 			 double grad_tol = 1.0e-6,
-			 double constraint_prune_margin = 1.0);
+			 double constraint_prune_margin = 1.0,
+			 int max_collision_pairs_per_step = 0);
 
 	// Explicit (not defaulted inline) for the same reason as
 	// GraphTimingMPC's: QpState is only complete in the .cpp, and pybind's

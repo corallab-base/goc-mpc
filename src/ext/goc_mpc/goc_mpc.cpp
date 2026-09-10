@@ -581,7 +581,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 	py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
 		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, double,
 		     const ObstacleSet&, Eigen::VectorXd, double, double, double, double, int, double, double,
-		     double, double, double>(),
+		     double, double, double, int>(),
 		     // No `dim` argument (Stage 5, graph_short_path_mpc.hpp) -- every
 		     // agent's tangent_dim/ambient_dim comes straight from `graph`'s
 		     // own per-agent robot specs, agents are no longer required to
@@ -595,6 +595,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("max_iterations") = 30, py::arg("initial_trust_radius") = 0.5,
 		     py::arg("max_trust_radius") = 5.0, py::arg("min_trust_radius") = 1.0e-6,
 		     py::arg("grad_tol") = 1.0e-6, py::arg("constraint_prune_margin") = 1.0,
+		     py::arg("max_collision_pairs_per_step") = 0,
 		     // `graph` and `obstacles` are both stored by the C++ side as raw
 		     // pointers (see GraphShortPathMPC::_graph/_obstacles) -- keep
 		     // both Python arguments alive at least as long as this

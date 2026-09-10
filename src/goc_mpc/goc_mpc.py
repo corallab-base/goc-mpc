@@ -190,6 +190,7 @@ class GraphOfConstraintsMPC():
             min_trust_radius: float = 1.0e-6,
             grad_tol: float = 1.0e-6,
             constraint_prune_margin: float = 1.0,
+            max_collision_pairs_per_step: int = 0,
             # Caller-supplied short-path solver, bypassing the
             # GraphShortPathMPC auto-construction below entirely -- mirrors
             # waypoint_mpc/timing_mpc's own override pattern. The override
@@ -370,7 +371,8 @@ class GraphOfConstraintsMPC():
                                                     acceleration_weight, penalty_weight,
                                                     max_iterations, initial_trust_radius,
                                                     max_trust_radius, min_trust_radius,
-                                                    grad_tol, constraint_prune_margin)
+                                                    grad_tol, constraint_prune_margin,
+                                                    max_collision_pairs_per_step)
 
     def _solve_for_waypoints(self, x: np.ndarray):
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):

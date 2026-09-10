@@ -535,7 +535,8 @@ std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 
 std::vector<ActivePair> PruneAgentPairsByDistance(
 	int num_steps, int num_agents, const std::vector<AgentReferenceSpheres>& ref_spheres,
-	const AgentCollisionModels& models, const Eigen::VectorXd& agent_radii, double prune_margin) {
+	const AgentCollisionModels& models, const Eigen::VectorXd& agent_radii, double prune_margin,
+	int max_pairs_per_step) {
 	std::vector<ActivePair> active_pairs;
 	if (num_agents < 2) {
 		return active_pairs;
@@ -562,24 +563,41 @@ std::vector<ActivePair> PruneAgentPairsByDistance(
 			}
 			const int Ka = static_cast<int>(ra.radii.size());
 			const int Kb = static_cast<int>(rb.radii.size());
-			auto near_at = [&](int i, int ka, int kb) {
+			// Reference-trajectory surface separation of sphere pair
+			// (ka, kb) at step i -- the per-step filter threshold AND the
+			// top-k ranking key.
+			auto sep_at = [&](int i, int ka, int kb) {
 				return (ra.centers[i].row(ka) - rb.centers[i].row(kb)).norm() -
-					   sphere_radius(ag_a, ka) - sphere_radius(ag_b, kb) <=
-				       margin;
+				       sphere_radius(ag_a, ka) - sphere_radius(ag_b, kb);
 			};
 			const auto [lo, hi] = StepRange(num_steps, [&](int i) {
 				for (int ka = 0; ka < Ka; ++ka)
 					for (int kb = 0; kb < Kb; ++kb)
-						if (near_at(i, ka, kb)) return true;
+						if (sep_at(i, ka, kb) <= margin) return true;
 				return false;
 			});
 			if (lo >= hi) continue;
 			std::vector<std::vector<std::pair<int, int>>> sphere_pairs(hi - lo);
-			for (int i = lo; i < hi; ++i)
+			for (int i = lo; i < hi; ++i) {
+				std::vector<std::pair<double, std::pair<int, int>>> near;
 				for (int ka = 0; ka < Ka; ++ka)
-					for (int kb = 0; kb < Kb; ++kb)
-						if (near_at(i, ka, kb))
-							sphere_pairs[i - lo].emplace_back(ka, kb);
+					for (int kb = 0; kb < Kb; ++kb) {
+						const double s = sep_at(i, ka, kb);
+						if (s <= margin) near.emplace_back(s, std::make_pair(ka, kb));
+					}
+				// Keep only the `max_pairs_per_step` closest at this step
+				// (0 = keep all). Only a few sphere pairs are ever the
+				// binding contact even when a hundred sit within `margin`.
+				if (max_pairs_per_step > 0 &&
+				    static_cast<int>(near.size()) > max_pairs_per_step) {
+					std::nth_element(near.begin(), near.begin() + max_pairs_per_step,
+							 near.end(),
+							 [](const auto& x, const auto& y) { return x.first < y.first; });
+					near.resize(max_pairs_per_step);
+				}
+				sphere_pairs[i - lo].reserve(near.size());
+				for (const auto& scored : near) sphere_pairs[i - lo].push_back(scored.second);
+			}
 			active_pairs.push_back(ActivePair{ag_a, ag_b, lo, hi, std::move(sphere_pairs)});
 		}
 	}

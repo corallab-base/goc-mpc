@@ -1,6 +1,9 @@
 #include "graph_short_path_mpc.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -89,7 +92,8 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 				  double max_trust_radius,
 				  double min_trust_radius,
 				  double grad_tol,
-				  double constraint_prune_margin)
+				  double constraint_prune_margin,
+				  int max_collision_pairs_per_step)
 	: _graph(&graph),
 	  _num_steps(num_steps),
 	  _num_agents(num_agents),
@@ -103,7 +107,8 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 	  _max_trust_radius(max_trust_radius),
 	  _min_trust_radius(min_trust_radius),
 	  _grad_tol(grad_tol),
-	  _constraint_prune_margin(constraint_prune_margin) {
+	  _constraint_prune_margin(constraint_prune_margin),
+	  _max_collision_pairs_per_step(max_collision_pairs_per_step) {
 
 	if (_agent_radii.size() != static_cast<int>(num_agents)) {
 		throw std::runtime_error(
@@ -794,6 +799,38 @@ SqpResult RunTrustRegionSqp(
 		// else: reject -- points/vels/f_current/violation_current/
 		// phi_current stay at the previous (still fully valid) iterate;
 		// only trust_radius moved.
+
+		// Sℓ1QP first-order convergence (Nocedal & Wright Sec. 18.5):
+		// `predicted_reduction` -- the QP model's own predicted decrease of
+		// the merit function phi -- is the natural stationarity measure for
+		// an exact-penalty trust-region step, so stop once it drops below
+		// `grad_tol` (scaled by the merit level). While the iterate is
+		// still infeasible this stays large (the `penalty_weight *
+		// predicted_violation_reduction` term dominates), so this doesn't
+		// cut the loop short of feasibility. Only trusted on an ACCEPTED
+		// step: a rejected step shrinks `predicted_reduction` too (its
+		// trust region just collapsed), but that path terminates via the
+		// `trust_radius <= min_trust_radius` check at the top of the loop.
+		// Without this the constrained case (m > 0) hits no break at all
+		// and always runs the full `max_iterations` -- the `grad_smooth`
+		// test above is smooth-only (m == 0).
+		if (rho > 1e-8 &&
+		    predicted_reduction <= grad_tol * std::max(1.0, std::abs(phi_current)))
+			break;
+	}
+
+	if (std::getenv("GOC_SHORT_PATH_STATS")) {
+		int max_pairs_step = 0, tot_pair_entries = 0;
+		for (const ActivePair& ap : active_pairs)
+			for (const auto& ps : ap.sphere_pairs) {
+				max_pairs_step = std::max(max_pairs_step, (int)ps.size());
+				tot_pair_entries += (int)ps.size();
+			}
+		std::fprintf(stderr,
+			"[short_path] NS=%d agents=%d wd=%d | m=%d (obs=%d pair=%d grid=%d) "
+			"n=%d n_in=%d | active_pairs=%d max_pairs/step=%d | iters=%d\n",
+			num_steps, num_agents, workspace_dim, m, obstacle_rows, pair_rows, grid_rows,
+			n, n_in, (int)active_pairs.size(), max_pairs_step, iter);
 	}
 
 	ApplySafetyProjection(num_steps, num_agents, agent_ambient_offsets, workspace_dim, obstacles, models,
@@ -858,7 +895,8 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 						  _constraint_prune_margin);
 		const std::vector<ActivePair> active_pairs =
 			PruneAgentPairsByDistance(H, num_agents, ref_spheres, _agent_collision_models,
-						   _agent_radii, _constraint_prune_margin);
+						   _agent_radii, _constraint_prune_margin,
+						   _max_collision_pairs_per_step);
 		const std::vector<ActiveGrid> active_grids =
 			PruneAgentSdfGridsByDistance(H, num_agents, ref_spheres, _agent_collision_models,
 						      *_obstacles, _constraint_prune_margin);
