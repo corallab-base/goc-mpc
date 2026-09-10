@@ -340,6 +340,146 @@ def _makespan_forward_wp(ext, P_pred, agent_of_node, wp_res, x0_of, sliced_of):
     return arr
 
 
+def _ext_nonfull_avg_minmax(objective, ext, P_pred, agent_of_node, owned, owner_vagent, aux,
+                            agent_keys, edge_tables, depot_tables, branch_counts, best, best_sol):
+    """One `ext` of the non-full avg/minmax loop: per-agent branch Viterbi
+    over the pre-built cost tables, keep it if it beats `best`. Returns the
+    (possibly updated) `(best, best_sol)`."""
+    agent_seq = {j: [n for n in ext if n in owned.get(j, ())] for j in owned}
+    per_agent = {}
+    br = {}
+    for j, seq in agent_seq.items():
+        c, ch = _branch_viterbi(seq, edge_tables[j], depot_tables[j], branch_counts[j])
+        per_agent[j] = c
+        for n, b in ch.items():
+            br[(n, agent_keys[j][n])] = b
+    score = (sum(per_agent.values()) if objective == "avg"
+             else max(per_agent.values(), default=0.0))
+    if score < best:
+        arr = _makespan_forward(
+            ext, P_pred, agent_seq, agent_of_node,
+            {(n, j): br[(n, agent_keys[j][n])] for n in ext
+             for j in agent_of_node.get(n, [])},
+            edge_tables, depot_tables)
+        best = score
+        best_sol = (dict(br), owner_vagent.copy(), aux, arr, agent_seq, per_agent)
+    return best, best_sol
+
+
+def _ext_nonfull_makespan(ext, P_pred, agent_of_node, owned, owner_vagent, aux,
+                          agent_keys, edge_tables, depot_tables, branch_counts, best, best_sol):
+    """One `ext` of the non-full makespan loop: brute-force every branch
+    combo for this order, DAG forward pass per combo, keep the best."""
+    agent_seq = {j: [n for n in ext if n in owned.get(j, ())] for j in owned}
+    proj_nodes = [(n, j) for n in ext for j in agent_of_node.get(n, [])]
+    ranges = [range(branch_counts[j][n]) for (n, j) in proj_nodes]
+    for combo in itertools.product(*ranges):
+        b_of = {proj_nodes[i]: combo[i] for i in range(len(proj_nodes))}
+        arr = _makespan_forward(ext, P_pred, agent_seq, agent_of_node,
+                                b_of, edge_tables, depot_tables)
+        ms = max(arr.values(), default=0.0)
+        if ms < best:
+            br = {(n, agent_keys[j][n]): b_of[(n, j)] for (n, j) in proj_nodes}
+            per_agent = {}
+            for j, seq in agent_seq.items():
+                pc = 0.0
+                for i in range(1, len(seq)):
+                    u, v = seq[i - 1], seq[i]
+                    pc += edge_tables[j][(u, v)][b_of[(u, j)], b_of[(v, j)]]
+                if seq:
+                    pc += depot_tables[j][seq[0]][b_of[(seq[0], j)]]
+                per_agent[j] = pc
+            best = ms
+            best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
+    return best, best_sol
+
+
+def _full_ext_resolve(problem, ext, n_nodes, owned, owner_vagent, aux, x0_full,
+                      layer0, branched, wp_template):
+    """Shared per-`ext` resolve for the full path: (1) the branch-free
+    projection layer once against this order's `t`, (2) each branched
+    entry's k candidate rows against that layer. Returns
+    `(agent_seq, tvec, wp0, rows_by_node, node_owner_of)`."""
+    agent_seq = {j: [n for n in ext if n in owned.get(j, ())] for j in owned}
+    tvec = _order_t(ext, n_nodes)
+    wp0 = _resolve_schedule_wp(
+        problem, wp_template[None], x0_full, owner_vagent, aux,
+        np.zeros((1, problem.n_branch)), tvec, only_entries=layer0)[0]
+
+    rows_by_node = {}
+    node_owner_of = {}          # projected node -> (entry, owner-agent)
+    for e in branched:
+        k = e.discrete_params
+        pb = np.zeros((k, problem.n_branch))
+        pb[np.arange(k), e.branch_slice.start + np.arange(k)] = 1.0
+        res = _resolve_schedule_wp(
+            problem, np.broadcast_to(wp0[None], (k,) + wp0.shape),
+            x0_full, owner_vagent, aux, pb, tvec, only_entries=(e,))
+        rows_by_node[int(e.write_node)] = res[:, int(e.write_node), :]
+        # For a DYNAMIC (var_agent_q) entry the owner is whichever agent
+        # THIS assignment binds its variable to -- fixed inside this
+        # `for A in assign_combos` iteration, so the entry prices exactly
+        # like a static multi-branch one from here on.
+        node_owner_of[int(e.write_node)] = (e, entry_owner(problem, e, owner_vagent))
+    return agent_seq, tvec, wp0, rows_by_node, node_owner_of
+
+
+def _ext_full_avg_minmax(problem, objective, ext, P_pred, agent_of_node, n_nodes, owned,
+                         owner_vagent, aux, x0_full, x0_of, sliced_of, layer0, branched,
+                         wp_template, best, best_sol):
+    """One `ext` of the full-resolve avg/minmax loop: separable per-agent
+    branch DP over the resolved candidate rows."""
+    agent_seq, _tvec, wp0, rows_by_node, node_owner_of = _full_ext_resolve(
+        problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched, wp_template)
+    per_agent, choice = {}, {}
+    for j, seq in agent_seq.items():
+        c, ch = _branch_viterbi_wp(seq, rows_by_node, wp0, x0_of[j], sliced_of[j])
+        per_agent[j] = c
+        choice.update(ch)
+    score = (sum(per_agent.values()) if objective == "avg"
+             else max(per_agent.values(), default=0.0))
+    if score < best:
+        wp_sel = _select_wp(ext, rows_by_node, wp0, choice)
+        arr = _makespan_forward_wp(ext, P_pred, agent_of_node, wp_sel, x0_of, sliced_of)
+        br = {(n, node_owner_of[n][1]): int(choice.get(n, 0)) for n in rows_by_node}
+        best = score
+        best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
+    return best, best_sol
+
+
+def _ext_full_makespan(problem, ext, P_pred, agent_of_node, n_nodes, owned, owner_vagent, aux,
+                       x0_full, x0_of, sliced_of, layer0, branched, wp_template, best, best_sol):
+    """One `ext` of the full-resolve makespan loop: branch choice couples
+    with cross-agent waiting, so enumerate combos over per-agent cost
+    matrices built once from the cached rows."""
+    agent_seq, _tvec, wp0, rows_by_node, node_owner_of = _full_ext_resolve(
+        problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched, wp_template)
+    et, dt, bc = {}, {}, {}
+    for j, seq in agent_seq.items():
+        rj = {n: (rows_by_node[n] if n in rows_by_node else wp0[n][None, :]) for n in seq}
+        bc[j] = {n: rj[n].shape[0] for n in seq}
+        dt[j] = {n: np.array([sliced_of[j](x0_of[j], r) for r in rj[n]]) for n in seq}
+        et[j] = {(u, v): np.array([[sliced_of[j](a, b) for b in rj[v]] for a in rj[u]])
+                 for u, v in zip(seq, seq[1:])}
+    pnodes = [(n, j) for n in ext for j in agent_of_node.get(n, [])]
+    for combo in itertools.product(*[range(bc[j][n]) for (n, j) in pnodes]):
+        b_of = dict(zip(pnodes, combo))
+        arr = _makespan_forward(ext, P_pred, agent_seq, agent_of_node, b_of, et, dt)
+        ms = max(arr.values(), default=0.0)
+        if ms < best:
+            per_agent = {}
+            for j, seq in agent_seq.items():
+                pc = dt[j][seq[0]][b_of[(seq[0], j)]] if seq else 0.0
+                for u, v in zip(seq, seq[1:]):
+                    pc += et[j][(u, v)][b_of[(u, j)], b_of[(v, j)]]
+                per_agent[j] = float(pc)
+            br = {(n, node_owner_of[n][1]): int(b_of[(n, j)])
+                  for (n, j) in pnodes if n in node_owner_of}
+            best = ms
+            best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
+    return best, best_sol
+
+
 def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
                     ordering_edges=None, edge_cost_fn=None, objective="makespan",
                     max_assign_combos=4096, max_orders=20000, x0_full=None,
@@ -436,10 +576,7 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
     for A in assign_combos:
         owner_vagent = np.asarray(A, dtype=int)
         owned = _agent_owned_nodes(problem, instances, owner_vagent)
-        # candidate-dict key + sliced tables per agent
-        agent_keys = {j: _inst_key(problem, instances, next(iter(ns)), j, owner_vagent)
-                      if ns else j
-                      for j, ns in owned.items()}
+        # candidate-dict key per (agent, node)
         agent_keys = {j: {n: _inst_key(problem, instances, n, j, owner_vagent) for n in ns}
                       for j, ns in owned.items()}
 
@@ -470,132 +607,29 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
                 for n in ns:
                     agent_of_node.setdefault(n, []).append(j)
 
-            if full:
-                # Per-schedule resolution, staged: (1) resolve the branch-
-                # free projection layer once per order (gates see this
-                # order's `t`); (2) resolve each branched (analytic-IK)
-                # entry's k candidate rows against that layer; (3) per-agent
-                # branch DP over those rows (avg/minmax) or a cached-row
-                # combo enumeration (makespan).
-                for ext in exts:
-                    agent_seq = {j: [n for n in ext if n in owned.get(j, ())] for j in owned}
-                    tvec = _order_t(ext, n_nodes)
-                    wp0 = _resolve_schedule_wp(
-                        problem, wp_template[None], x0_full, owner_vagent, aux,
-                        np.zeros((1, problem.n_branch)), tvec, only_entries=layer0)[0]
-
-                    rows_by_node = {}
-                    node_owner_of = {}          # projected node -> (entry, owner-agent)
-                    for e in branched:
-                        k = e.discrete_params
-                        pb = np.zeros((k, problem.n_branch))
-                        pb[np.arange(k), e.branch_slice.start + np.arange(k)] = 1.0
-                        res = _resolve_schedule_wp(
-                            problem, np.broadcast_to(wp0[None], (k,) + wp0.shape),
-                            x0_full, owner_vagent, aux, pb, tvec, only_entries=(e,))
-                        rows_by_node[int(e.write_node)] = res[:, int(e.write_node), :]
-                        # For a DYNAMIC (var_agent_q) entry the owner is
-                        # whichever agent THIS assignment binds its variable
-                        # to -- fixed inside this `for A in assign_combos`
-                        # iteration, so the entry prices exactly like a
-                        # static multi-branch one from here on.
-                        node_owner_of[int(e.write_node)] = (e, entry_owner(problem, e, owner_vagent))
-
-                    if objective in ("avg", "minmax"):
-                        per_agent, choice = {}, {}
-                        for j, seq in agent_seq.items():
-                            c, ch = _branch_viterbi_wp(seq, rows_by_node, wp0, x0_of[j], sliced_of[j])
-                            per_agent[j] = c
-                            choice.update(ch)
-                        score = (sum(per_agent.values()) if objective == "avg"
-                                 else max(per_agent.values(), default=0.0))
-                        if score < best:
-                            wp_sel = _select_wp(ext, rows_by_node, wp0, choice)
-                            arr = _makespan_forward_wp(ext, P_pred, agent_of_node, wp_sel,
-                                                       x0_of, sliced_of)
-                            br = {(n, node_owner_of[n][1]): int(choice.get(n, 0))
-                                  for n in rows_by_node}
-                            best = score
-                            best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
-                        continue
-
-                    # makespan: branch choice couples with cross-agent
-                    # waiting, so enumerate combos -- but over per-agent
-                    # (node-pair) cost MATRICES built once from the cached
-                    # rows (pure arithmetic per combo, reusing the fast
-                    # path's `_makespan_forward`), not a wp rebuild.
-                    et, dt, bc = {}, {}, {}
-                    for j, seq in agent_seq.items():
-                        rj = {n: (rows_by_node[n] if n in rows_by_node else wp0[n][None, :]) for n in seq}
-                        bc[j] = {n: rj[n].shape[0] for n in seq}
-                        dt[j] = {n: np.array([sliced_of[j](x0_of[j], r) for r in rj[n]]) for n in seq}
-                        et[j] = {(u, v): np.array([[sliced_of[j](a, b) for b in rj[v]] for a in rj[u]])
-                                 for u, v in zip(seq, seq[1:])}
-                    pnodes = [(n, j) for n in ext for j in agent_of_node.get(n, [])]
-                    for combo in itertools.product(*[range(bc[j][n]) for (n, j) in pnodes]):
-                        b_of = dict(zip(pnodes, combo))
-                        arr = _makespan_forward(ext, P_pred, agent_seq, agent_of_node, b_of, et, dt)
-                        ms = max(arr.values(), default=0.0)
-                        if ms < best:
-                            per_agent = {}
-                            for j, seq in agent_seq.items():
-                                pc = dt[j][seq[0]][b_of[(seq[0], j)]] if seq else 0.0
-                                for u, v in zip(seq, seq[1:]):
-                                    pc += et[j][(u, v)][b_of[(u, j)], b_of[(v, j)]]
-                                per_agent[j] = float(pc)
-                            br = {(n, node_owner_of[n][1]): int(b_of[(n, j)])
-                                  for (n, j) in pnodes if n in node_owner_of}
-                            best = ms
-                            best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
-                continue
-
+            # One `ext` at a time -- dispatch to the loop body for this
+            # (full/non-full) x (avg-minmax/makespan) combination. Both
+            # switches are loop-invariant across the whole enumeration, so
+            # the per-`ext` branch here is free.
             for ext in exts:
-                agent_seq = {j: [n for n in ext if n in owned.get(j, ())]
-                             for j in owned}
-
-                if objective in ("avg", "minmax"):
-                    per_agent = {}
-                    br = {}
-                    for j, seq in agent_seq.items():
-                        c, ch = _branch_viterbi(seq, edge_tables[j], depot_tables[j],
-                                                branch_counts[j])
-                        per_agent[j] = c
-                        for n, b in ch.items():
-                            br[(n, agent_keys[j][n])] = b
-                    score = (sum(per_agent.values()) if objective == "avg"
-                             else max(per_agent.values(), default=0.0))
-                    if score < best:
-                        arr = _makespan_forward(
-                            ext, P_pred, agent_seq, agent_of_node,
-                            {(n, j): br[(n, agent_keys[j][n])] for n in ext
-                             for j in agent_of_node.get(n, [])},
-                            edge_tables, depot_tables)
-                        best = score
-                        best_sol = (dict(br), owner_vagent.copy(), aux, arr, agent_seq,
-                                    per_agent)
-                    continue
-
-                # makespan: brute-force branch combos for this order
-                proj_nodes = [(n, j) for n in ext for j in agent_of_node.get(n, [])]
-                ranges = [range(branch_counts[j][n]) for (n, j) in proj_nodes]
-                for combo in itertools.product(*ranges):
-                    b_of = {proj_nodes[i]: combo[i] for i in range(len(proj_nodes))}
-                    arr = _makespan_forward(ext, P_pred, agent_seq, agent_of_node,
-                                            b_of, edge_tables, depot_tables)
-                    ms = max(arr.values(), default=0.0)
-                    if ms < best:
-                        br = {(n, agent_keys[j][n]): b_of[(n, j)] for (n, j) in proj_nodes}
-                        per_agent = {}
-                        for j, seq in agent_seq.items():
-                            pc = 0.0
-                            for i in range(1, len(seq)):
-                                u, v = seq[i - 1], seq[i]
-                                pc += edge_tables[j][(u, v)][b_of[(u, j)], b_of[(v, j)]]
-                            if seq:
-                                pc += depot_tables[j][seq[0]][b_of[(seq[0], j)]]
-                            per_agent[j] = pc
-                        best = ms
-                        best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
+                if full and objective in ("avg", "minmax"):
+                    best, best_sol = _ext_full_avg_minmax(
+                        problem, objective, ext, P_pred, agent_of_node, n_nodes, owned,
+                        owner_vagent, aux, x0_full, x0_of, sliced_of, layer0, branched,
+                        wp_template, best, best_sol)
+                elif full:
+                    best, best_sol = _ext_full_makespan(
+                        problem, ext, P_pred, agent_of_node, n_nodes, owned, owner_vagent,
+                        aux, x0_full, x0_of, sliced_of, layer0, branched, wp_template,
+                        best, best_sol)
+                elif objective in ("avg", "minmax"):
+                    best, best_sol = _ext_nonfull_avg_minmax(
+                        objective, ext, P_pred, agent_of_node, owned, owner_vagent, aux,
+                        agent_keys, edge_tables, depot_tables, branch_counts, best, best_sol)
+                else:
+                    best, best_sol = _ext_nonfull_makespan(
+                        ext, P_pred, agent_of_node, owned, owner_vagent, aux, agent_keys,
+                        edge_tables, depot_tables, branch_counts, best, best_sol)
 
     wall = _t.perf_counter() - t0
     if best_sol is None:
