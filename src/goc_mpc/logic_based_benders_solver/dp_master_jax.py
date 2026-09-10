@@ -57,7 +57,7 @@ from .dp_master import (
     _BIG, _agent_owned_nodes, _ensure_x64, _ext_full_avg_minmax_score,
     _ext_full_makespan_score, _ext_nonfull_avg_minmax, _ext_nonfull_makespan,
     _extensions_matrix, _full_ext_resolve, _inst_key, _linear_extensions,
-    _makespan_arr_jax, _resolve_precedence,
+    _makespan_arr_jax, _resolve_precedence, _resolve_schedule_wp,
 )
 
 
@@ -134,15 +134,9 @@ class _DpMasterJax:
         proj = list(problem.projections)
         self.layer0 = tuple(e for e in proj if e.discrete_params == 1)
         self.branched = [e for e in proj if e.discrete_params > 1]
-        _seen_wn = set()
-        for e in self.branched:
-            if e.write_node in _seen_wn:
-                raise NotImplementedError(
-                    "dp_master_jax: two multi-branch projections write the same "
-                    "node -- the grid tracks one branch index per node, so a "
-                    "shared-node handoff (each arm its own branch) is not "
-                    "supported yet")
-            _seen_wn.add(e.write_node)
+        self.branch_static = [e.owner_var_slot is None for e in self.branched]
+        self.branch_cols = [np.asarray(sorted(int(c) for c in e.pinned_cols), dtype=int)
+                            for e in self.branched]
         for e in self.branched:
             others = set().union(*(o.write_cols for o in self.branched if o is not e)) \
                 if len(self.branched) > 1 else set()
@@ -151,15 +145,54 @@ class _DpMasterJax:
                     "dp_master_jax: a multi-branch projection reads a column "
                     "another multi-branch projection pins -- coupled branch DP "
                     "not implemented")
+        # branched entries sharing a write_node (a two-arm handoff): each
+        # arm's branch is tracked per (node, OWNER), so the two owners must
+        # be GUARANTEED distinct -- either static-and-different, or forced
+        # apart by a `problem.categorical_ne` constraint. If not, raise (the
+        # graph needs the inequality) rather than silently pruning combos.
+        _wn_share = {}
+        for bi, e in enumerate(self.branched):
+            _wn_share.setdefault(int(e.write_node), []).append(bi)
+        self._shared_wn = [g for g in _wn_share.values() if len(g) > 1]
 
-        # -- assignment combos over ALL slots ----------------------------
+        # -- assignment combos over the free slots, minus the ones a
+        #    `categorical_ne` constraint forbids ------------------------
         n_assign = n_agents ** n_var if n_var else 1
         if n_assign > max_assign_combos:
             raise NotImplementedError(
                 f"dp_master_jax: {n_agents}**{n_var} = {n_assign} assignment "
                 f"combos > max_assign_combos={max_assign_combos}")
-        self.A = (np.array(list(itertools.product(range(n_agents), repeat=n_var)), dtype=np.int32)
+        ne_pairs = [(int(a), int(b)) for (a, b) in getattr(problem, "categorical_ne", ())]
+        _combos = [c for c in itertools.product(range(n_agents), repeat=n_var)
+                   if not any(c[a] == c[b] for (a, b) in ne_pairs)] if n_var else [()]
+        if not _combos:
+            raise NotImplementedError(
+                f"dp_master_jax: categorical_ne={ne_pairs} rules out every "
+                "assignment combo")
+        self.A = (np.array(_combos, dtype=np.int32)
                   if n_var else np.zeros((1, 0), dtype=np.int32))            # (NC, n_var)
+
+        # every surviving combo must keep the owners of a shared branched
+        # node apart -- the grid tracks one branch per (node, owner), so two
+        # entries there landing on the same agent would need that agent's
+        # branch product.
+        for grp in self._shared_wn:
+            wnn = int(self.branched[grp[0]].write_node)
+            slots = sorted({self.branched[bi].owner_var_slot for bi in grp
+                            if self.branched[bi].owner_var_slot is not None})
+            for ov in self.A:
+                owners = [entry_owner(problem, self.branched[bi], np.asarray(ov, int))
+                          for bi in grp]
+                if len(set(owners)) == len(owners):
+                    continue
+                hint = (f"add a categorical_ne constraint between slots {slots}"
+                        if slots else
+                        "these projections target the same fixed agent")
+                raise NotImplementedError(
+                    f"dp_master_jax: {len(grp)} multi-branch projections write "
+                    f"node {wnn} but can share an owner (e.g. assignment "
+                    f"{list(map(int, ov))}); {hint} so their owners are "
+                    "guaranteed distinct")
         self.AUX = (np.array(list(itertools.product((0, 1), repeat=n_cond)), dtype=np.int32)
                     if n_cond else np.zeros((1, 0), dtype=np.int32))         # (NA, n_cond)
         self.NC, self.NA = self.A.shape[0], self.AUX.shape[0]
@@ -325,9 +358,6 @@ class _DpMasterJax:
         wn = np.array([int(e.write_node) for e in self.branched], dtype=np.int32)
         starts = np.array([int(e.branch_slice.start) for e in self.branched], dtype=np.int32)
         max_k = max([1] + self.branch_ks)
-        KC_node = np.ones(N, dtype=np.int32)
-        for bi, k in enumerate(self.branch_ks):
-            KC_node[wn[bi]] = k
 
         # grid index arrays
         gc, ga, ge = (x.reshape(-1) for x in np.meshgrid(
@@ -340,7 +370,7 @@ class _DpMasterJax:
             owner_per_combo=jnp.asarray(owner_per_combo), OWN=jnp.asarray(OWN),
             hard_pred=jnp.asarray(hard_pred), gated_vu=jnp.asarray(gated_vu),
             gated_ends=jnp.asarray(gated_ends), wn=wn, wn_j=jnp.asarray(wn),
-            starts=starts, KC_node=jnp.asarray(KC_node), max_k=max_k,
+            starts=starts, max_k=max_k,
             BC_grid=jnp.asarray(self.BC_grid),
             gc=jnp.asarray(gc), ga=jnp.asarray(ga), ge=jnp.asarray(ge),
             n_ext=self.n_ext,
@@ -429,6 +459,7 @@ class _DpMasterJax:
         pred = pred & node_active[None, None, :, None] & node_active[None, None, None, :]
 
         OWN_act = st["OWN"] & node_active[None, :, None]                   # (NC,N,J)
+        n_br = len(self.branched)
 
         # -- resolve layer0 over the grid -------------------------------
         assign_g = assign_oh[gc]                                          # (G,n_var,J)
@@ -439,7 +470,16 @@ class _DpMasterJax:
                    jnp.zeros((G, n_psi)), jnp.zeros((G, n_branch)), params,
                    assign_g, cond_g, T_g, node_active, x0_full)           # (G,N,S)
 
-        CAND = jnp.repeat(wp0_g[:, :, None, :], max_k, axis=2)            # (G,N,max_k,S)
+        # Per-agent branch candidate rows: agent j's row at node n is `wp0`
+        # spliced with the branch candidates of the (single) branched entry
+        # that writes n AND is owned by j. Two entries at one shared node
+        # have distinct owners (guaranteed in __init__), so they land in
+        # different `CAND[j]`. `Kof[g, j, n]` is that entry's branch count
+        # (1 where j has no branched entry at n) -> masks the padding.
+        own_per_g = st["owner_per_combo"][gc] if n_br else jnp.zeros((G, 0), jnp.int32)
+        CAND = [jnp.repeat(wp0_g[:, :, None, :], max_k, axis=2) for _ in range(J)]
+        Kof = jnp.ones((G, J, N), jnp.int32)
+        res_rows = []                                                     # per bi: (G,k,S)
         for bi, k in enumerate(self.branch_ks):
             wn = int(st["wn"][bi])
             start = int(st["starts"][bi])
@@ -451,32 +491,38 @@ class _DpMasterJax:
                      jnp.repeat(T_g, k, axis=0), node_active, x0_full
                      ).reshape(G, k, N, S)
             rows = res[:, :, wn, :]                                       # (G,k,S)
-            CAND = CAND.at[:, wn, :k, :].set(rows)
-            CAND = CAND.at[:, wn, k:, :].set(rows[:, :1, :])
+            res_rows.append(rows)
+            padded = jnp.concatenate(
+                [rows, jnp.broadcast_to(rows[:, :1], (G, max_k - k, S))], axis=1)  # (G,max_k,S)
+            owner_bi = own_per_g[:, bi]                                   # (G,)
+            Kof = Kof.at[jnp.arange(G), owner_bi, wn].set(k)
+            for j in range(J):
+                sel = (owner_bi == j)[:, None, None]                     # (G,1,1)
+                CAND[j] = CAND[j].at[:, wn, :, :].set(
+                    jnp.where(sel, padded, CAND[j][:, wn, :, :]))
 
-        validk = jnp.arange(max_k)[None, :] < st["KC_node"][:, None]      # (N,max_k)
-
-        # -- dense EDGE/DEPOT per grid cell -----------------------------
+        # -- dense EDGE/DEPOT per grid cell, per agent -----------------
         DEP, EDG = [], []
         for j in range(J):
             sj = self.sliced_of[j]
             x0j = X0[j]
+            Cj = CAND[j]                                                 # (G,N,max_k,S)
             dep = jax.vmap(jax.vmap(jax.vmap(
-                lambda r: jnp.asarray(sj(x0j, r)))))(CAND)                # (G,N,K)
+                lambda r: jnp.asarray(sj(x0j, r)))))(Cj)                 # (G,N,K)
             gk = jax.vmap(jax.vmap(lambda ru, rv: jnp.asarray(sj(ru, rv)),
                                    (None, 0)), (0, None))
             gn = jax.vmap(jax.vmap(gk, (None, 0)), (0, None))
-            edg = jax.vmap(gn)(CAND, CAND)                                # (G,N,N,K,K)
-            dep = jnp.where(validk[None], dep, _BIG)
-            edg = jnp.where(validk[None, :, None, :, None], edg, _BIG)
-            edg = jnp.where(validk[None, None, :, None, :], edg, _BIG)
+            edg = jax.vmap(gn)(Cj, Cj)                                   # (G,N,N,K,K)
+            vkj = jnp.arange(max_k)[None, None, :] < Kof[:, j, :, None]  # (G,N,max_k)
+            dep = jnp.where(vkj, dep, _BIG)
+            edg = jnp.where(vkj[:, :, None, :, None], edg, _BIG)
+            edg = jnp.where(vkj[:, None, :, None, :], edg, _BIG)
             DEP.append(dep)
             EDG.append(edg)
         DEPOT = jnp.stack(DEP, axis=1)                                    # (G,J,N,K)
         EDGE = jnp.stack(EDG, axis=1)                                     # (G,J,N,N,K,K)
 
         order_g = st["EXT"][ge]                                           # (G,N)
-        n_br = len(self.branched)
         wn_j = st["wn_j"]                                                 # (n_br,)
 
         # -- cost + branch pick per grid cell --------------------------
@@ -537,15 +583,26 @@ class _DpMasterJax:
                   else jnp.zeros((kk, 0)))                                # (kk,n_cond)
         t_k = st["POS"][e_sel].astype(float)                             # (kk,N) rank/node
         be_k = branch_of_entry[g_sel]                                    # (kk,n_br)
+        own_k = st["owner_per_combo"][c_star] if n_br else None          # (kk,n_br)
         proj_branch_k = jnp.zeros((kk, n_branch))
         wp0_k = wp0_g[g_sel]                                            # (kk,N,S)
+        dim = p.dim
         for bi, kb in enumerate(self.branch_ks):
             wn = int(st["wn"][bi])
             start = int(st["starts"][bi])
             ch = be_k[:, bi]                                             # (kk,)
             proj_branch_k = proj_branch_k.at[:, start:start + kb].set(
                 jax.nn.one_hot(ch, kb))
-            wp0_k = wp0_k.at[:, wn, :].set(CAND[g_sel, wn, ch])          # (kk,S)
+            row_bi = res_rows[bi][g_sel, ch]                            # (kk,S) full spliced row
+            # write only the columns this entry controls, so two entries at a
+            # shared node don't clobber each other's band.
+            if self.branch_static[bi] and self.branch_cols[bi].shape[0]:
+                ci = jnp.asarray(self.branch_cols[bi])                  # (w,)
+                wp0_k = wp0_k.at[:, wn, ci].set(row_bi[:, ci])
+            else:                                                       # dynamic: owner's dim-band
+                band = own_k[:, bi:bi + 1] * dim + jnp.arange(dim)[None, :]  # (kk,dim)
+                wp0_k = wp0_k.at[jnp.arange(kk)[:, None], wn, band].set(
+                    jnp.take_along_axis(row_bi, band, axis=1))
         cell_k = jnp.stack([c_star, a_star, e_sel], axis=1)             # (kk,3)
         return obj, assign_k, cond_k, t_k, proj_branch_k, wp0_k, cell_k
 
@@ -630,9 +687,23 @@ class _DpMasterJax:
         for j, ns in owned.items():
             for n in ns:
                 agent_of_node.setdefault(n, []).append(j)
-        _as0, _tv, wp0, rows_by_node, node_owner_of = _full_ext_resolve(
+        _as0, tvec, wp0, _rbn, _now = _full_ext_resolve(
             p, ext, n_nodes, owned, ov, aux, x0_full,
             self.layer0, self.branched, wp_template, node_active=node_active)
+
+        # `_full_ext_resolve`'s `rows_by_node` keeps only the LAST branched
+        # entry at a shared node; re-resolve each entry keyed by its own
+        # owner so a two-arm handoff prices against the right columns.
+        rows_by_owner = {}                             # (write_node, owner) -> (k, S)
+        for be in self.branched:
+            kb = be.discrete_params
+            pb = _np.zeros((kb, p.n_branch))
+            pb[_np.arange(kb), be.branch_slice.start + _np.arange(kb)] = 1.0
+            res = _resolve_schedule_wp(
+                p, _np.broadcast_to(wp0[None], (kb,) + wp0.shape), x0_full, ov, aux,
+                pb, tvec, only_entries=(be,), node_active=node_active)
+            wnn = int(be.write_node)
+            rows_by_owner[(wnn, int(entry_owner(p, be, ov)))] = res[:, wnn, :]
 
         # Price the winning cell from numpy cost tables built in ONE batched
         # vmap per agent (structure.build_*_cost_table), then run the numpy
@@ -642,13 +713,12 @@ class _DpMasterJax:
         edge_tables, depot_tables, branch_counts, agent_keys = {}, {}, {}, {}
         for j, ns in owned.items():
             ns = sorted(ns)
-            rj = {n: rows_by_node[n] for n in ns if n in rows_by_node}
+            rj = {n: rows_by_owner[(n, j)] for n in ns if (n, j) in rows_by_owner}
             pairs = [(u, v) for u in ns for v in ns if u != v]
             edge_tables[j] = build_edge_cost_table(rj, wp0, pairs, edge_cost_fn=self.sliced_of[j])
             depot_tables[j] = build_depot_cost_table(rj, wp0, x0_of[j], ns,
                                                     edge_cost_fn=self.sliced_of[j])
-            branch_counts[j] = {n: (rows_by_node[n].shape[0] if n in rows_by_node else 1)
-                                for n in ns}
+            branch_counts[j] = {n: (rj[n].shape[0] if n in rj else 1) for n in ns}
             agent_keys[j] = {n: _inst_key(p, self.instances, n, j, ov) for n in ns}
         best, best_sol = _np.inf, None
         if self.objective in ("avg", "minmax"):
@@ -666,7 +736,7 @@ class _DpMasterJax:
         # node; solve_dp_master's full path (and mpc.py's materialisation) key
         # only the multi-branch entries by (write_node, entry_owner-int). Remap.
         br = {}
-        for n, (_e, owner) in node_owner_of.items():
+        for (n, owner) in rows_by_owner:
             k = (n, agent_keys.get(owner, {}).get(n))
             if k in br_raw:
                 br[(n, owner)] = br_raw[k]

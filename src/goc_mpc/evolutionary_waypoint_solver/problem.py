@@ -577,7 +577,8 @@ class GraphOrderingRelaxed:
                  instance_node, n_nodes, state_dim,
                  n_cond_vars=0, objective="avg", edge_cost_fn=None,
                  eq_constraints=(), ineq_constraints=(), params=None,
-                 instance_list=(), var_id_to_slot=None, projections=()):
+                 instance_list=(), var_id_to_slot=None, projections=(),
+                 categorical_ne=()):
         self.instance_sources = list(instance_sources)
         # Raw (node, (kind, val)) routing-instance pairs and the GA-slot
         # assignment for each assignable variable id -- unlike
@@ -590,6 +591,15 @@ class GraphOrderingRelaxed:
         # object past this call (see that function's docstring).
         self.instance_list = list(instance_list)
         self.var_id_to_slot = {} if var_id_to_slot is None else dict(var_id_to_slot)
+        # Categorical inequality constraints between assignment SLOTS: each
+        # `(slot_a, slot_b)` says those two assignable variables must resolve
+        # to different agents. Planners emit these ("robot0 != robot1"); the
+        # discrete solvers use them to prune the assignment enumeration (and,
+        # for dp_master_jax, to allow a two-arm handoff node whose per-arm
+        # branch owners are only guaranteed distinct BY such a constraint).
+        # Slot indices, already translated from the graph's var ids by
+        # build_graph_ordering_problem.
+        self.categorical_ne = [(int(a), int(b)) for (a, b) in categorical_ne]
         self.n_variables = n_variables
         self.n_agents = x0.shape[0]
         self.dim = x0.shape[1]

@@ -31,6 +31,18 @@ def _lit(g, agent, xy):
                         discrete_params=1, func=lambda psi, b, v=xy: v)
 
 
+def _ik(g, agent, xys):
+    xys = np.asarray(xys, float)
+    return ProjOperator(pins=g.agent_q(agent), reads=(), continuous_params=0,
+                        discrete_params=len(xys), func=lambda psi, b, v=xys: v[b])
+
+
+def _lit_var(g, var, xy):
+    xy = np.asarray(xy, float)
+    return ProjOperator(pins=g.var_agent_q(var), reads=(), continuous_params=0,
+                        discrete_params=1, func=lambda psi, b, v=xy: v)
+
+
 # -- scene A: dynamic var_agent_q multi-branch pin (full-resolve, NC=2) ----
 def scene_A():
     cands_xy = np.array([[9.0, 9.0], [1.0, 0.0], [-8.0, 7.0]])
@@ -199,6 +211,77 @@ class _AnchorShim:
         self.anchor_wp = _j.zeros((len(node_active), 1))
 
 
+# -- scene D: two STATIC analytic-IK entries at ONE node, one per arm -----
+# (a two-arm handoff -- each arm picks its own branch; the grid must track
+#  the branch per (node, agent), not collapse to one per node).
+def scene_D():
+    g = GraphOfConstraints([[Block.R(DIM)], [Block.R(DIM)]], [],
+                           state_lower_bound=-50.0, state_upper_bound=50.0,
+                           robot_names=["r0", "r1"])
+    n0, n1 = g.structure.add_nodes(2)
+    g.structure.add_edge(n0, n1, True)
+    g.add_constraint(n0, eq(g.agent_q(0), np.zeros(DIM)), proj=_ik(g, 0, [[3.0, 0.0], [0.0, 9.0]]))
+    g.add_constraint(n0, eq(g.agent_q(1), np.zeros(DIM)), proj=_ik(g, 1, [[0.0, 8.0], [10.0, 0.0]]))
+    g.add_constraint(n1, eq(g.agent_q(0), np.zeros(DIM)), proj=_lit(g, 0, [6.0, 0.0]))
+    problem = build_graph_ordering_problem(g, np.zeros((2, DIM)), wp_bounds=(-50.0, 50.0),
+                                           objective="avg", edge_cost_fn=EU)
+    return problem, np.zeros(problem.state_dim), {0: np.zeros(problem.state_dim),
+                                                 1: np.zeros(problem.state_dim)}
+
+
+def test_shared_static_node():
+    """Two static IK entries at node 0 (arm 0 and arm 1). `run_vec` must
+    match `solve_dp_master` (whose non-full path keys branches per
+    (node, owner)) -- arm 0 picks [3,0] (closer than [0,9]), arm 1 picks
+    [0,8] (closer than [10,0])."""
+    problem, x0_full, x0_rows = scene_D()
+    params = np.asarray(problem.params)
+    wp = warm_start_wp(problem, x0_full)
+    inst = node_instances(problem)
+    for obj in ("avg", "minmax", "makespan"):
+        cands = node_candidates(problem, wp, params, allow_unresolved=True)
+        ref = solve_dp_master(problem, cands, wp, x0_rows, inst,
+                              ordering_edges=problem.ordering_edges, edge_cost_fn=EU,
+                              objective=obj, x0_full=x0_full)
+        jm = make_dp_master_jax(problem, objective=obj, edge_cost_fn=EU)
+        got = jm.run_vec(params, wp, x0_full, x0_rows)
+        _cmp(ref, got)
+        # both arms' branches came through, independently
+        assert got["branch"].get((0, 0)) == 0, ("D", obj, "arm0 branch", got["branch"])
+        assert got["branch"].get((0, 1)) == 0, ("D", obj, "arm1 branch", got["branch"])
+    print("[D shared-static-node] run_vec == solve_dp_master; per-arm branch kept -- OK")
+
+
+def test_categorical_ne_prunes_assignment():
+    """`problem.categorical_ne` drops the assignment combos where the two
+    named slots land on the same agent -- from `_DpMasterJax.A` and hence
+    from every discrete solution."""
+    g = GraphOfConstraints([[Block.R(DIM)], [Block.R(DIM)]], [],
+                           state_lower_bound=-50.0, state_upper_bound=50.0,
+                           robot_names=["r0", "r1"])
+    n0, n1 = g.structure.add_nodes(2)
+    g.structure.add_edge(n0, n1, True)
+    va, vb = g.add_variable(), g.add_variable()
+    # both variables want to sit at the same cheap spot -> unconstrained
+    # optimum puts both on whichever arm is closer; the constraint forbids it
+    g.add_constraint(n0, eq(g.var_agent_q(va), np.zeros(DIM)), proj=_lit_var(g, va, [1.0, 0.0]))
+    g.add_constraint(n1, eq(g.var_agent_q(vb), np.zeros(DIM)), proj=_lit_var(g, vb, [1.0, 0.0]))
+    problem = build_graph_ordering_problem(g, np.zeros((2, DIM)), wp_bounds=(-50.0, 50.0),
+                                           objective="avg", edge_cost_fn=EU)
+    x0f = np.zeros(problem.state_dim)
+
+    base = make_dp_master_jax(problem, objective="avg", edge_cost_fn=EU)
+    assert base.NC == 4, base.NC                                   # 2 agents ** 2 slots
+
+    problem.categorical_ne = [(0, 1)]
+    jm = make_dp_master_jax(problem, objective="avg", edge_cost_fn=EU)
+    assert jm.NC == 2, jm.NC                                       # (0,1) and (1,0) only
+    assert all(int(r[0]) != int(r[1]) for r in jm.A), jm.A
+    got = jm.run_vec(np.asarray(problem.params), warm_start_wp(problem, x0f), x0f, x0f)
+    assert got["assignment"][0] != got["assignment"][1], got["assignment"]
+    print("[categorical_ne] assignment enumeration pruned to distinct-agent combos -- OK")
+
+
 if __name__ == "__main__":
     _check_scene("A dynamic-multibranch", scene_A, ("avg", "minmax", "makespan"))
     _check_scene("B conditional-edges", scene_B, ("avg", "minmax", "makespan"))
@@ -206,4 +289,6 @@ if __name__ == "__main__":
     # anchor: node 0 committed in scene A
     _check_scene("A +anchor", scene_A, ("avg", "makespan"),
                  anchor=(np.array([False, True]), np.array([False]), np.array([0])))
+    test_shared_static_node()
+    test_categorical_ne_prunes_assignment()
     print("\nAll checks passed.")
