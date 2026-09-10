@@ -86,22 +86,32 @@ def _transitive_closure(n_nodes, P):
     return reach
 
 
-def _linear_extensions(n_nodes, P, cap):
-    """All total orders over `range(n_nodes)` consistent with `P` (all
-    topological sorts).  Returns `list[tuple[int]]`; raises if there would
-    be more than `cap`.  `None` if `P` has a cycle."""
-    succ = [[] for _ in range(n_nodes)]
-    indeg = [0] * n_nodes
+def _linear_extensions(nodes, P, cap):
+    """All total orders over `nodes` consistent with `P` (all topological
+    sorts).  Returns `list[tuple[int]]`; raises if there would be more than
+    `cap`.  `None` if `P` (restricted to `nodes`) has a cycle.
+
+    `nodes` is the set of node ids to order -- pass `range(n_nodes)` for
+    the whole graph, or an `anchor`'s remaining vertices to enumerate only
+    the future subgraph (edges of `P` touching a node outside `nodes` are
+    ignored: an already-committed predecessor imposes no constraint on the
+    order the remaining work is done in)."""
+    nodes = list(nodes)
+    nset = set(nodes)
+    n = len(nodes)
+    succ = {i: [] for i in nodes}
+    indeg = {i: 0 for i in nodes}
     for u, v in P:
-        succ[u].append(v)
-        indeg[v] += 1
-    if sum(indeg) and all(d > 0 for d in indeg):
+        if u in nset and v in nset:
+            succ[u].append(v)
+            indeg[v] += 1
+    if n and all(d > 0 for d in indeg.values()):
         return None  # every node has a predecessor -> cycle
 
     out = []
     order = []
-    used = [False] * n_nodes
-    deg = indeg[:]
+    used = set()
+    deg = dict(indeg)
 
     def rec():
         if len(out) > cap:
@@ -109,14 +119,14 @@ def _linear_extensions(n_nodes, P, cap):
                 f"dp_master: precedence DAG has > {cap} linear extensions "
                 "-- too loosely ordered for order enumeration (use Held-Karp "
                 "per agent for avg/minmax, or CP-SAT)")
-        if len(order) == n_nodes:
+        if len(order) == n:
             out.append(tuple(order))
             return
-        ready = [i for i in range(n_nodes) if not used[i] and deg[i] == 0]
+        ready = [i for i in nodes if i not in used and deg[i] == 0]
         if not ready:
             return  # cycle among the remainder
         for i in ready:
-            used[i] = True
+            used.add(i)
             order.append(i)
             for j in succ[i]:
                 deg[j] -= 1
@@ -124,7 +134,7 @@ def _linear_extensions(n_nodes, P, cap):
             for j in succ[i]:
                 deg[j] += 1
             order.pop()
-            used[i] = False
+            used.discard(i)
 
     rec()
     return out
@@ -258,13 +268,18 @@ def _order_t(ext, n_nodes):
 
 
 def _resolve_schedule_wp(problem, wp_pop, x0_full, owner_vagent, aux, proj_branch_pop, t_vec,
-                         only_entries=None):
+                         only_entries=None, node_active=None):
     """`(pop, n_nodes, state_dim)` wp for one enumerated schedule: the
     (`only_entries` subset of) projections spliced in by apply_projections
     against this assignment (`owner_vagent` one-hots), aux, per-member branch
     vectors and the order-derived `t` (shared across the pop). jitted +
     cached per (problem, only_entries). `wp_pop` and `proj_branch_pop` carry
-    the population axis; everything else is broadcast."""
+    the population axis; everything else is broadcast.
+
+    `node_active` (n_nodes,) bool -- an `anchor`'s remaining-vertex mask, so
+    apply_projections freezes already-passed columns and the gate machinery
+    decodes ranks consistent with the committed set (a passed node is
+    pre-scheduled at rank -1, its `t` value ignored). Defaults to all-active."""
     import jax.numpy as jnp
     from ..evolutionary_waypoint_solver.problem import jit_apply_projections
     pop = wp_pop.shape[0]
@@ -274,12 +289,14 @@ def _resolve_schedule_wp(problem, wp_pop, x0_full, owner_vagent, aux, proj_branc
         assign[:, s, int(owner_vagent[s])] = 1.0
     cb = (np.broadcast_to(np.asarray(aux, dtype=float), (pop, problem.n_cond_vars))
           if problem.n_cond_vars else np.zeros((pop, 0)))
+    na = (np.ones((problem.n_nodes,), dtype=bool) if node_active is None
+          else np.asarray(node_active, dtype=bool))
     out = jit_apply_projections(problem, only_entries=only_entries)(
         jnp.asarray(wp_pop), jnp.zeros((pop, problem.n_psi)),
         jnp.asarray(proj_branch_pop), jnp.asarray(problem.params),
         jnp.asarray(assign), jnp.asarray(cb),
         jnp.broadcast_to(jnp.asarray(t_vec, dtype=float), (pop, problem.n_nodes)),
-        jnp.ones((problem.n_nodes,), dtype=bool), jnp.asarray(x0_full))
+        jnp.asarray(na), jnp.asarray(x0_full))
     return np.asarray(out)
 
 
@@ -395,16 +412,21 @@ def _ext_nonfull_makespan(ext, P_pred, agent_of_node, owned, owner_vagent, aux,
 
 
 def _full_ext_resolve(problem, ext, n_nodes, owned, owner_vagent, aux, x0_full,
-                      layer0, branched, wp_template):
+                      layer0, branched, wp_template, node_active=None):
     """Shared per-`ext` resolve for the full path: (1) the branch-free
     projection layer once against this order's `t`, (2) each branched
     entry's k candidate rows against that layer. Returns
-    `(agent_seq, tvec, wp0, rows_by_node, node_owner_of)`."""
+    `(agent_seq, tvec, wp0, rows_by_node, node_owner_of)`.
+
+    `node_active` (n_nodes,) bool -- an `anchor`'s remaining-vertex mask,
+    threaded into the resolve so passed columns freeze and gates decode
+    against the committed set."""
     agent_seq = {j: [n for n in ext if n in owned.get(j, ())] for j in owned}
     tvec = _order_t(ext, n_nodes)
     wp0 = _resolve_schedule_wp(
         problem, wp_template[None], x0_full, owner_vagent, aux,
-        np.zeros((1, problem.n_branch)), tvec, only_entries=layer0)[0]
+        np.zeros((1, problem.n_branch)), tvec, only_entries=layer0,
+        node_active=node_active)[0]
 
     rows_by_node = {}
     node_owner_of = {}          # projected node -> (entry, owner-agent)
@@ -414,7 +436,8 @@ def _full_ext_resolve(problem, ext, n_nodes, owned, owner_vagent, aux, x0_full,
         pb[np.arange(k), e.branch_slice.start + np.arange(k)] = 1.0
         res = _resolve_schedule_wp(
             problem, np.broadcast_to(wp0[None], (k,) + wp0.shape),
-            x0_full, owner_vagent, aux, pb, tvec, only_entries=(e,))
+            x0_full, owner_vagent, aux, pb, tvec, only_entries=(e,),
+            node_active=node_active)
         rows_by_node[int(e.write_node)] = res[:, int(e.write_node), :]
         # For a DYNAMIC (var_agent_q) entry the owner is whichever agent
         # THIS assignment binds its variable to -- fixed inside this
@@ -426,11 +449,12 @@ def _full_ext_resolve(problem, ext, n_nodes, owned, owner_vagent, aux, x0_full,
 
 def _ext_full_avg_minmax(problem, objective, ext, P_pred, agent_of_node, n_nodes, owned,
                          owner_vagent, aux, x0_full, x0_of, sliced_of, layer0, branched,
-                         wp_template, best, best_sol):
+                         wp_template, best, best_sol, node_active=None):
     """One `ext` of the full-resolve avg/minmax loop: separable per-agent
     branch DP over the resolved candidate rows."""
     agent_seq, _tvec, wp0, rows_by_node, node_owner_of = _full_ext_resolve(
-        problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched, wp_template)
+        problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched,
+        wp_template, node_active=node_active)
     per_agent, choice = {}, {}
     for j, seq in agent_seq.items():
         c, ch = _branch_viterbi_wp(seq, rows_by_node, wp0, x0_of[j], sliced_of[j])
@@ -448,12 +472,14 @@ def _ext_full_avg_minmax(problem, objective, ext, P_pred, agent_of_node, n_nodes
 
 
 def _ext_full_makespan(problem, ext, P_pred, agent_of_node, n_nodes, owned, owner_vagent, aux,
-                       x0_full, x0_of, sliced_of, layer0, branched, wp_template, best, best_sol):
+                       x0_full, x0_of, sliced_of, layer0, branched, wp_template, best, best_sol,
+                       node_active=None):
     """One `ext` of the full-resolve makespan loop: branch choice couples
     with cross-agent waiting, so enumerate combos over per-agent cost
     matrices built once from the cached rows."""
     agent_seq, _tvec, wp0, rows_by_node, node_owner_of = _full_ext_resolve(
-        problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched, wp_template)
+        problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched,
+        wp_template, node_active=node_active)
     et, dt, bc = {}, {}, {}
     for j, seq in agent_seq.items():
         rj = {n: (rows_by_node[n] if n in rows_by_node else wp0[n][None, :]) for n in seq}
@@ -483,7 +509,7 @@ def _ext_full_makespan(problem, ext, P_pred, agent_of_node, n_nodes, owned, owne
 def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
                     ordering_edges=None, edge_cost_fn=None, objective="makespan",
                     max_assign_combos=4096, max_orders=20000, x0_full=None,
-                    max_branch_combos=4096):
+                    max_branch_combos=4096, anchor=None):
     """Solve the discrete problem by enumerating (assignment, aux, global
     order) and running an exact branch DP / forward pass inside.  Return
     dict mirrors `solve_cpsat`: `status`, `objective`, `branch`
@@ -495,6 +521,27 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
     `(u, v, gate)`, `gate is None` for a hard edge else a
     `formula_compiler.compile_condition` closure `gate(owner_vagent,
     cond_binary) -> bool`.
+
+    `anchor`: optional `evolutionary_waypoint_solver.problem.AnchorState`
+    (node_active, anchor_wp, var_committed, var_anchor) -- the MPC-cycle
+    commitment state. When given, the discrete problem is solved over the
+    FUTURE subgraph only:
+      * assignment slots with `var_committed[slot]` are pinned to
+        `var_anchor[slot]`; the enumeration products only over the free
+        slots;
+      * linear extensions are generated over the remaining vertices only
+        (`node_active`), edges of `P` touching a passed node dropped -- an
+        already-committed predecessor imposes no constraint on the order the
+        remaining work is done in;
+      * passed nodes are excluded from every route / branch DP / forward
+        pass, and from the returned `time` / `branch` / `routes` dicts (the
+        caller keeps their committed rows);
+      * `node_active` is threaded into the per-schedule projection resolve
+        so passed columns freeze and the gate machinery decodes ranks
+        against the committed set.
+    Depot legs start from the live `x0_by_agent` / `x0_full` (each agent's
+    current real position after its committed prefix), so no separate
+    committed-position bookkeeping is needed here.
     """
     import time as _t
     t0 = _t.perf_counter()
@@ -506,6 +553,17 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
     n_agents = problem.n_agents
     n_var = problem.n_variables
     n_cond = problem.n_cond_vars
+
+    if anchor is not None:
+        node_active = np.asarray(anchor.node_active, dtype=bool)
+        var_committed = np.asarray(anchor.var_committed, dtype=bool)
+        var_anchor = np.asarray(anchor.var_anchor, dtype=int)
+    else:
+        node_active = np.ones(n_nodes, dtype=bool)
+        var_committed = np.zeros(n_var, dtype=bool)
+        var_anchor = np.zeros(n_var, dtype=int)
+    remaining = [n for n in range(n_nodes) if node_active[n]]
+    remaining_set = set(remaining)
 
     if isinstance(x0_by_agent, dict):
         x0_of = dict(x0_by_agent)
@@ -560,29 +618,39 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
                 "per-branch rows, but still exponential); avg/minmax use the "
                 "separable per-track DP")
 
-    n_assign = n_agents ** n_var if n_var else 1
+    # 2a: enumerate only the assignment slots not already committed by the
+    # anchor -- a committed slot is pinned to `var_anchor[slot]`.
+    free_slots = [s for s in range(n_var) if not var_committed[s]]
+    n_assign = n_agents ** len(free_slots) if free_slots else 1
     if n_assign > max_assign_combos:
         raise NotImplementedError(
-            f"dp_master: {n_agents}**{n_var} = {n_assign} assignment combos "
+            f"dp_master: {n_agents}**{len(free_slots)} = {n_assign} assignment combos "
             f"> max_assign_combos={max_assign_combos}")
 
-    assign_combos = (list(itertools.product(range(n_agents), repeat=n_var))
-                     if n_var else [()])
+    free_combos = (list(itertools.product(range(n_agents), repeat=len(free_slots)))
+                   if free_slots else [()])
     aux_combos = list(itertools.product((0, 1), repeat=n_cond)) if n_cond else [()]
 
     best = np.inf
     best_sol = None
 
-    for A in assign_combos:
-        owner_vagent = np.asarray(A, dtype=int)
+    for free_vals in free_combos:
+        owner_vagent = var_anchor.copy()
+        for s, val in zip(free_slots, free_vals):
+            owner_vagent[s] = val
         owned = _agent_owned_nodes(problem, instances, owner_vagent)
+        # Restrict to the future subgraph: a passed node is never re-routed.
+        owned = {j: {n for n in ns if n in remaining_set} for j, ns in owned.items()}
         # candidate-dict key per (agent, node)
         agent_keys = {j: {n: _inst_key(problem, instances, n, j, owner_vagent) for n in ns}
                       for j, ns in owned.items()}
 
         for aux in aux_combos:
             P = _resolve_precedence(problem, ordering_edges, owner_vagent, aux)
-            exts = _linear_extensions(n_nodes, P, max_orders)
+            # Drop edges touching a passed node -- an already-committed
+            # predecessor imposes no constraint on the remaining order.
+            P = {(u, v) for (u, v) in P if u in remaining_set and v in remaining_set}
+            exts = _linear_extensions(remaining, P, max_orders)
             if exts is None:
                 continue  # cyclic precedence for this (A, aux)
             P_pred = {v: set() for v in range(n_nodes)}
@@ -616,12 +684,12 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
                     best, best_sol = _ext_full_avg_minmax(
                         problem, objective, ext, P_pred, agent_of_node, n_nodes, owned,
                         owner_vagent, aux, x0_full, x0_of, sliced_of, layer0, branched,
-                        wp_template, best, best_sol)
+                        wp_template, best, best_sol, node_active=node_active)
                 elif full:
                     best, best_sol = _ext_full_makespan(
                         problem, ext, P_pred, agent_of_node, n_nodes, owned, owner_vagent,
                         aux, x0_full, x0_of, sliced_of, layer0, branched, wp_template,
-                        best, best_sol)
+                        best, best_sol, node_active=node_active)
                 elif objective in ("avg", "minmax"):
                     best, best_sol = _ext_nonfull_avg_minmax(
                         objective, ext, P_pred, agent_of_node, owned, owner_vagent, aux,

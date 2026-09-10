@@ -170,7 +170,7 @@ def entry_owner(problem, entry, owner_vagent=None):
     return int(np.asarray(owner_vagent)[entry.owner_var_slot])
 
 
-def node_candidates(problem, wp_template, params, allow_unresolved=False):
+def node_candidates(problem, wp_template, params, allow_unresolved=False, active_nodes=None):
     """dict[node] -> dict[owner] -> NodeCandidates, one inner entry per
     *self-contained static* projection (problem.projections,
     len(entry.node_locals) == 1 and entry.owner_var_slot is None) writing
@@ -220,6 +220,11 @@ def node_candidates(problem, wp_template, params, allow_unresolved=False):
             "allow_unresolved=True to defer them to solve_dp_master)")
     out = {}
     n_nodes = problem.n_nodes
+    # `active_nodes` (an anchor's remaining vertices): skip resolving a
+    # projection whose write_node is already committed -- solve_dp_master
+    # never consults a passed node's candidate rows (it routes only the
+    # future subgraph), so the analytic-IK resolve there is wasted work.
+    active_set = None if active_nodes is None else set(active_nodes)
     # Reused across entries (all traced args are per-entry; these are not).
     _dummy_assign1 = jnp.zeros((1, problem.n_variables, problem.n_agents))
     _dummy_cb1 = jnp.zeros((1, problem.n_cond_vars))
@@ -229,6 +234,8 @@ def node_candidates(problem, wp_template, params, allow_unresolved=False):
     _params = jnp.asarray(params)
     _wp1 = jnp.asarray(wp_template)[None]
     for entry in problem.projections:
+        if active_set is not None and entry.write_node not in active_set:
+            continue
         deferred = (len(entry.node_locals) != 1 or entry.owner_var_slot is not None
                     or entry.gate_fn is not None or id(entry) in chained_readers)
         if deferred:

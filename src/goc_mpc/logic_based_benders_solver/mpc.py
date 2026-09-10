@@ -156,7 +156,8 @@ class DpMasterWaypointSolver:
         anchor = self._compute_anchor(remaining_vertices)
 
         wp_template = warm_start_wp(problem, x0_full)
-        cands = node_candidates(problem, wp_template, params, allow_unresolved=True)
+        cands = node_candidates(problem, wp_template, params, allow_unresolved=True,
+                                active_nodes=remaining)
         inst = node_instances(problem)
         dim = problem.dim
         x0_by_agent = {a: np.pad(x0_full[a * dim:a * dim + dim],
@@ -166,7 +167,8 @@ class DpMasterWaypointSolver:
         r = solve_dp_master(problem, cands, wp_template, x0_by_agent, inst,
                             ordering_edges=problem.ordering_edges,
                             edge_cost_fn=getattr(problem, "edge_cost_fn", None),
-                            objective=self._objective, x0_full=x0_full, **self._dp_kwargs)
+                            objective=self._objective, x0_full=x0_full, anchor=anchor,
+                            **self._dp_kwargs)
         if r["status"] != "OPTIMAL":
             self._last_solve_time = time.perf_counter() - t0
             return False
