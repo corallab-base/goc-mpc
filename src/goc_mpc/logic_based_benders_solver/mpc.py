@@ -49,6 +49,12 @@ class DpMasterWaypointSolver:
         self._dp_kwargs = {k: kwargs.pop(k) for k in
                            ("max_assign_combos", "max_orders", "max_branch_combos")
                            if k in kwargs}
+        # "python" (default) -> dp_master.solve_dp_master; "jax" ->
+        # dp_master_jax.make_dp_master_jax, the build-once jitted grid solver
+        # (needs a jnp-traceable edge_cost_fn). Errors from the jax build
+        # propagate -- no silent fallback, so a profiling run fails loudly.
+        self._dp_backend = kwargs.pop("dp_backend", "python")
+        self._jax_solver = None
         # Evolutionary-shaped kwargs (pop_size / n_gen / outer_iters / ...)
         # ride in via every experiment's WAYPOINT_KWARGS; inert here, ignored
         # rather than raised on (matches how MILP drops the ones it can't use).
@@ -84,6 +90,12 @@ class DpMasterWaypointSolver:
         self._problem = build_graph_ordering_problem(
             graph, x0_per_agent, self._wp_bounds,
             objective=self._objective, edge_cost_fn=self._edge_cost_fn)
+        if self._dp_backend == "jax":
+            from .dp_master_jax import make_dp_master_jax
+            self._jax_solver = make_dp_master_jax(
+                self._problem, objective=self._objective,
+                edge_cost_fn=getattr(self._problem, "edge_cost_fn", self._edge_cost_fn),
+                **self._dp_kwargs)
 
     def _to_padded_row(self, packed_row):
         aw, sw = self._agent_widths, self._slot_width
@@ -156,19 +168,26 @@ class DpMasterWaypointSolver:
         anchor = self._compute_anchor(remaining_vertices)
 
         wp_template = warm_start_wp(problem, x0_full)
-        cands = node_candidates(problem, wp_template, params, allow_unresolved=True,
-                                active_nodes=remaining)
-        inst = node_instances(problem)
         dim = problem.dim
         x0_by_agent = {a: np.pad(x0_full[a * dim:a * dim + dim],
                                  (a * dim, problem.state_dim - a * dim - dim))
                        for a in range(problem.n_agents)}
 
-        r = solve_dp_master(problem, cands, wp_template, x0_by_agent, inst,
-                            ordering_edges=problem.ordering_edges,
-                            edge_cost_fn=getattr(problem, "edge_cost_fn", None),
-                            objective=self._objective, x0_full=x0_full, anchor=anchor,
-                            **self._dp_kwargs)
+        if self._dp_backend == "jax":
+            r = self._jax_solver.run_vec(
+                params, wp_template, x0_full, x0_by_agent,
+                node_active=np.asarray(anchor.node_active, dtype=bool),
+                var_committed=np.asarray(anchor.var_committed, dtype=bool),
+                var_anchor=np.asarray(anchor.var_anchor, dtype=int))
+        else:
+            cands = node_candidates(problem, wp_template, params, allow_unresolved=True,
+                                    active_nodes=remaining)
+            inst = node_instances(problem)
+            r = solve_dp_master(problem, cands, wp_template, x0_by_agent, inst,
+                                ordering_edges=problem.ordering_edges,
+                                edge_cost_fn=getattr(problem, "edge_cost_fn", None),
+                                objective=self._objective, x0_full=x0_full, anchor=anchor,
+                                **self._dp_kwargs)
         if r["status"] != "OPTIMAL":
             self._last_solve_time = time.perf_counter() - t0
             return False

@@ -140,6 +140,39 @@ def _linear_extensions(nodes, P, cap):
     return out
 
 
+def _extensions_matrix(nodes, P, cap, bucket=True):
+    """Static-shape linear extensions for the vectorized kernels.
+
+    `_linear_extensions` returns a variable-length `list[tuple]`; a `vmap` /
+    `scan` over it needs a fixed leading axis. This wraps it into
+
+      `(mat, n_valid, M)`
+
+    where `mat` is `(M, L)` int32 (`L == len(nodes)`), rows `[:n_valid]` are
+    the linear extensions of `P` over `nodes` (node ids in order) and rows
+    `[n_valid:M]` repeat `mat[0]` -- harmless filler so a vmapped kernel
+    never evaluates an invalid permutation; mask its results with
+    `arange(M) < n_valid`. `n_valid` is the real extension count (`0` iff `P`
+    restricted to `nodes` has a cycle). `M` is `n_valid` rounded up to the
+    next power of two when `bucket` (so the kernels see O(log cap) distinct
+    trace shapes instead of one per count), else exactly `max(n_valid, 1)`.
+
+    Raises (via `_linear_extensions`) if there would be more than `cap`
+    extensions."""
+    nodes = list(nodes)
+    L = len(nodes)
+    exts = _linear_extensions(nodes, P, cap)
+    if not exts:  # None (cycle) or [] (never -- kept defensive)
+        return np.zeros((1, L), dtype=np.int32), 0, 1
+    n_valid = len(exts)
+    M = (1 << (n_valid - 1).bit_length()) if bucket else n_valid
+    mat = np.zeros((M, L), dtype=np.int32)
+    for i, e in enumerate(exts):
+        mat[i, :] = e
+    mat[n_valid:, :] = mat[0, :]
+    return mat, n_valid, M
+
+
 def _agent_owned_nodes(problem, instances, owner_vagent):
     """`dict[agent_id] -> set[node]` -- every node the agent visits under
     this assignment, disjunctively over that node's instances."""
@@ -447,14 +480,73 @@ def _full_ext_resolve(problem, ext, n_nodes, owned, owner_vagent, aux, x0_full,
     return agent_seq, tvec, wp0, rows_by_node, node_owner_of
 
 
+def _full_ext_resolve_batched(problem, mat, n_valid, n_nodes, owned, owner_vagent, aux,
+                              x0_full, layer0, branched, wp_template, node_active=None):
+    """All `n_valid` extensions' full-path resolve in `(1 + len(branched))`
+    `apply_projections` launches instead of 2 per ext.
+
+    Each `_resolve_schedule_wp` call already broadcasts assignment / aux /
+    x0 / node_active over the population axis and takes a per-member `t`, so
+    the only per-ext input is the order-derived `t` -- stack those and run
+    the whole batch at once.
+
+    Returns `(resolved_list, node_owner_of, wp0_all, rows_all)`:
+    `resolved_list[m]` is the same `(agent_seq, tvec, wp0, rows_by_node,
+    node_owner_of)` tuple `_full_ext_resolve` returns for `mat[m]` (only the
+    first `n_valid` are real); `wp0_all` is `(M, n_nodes, S)` and `rows_all`
+    is `dict[node -> (M, k, S)]` -- the raw tensors the batched scorer needs
+    without re-slicing per ext."""
+    M = mat.shape[0]
+    S = wp_template.shape[1]
+    exts = [tuple(int(n) for n in mat[m]) for m in range(M)]
+    T = np.stack([_order_t(exts[m], n_nodes) for m in range(M)])       # (M, n_nodes)
+
+    wp0_all = _resolve_schedule_wp(
+        problem, np.broadcast_to(wp_template[None], (M, n_nodes, S)),
+        x0_full, owner_vagent, aux, np.zeros((M, problem.n_branch)), T,
+        only_entries=layer0, node_active=node_active)                  # (M, n_nodes, S)
+
+    rows_all = {}                       # node -> (M, k, S)
+    node_owner_of = {}
+    for e in branched:
+        k = e.discrete_params
+        pb = np.zeros((k, problem.n_branch))
+        pb[np.arange(k), e.branch_slice.start + np.arange(k)] = 1.0
+        res = _resolve_schedule_wp(
+            problem, np.repeat(wp0_all, k, axis=0), x0_full, owner_vagent, aux,
+            np.tile(pb, (M, 1)), np.repeat(T, k, axis=0), only_entries=(e,),
+            node_active=node_active).reshape(M, k, n_nodes, S)
+        rows_all[int(e.write_node)] = res[:, :, int(e.write_node), :]
+        node_owner_of[int(e.write_node)] = (e, entry_owner(problem, e, owner_vagent))
+
+    resolved_list = []
+    for m in range(M):
+        agent_seq = {j: [n for n in exts[m] if n in owned.get(j, ())] for j in owned}
+        rows_by_node = {nd: np.asarray(rows_all[nd][m]) for nd in rows_all}
+        resolved_list.append((agent_seq, T[m], np.asarray(wp0_all[m]),
+                              rows_by_node, node_owner_of))
+    return resolved_list, node_owner_of, np.asarray(wp0_all), rows_all
+
+
 def _ext_full_avg_minmax(problem, objective, ext, P_pred, agent_of_node, n_nodes, owned,
                          owner_vagent, aux, x0_full, x0_of, sliced_of, layer0, branched,
                          wp_template, best, best_sol, node_active=None):
     """One `ext` of the full-resolve avg/minmax loop: separable per-agent
     branch DP over the resolved candidate rows."""
-    agent_seq, _tvec, wp0, rows_by_node, node_owner_of = _full_ext_resolve(
+    resolved = _full_ext_resolve(
         problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched,
         wp_template, node_active=node_active)
+    return _ext_full_avg_minmax_score(
+        objective, ext, P_pred, agent_of_node, owned, owner_vagent, aux,
+        x0_of, sliced_of, resolved, best, best_sol)
+
+
+def _ext_full_avg_minmax_score(objective, ext, P_pred, agent_of_node, owned, owner_vagent,
+                               aux, x0_of, sliced_of, resolved, best, best_sol):
+    """Score one already-resolved ext (`resolved` = a `_full_ext_resolve`
+    tuple) for the full-resolve avg/minmax path -- split out so the batched
+    caller can resolve every ext in bulk and only score here."""
+    agent_seq, _tvec, wp0, rows_by_node, node_owner_of = resolved
     per_agent, choice = {}, {}
     for j, seq in agent_seq.items():
         c, ch = _branch_viterbi_wp(seq, rows_by_node, wp0, x0_of[j], sliced_of[j])
@@ -477,9 +569,18 @@ def _ext_full_makespan(problem, ext, P_pred, agent_of_node, n_nodes, owned, owne
     """One `ext` of the full-resolve makespan loop: branch choice couples
     with cross-agent waiting, so enumerate combos over per-agent cost
     matrices built once from the cached rows."""
-    agent_seq, _tvec, wp0, rows_by_node, node_owner_of = _full_ext_resolve(
+    resolved = _full_ext_resolve(
         problem, ext, n_nodes, owned, owner_vagent, aux, x0_full, layer0, branched,
         wp_template, node_active=node_active)
+    return _ext_full_makespan_score(
+        ext, P_pred, agent_of_node, owned, owner_vagent, aux, x0_of, sliced_of,
+        resolved, best, best_sol)
+
+
+def _ext_full_makespan_score(ext, P_pred, agent_of_node, owned, owner_vagent, aux,
+                             x0_of, sliced_of, resolved, best, best_sol):
+    """Score one already-resolved ext for the full-resolve makespan path."""
+    agent_seq, _tvec, wp0, rows_by_node, node_owner_of = resolved
     et, dt, bc = {}, {}, {}
     for j, seq in agent_seq.items():
         rj = {n: (rows_by_node[n] if n in rows_by_node else wp0[n][None, :]) for n in seq}
@@ -504,6 +605,311 @@ def _ext_full_makespan(problem, ext, P_pred, agent_of_node, n_nodes, owned, owne
             best = ms
             best_sol = (br, owner_vagent.copy(), aux, arr, agent_seq, per_agent)
     return best, best_sol
+
+
+# ----------------------------------------------------------------------------
+# Vectorized (JAX) non-full ext loop.
+#
+# The scalar `_ext_nonfull_*` bodies above stay the reference. These score
+# EVERY linear extension (and, for makespan, every branch combo) in one
+# batched vmap, pick the winner, and hand that single ext back to the scalar
+# body for an exact byte-identical reconstruction of `best_sol`. So the fast
+# path only ever REPLACES the O(#exts x #combos) Python loop with one kernel
+# launch; it never changes which solution is returned.
+# ----------------------------------------------------------------------------
+
+# OFF by default: on the real dual_ur5e scenes the per-(assignment, aux) vmap
+# trace/dispatch overhead is a 4-9x REGRESSION vs the scalar per-ext loop
+# (block_stacking/avg 106ms -> 417ms; tabletop/makespan 14ms -> 124ms). The
+# fully-vectorized replacement is dp_master_jax.make_dp_master_jax
+# (DpMasterWaypointSolver(dp_backend="jax")); these flags stay for A/B / a
+# future size-gated reuse.
+_DP_MASTER_BATCH_NONFULL = False
+_DP_MASTER_BATCH_FULL = False
+_DP_MASTER_BATCH_CAP = 200_000    # #exts x #combos above which we stay scalar
+
+
+def _ensure_x64():
+    import jax
+    if not jax.config.read("jax_enable_x64"):
+        jax.config.update("jax_enable_x64", True)
+
+
+_BIG = 1e12
+
+
+def _pack_nonfull_tables(n_agents, n_nodes, owned, edge_tables, depot_tables,
+                         branch_counts):
+    """Dense `(EDGE, DEPOT, KC, max_k)` from the per-agent dict tables:
+      EDGE  (n_agents, n_nodes, n_nodes, max_k, max_k)  -- `_BIG` where unset
+      DEPOT (n_agents, n_nodes, max_k)                  -- `_BIG` where unset
+      KC    (n_agents, n_nodes) int                     -- branch count, >=1
+    so the kernels are pure gather + reduce."""
+    max_k = 1
+    for j in owned:
+        for k in branch_counts[j].values():
+            max_k = max(max_k, int(k))
+    EDGE = np.full((n_agents, n_nodes, n_nodes, max_k, max_k), _BIG)
+    DEPOT = np.full((n_agents, n_nodes, max_k), _BIG)
+    KC = np.ones((n_agents, n_nodes), dtype=np.int32)
+    for j in owned:
+        for n, k in branch_counts[j].items():
+            KC[j, int(n)] = int(k)
+        for n, d in depot_tables[j].items():
+            d = np.asarray(d, float)
+            DEPOT[j, int(n), :d.shape[0]] = d
+        for (u, v), m in edge_tables[j].items():
+            m = np.asarray(m, float)
+            EDGE[j, int(u), int(v), :m.shape[0], :m.shape[1]] = m
+    return EDGE, DEPOT, KC, max_k
+
+
+def _agent_stops(mat, n_valid, owned, n_agents):
+    """`(STOPS (M, n_agents, L) int, NSTOP (M, n_agents) int)` -- for each
+    (extension, agent), the agent's ordered subsequence of that extension,
+    zero-padded to `L`."""
+    M, L = mat.shape
+    STOPS = np.zeros((M, n_agents, L), dtype=np.int32)
+    NSTOP = np.zeros((M, n_agents), dtype=np.int32)
+    osets = {j: set(int(n) for n in owned.get(j, ())) for j in range(n_agents)}
+    for m in range(n_valid):
+        row = [int(n) for n in mat[m]]
+        for j in range(n_agents):
+            s = [n for n in row if n in osets[j]]
+            STOPS[m, j, :len(s)] = s
+            NSTOP[m, j] = len(s)
+    return STOPS, NSTOP
+
+
+def _branch_combos(remaining, owned, KC, n_agents):
+    """`(pnodes, BR_batch)` -- `pnodes` the list of branched `(node, agent)`
+    pairs, `BR_batch` an `(C, n_nodes, n_agents)` int tensor with every
+    combination of their branch indices (0 elsewhere)."""
+    n_nodes = KC.shape[1]
+    pnodes = [(int(n), j) for n in remaining for j in range(n_agents)
+              if int(n) in owned.get(j, ()) and KC[j, int(n)] > 1]
+    ranges = [range(int(KC[j, n])) for (n, j) in pnodes]
+    combos = list(itertools.product(*ranges)) if pnodes else [()]
+    BR = np.zeros((len(combos), n_nodes, n_agents), dtype=np.int32)
+    for c, combo in enumerate(combos):
+        for i, (n, j) in enumerate(pnodes):
+            BR[c, n, j] = combo[i]
+    return pnodes, BR
+
+
+def _viterbi_cost_jax(stops, nstop, EDGE_j, DEPOT_j):
+    """min routed-path cost for one agent's padded `stops` (0 if `nstop==0`).
+    Forward min-DP only -- the scalar body redoes the argmin backtrace on the
+    winning ext."""
+    import jax.numpy as jnp
+    from jax import lax
+    L = stops.shape[0]
+
+    def step(cost, s):
+        v = stops[s]
+        prev_v = stops[jnp.maximum(s - 1, 0)]
+        edge_c = jnp.min(cost[:, None] + EDGE_j[prev_v, v], axis=0)
+        new = jnp.where(s == 0, DEPOT_j[v], edge_c)
+        return jnp.where(s < nstop, new, cost), None
+
+    cost, _ = lax.scan(step, jnp.zeros(EDGE_j.shape[-1]), jnp.arange(L))
+    return jnp.where(nstop == 0, 0.0, jnp.min(cost))
+
+
+def _makespan_arr_jax(ext_row, BR, EDGE, DEPOT, OWN, PRED, n_agents):
+    """DAG forward pass -> `arr` (n_nodes,) for one extension `ext_row` (a
+    permutation of the remaining node ids) and branch tensor `BR`
+    (n_nodes, n_agents)."""
+    import jax.numpy as jnp
+    from jax import lax
+    ag = jnp.arange(n_agents)
+    NEG = -_BIG
+
+    def step(carry, v):
+        arr, prev_own, prev_br = carry
+        t = jnp.maximum(0.0, jnp.max(jnp.where(PRED[v], arr, NEG)))
+        has_prev = prev_own >= 0
+        u_safe = jnp.where(has_prev, prev_own, 0)
+        bv = BR[v]
+        edge_leg = arr[u_safe] + EDGE[ag, u_safe, v, prev_br, bv]
+        leg = jnp.where(has_prev, edge_leg, DEPOT[ag, v, bv])
+        own_v = OWN[v]
+        t = jnp.maximum(t, jnp.max(jnp.where(own_v, leg, NEG)))
+        arr = arr.at[v].set(t)
+        return (arr, jnp.where(own_v, v, prev_own),
+                jnp.where(own_v, bv, prev_br)), None
+
+    init = (jnp.zeros(PRED.shape[0]), -jnp.ones(n_agents, jnp.int32),
+            jnp.zeros(n_agents, jnp.int32))
+    (arr, _, _), _ = lax.scan(step, init, ext_row)
+    return arr
+
+
+def _ext_nonfull_batched(objective, mat, n_valid, remaining, P, P_pred, agent_of_node,
+                         owned, owner_vagent, aux, agent_keys, edge_tables, depot_tables,
+                         branch_counts, n_agents, n_nodes, best, best_sol, max_branch_combos):
+    """Score all `n_valid` extensions of `mat` in one batched kernel, then
+    reconstruct the winner exactly via the scalar `_ext_nonfull_*` body.
+    Returns the (possibly updated) `(best, best_sol)`, or `None` to signal
+    'fall back to the scalar per-ext loop' (batch too large / degenerate)."""
+    import jax
+    import jax.numpy as jnp
+    _ensure_x64()
+    M, L = mat.shape
+    EDGE, DEPOT, KC, _mk = _pack_nonfull_tables(
+        n_agents, n_nodes, owned, edge_tables, depot_tables, branch_counts)
+    OWN = np.zeros((n_nodes, n_agents), dtype=bool)
+    for j, ns in owned.items():
+        for n in ns:
+            OWN[int(n), j] = True
+    PRED = np.zeros((n_nodes, n_nodes), dtype=bool)
+    for (u, v) in P:
+        PRED[int(v), int(u)] = True
+    rem_ids = np.asarray(sorted(int(n) for n in remaining), dtype=np.int32)
+    EXTS = jnp.asarray(mat)
+
+    if objective in ("avg", "minmax"):
+        STOPS, NSTOP = _agent_stops(mat, n_valid, owned, n_agents)
+        f_ag = jax.vmap(lambda st, ns, Ej, Dj: _viterbi_cost_jax(st, ns, Ej, Dj),
+                        in_axes=(0, 0, 0, 0))
+        f_all = jax.vmap(f_ag, in_axes=(0, 0, None, None))
+        costs = np.asarray(f_all(jnp.asarray(STOPS), jnp.asarray(NSTOP),
+                                 jnp.asarray(EDGE), jnp.asarray(DEPOT)))  # (M, n_agents)
+        score = costs.sum(1) if objective == "avg" else costs.max(1)
+        score = np.where(np.arange(M) < n_valid, score, np.inf)
+        m_star = int(np.argmin(score))
+        if not np.isfinite(score[m_star]) or score[m_star] >= best:
+            return best, best_sol
+        return _ext_nonfull_avg_minmax(
+            objective, tuple(int(n) for n in mat[m_star]), P_pred, agent_of_node,
+            owned, owner_vagent, aux, agent_keys, edge_tables, depot_tables,
+            branch_counts, best, best_sol)
+
+    # makespan
+    pnodes, BR = _branch_combos(remaining, owned, KC, n_agents)
+    C = BR.shape[0]
+    if n_valid * C > _DP_MASTER_BATCH_CAP or C > max_branch_combos:
+        return None
+    kern = lambda ext_row, br: jnp.max(_makespan_arr_jax(
+        ext_row, br, jnp.asarray(EDGE), jnp.asarray(DEPOT),
+        jnp.asarray(OWN), jnp.asarray(PRED), n_agents)[rem_ids])
+    grid = jax.vmap(jax.vmap(kern, in_axes=(None, 0)), in_axes=(0, None))
+    ms = np.asarray(grid(EXTS, jnp.asarray(BR)))  # (M, C)
+    ms = np.where((np.arange(M) < n_valid)[:, None], ms, np.inf)
+    m_star = int(np.argmin(ms) // C)
+    if not np.isfinite(ms.min()) or ms.min() >= best:
+        return best, best_sol
+    return _ext_nonfull_makespan(
+        tuple(int(n) for n in mat[m_star]), P_pred, agent_of_node, owned,
+        owner_vagent, aux, agent_keys, edge_tables, depot_tables, branch_counts,
+        best, best_sol)
+
+
+def _ecf_traceable(sliced_fn, state_dim):
+    """True iff `sliced_fn` (one agent's `_agent_sliced_cost_fn`) can run
+    under `jax.vmap` -- the full-resolve scoring kernels need a jnp cost fn.
+    A `float(...)`-wrapped or `np.asarray`-based fn fails here and the caller
+    stays on the scalar per-ext scorer."""
+    import jax
+    import jax.numpy as jnp
+    try:
+        jax.eval_shape(lambda a, b: jnp.asarray(sliced_fn(a, b)),
+                       jnp.zeros(state_dim), jnp.zeros(state_dim))
+        return True
+    except Exception:
+        return False
+
+
+def _ext_full_batched(objective, mat, n_valid, remaining, P, P_pred, agent_of_node,
+                      owned, owner_vagent, aux, x0_of, sliced_of, n_agents, n_nodes,
+                      state_dim, resolved_list, wp0_all, rows_all, best, best_sol,
+                      max_branch_combos):
+    """Score every batched-resolved extension in one vmapped kernel (dense
+    per-ext EDGE/DEPOT built from the resolved candidate rows via the jnp
+    `sliced_of`), pick the winner, reconstruct it exactly via the scalar
+    `_ext_full_*_score` body. `None` -> caller stays on the scalar scorer
+    (cost fn not jnp-traceable, or batch too large)."""
+    import jax
+    import jax.numpy as jnp
+    _ensure_x64()
+    if not _ecf_traceable(sliced_of[0], state_dim):
+        return None
+    M = mat.shape[0]
+    exts = [tuple(int(n) for n in mat[m]) for m in range(M)]
+
+    max_k = max([1] + [rows_all[n].shape[1] for n in rows_all])
+    CAND = np.repeat(np.asarray(wp0_all)[:, :, None, :], max_k, axis=2)  # (M,N,max_k,S)
+    KC_node = np.ones(n_nodes, dtype=np.int32)
+    for n, r in rows_all.items():
+        k = r.shape[1]
+        KC_node[int(n)] = k
+        CAND[:, int(n), :k, :] = r
+        CAND[:, int(n), k:, :] = r[:, :1, :]
+
+    OWN = np.zeros((n_nodes, n_agents), dtype=bool)
+    for j, ns in owned.items():
+        for n in ns:
+            OWN[int(n), j] = True
+    KC = np.where(OWN.T, KC_node[None, :], 1).astype(np.int32)  # (J, N)
+    PRED = np.zeros((n_nodes, n_nodes), dtype=bool)
+    for (u, v) in P:
+        PRED[int(v), int(u)] = True
+    rem_ids = np.asarray(sorted(int(n) for n in remaining), dtype=np.int32)
+    X0 = np.stack([np.asarray(x0_of[j], dtype=float) for j in range(n_agents)])  # (J,S)
+
+    CANDj = jnp.asarray(CAND)
+    validk = jnp.asarray(np.arange(max_k)[None, :] < KC_node[:, None])  # (N, max_k)
+
+    def tables_j(j):
+        sj = sliced_of[j]
+        x0j = jnp.asarray(X0[j])
+        dep = jax.vmap(jax.vmap(jax.vmap(lambda r: jnp.asarray(sj(x0j, r)))))(CANDj)  # (M,N,K)
+        gk = jax.vmap(jax.vmap(lambda ru, rv: jnp.asarray(sj(ru, rv)), (None, 0)), (0, None))
+        gn = jax.vmap(jax.vmap(gk, (None, 0)), (0, None))
+        edg = jax.vmap(gn)(CANDj, CANDj)  # (M,N,N,K,K)
+        dep = jnp.where(validk[None], dep, _BIG)
+        edg = jnp.where(validk[None, :, None, :, None], edg, _BIG)
+        edg = jnp.where(validk[None, None, :, None, :], edg, _BIG)
+        return dep, edg
+
+    DEP, EDG = zip(*(tables_j(j) for j in range(n_agents)))
+    DEPOT = jnp.stack(DEP, axis=1)   # (M, J, N, K)
+    EDGE = jnp.stack(EDG, axis=1)    # (M, J, N, N, K, K)
+
+    if objective in ("avg", "minmax"):
+        STOPS, NSTOP = _agent_stops(mat, n_valid, owned, n_agents)
+        f_all = jax.vmap(jax.vmap(_viterbi_cost_jax, in_axes=(0, 0, 0, 0)),
+                         in_axes=(0, 0, 0, 0))
+        costs = np.asarray(f_all(jnp.asarray(STOPS), jnp.asarray(NSTOP), EDGE, DEPOT))
+        score = costs.sum(1) if objective == "avg" else costs.max(1)
+        score = np.where(np.arange(M) < n_valid, score, np.inf)
+        m_star = int(np.argmin(score))
+        if not np.isfinite(score[m_star]) or score[m_star] >= best:
+            return best, best_sol
+        return _ext_full_avg_minmax_score(
+            objective, exts[m_star], P_pred, agent_of_node, owned, owner_vagent,
+            aux, x0_of, sliced_of, resolved_list[m_star], best, best_sol)
+
+    pnodes, BR = _branch_combos(remaining, owned, KC, n_agents)
+    C = BR.shape[0]
+    if n_valid * C > _DP_MASTER_BATCH_CAP or C > max_branch_combos:
+        return None
+    OWNj, PREDj = jnp.asarray(OWN), jnp.asarray(PRED)
+
+    def kern(ext_row, br, edge_m, depot_m):
+        return jnp.max(_makespan_arr_jax(ext_row, br, edge_m, depot_m,
+                                         OWNj, PREDj, n_agents)[rem_ids])
+
+    grid = jax.vmap(jax.vmap(kern, in_axes=(None, 0, None, None)),
+                    in_axes=(0, None, 0, 0))
+    ms = np.asarray(grid(jnp.asarray(mat), jnp.asarray(BR), EDGE, DEPOT))  # (M, C)
+    ms = np.where((np.arange(M) < n_valid)[:, None], ms, np.inf)
+    if not np.isfinite(ms.min()) or ms.min() >= best:
+        return best, best_sol
+    m_star = int(np.argmin(ms) // C)
+    return _ext_full_makespan_score(
+        exts[m_star], P_pred, agent_of_node, owned, owner_vagent, aux,
+        x0_of, sliced_of, resolved_list[m_star], best, best_sol)
 
 
 def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
@@ -674,6 +1080,48 @@ def solve_dp_master(problem, candidates, wp_template, x0_by_agent, instances,
             for j, ns in owned.items():
                 for n in ns:
                     agent_of_node.setdefault(n, []).append(j)
+
+            # Non-full: score every extension (and branch combo) in one
+            # batched kernel, reconstruct the winner via the scalar body.
+            if not full and _DP_MASTER_BATCH_NONFULL and exts:
+                mat, n_valid, _M = _extensions_matrix(remaining, P, max_orders)
+                r = _ext_nonfull_batched(
+                    objective, mat, n_valid, remaining, P, P_pred, agent_of_node,
+                    owned, owner_vagent, aux, agent_keys, edge_tables, depot_tables,
+                    branch_counts, n_agents, n_nodes, best, best_sol, max_branch_combos)
+                if r is not None:
+                    best, best_sol = r
+                    continue
+
+            # Full-resolve: resolve every extension's projection layers in
+            # one batched `apply_projections` launch (per branched entry),
+            # then score each ext with the scalar body.
+            if full and _DP_MASTER_BATCH_FULL and exts:
+                mat, n_valid, _M = _extensions_matrix(remaining, P, max_orders)
+                resolved_list, _now, wp0_all, rows_all = _full_ext_resolve_batched(
+                    problem, mat, n_valid, n_nodes, owned, owner_vagent, aux, x0_full,
+                    layer0, branched, wp_template, node_active=node_active)
+                r = _ext_full_batched(
+                    objective, mat, n_valid, remaining, P, P_pred, agent_of_node,
+                    owned, owner_vagent, aux, x0_of, sliced_of, n_agents, n_nodes,
+                    problem.state_dim, resolved_list, wp0_all, rows_all,
+                    best, best_sol, max_branch_combos)
+                if r is not None:
+                    best, best_sol = r
+                    continue
+                # cost fn not jnp-traceable / batch too big -- score the
+                # (still batch-resolved) exts with the scalar body.
+                for m in range(n_valid):
+                    ext = tuple(int(n) for n in mat[m])
+                    if objective in ("avg", "minmax"):
+                        best, best_sol = _ext_full_avg_minmax_score(
+                            objective, ext, P_pred, agent_of_node, owned, owner_vagent,
+                            aux, x0_of, sliced_of, resolved_list[m], best, best_sol)
+                    else:
+                        best, best_sol = _ext_full_makespan_score(
+                            ext, P_pred, agent_of_node, owned, owner_vagent, aux,
+                            x0_of, sliced_of, resolved_list[m], best, best_sol)
+                continue
 
             # One `ext` at a time -- dispatch to the loop body for this
             # (full/non-full) x (avg-minmax/makespan) combination. Both

@@ -1,0 +1,165 @@
+"""`make_dp_master_jax` -- piece 1: the exhaustive static enumeration plus
+the plain-Python `run_python` loop must reproduce `dp_master.solve_dp_master`
+exactly, and the precomputed gate-activation / extension-feasibility tensors
+must agree with `_linear_extensions` on the resolved precedence graph for
+every (assignment, aux) combo.
+
+Run: python examples/test_dp_master_jax.py
+"""
+
+import numpy as np
+import jax.numpy as jnp
+from pydrake.math import eq, ge
+
+from goc_mpc import GraphOfConstraints
+from goc_mpc._ext.configuration_spline import Block
+from goc_mpc.evolutionary_waypoint_solver.projection import ProjOperator
+from goc_mpc.evolutionary_waypoint_solver.spec import build_graph_ordering_problem
+from goc_mpc.logic_based_benders_solver.structure import (
+    node_instances, node_candidates, warm_start_wp)
+from goc_mpc.logic_based_benders_solver.dp_master import (
+    solve_dp_master, _resolve_precedence, _linear_extensions)
+from goc_mpc.logic_based_benders_solver.dp_master_jax import make_dp_master_jax
+
+DIM = 2
+EU = lambda a, b: jnp.sqrt(jnp.sum((jnp.asarray(b) - jnp.asarray(a)) ** 2))
+
+
+def _lit(g, agent, xy):
+    xy = np.asarray(xy, float)
+    return ProjOperator(pins=g.agent_q(agent), reads=(), continuous_params=0,
+                        discrete_params=1, func=lambda psi, b, v=xy: v)
+
+
+# -- scene A: dynamic var_agent_q multi-branch pin (full-resolve, NC=2) ----
+def scene_A():
+    cands_xy = np.array([[9.0, 9.0], [1.0, 0.0], [-8.0, 7.0]])
+    g = GraphOfConstraints([[Block.R(DIM)], [Block.R(DIM)]], [],
+                           state_lower_bound=-20.0, state_upper_bound=20.0,
+                           robot_names=["r0", "r1"])
+    n0, n1 = g.structure.add_nodes(2)
+    g.structure.add_edge(n0, n1, True)
+    var = g.add_variable()
+    g.add_constraint(n0, ge(g.var_agent_q(var), np.array([-20.0, -20.0])),
+                     proj=ProjOperator(pins=g.var_agent_q(var), reads=(), continuous_params=0,
+                                       discrete_params=3,
+                                       func=lambda psi, b: jnp.asarray(cands_xy)[b]))
+    g.add_constraint(n1, eq(g.var_agent_q(var), np.array([2.0, 2.0])),
+                     proj=ProjOperator(pins=g.var_agent_q(var), reads=(),
+                                       func=lambda psi, b: np.array([2.0, 2.0])))
+    x0 = np.concatenate([cands_xy[1], np.array([40.0, 40.0])])
+    problem = build_graph_ordering_problem(g, x0.reshape(2, DIM), wp_bounds=(-20.0, 20.0),
+                                           objective="avg", edge_cost_fn=EU)
+    x0_full = np.zeros(problem.state_dim)
+    x0_full[:len(x0)] = x0
+    x0_rows = {0: np.pad(cands_xy[1], (0, problem.state_dim - DIM)),
+               1: np.pad(np.array([40.0, 40.0]), (DIM, problem.state_dim - 2 * DIM))}
+    return problem, x0_full, x0_rows
+
+
+# -- scene B: conditional ordering edges on a free aux binary (NA=2) ------
+def scene_B():
+    g = GraphOfConstraints([[Block.R(DIM)]], [], state_lower_bound=-50.0,
+                           state_upper_bound=50.0, robot_names=["robot"])
+    n0, n1, n2 = g.structure.add_nodes(3)
+    g.structure.add_edge(n0, n1, True)
+    g.structure.add_edge(n0, n2, True)
+    bv = g.add_binary_cond_var()
+    g.add_edge(n1, n2, cond=(bv == 1))
+    g.add_edge(n2, n1, cond=(bv == 0))
+    g.add_constraint(n0, eq(g.agent_q(0), np.zeros(DIM)), proj=_lit(g, 0, [0.0, 0.0]))
+    g.add_constraint(n1, eq(g.agent_q(0), np.zeros(DIM)), proj=_lit(g, 0, [1.0, 0.0]))
+    g.add_constraint(n2, eq(g.agent_q(0), np.zeros(DIM)), proj=_lit(g, 0, [8.0, 0.0]))
+    problem = build_graph_ordering_problem(g, np.zeros((1, DIM)), wp_bounds=(-50.0, 50.0),
+                                           objective="makespan", edge_cost_fn=EU)
+    x0_full = np.zeros(problem.state_dim)
+    return problem, x0_full, {0: np.zeros(problem.state_dim)}
+
+
+# -- scene C: two arms, cross-agent edge, per-arm branch (makespan) -------
+def scene_C():
+    g = GraphOfConstraints([[Block.R(DIM)], [Block.R(DIM)]], [],
+                           state_lower_bound=-50.0, state_upper_bound=50.0,
+                           robot_names=["r0", "r1"])
+    n = g.structure.add_nodes(3)
+    g.structure.add_edge(n[0], n[1], True)
+    g.structure.add_edge(n[1], n[2], True)
+    g.add_constraint(n[0], eq(g.agent_q(0), np.zeros(DIM)),
+                     proj=ProjOperator(pins=g.agent_q(0), reads=(), continuous_params=0,
+                                       discrete_params=2,
+                                       func=lambda psi, b: jnp.array([[3.0, 0.0], [0.0, 3.0]])[b]))
+    g.add_constraint(n[1], eq(g.agent_q(0), np.zeros(DIM)), proj=_lit(g, 0, [6.0, 0.0]))
+    g.add_constraint(n[2], eq(g.agent_q(1), np.zeros(DIM)), proj=_lit(g, 1, [10.0, 0.0]))
+    problem = build_graph_ordering_problem(g, np.zeros((2, DIM)), wp_bounds=(-50.0, 50.0),
+                                           objective="makespan", edge_cost_fn=EU)
+    return problem, np.zeros(problem.state_dim), {0: np.zeros(problem.state_dim),
+                                                 1: np.zeros(problem.state_dim)}
+
+
+def _cmp(a, b):
+    for k in ("status", "assignment", "aux", "time", "routes"):
+        assert a.get(k) == b.get(k), (k, a.get(k), b.get(k))
+    assert abs((a["objective"] or 0.0) - (b["objective"] or 0.0)) < 1e-9, \
+        ("objective", a["objective"], b["objective"])
+    # `branch` differs only in whether single-branch nodes get an explicit 0
+    # (non-full path lists them, full-machinery path doesn't) -- compare with
+    # a 0 default over the union of keys.
+    for k in set(a.get("branch", {})) | set(b.get("branch", {})):
+        assert a["branch"].get(k, 0) == b["branch"].get(k, 0), ("branch", k, a["branch"], b["branch"])
+
+
+def _check_scene(name, scene, objectives, anchor=None):
+    problem, x0_full, x0_rows = scene()
+    params = np.asarray(problem.params)
+    wp = warm_start_wp(problem, x0_full)
+    inst = node_instances(problem)
+    na = None if anchor is None else anchor[0]
+    for obj in objectives:
+        cands = node_candidates(problem, wp, params, allow_unresolved=True)
+        ref = solve_dp_master(problem, cands, wp, x0_rows, inst,
+                              ordering_edges=problem.ordering_edges, edge_cost_fn=EU,
+                              objective=obj, x0_full=x0_full,
+                              anchor=None if anchor is None else _AnchorShim(*anchor))
+        jm = make_dp_master_jax(problem, objective=obj, edge_cost_fn=EU)
+        kw = dict(node_active=na,
+                  var_committed=None if anchor is None else anchor[1],
+                  var_anchor=None if anchor is None else anchor[2])
+        _cmp(ref, jm.run_python(params, wp, x0_full, x0_rows, **kw))
+        _cmp(ref, jm.run_vec(params, wp, x0_full, x0_rows, **kw))
+
+        # gate-activation / feasibility tensors vs _linear_extensions
+        node_active = np.ones(problem.n_nodes, bool) if na is None else np.asarray(na, bool)
+        remaining = [n for n in range(problem.n_nodes) if node_active[n]]
+        for c in range(jm.NC):
+            ov = np.asarray(jm.A[c], int)
+            for aidx in range(jm.NA):
+                aux = tuple(int(x) for x in jm.AUX[aidx])
+                P = _resolve_precedence(problem, jm.ordering_edges, ov, aux)
+                P = {(u, v) for (u, v) in P if node_active[u] and node_active[v]}
+                exts = _linear_extensions(remaining, P, jm.max_orders)
+                want = set() if exts is None else {tuple(e) for e in exts}
+                mask = jm.feasible_ext_mask(c, aidx, node_active)
+                have = {tuple(int(x) for x in jm.EXT[e] if node_active[int(x)])
+                        for e in range(jm.E) if mask[e]}
+                assert have == want, (name, obj, c, aux, have, want)
+    print(f"[{name}] run_python & run_vec == solve_dp_master; feasibility tensors == "
+          f"_linear_extensions ({','.join(objectives)}) -- OK")
+
+
+class _AnchorShim:
+    def __init__(self, node_active, var_committed, var_anchor):
+        import jax.numpy as _j
+        self.node_active = _j.asarray(node_active)
+        self.var_committed = _j.asarray(var_committed)
+        self.var_anchor = _j.asarray(var_anchor)
+        self.anchor_wp = _j.zeros((len(node_active), 1))
+
+
+if __name__ == "__main__":
+    _check_scene("A dynamic-multibranch", scene_A, ("avg", "minmax", "makespan"))
+    _check_scene("B conditional-edges", scene_B, ("avg", "minmax", "makespan"))
+    _check_scene("C coupled-makespan", scene_C, ("avg", "minmax", "makespan"))
+    # anchor: node 0 committed in scene A
+    _check_scene("A +anchor", scene_A, ("avg", "makespan"),
+                 anchor=(np.array([False, True]), np.array([False]), np.array([0])))
+    print("\nAll checks passed.")

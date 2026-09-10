@@ -23,7 +23,8 @@ from goc_mpc.evolutionary_waypoint_solver.problem import AnchorState
 from goc_mpc.evolutionary_waypoint_solver.spec import build_graph_ordering_problem
 from goc_mpc.logic_based_benders_solver.structure import (
     node_instances, node_candidates, warm_start_wp)
-from goc_mpc.logic_based_benders_solver.dp_master import solve_dp_master, _linear_extensions
+from goc_mpc.logic_based_benders_solver.dp_master import (
+    solve_dp_master, _linear_extensions, _extensions_matrix)
 
 DIM = 2
 
@@ -171,8 +172,42 @@ def test_C():
     print(f"[C] linear extensions: full={len(full)} -> remaining-only={len(rem)} (edge to passed node dropped) -- OK")
 
 
+# --------------------------------------------------------------------------
+# D. static-shape linear extensions (for the vectorized kernels)
+# --------------------------------------------------------------------------
+def test_D():
+    P = {(0, 3)}
+    exts = _linear_extensions(range(4), P, 10000)          # 12 orders
+    mat, n_valid, M = _extensions_matrix(range(4), P, 10000)
+    assert n_valid == len(exts) == 12
+    assert M == 16 and mat.shape == (16, 4)               # 12 -> next pow2
+    assert {tuple(r) for r in mat[:n_valid]} == set(exts)
+    assert all(tuple(mat[i]) == tuple(mat[0]) for i in range(n_valid, M))  # filler
+    # every real row is a permutation of the 4 nodes, and respects 0 -> 3
+    for r in mat[:n_valid]:
+        assert sorted(r) == [0, 1, 2, 3]
+        assert list(r).index(0) < list(r).index(3)
+
+    # remaining-only subgraph: 3! free, edge to passed node dropped
+    rmat, rn, rM = _extensions_matrix([1, 2, 3], P, 10000)
+    assert rn == 6 and rM == 8 and rmat.shape == (8, 3)
+    assert {tuple(r) for r in rmat[:rn]} == {tuple(e) for e in
+                                             _linear_extensions([1, 2, 3], P, 10000)}
+
+    # bucket=False -> exact count
+    emat, en, eM = _extensions_matrix([1, 2, 3], P, 10000, bucket=False)
+    assert en == eM == 6 and emat.shape == (6, 3)
+
+    # cycle -> n_valid == 0, shape still static
+    cmat, cn, cM = _extensions_matrix(range(2), {(0, 1), (1, 0)}, 10000)
+    assert cn == 0 and cmat.shape == (1, 2)
+    print(f"[D] extensions matrix: {n_valid} orders -> static ({M}, 4) pow2-bucketed, "
+          "filler rows masked by n_valid -- OK")
+
+
 if __name__ == "__main__":
     test_A()
     test_B()
     test_C()
+    test_D()
     print("\nAll checks passed.")
