@@ -127,6 +127,50 @@ def _check_scene(name, scene, objectives, anchor=None):
         _cmp(ref, jm.run_python(params, wp, x0_full, x0_rows, **kw))
         _cmp(ref, jm.run_vec(params, wp, x0_full, x0_rows, **kw))
 
+        # run_topk: first == run_vec, objectives non-decreasing, (assignment,
+        # aux) distinct across the returned members.
+        top = jm.run_topk(5, params, wp, x0_full, x0_rows, **kw)
+        assert top, (name, obj, "run_topk empty")
+        _cmp(ref, top[0])
+        objs = [d["objective"] for d in top]
+        assert objs == sorted(objs), (name, obj, "run_topk not sorted", objs)
+        seen = [(tuple(sorted(d["assignment"].items())),
+                 tuple(sorted(d["aux"].items()))) for d in top]
+        assert len(seen) == len(set(seen)), (name, obj, "run_topk dup skeleton", seen)
+
+        # skeleton_grid_fn: the jittable genome tuple for the top skeleton must
+        # decode to the same discrete solution solve_dp_master found.
+        X0 = jnp.stack([jnp.asarray(x0_rows[j] if isinstance(x0_rows, dict) else x0_rows,
+                                    float) for j in range(problem.n_agents)])
+        node_active = np.ones(problem.n_nodes, bool) if na is None else np.asarray(na, bool)
+        vc = np.zeros(problem.n_variables, bool) if anchor is None else np.asarray(anchor[1], bool)
+        va = np.zeros(problem.n_variables, int) if anchor is None else np.asarray(anchor[2], int)
+        gobj, gassign, gcond, gt, gpb, gwp0, gcell = jm.skeleton_grid_fn(3)(
+            jnp.asarray(params), jnp.asarray(wp), jnp.asarray(x0_full), X0,
+            jnp.asarray(node_active), jnp.asarray(vc), jnp.asarray(va))
+        gobj = np.asarray(gobj)
+        assert abs(float(gobj[0]) - ref["objective"]) < 1e-9, (name, obj, "grid obj", gobj[0])
+        if problem.n_variables:
+            got_assign = {s: int(np.argmax(np.asarray(gassign)[0, s])) for s in range(problem.n_variables)}
+            assert got_assign == ref["assignment"], (name, obj, "grid assign", got_assign)
+        got_aux = {k: int(round(v)) for k, v in enumerate(np.asarray(gcond)[0])}
+        assert got_aux == ref["aux"], (name, obj, "grid aux", got_aux, ref["aux"])
+        # proj_branch one-hot decodes per branched entry to the ref branch
+        for e in problem.projections:
+            if e.discrete_params <= 1:
+                continue
+            sl = e.branch_slice
+            picked = int(np.argmax(np.asarray(gpb)[0, sl.start:sl.start + e.discrete_params]))
+            owner = [o for (n, o) in ref["branch"] if n == e.write_node]
+            if owner:
+                assert ref["branch"][(e.write_node, owner[0])] == picked, \
+                    (name, obj, "grid branch", e.write_node, picked, ref["branch"])
+        # t is a valid linearisation of the hard precedence graph
+        gt0 = np.asarray(gt)[0]
+        for (u, v) in problem.hard_edges:
+            if node_active[u] and node_active[v]:
+                assert gt0[u] < gt0[v], (name, obj, "grid t not topological", u, v, gt0)
+
         # gate-activation / feasibility tensors vs _linear_extensions
         node_active = np.ones(problem.n_nodes, bool) if na is None else np.asarray(na, bool)
         remaining = [n for n in range(problem.n_nodes) if node_active[n]]

@@ -24,15 +24,21 @@ reference implementation and the A/B oracle (see
 `examples/test_dp_master_jax.py`).
 
 `make_dp_master_jax(problem, ...)` returns a `_DpMasterJax`; call it (or its
-`run_vec`) with the cycle's continuous data. The grid search --
-`_score_grid_core`: resolve every `(assignment, aux, extension)` cell via
-one batched `apply_projections` per projection layer, build dense
-EDGE/DEPOT, score with `_viterbi_cost_masked` (avg/minmax) or
-`_makespan_arr_jax` (makespan), mask infeasible cells, global argmin -- is
-one `jax.jit` compiled once per problem. Only the final winner -> dict
-reconstruction (routes per agent, branch per (node, owner)) stays in Python,
-on the single winning extension (same trick as
-`dp_master._ext_full_batched`).
+`run_vec`) with the cycle's continuous data. `run_topk(k, ...)` returns the
+`k` best discrete skeletons (distinct `(assignment, aux)`, ascending by
+objective) instead of just the winner; `skeleton_grid_fn(k)` is the same
+computation as a jittable pure function returning genome tensors, for
+`SmallContinuousVRPSolver._ask` to seed its population from.
+
+The grid search -- `_score_grid_core`: resolve every `(assignment, aux,
+ordering)` cell via one batched `apply_projections` per projection layer,
+build dense EDGE/DEPOT, price each with a per-agent branch Viterbi
+(`_agent_route_dp`, avg/minmax -- returns the chosen branch per node too, not
+just the cost) or the coupled makespan forward pass (`_makespan_arr_jax`,
+over an explicit `BC` branch-combo axis), reduce `min` over orderings so each
+skeleton has one score, then `lax.top_k` -- is one `jax.jit` per `k`. Only
+the winner -> `solve_dp_master` dict reconstruction (routes, times) stays in
+Python (`_reconstruct_cell`), on the single winning cell.
 
 Requires a jnp-traceable `edge_cost_fn`. Needs no `node_candidates` -- the
 grid search resolves everything through `apply_projections`, so the
@@ -55,27 +61,48 @@ from .dp_master import (
 )
 
 
-def _viterbi_cost_masked(order, act, EDGE_j, DEPOT_j):
-    """min routed-path cost for the agent whose visited positions along the
-    full node order `order` are flagged by `act` (bool, same length). Like
-    `dp_master._viterbi_cost_jax` but consumes the un-compacted extension +
-    an ownership mask, so the caller need not compact per (combo, agent)."""
+def _agent_route_dp(order, act, EDGE_j, DEPOT_j):
+    """One agent's minimum routed-path cost AND the branch index it picks at
+    each node it owns.
+
+    `order` (N,) is the full node visiting order; `act` (N,) bool flags the
+    stops this agent owns. `EDGE_j` (N,N,K,K) / `DEPOT_j` (N,K) are this
+    agent's branch-resolved edge / depot costs -- entry `[u, v, bu, bv]` is
+    the cost of hopping from node `u`'s branch `bu` to node `v`'s branch `bv`
+    (invalid branch slots already sit at `_BIG`, so they never win an argmin).
+
+    A Viterbi over the K-branch lattice along the agent's own stops, carrying
+    backpointers so the chosen branch per node comes back too, not just the
+    cost (`dp_master._viterbi_cost_jax` returns cost only -- fine for its
+    scalar dispatch, but the grid needs the full discrete solution to seed a
+    population). `branch_of_node` is 0 at every node this agent does not own
+    and at every owned node with no real branch choice (K_valid == 1)."""
     import jax.numpy as jnp
     from jax import lax
     K = EDGE_j.shape[-1]
+    N = order.shape[0]
 
-    def step(carry, i):
+    def fwd(carry, i):
         cost, prev, seen = carry
-        v = order[i]
-        a = act[i]
+        v, a = order[i], act[i]
         first = a & (~seen)
-        edge_c = jnp.min(cost[:, None] + EDGE_j[prev, v], axis=0)
+        trans = cost[:, None] + EDGE_j[prev, v]              # (K_prev, K_v)
+        edge_c = jnp.min(trans, axis=0)                      # (K_v,)
+        bp = jnp.argmin(trans, axis=0).astype(jnp.int32)     # (K_v,) best prev-branch
         new = jnp.where(first, DEPOT_j[v], edge_c)
-        return (jnp.where(a, new, cost), jnp.where(a, v, prev), seen | a), None
+        return (jnp.where(a, new, cost), jnp.where(a, v, prev), seen | a), (bp, a, v)
 
-    (cost, _, seen), _ = lax.scan(
-        step, (jnp.zeros(K), order[0], jnp.bool_(False)), jnp.arange(order.shape[0]))
-    return jnp.where(seen, jnp.min(cost), 0.0)
+    (cost, _, seen), (BP, A, V) = lax.scan(
+        fwd, (jnp.zeros(K), order[0], jnp.bool_(False)), jnp.arange(N))
+
+    def bwd(cur_b, i):
+        a = A[i]
+        return jnp.where(a, BP[i, cur_b], cur_b), jnp.where(a, cur_b, 0)
+
+    _, b_rev = lax.scan(bwd, jnp.argmin(cost).astype(jnp.int32), jnp.arange(N)[::-1])
+    b_fwd = b_rev[::-1]                                      # branch chosen at each step
+    branch_of_node = jnp.zeros(N, jnp.int32).at[V].set(jnp.where(A, b_fwd, 0))
+    return jnp.where(seen, jnp.min(cost), 0.0), branch_of_node
 
 
 class _DpMasterJax:
@@ -86,7 +113,7 @@ class _DpMasterJax:
     def __init__(self, problem, objective, edge_cost_fn, max_assign_combos,
                  max_orders, max_branch_combos):
         self._prepped = None
-        self._jitted = None
+        self._jitted = {}
         self.problem = problem
         self.objective = objective
         self.max_orders = max_orders
@@ -107,6 +134,15 @@ class _DpMasterJax:
         proj = list(problem.projections)
         self.layer0 = tuple(e for e in proj if e.discrete_params == 1)
         self.branched = [e for e in proj if e.discrete_params > 1]
+        _seen_wn = set()
+        for e in self.branched:
+            if e.write_node in _seen_wn:
+                raise NotImplementedError(
+                    "dp_master_jax: two multi-branch projections write the same "
+                    "node -- the grid tracks one branch index per node, so a "
+                    "shared-node handoff (each arm its own branch) is not "
+                    "supported yet")
+            _seen_wn.add(e.write_node)
         for e in self.branched:
             others = set().union(*(o.write_cols for o in self.branched if o is not e)) \
                 if len(self.branched) > 1 else set()
@@ -303,30 +339,52 @@ class _DpMasterJax:
             GACT=jnp.asarray(self.GACT), GFEAS=jnp.asarray(self.GFEAS),
             owner_per_combo=jnp.asarray(owner_per_combo), OWN=jnp.asarray(OWN),
             hard_pred=jnp.asarray(hard_pred), gated_vu=jnp.asarray(gated_vu),
-            gated_ends=jnp.asarray(gated_ends), wn=wn, starts=starts,
-            KC_node=jnp.asarray(KC_node), max_k=max_k,
+            gated_ends=jnp.asarray(gated_ends), wn=wn, wn_j=jnp.asarray(wn),
+            starts=starts, KC_node=jnp.asarray(KC_node), max_k=max_k,
             BC_grid=jnp.asarray(self.BC_grid),
             gc=jnp.asarray(gc), ga=jnp.asarray(ga), ge=jnp.asarray(ge),
             n_ext=self.n_ext,
         )
         return self._prepped
 
-    def _score_grid(self, params, wp_template, x0_full, X0,
-                    node_active, var_committed, var_anchor):
-        """`(g_star, bc_star, best_obj)` for the optimal grid cell -- the flat
-        index (into `gc`/`ga`/`ge`) and branch-combo index, and its
-        objective. `jax.jit`ed once per `_DpMasterJax` (all args are traced
-        arrays of problem-fixed shape, so one compile serves every cycle)."""
+    def skeleton_grid_fn(self, k):
+        """A jittable pure function
+        `(params, wp_template, x0_full, X0, node_active, var_committed,
+        var_anchor) -> (obj, assign_oh, cond, t, proj_branch, wp0, cell)` for
+        the `k` best discrete skeletons (distinct `(assignment, aux)`,
+        ascending by objective). Safe to call inside another `jax.jit` trace
+        (e.g. `SmallContinuousVRPSolver._ask`). See `_score_grid_core`."""
+        from functools import partial
+        _ensure_x64()
+        self._prep()
+        return partial(self._score_grid_core, n_top=int(k))
+
+    def _skeleton_grid(self, params, wp_template, x0_full, X0,
+                       node_active, var_committed, var_anchor, k):
+        """`skeleton_grid_fn(k)` compiled + cached per `k` and run eagerly.
+        Returns the 7-tuple `(obj (k,), assign_oh (k,n_var,J), cond (k,n_cond),
+        t (k,N), proj_branch (k,n_branch), wp0 (k,N,S), cell (k,3))` -- `cell`
+        is `[assignment_combo, aux_combo, extension]` for `_reconstruct_cell`.
+        `obj` is `+inf` for a skeleton with no feasible ordering."""
         import jax
-        if self._jitted is None:
-            _ensure_x64()
-            self._prep()
-            self._jitted = jax.jit(self._score_grid_core)
-        return self._jitted(params, wp_template, x0_full, X0,
-                            node_active, var_committed, var_anchor)
+        _ensure_x64()
+        self._prep()
+        if k not in self._jitted:
+            self._jitted[k] = jax.jit(self.skeleton_grid_fn(k))
+        return self._jitted[k](params, wp_template, x0_full, X0,
+                               node_active, var_committed, var_anchor)
 
     def _score_grid_core(self, params, wp_template, x0_full, X0,
-                         node_active, var_committed, var_anchor):
+                         node_active, var_committed, var_anchor, n_top):
+        """The whole grid search, one `jax.jit` per `n_top`. Enumerates every
+        `(assignment, aux, ordering)` cell (`G = NC*NA*E`), resolves each
+        through `apply_projections`, prices it with a per-agent branch Viterbi
+        (`_agent_route_dp`, avg/minmax) or the coupled makespan forward pass
+        (`_makespan_arr_jax`, over the `BC` branch-combo axis), then reduces
+        `min` over orderings so each `(assignment, aux)` skeleton has one
+        score, and returns the `n_top` cheapest skeletons with the genome
+        pieces needed to seed a GA individual. See `_skeleton_grid` for the
+        return shape."""
         import jax
         import jax.numpy as jnp
         from ..evolutionary_waypoint_solver.problem import jit_apply_projections
@@ -418,52 +476,109 @@ class _DpMasterJax:
         EDGE = jnp.stack(EDG, axis=1)                                     # (G,J,N,N,K,K)
 
         order_g = st["EXT"][ge]                                           # (G,N)
+        n_br = len(self.branched)
+        wn_j = st["wn_j"]                                                 # (n_br,)
 
+        # -- cost + branch pick per grid cell --------------------------
         if self.objective in ("avg", "minmax"):
             actmask = OWN_act[gc[:, None], order_g]                       # (G,N,J)
-            f_g = jax.vmap(lambda o, am, ed, dp: jax.vmap(
-                _viterbi_cost_masked, (None, 1, 0, 0))(o, am, ed, dp))    # over J
-            costs = f_g(order_g, actmask, EDGE, DEPOT)                    # (G,J)
-            score = costs.sum(1) if self.objective == "avg" else costs.max(1)
-            score = jnp.where(feas_g, score, jnp.inf)
-            g_star = jnp.argmin(score)
-            return g_star, jnp.int32(0), score[g_star]
+            route = jax.vmap(lambda o, am, ed, dp: jax.vmap(
+                _agent_route_dp, (None, 1, 0, 0))(o, am, ed, dp))         # over J
+            costs, br_gj = route(order_g, actmask, EDGE, DEPOT)           # (G,J), (G,J,N)
+            cost_g = costs.sum(1) if self.objective == "avg" else costs.max(1)
+            score_g = jnp.where(feas_g, cost_g, jnp.inf)                  # (G,)
+            if n_br:
+                own_g = st["owner_per_combo"][gc]                        # (G,n_br)
+                branch_of_entry = br_gj[jnp.arange(G)[:, None], own_g,
+                                        wn_j[None, :]]                   # (G,n_br)
+            else:
+                branch_of_entry = jnp.zeros((G, 0), jnp.int32)
+        else:
+            # makespan: branch combos couple with cross-agent waiting, so the
+            # branch combo stays an explicit grid axis and its winner is the
+            # BC argmin (not a per-agent Viterbi pick).
+            BC = st["BC_grid"].shape[0]
+            BR = jnp.zeros((NC, BC, N, J), jnp.int32)
+            for bi in range(n_br):
+                wn = int(st["wn"][bi])
+                own_c = st["owner_per_combo"][:, bi]                      # (NC,)
+                BR = BR.at[jnp.arange(NC)[:, None], jnp.arange(BC)[None, :],
+                           wn, own_c[:, None]].set(st["BC_grid"][None, :, bi])
+            BR_g = BR[gc]                                                 # (G,BC,N,J)
 
-        # makespan: branch combos couple with cross-agent waiting
-        BC = st["BC_grid"].shape[0]
-        BR = jnp.zeros((NC, BC, N, J), jnp.int32)
-        for bi in range(len(self.branched)):
+            def cell(order, br, edge_m, depot_m, own_c, pred_ca):
+                arr = _makespan_arr_jax(order, br, edge_m, depot_m, own_c, pred_ca, J)
+                return jnp.max(jnp.where(node_active, arr, -_BIG))
+
+            ms = jax.vmap(jax.vmap(cell, (None, 0, None, None, None, None)),
+                          (0, 0, 0, 0, 0, 0))(
+                order_g, BR_g, EDGE, DEPOT, OWN_act[gc], pred[gc, ga])    # (G,BC)
+            ms = jnp.where(feas_g[:, None], ms, jnp.inf)
+            bc_star_g = jnp.argmin(ms, axis=1)                            # (G,)
+            score_g = jnp.min(ms, axis=1)                                 # (G,)
+            branch_of_entry = (st["BC_grid"][bc_star_g] if n_br
+                               else jnp.zeros((G, 0), jnp.int32))         # (G,n_br)
+
+        # -- reduce over orderings: one score per (assignment, aux) ----
+        s2 = score_g.reshape(NC * NA, E)
+        e_star = jnp.argmin(s2, axis=1).astype(jnp.int32)                 # (NC*NA,)
+        skel_score = jnp.min(s2, axis=1)                                  # (NC*NA,)
+        kk = min(int(n_top), NC * NA)
+        neg, s_star = jax.lax.top_k(-skel_score, kk)                      # (kk,)
+        obj = -neg
+        c_star = (s_star // NA).astype(jnp.int32)
+        a_star = (s_star % NA).astype(jnp.int32)
+        e_sel = e_star[s_star]                                           # (kk,)
+        g_sel = (s_star * E + e_sel).astype(jnp.int32)                   # flat G index
+
+        # -- gather genome pieces for the kk best skeletons ------------
+        assign_k = assign_oh[c_star] if n_var else jnp.zeros((kk, 0, J))  # (kk,n_var,J)
+        cond_k = (st["AUX"][a_star].astype(float) if n_cond
+                  else jnp.zeros((kk, 0)))                                # (kk,n_cond)
+        t_k = st["POS"][e_sel].astype(float)                             # (kk,N) rank/node
+        be_k = branch_of_entry[g_sel]                                    # (kk,n_br)
+        proj_branch_k = jnp.zeros((kk, n_branch))
+        wp0_k = wp0_g[g_sel]                                            # (kk,N,S)
+        for bi, kb in enumerate(self.branch_ks):
             wn = int(st["wn"][bi])
-            own_c = st["owner_per_combo"][:, bi]                          # (NC,)
-            BR = BR.at[jnp.arange(NC)[:, None], jnp.arange(BC)[None, :],
-                       wn, own_c[:, None]].set(st["BC_grid"][None, :, bi])
-        BR_g = BR[gc]                                                     # (G,BC,N,J)
-
-        def cell(order, br, edge_m, depot_m, own_c, pred_ca):
-            arr = _makespan_arr_jax(order, br, edge_m, depot_m, own_c, pred_ca, J)
-            return jnp.max(jnp.where(node_active, arr, -_BIG))
-
-        ms = jax.vmap(jax.vmap(cell, (None, 0, None, None, None, None)),
-                      (0, 0, 0, 0, 0, 0))(
-            order_g, BR_g, EDGE, DEPOT, OWN_act[gc], pred[gc, ga])        # (G,BC)
-        ms = jnp.where(feas_g[:, None], ms, jnp.inf)
-        flat = jnp.argmin(ms)
-        g_star, bc_star = flat // BC, flat % BC
-        return g_star, bc_star, ms[g_star, bc_star]
+            start = int(st["starts"][bi])
+            ch = be_k[:, bi]                                             # (kk,)
+            proj_branch_k = proj_branch_k.at[:, start:start + kb].set(
+                jax.nn.one_hot(ch, kb))
+            wp0_k = wp0_k.at[:, wn, :].set(CAND[g_sel, wn, ch])          # (kk,S)
+        cell_k = jnp.stack([c_star, a_star, e_sel], axis=1)             # (kk,3)
+        return obj, assign_k, cond_k, t_k, proj_branch_k, wp0_k, cell_k
 
     def __call__(self, *a, **k):
         return self.run_vec(*a, **k)
 
     def run_vec(self, params, wp_template, x0_full, x0_by_agent,
                 node_active=None, var_committed=None, var_anchor=None):
-        """Run the jitted grid search to pick the optimal (assignment, aux,
-        extension) cell, then reconstruct the full `solve_dp_master`-shaped
-        result dict via the scalar `_ext_full_*_score` body on that one cell
-        (same trick as `dp_master._ext_full_batched`)."""
+        """Run the jitted grid search and reconstruct the winning
+        `(assignment, aux, extension)` cell into a `solve_dp_master`-shaped
+        dict. Thin wrapper over `run_topk(1, ...)`."""
+        top = self.run_topk(1, params, wp_template, x0_full, x0_by_agent,
+                            node_active=node_active, var_committed=var_committed,
+                            var_anchor=var_anchor)
+        if not top:
+            return dict(status="INFEASIBLE", objective=None, branch={}, assignment={},
+                        aux={}, time={}, routes={}, agent_cost={})
+        return top[0]
+
+    def run_topk(self, k, params, wp_template, x0_full, x0_by_agent,
+                 node_active=None, var_committed=None, var_anchor=None):
+        """The `k` best discrete skeletons (distinct `(assignment, aux)`),
+        each a `solve_dp_master`-shaped dict, ascending by objective. Returns
+        fewer than `k` dicts if the feasible grid is smaller, `[]` if
+        infeasible.
+
+        `_skeleton_grid` already reduces `min` over orderings, so the returned
+        skeletons are distinct by construction -- this is one `lax.top_k` plus
+        one `_reconstruct_cell` per skeleton. Intended as the population seed
+        for `SmallContinuousVRP`."""
         import jax.numpy as jnp
         import numpy as _np
-        p = self.problem
-        n_nodes, n_agents, n_var, n_cond = self.n_nodes, self.n_agents, self.n_var, self.n_cond
+        n_nodes, n_agents, n_var = self.n_nodes, self.n_agents, self.n_var
         node_active = (_np.ones(n_nodes, bool) if node_active is None
                        else _np.asarray(node_active, bool))
         var_committed = (_np.zeros(n_var, bool) if var_committed is None
@@ -474,21 +589,35 @@ class _DpMasterJax:
                  else {a: _np.asarray(x0_by_agent) for a in range(n_agents)})
         X0 = jnp.stack([jnp.asarray(x0_of[j], float) for j in range(n_agents)])
 
-        g_star, bc_star, best_obj = self._score_grid(
+        k = max(1, int(k))
+        obj, _ak, _ck, _tk, _pk, _wk, cell = self._skeleton_grid(
             jnp.asarray(params), jnp.asarray(wp_template), jnp.asarray(x0_full), X0,
-            jnp.asarray(node_active), jnp.asarray(var_committed), jnp.asarray(var_anchor))
-        g_star, bc_star = int(g_star), int(bc_star)
-        st = self._prep()
-        c = int(_np.asarray(st["gc"])[g_star])
-        a = int(_np.asarray(st["ga"])[g_star])
-        e = int(_np.asarray(st["ge"])[g_star])
-        if not _np.isfinite(float(best_obj)):
-            return dict(status="INFEASIBLE", objective=None, branch={}, assignment={},
-                        aux={}, time={}, routes={}, agent_cost={})
+            jnp.asarray(node_active), jnp.asarray(var_committed),
+            jnp.asarray(var_anchor), k)
+        obj = _np.asarray(obj)
+        cell = _np.asarray(cell)
 
+        out = []
+        for i in range(len(obj)):
+            if not _np.isfinite(float(obj[i])):
+                break
+            c, a, e = int(cell[i, 0]), int(cell[i, 1]), int(cell[i, 2])
+            d = self._reconstruct_cell(c, a, e, wp_template, x0_full, x0_of,
+                                       node_active, var_committed, var_anchor)
+            if d is not None:
+                out.append(d)
+        return out
+
+    def _reconstruct_cell(self, c, a, e, wp_template, x0_full, x0_of,
+                          node_active, var_committed, var_anchor):
+        """Reconstruct one grid cell `(A[c], AUX[a], EXT[e])` into a
+        `solve_dp_master`-shaped dict, or `None` if the cell has no feasible
+        branch DP solution."""
+        import numpy as _np
+        p = self.problem
+        n_nodes, n_var, n_cond = self.n_nodes, self.n_var, self.n_cond
         ov = _np.where(var_committed, var_anchor, _np.asarray(self.A[c], int))
         aux = tuple(int(x) for x in self.AUX[a])
-        remaining = [n for n in range(n_nodes) if node_active[n]]
         ext = tuple(int(x) for x in self.EXT[e] if node_active[int(x)])
         owned = {j: {n for n in ns if node_active[n]}
                  for j, ns in _agent_owned_nodes(p, self.instances, ov).items()}
@@ -531,8 +660,7 @@ class _DpMasterJax:
                 ext, P_pred, agent_of_node, owned, ov, aux, agent_keys,
                 edge_tables, depot_tables, branch_counts, best, best_sol)
         if best_sol is None:
-            return dict(status="INFEASIBLE", objective=None, branch={}, assignment={},
-                        aux={}, time={}, routes={}, agent_cost={})
+            return None
         br_raw, ovv, auxx, arr, agent_seq, per_agent = best_sol
         # `_ext_nonfull_*` keys `branch` by (node, _inst_key) for every routed
         # node; solve_dp_master's full path (and mpc.py's materialisation) key
