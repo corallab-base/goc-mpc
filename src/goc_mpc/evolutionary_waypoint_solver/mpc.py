@@ -124,7 +124,7 @@ from .spec import (
     build_graph_ordering_problem, _agent_widths, _slot_width,
     _object_widths, _object_slot_width,
 )
-from .problem import AnchorState, apply_projections
+from .problem import AnchorState, jit_apply_projections
 from .evosax_ga import build_evosax_ga, build_initial_carry_fn as _build_evosax_initial_carry_fn
 from .lamarckian_ga import LamarckianGA
 from .small_continuous_vrp import SmallContinuousVRPSolver
@@ -506,12 +506,12 @@ class EvolutionaryWaypointSolver:
         # -- so the raw wp value extracted above is not the real answer for
         # those columns; substitute it in now, once, on the winning
         # individual, before persisting anything to self._waypoints.
-        wp = apply_projections(problem, jnp.asarray(wp)[None, :, :], jnp.asarray(psi)[None, :],
-                                jnp.asarray(proj_branch)[None, :], params_arr,
-                                assign=jnp.asarray(assign)[None, :, :], anchor=anchor,
-                                cond_binary=jnp.asarray(cond_binary)[None, :],
-                                t=jnp.asarray(t)[None, :], node_active=anchor.node_active,
-                                x0=jnp.asarray(x0_arr))[0]
+        wp = jit_apply_projections(problem)(
+            jnp.asarray(wp)[None, :, :], jnp.asarray(psi)[None, :],
+            jnp.asarray(proj_branch)[None, :], params_arr,
+            jnp.asarray(assign)[None, :, :], jnp.asarray(cond_binary)[None, :],
+            jnp.asarray(t)[None, :], anchor.node_active, jnp.asarray(x0_arr),
+            anchor.var_committed, anchor.var_anchor)[0]
         wp = np.asarray(wp)
         owner_variable = (np.argmax(np.asarray(assign), axis=-1) if problem.n_variables > 0
                           else np.zeros(0, dtype=int))

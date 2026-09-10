@@ -340,7 +340,8 @@ def precompute_static_projections(problem, wp0, proj_branch, params):
 
 
 def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor=None, static_cache=None,
-                      cond_binary=None, t=None, node_active=None, x0=None, only_entries=None):
+                      cond_binary=None, t=None, node_active=None, x0=None, only_entries=None,
+                      var_committed=None, var_anchor=None):
     """Splices every registered analytic-elimination substitution
     (spec.py's _resolve_projections, projection.ProjOperator) into batched
     `(pop, n_nodes, state_dim)` wp, reading batched `psi`
@@ -493,9 +494,12 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
                     "`assign` argument to resolve which agent's row to write "
                     "into -- see this function's docstring")
             owner = jnp.argmax(assign[:, entry.owner_var_slot, :], axis=-1)  # (pop,)
-            if anchor is not None:
-                committed = anchor.var_committed[entry.owner_var_slot]
-                owner = jnp.where(committed, anchor.var_anchor[entry.owner_var_slot], owner)
+            vc = var_committed if var_committed is not None else (
+                anchor.var_committed if anchor is not None else None)
+            vanc = var_anchor if var_anchor is not None else (
+                anchor.var_anchor if anchor is not None else None)
+            if vc is not None:
+                owner = jnp.where(vc[entry.owner_var_slot], vanc[entry.owner_var_slot], owner)
             cols = jnp.asarray(entry.owner_cols_per_agent)[owner]  # (pop, w) -- per-individual ABSOLUTE cols
             row = wp[:, entry.write_node, :]
             new_row = jax.vmap(lambda r, c, v: r.at[c].set(v))(row, cols, value)
@@ -511,7 +515,10 @@ def jit_apply_projections(problem, only_entries=None):
     given, `only_entries`) -- both closed over as static -- cached per
     problem instance. The returned callable takes `(wp, psi, proj_branch,
     params, assign, cond_binary, t, node_active, x0)`, all traced arrays,
-    every one required (no None defaults under jit).
+    every one required (no None defaults under jit), plus optional
+    `var_committed`/`var_anchor` traced arrays -- pass them (from `anchor`)
+    when a committed var_agent_q(...) pin must write into the agent it was
+    frozen to rather than this genome's searched owner.
 
     For a caller hitting `apply_projections` repeatedly on ONE problem at
     fixed array shapes but changing values -- structure.node_candidates
@@ -528,10 +535,12 @@ def jit_apply_projections(problem, only_entries=None):
     if f is None:
         oe = None if only_entries is None else tuple(only_entries)
 
-        def _run(wp, psi, proj_branch, params, assign, cond_binary, t, node_active, x0):
+        def _run(wp, psi, proj_branch, params, assign, cond_binary, t, node_active, x0,
+                 var_committed=None, var_anchor=None):
             return apply_projections(problem, wp, psi, proj_branch, params, assign=assign,
                                      cond_binary=cond_binary, t=t, node_active=node_active,
-                                     x0=x0, only_entries=oe)
+                                     x0=x0, only_entries=oe,
+                                     var_committed=var_committed, var_anchor=var_anchor)
         f = jax.jit(_run)
         per_problem[only_key] = f
     return f
