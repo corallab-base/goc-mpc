@@ -128,6 +128,7 @@ from .problem import AnchorState, jit_apply_projections
 from .evosax_ga import build_evosax_ga, build_initial_carry_fn as _build_evosax_initial_carry_fn
 from .lamarckian_ga import LamarckianGA
 from .small_continuous_vrp import SmallContinuousVRPSolver
+from .solver import _evaluate_population_jax
 
 # `algorithm=` constructor choices -- both evosax PopulationBasedAlgorithm
 # subclasses (lamarckian_ga.py/small_continuous_vrp.py), built through the
@@ -227,6 +228,8 @@ class EvolutionaryWaypointSolver:
         self._var_assignments = -np.ones(graph.num_variables, dtype=int)
         self._t_by_node_id = np.zeros(num_nodes)
         self._last_solve_time = 0.0
+        self._last_F = None
+        self._last_CV = None
 
         # Built once, on the first solve()/warmup() call -- see module
         # docstring -- and never rebuilt again.
@@ -499,6 +502,19 @@ class EvolutionaryWaypointSolver:
         state_out, _key_out = carry_out
         best_X = np.asarray(state_out.best_solution[:problem.n_var])
 
+        # `state_out.best_fitness` is a SOFT combined score frozen under
+        # whatever w/cv_tol schedule was live when this individual last
+        # improved (see lamarckian_ga.py's own State docstring) -- not the
+        # raw, CURRENT-scene (F, CV) a caller wants to inspect (e.g. "does
+        # the solver even know this pick is now infeasible after I moved a
+        # block"). Recompute both fresh against this call's x0/anchor,
+        # exactly like reseed()/_ask()/_tell() already do for the same
+        # never-trust-stale-fitness reason.
+        F_best, CV_best = _evaluate_population_jax(
+            problem, jnp.asarray(best_X)[None, :], x0_arr, params_arr, anchor)
+        self._last_F = float(F_best[0])
+        self._last_CV = float(CV_best[0])
+
         assign, cond_binary, proj_branch, t, wp, psi = problem._extract_single(best_X)
         # A projected node's own pinned columns are never actually driven
         # anywhere by local refinement (apply_projections overwrites them
@@ -584,6 +600,13 @@ class EvolutionaryWaypointSolver:
 
     def view_t_by_node(self):
         return self._t_by_node_id
+
+    def get_last_fitness(self):
+        """(F, CV) of the population member solve() last selected, raw and
+        freshly evaluated against that solve() call's own x0/anchor (see the
+        comment at its computation in solve() for why this can't just read
+        `state.best_fitness`). None, None before the first solve()."""
+        return self._last_F, self._last_CV
 
     def get_last_solve_time(self):
         return self._last_solve_time
