@@ -35,10 +35,14 @@ ordering)` cell via one batched `apply_projections` per projection layer,
 build dense EDGE/DEPOT, price each with a per-agent branch Viterbi
 (`_agent_route_dp`, avg/minmax -- returns the chosen branch per node too, not
 just the cost) or the coupled makespan forward pass (`_makespan_arr_jax`,
-over an explicit `BC` branch-combo axis), reduce `min` over orderings so each
-skeleton has one score, then `lax.top_k` -- is one `jax.jit` per `k`. Only
-the winner -> `solve_dp_master` dict reconstruction (routes, times) stays in
-Python (`_reconstruct_cell`), on the single winning cell.
+over an explicit `BC` branch-combo axis), bias that cost by each cell's
+`CV_proj` (did the now-known winning branch's spliced waypoints actually
+satisfy their own analytic projections, e.g. an out-of-reach analytic IK --
+same `cost + 1e6*max(0, CV_proj - cv_proj_tol)` hard-score convention
+`SmallContinuousVRPSolver.reseed` uses), reduce `min` over orderings so each
+skeleton has one (biased) score, then `lax.top_k` -- is one `jax.jit` per
+`k`. Only the winner -> `solve_dp_master` dict reconstruction (routes,
+times) stays in Python (`_reconstruct_cell`), on the single winning cell.
 
 Requires a jnp-traceable `edge_cost_fn`. Needs no `node_candidates` -- the
 grid search resolves everything through `apply_projections`, so the
@@ -111,13 +115,24 @@ class _DpMasterJax:
     continuous data against it."""
 
     def __init__(self, problem, objective, edge_cost_fn, max_assign_combos,
-                 max_orders, max_branch_combos):
+                 max_orders, max_branch_combos, cv_proj_bias=False, cv_proj_tol=1e-4):
         self._prepped = None
         self._jitted = {}
         self.problem = problem
         self.objective = objective
         self.max_orders = max_orders
         self.max_branch_combos = max_branch_combos
+        # Opt-in (default off): biases `_score_grid_core`'s top-k selection
+        # away from cells whose analytic projections didn't actually hold
+        # (`CV_proj`), same hard-score convention `SmallContinuousVRPSolver.
+        # reseed` uses (F + 1e6*max(0, CV_total - tol)) -- that class turns
+        # this on and threads its own `reseed_cv_tol` in as `cv_proj_tol` so
+        # one number governs both places. Off by default so `run_vec`/
+        # `run_topk` stay a pure-cost equivalence oracle against
+        # `solve_dp_master` for callers that want exactly that (e.g.
+        # logic_based_benders_solver/mpc.py, test_dp_master_jax.py).
+        self.cv_proj_bias = bool(cv_proj_bias)
+        self.cv_proj_tol = float(cv_proj_tol)
         n_nodes = problem.n_nodes
         n_agents = problem.n_agents
         n_var = problem.n_variables
@@ -565,6 +580,57 @@ class _DpMasterJax:
             branch_of_entry = (st["BC_grid"][bc_star_g] if n_br
                                else jnp.zeros((G, 0), jnp.int32))         # (G,n_br)
 
+        # -- CV_proj bias: every cell's fully-resolved wp (layer0 +
+        # each branched entry spliced at its now-known winning branch,
+        # same splice `_reconstruct_cell`/the kk-gather below do post-
+        # selection, done here for every grid cell instead) -- then bias
+        # `score_g` away from cells whose analytic projections didn't
+        # actually hold (e.g. ur5e_ik.py's clipped out-of-reach IK),
+        # mirroring `SmallContinuousVRPSolver.reseed`'s own hard_score
+        # exactly: cost + 1e6*max(0, CV_proj - cv_proj_tol). Without this,
+        # `lax.top_k` below is purely cost-ordered and a cheaper-but-
+        # analytically-broken skeleton can starve a feasible one out of
+        # the top-k entirely -- reseed can only re-rank what made the cut.
+        #
+        # `apply_anchor`'s frozen/live substitution is skipped here (no
+        # `anchor.anchor_wp` at this layer): frozen == live == wp_full_g at
+        # every ACTIVE node (the only nodes this grid varies), and
+        # node_active/var_committed/x0 are fixed for the whole grid, so any
+        # divergence at a passed node is the same constant for every cell
+        # -- it cannot change which cell ranks best.
+        #
+        # Opt-in (`self.cv_proj_bias`, see __init__) and zero-cost whenever
+        # this problem declares no `proj=` constraints (no CV_proj term at
+        # all, same as `_evaluate_projection_cv_jax`'s own all-zero
+        # convention) -- the splice below is skipped too, so a caller that
+        # doesn't want this (or a scene with nothing to check) doesn't pay
+        # for it.
+        if self.cv_proj_bias and (p._proj_ineq_constraints or p._proj_eq_constraints):
+            from ..evolutionary_waypoint_solver.solver import _calc_cv_jax
+            wp_full_g = wp0_g
+            for bi, kb in enumerate(self.branch_ks):
+                wn = int(st["wn"][bi])
+                ch = branch_of_entry[:, bi]                              # (G,)
+                row_bi = res_rows[bi][jnp.arange(G), ch]                 # (G,S)
+                if self.branch_static[bi] and self.branch_cols[bi].shape[0]:
+                    ci = jnp.asarray(self.branch_cols[bi])
+                    wp_full_g = wp_full_g.at[:, wn, ci].set(row_bi[:, ci])
+                else:
+                    owner_bi_g = own_per_g[:, bi]                        # (G,)
+                    band = owner_bi_g[:, None] * p.dim + jnp.arange(p.dim)[None, :]  # (G,dim)
+                    wp_full_g = wp_full_g.at[jnp.arange(G)[:, None], wn, band].set(
+                        jnp.take_along_axis(row_bi, band, axis=1))
+            cv_G = (jnp.concatenate(
+                    [fn(assign_g, cond_g, T_g, wp_full_g, wp_full_g, node_active, x0_full, params)
+                     for fn in p._proj_ineq_constraints], axis=1)
+                  if p._proj_ineq_constraints else None)
+            cv_H = (jnp.concatenate(
+                    [fn(assign_g, cond_g, T_g, wp_full_g, wp_full_g, node_active, x0_full, params)
+                     for fn in p._proj_eq_constraints], axis=1)
+                  if p._proj_eq_constraints else None)
+            cv_proj_g = _calc_cv_jax(G, cv_G, cv_H)                       # (G,)
+            score_g = score_g + 1e6 * jnp.maximum(0.0, cv_proj_g - self.cv_proj_tol)
+
         # -- reduce over orderings: one score per (assignment, aux) ----
         s2 = score_g.reshape(NC * NA, E)
         e_star = jnp.argmin(s2, axis=1).astype(jnp.int32)                 # (NC*NA,)
@@ -752,11 +818,13 @@ class _DpMasterJax:
 
 
 def make_dp_master_jax(problem, *, objective="makespan", edge_cost_fn=None,
-                       max_assign_combos=4096, max_orders=20000, max_branch_combos=4096):
+                       max_assign_combos=4096, max_orders=20000, max_branch_combos=4096,
+                       cv_proj_bias=False, cv_proj_tol=1e-4):
     """Build the exhaustive static enumeration for `problem` and return an
     object whose `run_python` (piece 1) / `run` (piece 3) solves the discrete
     subproblem for a cycle's continuous data. See the module docstring."""
     if objective not in ("makespan", "minmax", "avg"):
         raise ValueError(f"unknown objective {objective!r}")
     return _DpMasterJax(problem, objective, edge_cost_fn, max_assign_combos,
-                        max_orders, max_branch_combos)
+                        max_orders, max_branch_combos,
+                        cv_proj_bias=cv_proj_bias, cv_proj_tol=cv_proj_tol)

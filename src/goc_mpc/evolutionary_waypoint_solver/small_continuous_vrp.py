@@ -8,10 +8,12 @@ jax`) instead of being evolutionarily searched by crossover/mutation.
 `dp_master_jax` enumerates every `(assignment, aux, ordering)` skeleton,
 prices each with the same per-agent obstacle-aware `edge_cost_fn` kernel.py's
 routing objective uses (a branch Viterbi for avg/minmax, the coupled
-makespan forward pass otherwise), reduces `min` over orderings, and returns
-the `k` cheapest DISTINCT skeletons -- each as a ready-to-splice genome
-fragment `(assign one-hot, cond_binary, node rank `t`, proj_branch one-hot)`
-plus its analytically-resolved waypoints.
+makespan forward pass otherwise), biases that cost away from cells whose
+analytic projections didn't actually hold (`CV_proj`, same hard-score
+convention `reseed` below uses), reduces `min` over orderings, and returns
+the `k` best DISTINCT skeletons by that biased score -- each as a
+ready-to-splice genome fragment `(assign one-hot, cond_binary, node rank
+`t`, proj_branch one-hot)` plus its analytically-resolved waypoints.
 
 The top-`k` `(assignment, aux)` skeletons are enumerated ONCE, in `init`
 (from `problem.x0` / the initial `anchor`), and stashed on the algorithm
@@ -81,12 +83,17 @@ Known limitations:
     is routed through but carries no projection at all -- rare in the
     single-chain scenes this class targets -- is priced from the origin in
     the initial skeleton ranking (`local_refine` then fixes its columns).
-  - IK-feasibility is not checked (`make_dp_master_jax` inherits
-    `solve_dp_master`'s limitation): analytic IK returns a best-effort `q`
-    for an out-of-reach target, so a skeleton can look cheap yet be
-    continuously infeasible. Downstream continuous feedback -- rejecting
-    such an individual on its real CV and letting the next skeleton win --
-    is exactly what the top-`k` population is for.
+  - IK-feasibility is scored, not verified exactly: analytic IK returns a
+    best-effort `q` for an out-of-reach target rather than raising, and
+    `_score_grid_core` biases the top-`k` search away from a skeleton whose
+    resolved waypoints don't satisfy that skeleton's own analytic
+    projections (`CV_proj`, folded into the ranking cost, same hard-score
+    convention `reseed` uses below) -- but this is still a smooth bias, not
+    a hard filter, so a skeleton with a small CV_proj can still edge out a
+    slightly-more-expensive perfectly-feasible one. Downstream continuous
+    feedback -- rejecting such an individual on its real CV and letting the
+    next skeleton win -- remains the backstop the top-`k` population is
+    for.
 """
 
 import dataclasses
@@ -134,7 +141,8 @@ class SmallContinuousVRPSolver(LamarckianGA):
         self._dp = make_dp_master_jax(
             problem, objective=problem.objective, edge_cost_fn=problem.edge_cost_fn,
             max_assign_combos=max_assign_combos, max_orders=max_orders,
-            max_branch_combos=max_branch_combos)
+            max_branch_combos=max_branch_combos,
+            cv_proj_bias=True, cv_proj_tol=reseed_cv_tol)
         # one skeleton per population member, capped at the number of
         # distinct (assignment, aux) skeletons that actually exist.
         self._n_skeletons = int(min(population_size, self._dp.NC * self._dp.NA))
