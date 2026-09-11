@@ -147,17 +147,20 @@ def _unsupported_placeholder(var):
         f"Symbolic constraint references placeholder variable {var!r} that "
         "isn't representable here -- expected one of agent_q(k)/object_q(k)/"
         "var_agent_q(var)/param(id)/agent_link_pos(agent_id, link_name)/"
-        "agent_link_rot(agent_id, link_name) (node constraints, or an edge "
-        "constraint's \"along the edge\" form) or "
+        "agent_link_rot(agent_id, link_name)/var_agent_link_pos(var, "
+        "link_name)/var_agent_link_rot(var, link_name) (node constraints, "
+        "or an edge constraint's \"along the edge\" form) or "
         "u_agent_q(k)/u_object_q(k) (an edge constraint's u side) or "
         "v_agent_q(k)/v_object_q(k) (an edge constraint's v side; "
         "u_/v_-prefixed placeholders are not valid inside a node constraint, "
         "which has no u/v side). If this is an agent_link_pos(agent_id, "
-        "link_name)/agent_link_rot(agent_id, link_name) placeholder, check "
-        "that a forward-kinematics function is registered for that "
-        "(agent_id, link_name) via graph.set_robot_fk -- this solver "
-        "resolves it by calling that function directly, in Python, and has "
-        "no fallback for an unregistered link. Otherwise, use "
+        "link_name)/agent_link_rot(agent_id, link_name)/var_agent_link_pos("
+        "var, link_name)/var_agent_link_rot(var, link_name) placeholder, "
+        "check that a forward-kinematics function is registered for that "
+        "(agent_id, link_name) via graph.set_robot_fk, or that the agent's "
+        "configuration space has a built-in closed-form pose (default_fk."
+        "resolve_link_fk's own docstring) -- an articulated agent has no "
+        "default and needs a real fk_fn registered. Otherwise, use "
         "add_python_constraint for anything genuinely outside this scope.")
 
 
@@ -195,6 +198,63 @@ def _make_link_rot_map(graph):
             v = as_variable(expr)
             if v is not None:
                 out[v.get_id()] = (agent_id, link_name, fk_fn, j)
+    return out
+
+
+# Link names ever worth probing for a var_agent_link_pos/_rot(var, ...)
+# placeholder: every explicitly-registered (graph.set_robot_fk) link name,
+# plus "ee" (default_fk.resolve_link_fk's own default -- the only link name
+# this codebase's built-in closed-form poses ever key on, per that module's
+# docstring: "link_name is ignored once it falls back"). Unlike
+# _make_link_pos_map/_make_link_rot_map above (which only need to iterate
+# graph.robot_fk_registry's OWN keys, since a concrete agent_link_pos/_rot
+# placeholder's agent_id is fixed at authoring time, already paired with
+# its own registered link_name), a var_id has no fixed agent to pair with
+# a link_name up front -- resolving it needs every CANDIDATE agent's own
+# FK, most of which may have no explicit registration at all (a non-
+# articulated agent's built-in fallback needs none -- see resolve_link_fk).
+def _var_fk_link_name_universe(graph):
+    return {"ee"} | {link_name for (_agent_id, link_name) in graph.robot_fk_registry}
+
+
+def _make_var_link_pos_map(graph, var_id_to_slot):
+    """{Variable.get_id(): (var_id, link_name, component_index)} for every
+    var_agent_link_pos(var_id, link_name) placeholder -- the ASSIGNABLE
+    counterpart of _make_link_pos_map. Cross-products every assignable
+    var_id against _var_fk_link_name_universe(graph) (a var_id has no fixed
+    agent, so unlike the concrete map above there's no single (agent_id,
+    link_name) registry key to iterate that already pairs the two).
+    Building a placeholder that turns out never to be referenced by any
+    real constraint is harmless -- same as _make_link_pos_map's own
+    registry-keys-regardless-of-use iteration. Whether every CANDIDATE
+    agent actually has a usable FK for a given link_name (registered or
+    built-in) is deferred to first real use (_make_row_resolver's
+    _get_var_fk_branches), not checked here -- so an unrelated var_id/
+    link_name combination nothing ever references can't spuriously break a
+    scene that doesn't use it."""
+    link_names = _var_fk_link_name_universe(graph)
+    out = {}
+    for var_id in var_id_to_slot:
+        for link_name in link_names:
+            for j, expr in enumerate(graph.var_agent_link_pos(var_id, link_name)):
+                v = as_variable(expr)
+                if v is not None:
+                    out[v.get_id()] = (var_id, link_name, j)
+    return out
+
+
+def _make_var_link_rot_map(graph, var_id_to_slot):
+    """Rotation counterpart of _make_var_link_pos_map -- see that
+    function's own docstring. flat_index follows the same row-major
+    convention as _make_link_rot_map's own."""
+    link_names = _var_fk_link_name_universe(graph)
+    out = {}
+    for var_id in var_id_to_slot:
+        for link_name in link_names:
+            for j, expr in enumerate(graph.var_agent_link_rot(var_id, link_name)):
+                v = as_variable(expr)
+                if v is not None:
+                    out[v.get_id()] = (var_id, link_name, j)
     return out
 
 
@@ -487,7 +547,8 @@ def _read_array_fn_multi(reads, static_map, link_pos_map, link_rot_map, param_ma
 
 
 def _free_var_read_cols(free_var_ids, node_locals, static_map, link_pos_map, link_rot_map,
-                        agent_widths, slot_width, var_map=None, num_agents=0):
+                        agent_widths, slot_width, var_map=None, num_agents=0,
+                        var_link_pos_map=None, var_link_rot_map=None):
     """{placeholder Variable id} -> frozenset of (node, col) `wp` entries
     those placeholders structurally resolve to, given `node_locals` (this
     constraint's own node, or (u, v)/(u,) for an edge/along-edge one) --
@@ -507,6 +568,15 @@ def _free_var_read_cols(free_var_ids, node_locals, static_map, link_pos_map, lin
     runtime), exactly like a projection's own dynamic (var_agent_q-pinned)
     write claims the union over every candidate (ProjectionEntry's own
     docstring) -- not a conservative over-approximation, an exact one.
+
+    var_agent_link_pos/_rot(var_id, link_name) (`var_link_pos_map`/
+    `var_link_rot_map`, optional -- same "ProjectionEntry.reads may not
+    contain one" reasoning as var_map) is the same DYNAMIC story as
+    var_agent_q, just over each candidate's WHOLE width (like link_pos_map/
+    link_rot_map's own static case below) rather than one column -- every
+    candidate agent's FK genuinely gets computed (_make_row_resolver's own
+    _var_link_fk stacks every candidate before hard-selecting the resolved
+    owner), so every one of their columns is a real, unconditional read.
 
     A param(id) placeholder resolves to no `wp` column at all (it's read
     from the separate `params` argument) -- simply absent from every map
@@ -533,6 +603,12 @@ def _free_var_read_cols(free_var_ids, node_locals, static_map, link_pos_map, lin
             _slot, j = var_map[vid]
             for k in range(num_agents):
                 read_cols.add((node_locals[0], k * slot_width + j))
+        elif (var_link_pos_map is not None and vid in var_link_pos_map) or (
+                var_link_rot_map is not None and vid in var_link_rot_map):
+            for k in range(num_agents):
+                c0 = k * slot_width
+                for c in range(c0, c0 + agent_widths[k]):
+                    read_cols.add((node_locals[0], c))
     return frozenset(read_cols)
 
 
@@ -648,6 +724,18 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
     slot_width`/`agents_width + k * object_slot_width` regardless of its
     own real width, so every static offset below is one of those plus `j`,
     never a packed cumulative offset.
+
+    var_agent_link_pos(var, link_name)/var_agent_link_rot(var, link_name)
+    are a fifth case -- the ASSIGNABLE counterpart of agent_link_pos/_rot:
+    BOTH which agent's column to read (var_agent_q's own DYNAMIC case) AND
+    an FK call (agent_link_pos/_rot's own case) at once. Resolved by
+    stacking every CANDIDATE agent's own FK result and hard-selecting the
+    resolved owner's row via jax.lax.dynamic_index_in_dim -- mirrors
+    _resolve_holds' own dynamic-hold branch (an assignable rigid-carry
+    constraint has exactly the same "which agent's FK" problem), not
+    var_agent_q's plain jax.lax.dynamic_slice (there's no single flat
+    column to slice across candidates here, since agent_widths can differ
+    -- see _get_var_fk_branches/_var_link_fk below).
     """
     static_map = _build_static_map(graph, slot_width, object_slot_width)
 
@@ -660,6 +748,8 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
 
     link_pos_map = _make_link_pos_map(graph)  # var_id -> (agent_id, link_name, fk_fn, j)
     link_rot_map = _make_link_rot_map(graph)  # var_id -> (agent_id, link_name, fk_fn, flat_j)
+    var_link_pos_map = _make_var_link_pos_map(graph, var_id_to_slot)  # var_id -> (owner_var_id, link_name, j)
+    var_link_rot_map = _make_var_link_rot_map(graph, var_id_to_slot)  # var_id -> (owner_var_id, link_name, flat_j)
 
     # Shared FK-result cache. Every agent_link_pos(a, link) / agent_link_rot(
     # a, link) COMPONENT placeholder resolves to its own closure, and each
@@ -683,6 +773,59 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
         if got is None:
             got = fk_fn(row[col0:col0 + w])
             entry[1][(agent_id, link_name)] = got
+        return got
+
+    # Per-link_name (branch_cols, branch_widths, branch_fks) -- one entry
+    # per CANDIDATE agent, built (and, via resolve_link_fk, validated --
+    # raises if some agent is articulated with no registered fk_fn) the
+    # first time a var_agent_link_pos/_rot placeholder for that link_name
+    # is actually resolved, not eagerly for every link_name
+    # _var_fk_link_name_universe considered (most of which no real
+    # constraint may ever reference -- see _make_var_link_pos_map's own
+    # docstring for why that map itself defers this same check). Shared
+    # across every var_id using the same link_name -- the branch list
+    # itself doesn't depend on which variable is being resolved.
+    _var_fk_branches: dict = {}  # link_name -> (branch_cols, branch_widths, branch_fks)
+
+    def _get_var_fk_branches(link_name):
+        cached = _var_fk_branches.get(link_name)
+        if cached is None:
+            n = len(agent_widths)
+            branch_cols = [k * slot_width for k in range(n)]
+            branch_widths = [agent_widths[k] for k in range(n)]
+            branch_fks = [resolve_link_fk(graph, k, link_name) for k in range(n)]
+            cached = (branch_cols, branch_widths, branch_fks)
+            _var_fk_branches[link_name] = cached
+        return cached
+
+    def _var_link_fk(row, agent, slot, link_name):
+        """Owner-aware FK for a var_agent_link_pos/_rot(var, link_name)
+        placeholder -- mirrors _resolve_holds' own dynamic-hold branch:
+        stack every CANDIDATE agent's own FK result, then hard-select the
+        resolved owner's row via jax.lax.dynamic_index_in_dim (not
+        var_agent_q's plain jax.lax.dynamic_slice -- agent_widths can
+        differ per candidate, so there's no single flat column stride to
+        slice across all of them the way var_agent_q's bare column read
+        has). Cached in the SAME _fk_cache _link_fk uses above (a distinct
+        ("var", slot, link_name) key, so it can't collide with that
+        function's own (agent_id, link_name) int-keyed entries), so a
+        Formula referencing both _pos and _rot for the same (var, link)
+        only pays for this once."""
+        entry = _fk_cache.get(id(row))
+        if entry is None or entry[0] is not row:
+            entry = (row, {})
+            _fk_cache[id(row)] = entry
+        key = ("var", slot, link_name)
+        got = entry[1].get(key)
+        if got is None:
+            branch_cols, branch_widths, branch_fks = _get_var_fk_branches(link_name)
+            results = [fk(row[c:c + w]) for c, w, fk in zip(branch_cols, branch_widths, branch_fks)]
+            pos_stack = jnp.stack([r[0] for r in results])   # (num_agents, workspace_dim)
+            rot_stack = jnp.stack([r[1] for r in results])   # (num_agents, ...rot shape)
+            pos = jax.lax.dynamic_index_in_dim(pos_stack, agent, axis=0, keepdims=False)
+            rot = jax.lax.dynamic_index_in_dim(rot_stack, agent, axis=0, keepdims=False)
+            got = (pos, rot)
+            entry[1][key] = got
         return got
 
     # param(id) -- runtime-editable scalar placeholders (GraphOfConstraints.
@@ -736,6 +879,26 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
 
             def fn(*args, agent_id=agent_id, link_name=link_name, col0=col0, w=w, fk_fn=fk_fn, j=j):
                 _pos, rot = _link_fk(args[0], agent_id, link_name, col0, w, fk_fn)
+                return jnp.reshape(rot, (-1,))[j]
+            return fn
+        if vid in var_link_pos_map:
+            owner_var_id, link_name, j = var_link_pos_map[vid]
+            slot = var_id_to_slot[owner_var_id]
+
+            def fn(*args, slot=slot, link_name=link_name, j=j):
+                owner_variable = args[-2]
+                agent = owner_variable[slot]
+                pos, _rot = _var_link_fk(args[0], agent, slot, link_name)
+                return pos[j]
+            return fn
+        if vid in var_link_rot_map:
+            owner_var_id, link_name, j = var_link_rot_map[vid]
+            slot = var_id_to_slot[owner_var_id]
+
+            def fn(*args, slot=slot, link_name=link_name, j=j):
+                owner_variable = args[-2]
+                agent = owner_variable[slot]
+                _pos, rot = _var_link_fk(args[0], agent, slot, link_name)
                 return jnp.reshape(rot, (-1,))[j]
             return fn
         _unsupported_placeholder(var)
@@ -1278,6 +1441,13 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
     link_pos_map = _make_link_pos_map(graph)
     link_rot_map = _make_link_rot_map(graph)
     param_map = _build_param_map(graph)
+    # var_agent_link_pos/_rot(var, link_name) counterparts of link_pos_map/
+    # link_rot_map above -- see _make_var_link_pos_map's own docstring.
+    # var_id_to_slot is already available in this scope (build_graph_
+    # ordering_problem's own parameter), unlike _make_row_resolver's
+    # internal copies, so no extra plumbing is needed to build these here.
+    var_link_pos_map = _make_var_link_pos_map(graph, var_id_to_slot)
+    var_link_rot_map = _make_var_link_rot_map(graph, var_id_to_slot)
     # var_id -> (slot, component j) -- same construction as
     # _make_row_resolver's own internal var_map (that one stays local to it,
     # a self-contained utility); needed here so _resolve_projections/
@@ -1586,31 +1756,22 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 mode = "frozen"
                 resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 1)
                 node_locals = (node,)
-                try:
-                    fn, kind = compile_relational_formula(formula, resolver)
-                    read_cols = _free_var_read_cols(
-                        {v.get_id() for v in formula.GetFreeVariables()}, node_locals,
-                        static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
-                        var_map=var_map, num_agents=graph.num_agents)
-                except ValueError:
-                    # A projected constraint's accompanying "real" Formula
-                    # (pin_full_pose_ik's own docstring) can reference a
-                    # var_agent_link_pos/_rot(var) placeholder for an
-                    # ASSIGNABLE arm -- only the projection's OWN owner-
-                    # aware machinery resolves that (a jax.lax.switch on the
-                    # decoded owner, ur5e_joint_ik.py's _switch_ik), never
-                    # the ordinary per-node resolver above (row_resolver
-                    # has no case for it, hence _unsupported_placeholder).
-                    # Non-skip constraints must still raise -- an ordinary,
-                    # authored constraint hitting this is a real bug, not a
-                    # known gap -- so re-raise unless this phi was only
-                    # ever going to be diagnostic-only (proj_check_
-                    # constraints; see that list's own comment above): no
-                    # CV_proj coverage for this one constraint, same blind
-                    # spot it had before this feature existed, not a crash.
-                    if phi_id not in skip_node_phis:
-                        raise
-                    continue
+                # No try/except here (even for a skip_node_phis/proj_check-
+                # only phi): if row_resolver can't compile this Formula --
+                # an unregistered placeholder kind, or an agent with no FK
+                # (registered or built-in) for a link_name this constraint
+                # needs -- that means CV_proj can't actually see whether
+                # this projection held, silently, which is worse than a
+                # loud failure: a visibly-infeasible population member
+                # could then go unevicted with nothing in the logs to say
+                # why. Raise immediately instead, same as any other
+                # constraint here.
+                fn, kind = compile_relational_formula(formula, resolver)
+                read_cols = _free_var_read_cols(
+                    {v.get_id() for v in formula.GetFreeVariables()}, node_locals,
+                    static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
+                    var_map=var_map, num_agents=graph.num_agents,
+                    var_link_pos_map=var_link_pos_map, var_link_rot_map=var_link_rot_map)
                 entry = (node_locals, fn, kind, mode, f"phi_{phi_id}", read_cols)
                 if phi_id in skip_node_phis:
                     proj_check_constraints.append(entry)  # projected -- see above
@@ -1645,10 +1806,12 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     free_var_ids = {v.get_id() for v in formula.GetFreeVariables()}
                     read_cols_u = _free_var_read_cols(
                         free_var_ids, (u,), static_map, link_pos_map, link_rot_map,
-                        agent_widths, slot_width, var_map=var_map, num_agents=graph.num_agents)
+                        agent_widths, slot_width, var_map=var_map, num_agents=graph.num_agents,
+                        var_link_pos_map=var_link_pos_map, var_link_rot_map=var_link_rot_map)
                     read_cols_v = _free_var_read_cols(
                         free_var_ids, (v,), static_map, link_pos_map, link_rot_map,
-                        agent_widths, slot_width, var_map=var_map, num_agents=graph.num_agents)
+                        agent_widths, slot_width, var_map=var_map, num_agents=graph.num_agents,
+                        var_link_pos_map=var_link_pos_map, var_link_rot_map=var_link_rot_map)
                     symbolic_constraints.append(
                         ((u,), fn, kind, mode, f"edge_phi_{phi_id}_u", read_cols_u))
                     symbolic_constraints.append(
@@ -1661,19 +1824,14 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
                 resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 2)
                 node_locals = (u, v)
-                try:
-                    fn, kind = compile_relational_formula(formula, resolver)
-                    read_cols = _free_var_read_cols(
-                        {v_.get_id() for v_ in formula.GetFreeVariables()}, node_locals,
-                        static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
-                        var_map=var_map, num_agents=graph.num_agents)
-                except ValueError:
-                    # See the node-constraint loop's own try/except above --
-                    # same var_agent_link_pos/_rot(var) (assignable-arm FK)
-                    # gap, same re-raise-unless-diagnostic-only handling.
-                    if phi_id not in skip_edge_phis:
-                        raise
-                    continue
+                # See the node-constraint loop's own comment above -- no
+                # try/except here either, same reasoning.
+                fn, kind = compile_relational_formula(formula, resolver)
+                read_cols = _free_var_read_cols(
+                    {v_.get_id() for v_ in formula.GetFreeVariables()}, node_locals,
+                    static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
+                    var_map=var_map, num_agents=graph.num_agents,
+                    var_link_pos_map=var_link_pos_map, var_link_rot_map=var_link_rot_map)
                 entry = (node_locals, fn, kind, mode, f"edge_phi_{phi_id}", read_cols)
                 if phi_id in skip_edge_phis:
                     proj_check_constraints.append(entry)  # projected -- see above
