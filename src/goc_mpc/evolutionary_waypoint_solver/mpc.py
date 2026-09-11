@@ -114,6 +114,7 @@ step to call first. Call `warmup()` once up front to pay the first trace/
 compile outside of a timed run and seed `_carry` from that run's own result.
 """
 
+import dataclasses
 import time
 
 import jax
@@ -125,7 +126,10 @@ from .spec import (
     _object_widths, _object_slot_width,
 )
 from .problem import AnchorState, jit_apply_projections
-from .evosax_ga import build_evosax_ga, build_initial_carry_fn as _build_evosax_initial_carry_fn
+from .evosax_ga import (
+    build_evosax_ga, build_initial_carry_fn as _build_evosax_initial_carry_fn,
+    _split_genome,
+)
 from .lamarckian_ga import LamarckianGA
 from .small_continuous_vrp import SmallContinuousVRPSolver
 from .solver import _evaluate_population_jax, _evaluate_projection_cv_jax
@@ -170,6 +174,22 @@ _SCHEDULE_KWARGS = ("w", "cv_tol", "w_frac", "cv_tol_frac", "w_growth", "cv_tol_
 # both explicitly instead of living in one list and silently missing the
 # other.
 _PARAMS_KWARGS = ("mut_sigma", "cx_prob", "ox_prob")
+
+
+@dataclasses.dataclass
+class PopulationDiagnostics:
+    """Per-current-population-member diagnostics -- see
+    EvolutionaryWaypointSolver.get_population_diagnostics()'s own
+    docstring. Plain numpy, not jax arrays -- a debug/visualization
+    accessor, not a hot path."""
+    F: np.ndarray               # (pop,)
+    CV: np.ndarray               # (pop,)
+    CV_proj: np.ndarray          # (pop,)
+    owner_variable: np.ndarray   # (pop, n_variables) int -- assigned agent id per var slot
+    hard_score: np.ndarray       # (pop,)
+    rank: np.ndarray             # (pop,) int, 0 = best (lowest hard_score)
+    will_be_evicted: np.ndarray  # (pop,) bool -- the n_evict worst by hard_score
+    n_evict: int
 
 
 class EvolutionaryWaypointSolver:
@@ -236,6 +256,13 @@ class EvolutionaryWaypointSolver:
         self._last_F = None
         self._last_CV = None
         self._last_CV_proj = None
+        # Stashed every solve() so get_population_diagnostics() can
+        # re-evaluate the CURRENT population against the SAME scene state
+        # get_last_fitness()'s own (F, CV, CV_proj) was computed against
+        # (see that method's comment for why staleness matters here).
+        self._last_x0_arr = None
+        self._last_params_arr = None
+        self._last_anchor = None
 
         # Built once, on the first solve()/warmup() call -- see module
         # docstring -- and never rebuilt again.
@@ -483,6 +510,10 @@ class EvolutionaryWaypointSolver:
         # arrays -- avoids repeated jnp->python scalar coercion per instance).
         var_committed_np = np.asarray(anchor.var_committed)
         var_anchor_np = np.asarray(anchor.var_anchor)
+        # Stashed for get_population_diagnostics() -- see its own comment.
+        self._last_x0_arr = x0_arr
+        self._last_params_arr = params_arr
+        self._last_anchor = anchor
 
         self._last_solve_was_warm = was_already_built
 
@@ -629,6 +660,66 @@ class EvolutionaryWaypointSolver:
         analytic-IK branch on an out-of-reach target -- see that function's
         own docstring). None, None, None before the first solve()."""
         return self._last_F, self._last_CV, self._last_CV_proj
+
+    def get_population_diagnostics(self):
+        """Per-population-member (F, CV, CV_proj, owner_variable,
+        hard_score, rank, will_be_evicted) as of the last solve()/warmup()
+        call -- unlike get_last_fitness() (which reports only the single
+        selected/best member), this reports the WHOLE population
+        `state.population` carries, freshly evaluated against that call's
+        own x0/anchor (same never-trust-stale-fitness stance as
+        get_last_fitness()/reseed() -- see get_last_fitness()'s own
+        comment for why). A debug/visualization accessor, not a hot path
+        -- returns a PopulationDiagnostics of plain numpy arrays, not jax.
+
+        `hard_score`/`rank`/`will_be_evicted` mirror
+        SmallContinuousVRPSolver.reseed()'s own CV-dominant eviction
+        ranking exactly (small_continuous_vrp.py: `F + 1e6 * max(0,
+        CV_total - reseed_cv_tol)`, `CV_total = CV + CV_proj`), read off
+        the active algorithm instance via getattr so this degrades
+        gracefully under algorithm="lamarckian_al" (no reseed mechanism at
+        all): `will_be_evicted` is then all False (n_evict=0) and
+        `hard_score` uses reseed_cv_tol=0 (a plain hard CV-dominant
+        score).
+
+        `owner_variable[i]` is member `i`'s assigned agent id per
+        assignment-variable slot (`argmax` of that member's one-hot
+        `assign`) -- e.g. `[0, 1]` means variable slot 0 went to agent 0
+        ("r0") and slot 1 to agent 1 ("r1").
+
+        None before the first solve()/warmup() call."""
+        if self._carry is None:
+            return None
+        problem = self._problem
+        state_out, _key_out = self._carry
+        X, _mu, _lam, _rho = _split_genome(problem, state_out.population)
+
+        F, CV = _evaluate_population_jax(
+            problem, X, self._last_x0_arr, self._last_params_arr, self._last_anchor)
+        CV_proj = _evaluate_projection_cv_jax(
+            problem, X, self._last_x0_arr, self._last_params_arr, self._last_anchor)
+        F = np.asarray(F)
+        CV = np.asarray(CV)
+        CV_proj = np.asarray(CV_proj)
+        pop = F.shape[0]
+
+        assign, _cond_binary, _proj_branch, _t, _wp0, _psi0 = problem._extract_batch(X)
+        owner_variable = (np.argmax(np.asarray(assign), axis=-1) if problem.n_variables > 0
+                          else np.zeros((pop, 0), dtype=int))
+
+        reseed_cv_tol = getattr(self._algo, "_reseed_cv_tol", 0.0)
+        n_evict = int(getattr(self._algo, "_n_evict", 0))
+        hard_score = F + 1e6 * np.maximum(0.0, (CV + CV_proj) - reseed_cv_tol)
+        rank = np.argsort(np.argsort(hard_score))       # 0 = best (lowest hard_score)
+        will_be_evicted = np.zeros(pop, dtype=bool)
+        if n_evict > 0:
+            worst_first = np.argsort(-hard_score)        # mirrors reseed()'s own selection
+            will_be_evicted[worst_first[:n_evict]] = True
+
+        return PopulationDiagnostics(
+            F=F, CV=CV, CV_proj=CV_proj, owner_variable=owner_variable,
+            hard_score=hard_score, rank=rank, will_be_evicted=will_be_evicted,
+            n_evict=n_evict)
 
     def get_last_solve_time(self):
         return self._last_solve_time
