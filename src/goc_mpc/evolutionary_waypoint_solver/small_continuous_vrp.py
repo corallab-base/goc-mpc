@@ -125,7 +125,7 @@ class SmallContinuousVRPSolver(LamarckianGA):
 
     def __init__(self, population_size, solution, problem,
                  max_assign_combos=4096, max_orders=20000, max_branch_combos=4096,
-                 reseed_frac=0.2, reseed_rho0=1.0,
+                 reseed_frac=0.2, reseed_rho0=1.0, reseed_cv_tol=1e-4,
                  **kwargs):
         super().__init__(population_size, solution, problem, **kwargs)
         self._dp = make_dp_master_jax(
@@ -144,6 +144,13 @@ class SmallContinuousVRPSolver(LamarckianGA):
         # method's docstring.
         self._n_evict = int(max(1, min(population_size, round(reseed_frac * population_size))))
         self._reseed_rho0 = reseed_rho0
+        # Fixed (not annealed, unlike `_combined_score`'s own `cv_tol`) hard-
+        # score slack -- see reseed's docstring for why a bare CV-dominant
+        # comparison, with no slack at all, isn't what's wanted here. 1e-4
+        # matches _calc_cv_jax's own eq_eps: the same "quantization floor" a
+        # closed-form/analytic residual already carries elsewhere in this
+        # module, not a new number invented for this purpose.
+        self._reseed_cv_tol = reseed_cv_tol
 
     def _init(self, key, params):
         base = super()._init(key, params)
@@ -202,11 +209,20 @@ class SmallContinuousVRPSolver(LamarckianGA):
         identical skeletons every generation for `n_gen`x the cost.
 
         Ranks the CURRENT population by a hard CV-dominant score (`F + 1e6
-        * max(0, CV)` -- mirrors solver.py's own `_carry_from_population`
-        seed-selection, not the softly-annealed `_combined_score` `_tell`
-        uses for tournament/elitism: this decision wants a confident
-        feasible-beats-infeasible split, not something still mid-anneal),
-        takes the `n_evict` worst slots, and re-runs `_seed_population`
+        * max(0, CV - reseed_cv_tol)` -- mirrors solver.py's own
+        `_carry_from_population` seed-selection, not the softly-annealed
+        `_combined_score` `_tell` uses for tournament/elitism: this decision
+        wants a confident feasible-beats-infeasible split, not something
+        still mid-anneal). `reseed_cv_tol` (default 1e-4, matching
+        _calc_cv_jax's own eq_eps) is exactly this score's `cv_tol`: two
+        candidates both under it are compared on `F` alone, so an
+        incumbent whose only "violation" is analytic/quantization-floor
+        noise below that line isn't evicted just because some other
+        candidate randomly rolled a CV a few floating-point ulps lower --
+        without it, CV noise this small would dominate every ranking
+        decision here even though it's invisible to `_combined_score`'s own
+        softly-annealed ranking everywhere else in this class. Takes the
+        `n_evict` worst slots by that score, and re-runs `_seed_population`
         against the LIVE `params.x0`/`anchor` (unlike `state.seed_disc`/
         `seed_wp`, frozen from `init`, `_seed_population` was always
         parameterized by live params -- it was just never called again)
@@ -240,10 +256,13 @@ class SmallContinuousVRPSolver(LamarckianGA):
         if n_evict == 0:
             return state
 
+        def hard_score(F, CV):
+            return F + 1e6 * jnp.maximum(0.0, CV - self._reseed_cv_tol)
+
         X_old = _split_genome(problem, state.population)[0]
         F_old, CV_old = _evaluate_population_jax(
             problem, X_old, params.x0, params.problem_params, params.anchor)
-        hard_old = F_old + 1e6 * jnp.maximum(0.0, CV_old)
+        hard_old = hard_score(F_old, CV_old)
         worst = jnp.argsort(-hard_old)[:n_evict]                      # worst-first slots
 
         seed_disc, seed_wp = self._seed_population(params, n_evict)
@@ -270,7 +289,7 @@ class SmallContinuousVRPSolver(LamarckianGA):
 
         F_cand, CV_cand = _evaluate_population_jax(
             problem, cand_X, params.x0, params.problem_params, params.anchor)
-        hard_cand = F_cand + 1e6 * jnp.maximum(0.0, CV_cand)
+        hard_cand = hard_score(F_cand, CV_cand)
 
         take_cand = (hard_cand < hard_old[worst])[:, None]
         new_slots = jnp.where(take_cand, cand_genome, state.population[worst])

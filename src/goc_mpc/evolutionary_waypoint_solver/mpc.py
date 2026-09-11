@@ -151,10 +151,15 @@ _ALGORITHMS = {
 _CARRY_KWARGS = ("rho0", "n_seed_individuals", "seed_jitter_t", "seed_jitter_wp_frac")
 # LamarckianGA/SmallContinuousVRPSolver constructor kwargs (both share the
 # same __init__ signature -- SmallContinuousVRPSolver only adds its own
-# static-chain setup on top, see that module).
+# static-chain setup on top, see that module). The last three
+# (reseed_frac/reseed_rho0/reseed_cv_tol) are SmallContinuousVRPSolver-only
+# -- LamarckianGA's own __init__ has no **kwargs sink, so passing one of
+# these under algorithm="lamarckian_al" fails loudly with a plain
+# TypeError from that constructor, rather than silently doing nothing.
 _ALGO_KWARGS = ("tournament_k", "wp_mut_scale", "outer_iters", "inner_maxiter",
                 "rho_growth", "lbfgs_history", "ls_max_trials", "optimizer",
-                "n_2opt_trials", "or_opt_prob", "max_or_opt_seg_len")
+                "n_2opt_trials", "or_opt_prob", "max_or_opt_seg_len",
+                "reseed_frac", "reseed_rho0", "reseed_cv_tol")
 # build_evosax_ga's own top-level annealed-schedule kwargs.
 _SCHEDULE_KWARGS = ("w", "cv_tol", "w_frac", "cv_tol_frac", "w_growth", "cv_tol_floor_frac")
 # LamarckianGA.Params fields with no constructor-kwarg home -- applied via
