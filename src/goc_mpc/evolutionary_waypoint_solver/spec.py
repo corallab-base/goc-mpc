@@ -1585,12 +1585,32 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 # spuriously matching an unrelated edge's id.
                 mode = "frozen"
                 resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 1)
-                fn, kind = compile_relational_formula(formula, resolver)
                 node_locals = (node,)
-                read_cols = _free_var_read_cols(
-                    {v.get_id() for v in formula.GetFreeVariables()}, node_locals,
-                    static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
-                    var_map=var_map, num_agents=graph.num_agents)
+                try:
+                    fn, kind = compile_relational_formula(formula, resolver)
+                    read_cols = _free_var_read_cols(
+                        {v.get_id() for v in formula.GetFreeVariables()}, node_locals,
+                        static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
+                        var_map=var_map, num_agents=graph.num_agents)
+                except ValueError:
+                    # A projected constraint's accompanying "real" Formula
+                    # (pin_full_pose_ik's own docstring) can reference a
+                    # var_agent_link_pos/_rot(var) placeholder for an
+                    # ASSIGNABLE arm -- only the projection's OWN owner-
+                    # aware machinery resolves that (a jax.lax.switch on the
+                    # decoded owner, ur5e_joint_ik.py's _switch_ik), never
+                    # the ordinary per-node resolver above (row_resolver
+                    # has no case for it, hence _unsupported_placeholder).
+                    # Non-skip constraints must still raise -- an ordinary,
+                    # authored constraint hitting this is a real bug, not a
+                    # known gap -- so re-raise unless this phi was only
+                    # ever going to be diagnostic-only (proj_check_
+                    # constraints; see that list's own comment above): no
+                    # CV_proj coverage for this one constraint, same blind
+                    # spot it had before this feature existed, not a crash.
+                    if phi_id not in skip_node_phis:
+                        raise
+                    continue
                 entry = (node_locals, fn, kind, mode, f"phi_{phi_id}", read_cols)
                 if phi_id in skip_node_phis:
                     proj_check_constraints.append(entry)  # projected -- see above
@@ -1640,12 +1660,20 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     continue
 
                 resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 2)
-                fn, kind = compile_relational_formula(formula, resolver)
                 node_locals = (u, v)
-                read_cols = _free_var_read_cols(
-                    {v_.get_id() for v_ in formula.GetFreeVariables()}, node_locals,
-                    static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
-                    var_map=var_map, num_agents=graph.num_agents)
+                try:
+                    fn, kind = compile_relational_formula(formula, resolver)
+                    read_cols = _free_var_read_cols(
+                        {v_.get_id() for v_ in formula.GetFreeVariables()}, node_locals,
+                        static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
+                        var_map=var_map, num_agents=graph.num_agents)
+                except ValueError:
+                    # See the node-constraint loop's own try/except above --
+                    # same var_agent_link_pos/_rot(var) (assignable-arm FK)
+                    # gap, same re-raise-unless-diagnostic-only handling.
+                    if phi_id not in skip_edge_phis:
+                        raise
+                    continue
                 entry = (node_locals, fn, kind, mode, f"edge_phi_{phi_id}", read_cols)
                 if phi_id in skip_edge_phis:
                     proj_check_constraints.append(entry)  # projected -- see above
