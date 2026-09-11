@@ -48,6 +48,17 @@ instance) -- every `ask()` output is clipped here before use, to
 `problem.xl`/`problem.xu` for the `X` block and to AL-appropriate ranges
 for `mu`/`lam`/`rho` (lam >= 0, rho in (0, rho_max], mu unconstrained but
 kept finite).
+
+Optional `reseed` hook: `step`, below, calls `algo.reseed(key, state,
+params) -> state` once per EXTERNAL call, before the `n_gen`-generation
+scan, if `algo` declares it (checked via `hasattr`, the same no-op-for-
+algorithms-that-don't-need-it pattern as the live-`Params` merge above)
+-- e.g. `small_continuous_vrp.SmallContinuousVRPSolver.reseed`, which
+periodically evicts/replaces the carried population's worst members with
+fresh discrete-solver candidates re-derived against the live `x0`/
+`anchor` (see that method's docstring). Once per call, not once per
+generation, because `x0`/`anchor`/`problem_params` don't change within a
+call's scan -- only `w`/`cv_tol` anneal generation-to-generation.
 """
 
 import jax
@@ -169,6 +180,17 @@ def build_evosax_ga(problem, algo_cls, pop_size, n_gen, algo_kwargs=None, algo_p
         # scan (only cv_tol anneals per generation, below) -- threaded in
         # once here rather than re-merged every generation.
         base_params = _live_params(algo_params, x0=x0, problem_params=params, anchor=anchor)
+
+        # Optional reseed hook (module docstring) -- once per external call,
+        # here, before the scan, not once per generation inside it: static
+        # `hasattr`-style check (`algo` is a concrete Python object at trace
+        # time, not a traced value), a no-op for any algo_cls that doesn't
+        # declare `reseed`.
+        reseed_fn = getattr(algo, "reseed", None)
+        if reseed_fn is not None:
+            key0, key_reseed = jax.random.split(key0)
+            reseed_params = _live_params(base_params, w=w_val, cv_tol=cv_tol_val)
+            state0 = reseed_fn(key_reseed, state0, reseed_params)
 
         def gen_step(carry, gen):
             state, key = carry
