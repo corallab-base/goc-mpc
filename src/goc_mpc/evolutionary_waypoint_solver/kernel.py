@@ -297,7 +297,7 @@ def make_graph_kernel(instance_sources, n_variables, ordering_edges, instance_no
     per_agent_edge_cost_fns = (list(edge_cost_fn)
                                if isinstance(edge_cost_fn, (list, tuple)) else None)
 
-    def decode_and_cost(assign, cond_binary, t, wp, x0, node_active):
+    def decode_and_cost(assign, cond_binary, t, wp, x0, node_active, node_rank=None):
         n_agents = x0.shape[0]
         instance_active = node_active[instance_node]              # (n_instances,)
 
@@ -313,7 +313,13 @@ def make_graph_kernel(instance_sources, n_variables, ordering_edges, instance_no
             owner_variable = jnp.zeros((0,), dtype=jnp.int32)
             owner_instance = instance_fixed_agent
 
-        node_rank = decode_node_rank(owner_variable, cond_binary, t, node_active)
+        # `node_rank` (optional): the priority->topological-rank decode is
+        # loop-invariant within one local_refine call (assign/cond_binary/t/
+        # node_active all frozen there), so make_batched_local_refine decodes
+        # it once and threads it in -- same idea as apply_projections'
+        # static_cache. None (every other caller) => decode it here as before.
+        if node_rank is None:
+            node_rank = decode_node_rank(owner_variable, cond_binary, t, node_active)
         rank_per_instance = node_rank[instance_node].astype(t.dtype)   # (n_instances,)
 
         # Gather each routing instance's dim-wide position slice out of its
@@ -350,10 +356,20 @@ def make_graph_kernel(instance_sources, n_variables, ordering_edges, instance_no
                 functools.partial(_one_agent_route, edge_cost_fn=edge_cost_fn),
                 in_axes=(0, None, None, None, 0, None)
             )(agent_ids, owner_instance, rank_per_instance, wp, x0, instance_active)
+
+        # TODO: Consider makespan here rather than minmax
         route_cost = jnp.max(per_agent_costs) if objective == "minmax" else jnp.mean(per_agent_costs)
 
         g = jnp.abs(jnp.sum(assign, axis=-1) - 1.0) - 1e-6   # (n_variables,)
         return route_cost, g
 
-    batched = jax.jit(jax.vmap(decode_and_cost, in_axes=(0, 0, 0, 0, None, None)))
+    @jax.jit
+    def batched(assign, cond_binary, t, wp, x0, node_active, node_rank=None):
+        # node_rank None (default) -> decode_and_cost decodes per-member;
+        # a (pop, n_nodes) array -> vmapped in as the precomputed rank.
+        rank_axis = None if node_rank is None else 0
+        return jax.vmap(decode_and_cost,
+                        in_axes=(0, 0, 0, 0, None, None, rank_axis))(
+            assign, cond_binary, t, wp, x0, node_active, node_rank)
+
     return decode_and_cost, batched, jax.jit(decode_node_rank)

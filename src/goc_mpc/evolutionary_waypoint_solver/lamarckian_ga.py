@@ -80,7 +80,7 @@ from evosax.algorithms.population_based.base import (
 from evosax.core.fitness_shaping import identity_fitness_shaping_fn
 
 from .evosax_ga import _split_genome, _join_genome
-from .problem import apply_anchor, apply_projections, full_active_anchor
+from .problem import apply_anchor, jit_apply_projections, full_active_anchor
 from .solver import (
     make_batched_local_refine,
     _routing_local_search_batched,
@@ -253,9 +253,15 @@ class LamarckianGA(PopulationBasedAlgorithm):
         # `wp` -- also part of what this offspring's candidate solution IS,
         # not a post-hoc evaluation step (see module docstring).
         off_assign, off_cond_binary, off_proj_branch, off_t, off_wp, off_psi = problem._extract_batch(off_X)
-        off_wp = apply_projections(problem, off_wp, off_psi, off_proj_branch, params.problem_params,
-                                    assign=off_assign, anchor=params.anchor,
-                                    cond_binary=off_cond_binary, t=off_t, node_active=params.anchor.node_active, x0=params.x0)
+        # jit_apply_projections (cached, compiled once per problem --
+        # problem.py) instead of eager apply_projections: this is one of
+        # several distinct textual call sites of the same projection chain
+        # across this module/solver.py, each of which would otherwise
+        # independently re-trace it (see _evaluate_population_jax's own
+        # comment, solver.py).
+        off_wp = jit_apply_projections(problem)(
+            off_wp, off_psi, off_proj_branch, params.problem_params, off_assign, off_cond_binary, off_t,
+            params.anchor.node_active, params.x0, params.anchor.var_committed, params.anchor.var_anchor)
         off_assign_eff, off_wp_eff_frozen, _off_wp_eff_live = apply_anchor(
             problem, off_assign, off_wp, params.anchor, params.x0)
         off_t = _routing_local_search_batched(

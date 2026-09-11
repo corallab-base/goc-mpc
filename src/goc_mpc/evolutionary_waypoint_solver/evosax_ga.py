@@ -193,8 +193,8 @@ def build_evosax_ga(problem, algo_cls, pop_size, n_gen, algo_kwargs=None, algo_p
     return algo, algo_params, jax.jit(step)
 
 
-def build_initial_carry_fn(problem, algo, algo_params, pop_size, anchor, rho0=1.0,
-                            n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05):
+def build_initial_carry_fn(problem, algo, algo_params, pop_size, anchor, x0=None, params=None,
+                            rho0=1.0, n_seed_individuals=None, seed_jitter_t=1.0, seed_jitter_wp_frac=0.05):
     """Returns a jitted `init(key) -> carry` -- the evosax-native analogue
     of solver.py's `build_initial_carry_fn`: a fresh (cold) random genome
     population (plus the same small precedence-heuristic-seeded subset,
@@ -209,12 +209,27 @@ def build_initial_carry_fn(problem, algo, algo_params, pop_size, anchor, rho0=1.
     `algo_params` is threaded with the real x0/params/anchor (via
     `_live_params`, a no-op for algorithms that don't declare those fields)
     before this call, so an algorithm whose own `init` override needs them
-    (e.g. `lamarckian_ga.LamarckianGA`, to seed its raw best-so-far) sees
-    live values, not `_default_params`'s structural placeholders."""
+    (e.g. `lamarckian_ga.LamarckianGA`, to seed its raw best-so-far; or
+    `small_continuous_vrp.SmallContinuousVRPSolver`, whose `init` override
+    makes an irrevocable discrete choice from them) sees live values, not
+    `_default_params`'s structural placeholders.
+
+    `x0`/`params` default to `None`, which falls back to a COLD value
+    derived from `problem.x0`/`problem.params` -- the problem-BUILD-time
+    snapshot (`GraphOfConstraintsMPC`'s first `_ensure_built` call), zero-
+    padded to `state_dim` (`pad_to_state_dim`) for any column `problem.x0`
+    doesn't itself carry (e.g. object/non-agent state) -- backward-
+    compatible with every existing call site, but WRONG for an `init`
+    override that needs an object's real current position (a moved block,
+    not the zero `pad_to_state_dim` fills in): pass the caller's own live
+    `x0_arr`/`params_arr` (mpc.py's `warmup`/`solve` already compute them,
+    the same values handed to `step_fn` right after this) to get that."""
     n_var, n_eq, n_ineq = _genome_dims(problem)
     xl, xu = jnp.asarray(problem.xl), jnp.asarray(problem.xu)
-    x0 = pad_to_state_dim(jnp.asarray(problem.x0).reshape(-1), problem.state_dim)
-    params = jnp.asarray(problem.params)
+    if x0 is None:
+        x0 = pad_to_state_dim(jnp.asarray(problem.x0).reshape(-1), problem.state_dim)
+    if params is None:
+        params = jnp.asarray(problem.params)
     n_seed = pop_size // 10 if n_seed_individuals is None else n_seed_individuals
     n_seed = max(0, min(n_seed, pop_size))
 

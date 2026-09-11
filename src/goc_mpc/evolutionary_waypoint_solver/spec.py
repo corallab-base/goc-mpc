@@ -486,6 +486,56 @@ def _read_array_fn_multi(reads, static_map, link_pos_map, link_rot_map, param_ma
     return read_fn
 
 
+def _free_var_read_cols(free_var_ids, node_locals, static_map, link_pos_map, link_rot_map,
+                        agent_widths, slot_width, var_map=None, num_agents=0):
+    """{placeholder Variable id} -> frozenset of (node, col) `wp` entries
+    those placeholders structurally resolve to, given `node_locals` (this
+    constraint's own node, or (u, v)/(u,) for an edge/along-edge one) --
+    the same static agent_q/object_q(/u_/v_)/agent_link_pos/_rot mapping
+    `_resolve_projections`'s own `_register` uses to compute a
+    ProjectionEntry's `read_cols`, generalized here to work off any
+    `free_var_ids` set (typically `formula.GetFreeVariables()`) rather than
+    only a ProjOperator's own declared `reads`.
+
+    var_agent_q(var_id) (`var_map`, optional -- `_register`'s own call never
+    needs it: ProjOperator.reads may not contain one, see its own
+    validation) is DYNAMIC -- _make_row_resolver's own docstring: "It only
+    ever binds side 0", and WHICH agent's column it reads depends on the
+    GA-searched assignment, not anything known at spec-build time -- so
+    every candidate agent's own column is genuinely, unconditionally read
+    (the compiled fn's `jax.lax.dynamic_slice` selects among them at
+    runtime), exactly like a projection's own dynamic (var_agent_q-pinned)
+    write claims the union over every candidate (ProjectionEntry's own
+    docstring) -- not a conservative over-approximation, an exact one.
+
+    A param(id) placeholder resolves to no `wp` column at all (it's read
+    from the separate `params` argument) -- simply absent from every map
+    here, so it contributes nothing, same as it contributes no edge to a
+    ProjectionEntry's own read_cols.
+
+    Used to answer "does this residual structurally depend on any FREE
+    (non-projection-pinned) `wp` column" without ever numerically
+    differentiating through it -- see GraphOrderingRelaxed's eq_free_mask/
+    ineq_free_mask (problem.py), which replaced solver.py's old jax.vjp-
+    based `_free_dependent_mask` probe."""
+    read_cols = set()
+    for vid in free_var_ids:
+        if vid in static_map:
+            r_side, r_col = static_map[vid]
+            if r_side < len(node_locals):
+                read_cols.add((node_locals[r_side], int(r_col)))
+        elif vid in link_pos_map or vid in link_rot_map:
+            agent_id = (link_pos_map.get(vid) or link_rot_map[vid])[0]
+            c0 = agent_id * slot_width
+            for c in range(c0, c0 + agent_widths[agent_id]):
+                read_cols.add((node_locals[0], c))
+        elif var_map is not None and vid in var_map:
+            _slot, j = var_map[vid]
+            for k in range(num_agents):
+                read_cols.add((node_locals[0], k * slot_width + j))
+    return frozenset(read_cols)
+
+
 def _order_projection_entries(pending):
     """`pending`: list of {"phi_id", "entry": ProjectionEntry} records, in
     discovery order (explicit `proj=` first, then the auto-derived
@@ -759,7 +809,7 @@ def _batch_along_edge_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
     applied uniformly to every other between-node's row too."""
     vmapped_pop = jax.vmap(fn, in_axes=(0, 0, None))
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, u=u, v=v,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node_rank=None, u=u, v=v,
                 kind=kind, vmapped_pop=vmapped_pop, mode=mode, decode_node_rank=decode_node_rank):
         wp = wp_live if mode == "live" else wp_frozen
         owner_variable = jnp.argmax(assign, axis=-1)
@@ -772,7 +822,11 @@ def _batch_along_edge_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
         all_residuals = jax.vmap(per_node, in_axes=1, out_axes=0)(wp)
         viol = jnp.maximum(0.0, all_residuals) if kind == "ineq" else all_residuals ** 2
 
-        rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
+        # `node_rank` (optional): loop-invariant within one local_refine call,
+        # decoded once by make_batched_local_refine and threaded in. None
+        # (every other caller) => decode it here as before.
+        rank = (node_rank if node_rank is not None
+                else _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active))
         lo = jnp.minimum(rank[:, u], rank[:, v])
         hi = jnp.maximum(rank[:, u], rank[:, v])
         between = (rank >= lo[:, None]) & (rank <= hi[:, None])
@@ -809,7 +863,7 @@ def _batch_relational_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
     trading exact per-node multipliers for a single shared one."""
     vmapped_pop = jax.vmap(fn, in_axes=(0, 0, 0, None))
 
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, u=u, v=v,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node_rank=None, u=u, v=v,
                 kind=kind, vmapped_pop=vmapped_pop, mode=mode, decode_node_rank=decode_node_rank):
         wp = wp_live if mode == "live" else wp_frozen
         owner_variable = jnp.argmax(assign, axis=-1)
@@ -823,7 +877,9 @@ def _batch_relational_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen
         all_residuals = jax.vmap(per_node, in_axes=1, out_axes=0)(wp)
         viol = jnp.maximum(0.0, all_residuals) if kind == "ineq" else all_residuals ** 2
 
-        rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
+        # `node_rank` (optional): see _batch_along_edge_interior_fn.
+        rank = (node_rank if node_rank is not None
+                else _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active))
         lo = jnp.minimum(rank[:, u], rank[:, v])
         hi = jnp.maximum(rank[:, u], rank[:, v])
         between = (rank >= lo[:, None]) & (rank <= hi[:, None])
@@ -910,13 +966,16 @@ def _batch_stationary_edge_fn(u, v, seg_slice, hold_node_pairs, decode_node_rank
     for the same reasoning applied to hold rigidity): once u has passed, an
     untouched object's real current position (x0) is the ground truth going
     forward, not whatever was merely planned there."""
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, u=u, v=v, seg_slice=seg_slice,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node_rank=None, u=u, v=v,
+                seg_slice=seg_slice,
                 hold_node_pairs=hold_node_pairs, decode_node_rank=decode_node_rank, mode=mode):
         wp = wp_live if mode == "live" else wp_frozen
         residual = wp[:, u, seg_slice] - wp[:, v, seg_slice]
         viol = jnp.sum(residual ** 2, axis=-1, keepdims=True)  # (pop, 1)
 
-        rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
+        # `node_rank` (optional): see _batch_along_edge_interior_fn.
+        rank = (node_rank if node_rank is not None
+                else _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active))
         gate = _make_interval_overlap_gate(u, v, hold_node_pairs)(rank)[:, None]  # (pop, 1)
         return viol * gate  # feasible at <=0: forces exact equality unless gated off
     return batched
@@ -943,13 +1002,16 @@ def _batch_depot_stationary_fn(v, seg_slice, hold_node_pairs, decode_node_rank, 
     interval-overlap gate against each hold's own [rank_hu, rank_hv] span
     still correctly turns this off wherever a hold reaches v before the
     depot's (definitionally always-earliest) claim would apply."""
-    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, v=v, seg_slice=seg_slice,
+    def batched(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node_rank=None, v=v,
+                seg_slice=seg_slice,
                 hold_node_pairs=hold_node_pairs, decode_node_rank=decode_node_rank, mode=mode):
         wp = wp_live if mode == "live" else wp_frozen
         residual = x0[None, seg_slice] - wp[:, v, seg_slice]
         viol = jnp.sum(residual ** 2, axis=-1, keepdims=True)  # (pop, 1)
 
-        rank = _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active)
+        # `node_rank` (optional): see _batch_along_edge_interior_fn.
+        rank = (node_rank if node_rank is not None
+                else _decode_rank_batched(decode_node_rank, assign, cond_binary, t, node_active))
         gate = _make_interval_overlap_gate(None, v, hold_node_pairs)(rank)[:, None]  # (pop, 1)
         return viol * gate  # feasible at <=0: forces exact equality unless gated off
     return batched
@@ -1201,6 +1263,26 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
     row_resolver = _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
                                        object_widths, object_slot_width)
     static_map = _build_static_map(graph, slot_width, object_slot_width)
+    # Hoisted up here (rather than local to _resolve_projections, where they
+    # used to live) so _resolve_symbolic_constraints/_resolve_holds below can
+    # also use them -- to derive each residual's own static (node, col) read
+    # set the same way _resolve_projections derives a ProjectionEntry's
+    # read_cols (see _free_var_read_cols).
+    link_pos_map = _make_link_pos_map(graph)
+    link_rot_map = _make_link_rot_map(graph)
+    param_map = _build_param_map(graph)
+    # var_id -> (slot, component j) -- same construction as
+    # _make_row_resolver's own internal var_map (that one stays local to it,
+    # a self-contained utility); needed here so _resolve_projections/
+    # _resolve_symbolic_constraints can each resolve a var_agent_q(var_id)
+    # placeholder (a projection's `pins`, or a residual Formula's free
+    # variable) to its owning slot/component too.
+    var_map = {}
+    for var_id, slot in var_id_to_slot.items():
+        for j, expr in enumerate(graph.var_agent_q(var_id)):
+            v = as_variable(expr)
+            if v is not None:
+                var_map[v.get_id()] = (slot, j)
 
     # -- analytic-elimination projections ------------------------------------
 
@@ -1251,20 +1333,13 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
           * no two projections pin overlapping columns at the same node.
           * the read/pin dependency between projections is acyclic (see
             above)."""
-        link_pos_map = _make_link_pos_map(graph)
-        link_rot_map = _make_link_rot_map(graph)
-        param_map = _build_param_map(graph)
-        # var_id -> (slot, component j) -- same construction as
-        # _make_row_resolver's own var_map, needed here so a projection's
-        # `pins` may ALSO resolve a var_agent_q(var_id) component (a
-        # "dynamic" pin -- see _resolve_pin_columns/ProjectionEntry's own
-        # docstrings), not just a plain static agent_q/object_q one.
-        var_map = {}
-        for var_id, slot in var_id_to_slot.items():
-            for j, expr in enumerate(graph.var_agent_q(var_id)):
-                v = as_variable(expr)
-                if v is not None:
-                    var_map[v.get_id()] = (slot, j)
+        # link_pos_map/link_rot_map/param_map: hoisted to build_graph_
+        # ordering_problem's own top level now (shared with
+        # _resolve_symbolic_constraints/_resolve_holds), see the comment
+        # there. var_map (var_id -> (slot, component j), needed here so a
+        # projection's `pins` may ALSO resolve a var_agent_q(var_id)
+        # component -- a "dynamic" pin, see _resolve_pin_columns/
+        # ProjectionEntry's own docstrings) is hoisted the same way.
 
         # {placeholder Variable id -> owning var slot} for every
         # var_agent_link_pos/_rot(var_id, link) FK placeholder (one per
@@ -1358,26 +1433,19 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
             # (node, col) wp entries this proj's `func` READS -- the other
             # half (with `write_cols` below) of the data-dependency edges the
-            # topo sort after both loops uses to order `entries`. A static
-            # agent_q/object_q(/u_/v_) read resolves to one column at its
-            # endpoint node; an agent_link_pos/_rot FK read consumes that
-            # agent's whole config slice at node_locals[0] (that's what
-            # _resolve_read_component slices before calling fk_fn); a
-            # param(id) read is not a wp column at all, so contributes no
-            # edge.
-            read_cols = set()
-            for arr in proj.reads:
-                for expr in np.asarray(arr).flat:
-                    vid = as_variable(expr).get_id()
-                    if vid in static_map:
-                        r_side, r_col = static_map[vid]
-                        if r_side < len(node_locals):
-                            read_cols.add((node_locals[r_side], int(r_col)))
-                    elif vid in link_pos_map or vid in link_rot_map:
-                        agent_id = (link_pos_map.get(vid) or link_rot_map[vid])[0]
-                        c0 = agent_id * slot_width
-                        for c in range(c0, c0 + agent_widths[agent_id]):
-                            read_cols.add((node_locals[0], c))
+            # topo sort after both loops uses to order `entries`. See
+            # _free_var_read_cols's own docstring for exactly what resolves
+            # to a column and what doesn't (agent_link_pos/_rot FK reads
+            # consume that agent's whole config slice at node_locals[0];
+            # param(id) reads contribute nothing). No var_map passed --
+            # ProjOperator.reads may never contain a var_agent_q(...)
+            # placeholder (validated elsewhere in this function), so it
+            # would never match anyway.
+            read_var_ids_flat = {as_variable(expr).get_id()
+                                  for arr in proj.reads for expr in np.asarray(arr).flat}
+            read_cols = _free_var_read_cols(
+                read_var_ids_flat, node_locals, static_map, link_pos_map, link_rot_map,
+                agent_widths, slot_width)
 
             read_fn = _read_array_fn_multi(proj.reads, static_map, link_pos_map, link_rot_map, param_map,
                                             agent_widths, slot_width)
@@ -1513,8 +1581,13 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 mode = "frozen"
                 resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 1)
                 fn, kind = compile_relational_formula(formula, resolver)
+                node_locals = (node,)
+                read_cols = _free_var_read_cols(
+                    {v.get_id() for v in formula.GetFreeVariables()}, node_locals,
+                    static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
+                    var_map=var_map, num_agents=graph.num_agents)
                 symbolic_constraints.append(
-                    ((node,), fn, kind, mode, f"phi_{phi_id}"))
+                    (node_locals, fn, kind, mode, f"phi_{phi_id}", read_cols))
 
         edge_formulas = graph.edge_phi_to_formula_map
         edge_along_edge = graph.edge_phi_to_along_edge_map
@@ -1539,10 +1612,17 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     # _batch_along_edge_interior_fn.
                     resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 1)
                     fn, kind = compile_relational_formula(formula, resolver)
+                    free_var_ids = {v.get_id() for v in formula.GetFreeVariables()}
+                    read_cols_u = _free_var_read_cols(
+                        free_var_ids, (u,), static_map, link_pos_map, link_rot_map,
+                        agent_widths, slot_width, var_map=var_map, num_agents=graph.num_agents)
+                    read_cols_v = _free_var_read_cols(
+                        free_var_ids, (v,), static_map, link_pos_map, link_rot_map,
+                        agent_widths, slot_width, var_map=var_map, num_agents=graph.num_agents)
                     symbolic_constraints.append(
-                        ((u,), fn, kind, mode, f"edge_phi_{phi_id}_u"))
+                        ((u,), fn, kind, mode, f"edge_phi_{phi_id}_u", read_cols_u))
                     symbolic_constraints.append(
-                        ((v,), fn, kind, mode, f"edge_phi_{phi_id}_v"))
+                        ((v,), fn, kind, mode, f"edge_phi_{phi_id}_v", read_cols_v))
                     interior_batched = _batch_along_edge_interior_fn(
                         fn, kind, u, v, decode_node_rank, mode=mode)
                     interior_constraints.append(
@@ -1551,8 +1631,13 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
                 resolver = lambda var, row_resolver=row_resolver: row_resolver(var, 2)
                 fn, kind = compile_relational_formula(formula, resolver)
+                node_locals = (u, v)
+                read_cols = _free_var_read_cols(
+                    {v_.get_id() for v_ in formula.GetFreeVariables()}, node_locals,
+                    static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
+                    var_map=var_map, num_agents=graph.num_agents)
                 symbolic_constraints.append(
-                    ((u, v), fn, kind, mode, f"edge_phi_{phi_id}"))
+                    (node_locals, fn, kind, mode, f"edge_phi_{phi_id}", read_cols))
 
     def _resolve_holds():
         """Auto-derives rigid-carry (translation-only) constraints from the
@@ -1651,6 +1736,18 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                         obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
                         obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
                         return (obj_v - obj_u) - (v_pos - u_pos)
+
+                    # Structural (node, col) read set -- see
+                    # _free_var_read_cols's own docstring for why this
+                    # mirrors that helper rather than calling it (no Formula
+                    # here, this fn is hand-rolled -- see this function's own
+                    # docstring -- but its reads are just as statically known
+                    # from the slices captured above).
+                    read_cols = (
+                        {(u, c) for c in range(agent_col0, agent_col0 + agent_w)}
+                        | {(v, c) for c in range(agent_col0, agent_col0 + agent_w)}
+                        | {(u, c) for c in range(obj_col0, obj_col0 + workspace_dim)}
+                        | {(v, c) for c in range(obj_col0, obj_col0 + workspace_dim)})
                 else:
                     slot = var_id_to_slot[hold.var_id]
                     # One (agent_col0, agent_w, fk_fn) triple per candidate
@@ -1694,9 +1791,20 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                         obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
                         return (obj_v - obj_u) - delta
 
+                    # Every candidate agent's own slice is genuinely read
+                    # (to build `deltas` above, before the runtime select) --
+                    # not a conservative over-approximation, an exact one.
+                    read_cols = {
+                        (node, c)
+                        for node in (u, v)
+                        for col, w in zip(branch_cols, branch_widths)
+                        for c in range(col, col + w)
+                    } | {(u, c) for c in range(obj_col0, obj_col0 + workspace_dim)} | {
+                        (v, c) for c in range(obj_col0, obj_col0 + workspace_dim)}
+
                 kind = "eq"
                 name = f"hold_{hold_id}_obj_{oid}"
-                symbolic_constraints.append(((u, v), fn, kind, mode, name))
+                symbolic_constraints.append(((u, v), fn, kind, mode, name, frozenset(read_cols)))
                 interior_batched = _batch_relational_interior_fn(
                     fn, kind, u, v, decode_node_rank, mode=mode)
                 interior_constraints.append((interior_batched, f"{name}_interior"))
@@ -1893,19 +2001,33 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
     # -- python constraints + build -----------------------------------------
 
+    # eq_read_cols/ineq_read_cols: parallel to eq_constraints/ineq_constraints
+    # (same order, one entry each) -- each residual's own structural (node,
+    # col) `wp` read set, or None for one whose reads aren't statically known
+    # (deprecated raw python_constraints; the aggregate/gated interior_
+    # constraints and stationary_constraints re-applications, which read
+    # potentially-any node's row depending on the runtime-decoded visiting
+    # order). None means GraphOrderingRelaxed's eq_free_mask/ineq_free_mask
+    # conservatively treats that row as free-dependent (never masked out) --
+    # see that class's own docstring/problem.py.
     eq_constraints, ineq_constraints = [], []
+    eq_read_cols, ineq_read_cols = [], []
     for node, fn, kind, _name in python_constraints:
         if kind not in ("eq", "ineq"):
             raise ValueError(f"Unknown constraint kind {kind!r}, expected 'eq' or 'ineq'")
         batched = _batch_python_constraint_fn(fn, node)
         (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
-    for node_locals, fn, kind, mode, _name in symbolic_constraints:
+        (eq_read_cols if kind == "eq" else ineq_read_cols).append(None)
+    for node_locals, fn, kind, mode, _name, read_cols in symbolic_constraints:
         batched = _batch_symbolic_constraint_fn(fn, node_locals, mode=mode)
         (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
+        (eq_read_cols if kind == "eq" else ineq_read_cols).append(read_cols)
     for batched, _name in interior_constraints:
         ineq_constraints.append(batched)
+        ineq_read_cols.append(None)
     for batched, _name in stationary_constraints:
         ineq_constraints.append(batched)
+        ineq_read_cols.append(None)
 
     return GraphOrderingRelaxed(
         instance_sources=instance_sources,
@@ -1921,6 +2043,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         edge_cost_fn=edge_cost_fn,
         eq_constraints=eq_constraints,
         ineq_constraints=ineq_constraints,
+        eq_read_cols=eq_read_cols,
+        ineq_read_cols=ineq_read_cols,
         # Structural shape only (n_params) -- fixes the jitted GA's
         # `params` argument width for this problem's whole lifetime, same
         # as x0 fixes n_agents/dim. The actual VALUES a live solve() reads

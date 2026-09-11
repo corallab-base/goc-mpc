@@ -436,7 +436,7 @@ class EvolutionaryWaypointSolver:
 
         init_fn = _build_evosax_initial_carry_fn(
             self._problem, self._algo, self._algo_params, self._pop_size, anchor,
-            **self._carry_kwargs)
+            x0=x0_arr, params=params_arr, **self._carry_kwargs)
 
         start = time.perf_counter()
         carry_in = init_fn(jax.random.PRNGKey(self._seed))
@@ -490,7 +490,7 @@ class EvolutionaryWaypointSolver:
         else:
             init_fn = _build_evosax_initial_carry_fn(
                 problem, self._algo, self._algo_params, self._pop_size, anchor,
-                **self._carry_kwargs)
+                x0=x0_arr, params=params_arr, **self._carry_kwargs)
             carry_in = init_fn(jax.random.PRNGKey(self._seed))
             self._last_population_reused = False
 

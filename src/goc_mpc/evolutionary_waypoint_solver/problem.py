@@ -341,7 +341,7 @@ def precompute_static_projections(problem, wp0, proj_branch, params):
 
 def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor=None, static_cache=None,
                       cond_binary=None, t=None, node_active=None, x0=None, only_entries=None,
-                      var_committed=None, var_anchor=None):
+                      var_committed=None, var_anchor=None, precomputed_rank=None):
     """Splices every registered analytic-elimination substitution
     (spec.py's _resolve_projections, projection.ProjOperator) into batched
     `(pop, n_nodes, state_dim)` wp, reading batched `psi`
@@ -441,15 +441,21 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
 
     rank = None
     if any(e.gate_fn is not None for e in entries):
-        if cond_binary is None or t is None or assign is None:
-            raise ValueError(
-                "a gated projection (ProjectionEntry.gate_fn) needs "
-                "apply_projections' `assign`, `cond_binary` and `t` arguments to "
-                "decode the node-rank its gate is evaluated against")
-        na = node_active
-        if na is None:
-            na = anchor.node_active if anchor is not None else jnp.ones((problem.n_nodes,), dtype=bool)
-        rank = decode_rank_batched(problem._decode_node_rank, assign, cond_binary, t, na)  # (pop, n_nodes)
+        if precomputed_rank is not None:
+            # Loop-invariant within one local_refine call (assign/cond_binary/
+            # t/node_active all frozen there) -- make_batched_local_refine
+            # decodes it once and threads it in, same as static_cache.
+            rank = precomputed_rank
+        else:
+            if cond_binary is None or t is None or assign is None:
+                raise ValueError(
+                    "a gated projection (ProjectionEntry.gate_fn) needs "
+                    "apply_projections' `assign`, `cond_binary` and `t` arguments to "
+                    "decode the node-rank its gate is evaluated against")
+            na = node_active
+            if na is None:
+                na = anchor.node_active if anchor is not None else jnp.ones((problem.n_nodes,), dtype=bool)
+            rank = decode_rank_batched(problem._decode_node_rank, assign, cond_binary, t, na)  # (pop, n_nodes)
 
     for entry in entries:
         if static_cache is not None and id(entry) in static_cache:
@@ -587,7 +593,7 @@ class GraphOrderingRelaxed:
                  n_cond_vars=0, objective="avg", edge_cost_fn=None,
                  eq_constraints=(), ineq_constraints=(), params=None,
                  instance_list=(), var_id_to_slot=None, projections=(),
-                 categorical_ne=()):
+                 categorical_ne=(), eq_read_cols=(), ineq_read_cols=()):
         self.instance_sources = list(instance_sources)
         # Raw (node, (kind, val)) routing-instance pairs and the GA-slot
         # assignment for each assignable variable id -- unlike
@@ -652,6 +658,7 @@ class GraphOrderingRelaxed:
         # one shared callable, or a per-agent list -- see make_graph_kernel.
         self.edge_cost_fn = edge_cost_fn
         kernel_kwargs = {} if edge_cost_fn is None else {"edge_cost_fn": edge_cost_fn}
+
         self._decode_and_cost, self._batched, self._decode_node_rank = make_graph_kernel(
             self.instance_sources, self.n_variables, self.ordering_edges,
             self.instance_node, self.dim, self.n_nodes,
@@ -659,12 +666,18 @@ class GraphOrderingRelaxed:
 
         self._eq_constraints = list(eq_constraints)
         self._ineq_constraints = list(ineq_constraints)
-        sizes = lambda fns: sum(_infer_constraint_size(fn, self.n_variables, self.n_agents,
-                                                         self.n_nodes, self.state_dim, self.n_cond_vars,
-                                                         self.n_params)
-                                 for fn in fns)
-        self.n_eq_extra = sizes(self._eq_constraints)
-        self.n_ineq_extra = sizes(self._ineq_constraints)
+        widths = lambda fns: [_infer_constraint_size(fn, self.n_variables, self.n_agents,
+                                                       self.n_nodes, self.state_dim, self.n_cond_vars,
+                                                       self.n_params)
+                               for fn in fns]
+        # Kept (not just summed) -- eq_free_mask/ineq_free_mask below reuse
+        # these same per-fn widths to broadcast one structural free/pinned
+        # verdict per CONSTRAINT out to that constraint's own output rows,
+        # rather than paying for a second jax.eval_shape pass per fn.
+        eq_widths = widths(self._eq_constraints)
+        ineq_widths = widths(self._ineq_constraints)
+        self.n_eq_extra = sum(eq_widths)
+        self.n_ineq_extra = sum(ineq_widths)
         self.n_eq_constr = self.n_eq_extra
         self.n_ieq_constr = self.n_ineq_extra
 
@@ -719,6 +732,65 @@ class GraphOrderingRelaxed:
         self.wp_pinned_mask = wp_pinned_mask
         self.wp_free_idx = np.flatnonzero(~wp_pinned_mask.reshape(-1))
         self.n_wp_free = int(self.wp_free_idx.shape[0])
+
+        # eq_free_mask/ineq_free_mask: per-residual-row "does this row have
+        # ANY gradient dependence on a free wp/psi column" -- solver.py's
+        # make_batched_local_refine zeroes out a False row before summing
+        # into the AL penalty, since a row entirely determined by
+        # projection-pinned columns (and x0/params) can never be driven to
+        # satisfaction by local_refine's free variables, and keeping it in
+        # would otherwise force `rho` to escalate for no reason (see
+        # make_batched_local_refine's own eq_free_mask/ineq_free_mask
+        # comment, solver.py).
+        #
+        # Computed STRUCTURALLY here (once, in plain numpy, at problem-build
+        # time) from eq_read_cols/ineq_read_cols -- spec.py's per-constraint
+        # (node, col) read set, the same Formula.GetFreeVariables()-derived
+        # information a ProjectionEntry's own read_cols already comes from
+        # (see spec.py's _free_var_read_cols) -- rather than by numerically
+        # probing each row's real gradient via jax.vjp (solver.py's old
+        # _free_dependent_mask). A structural read into a column this
+        # problem's own projections pin is only a genuine non-dependency
+        # when that pin has no psi: a psi-parameterized pin's value is
+        # itself a differentiable function of psi (a real free/gradient-
+        # refined quantity, see apply_projections' docstring), so a residual
+        # reading such a column must still count as dependent -- dead_cols
+        # below excludes exactly those.
+        psi_pinned_mask = np.zeros((n_nodes, state_dim), dtype=bool)
+        for p in self.projections:
+            if p.owner_var_slot is not None or p.gate_fn is not None or p.continuous_params == 0:
+                continue
+            psi_pinned_mask[p.write_node, p.pinned_cols] = True
+        dead_mask = wp_pinned_mask & ~psi_pinned_mask  # truly constant for local_refine's whole call
+        dead_cols = {(int(n), int(c)) for n, c in zip(*np.nonzero(dead_mask))}
+
+        def _free_mask(fn_widths, read_cols_list):
+            assert len(fn_widths) == len(read_cols_list), (
+                f"eq_read_cols/ineq_read_cols must have exactly one entry per "
+                f"constraint fn ({len(read_cols_list)} given, {len(fn_widths)} fns) -- "
+                f"a caller passing a partial list would silently misalign the rest "
+                f"via zip() otherwise")
+            # read_cols=None (deprecated raw python_constraints; the
+            # aggregate/gated interior_constraints/stationary_constraints
+            # re-applications, whose reads span a runtime-decoded set of
+            # nodes -- see spec.py's build_graph_ordering_problem) means
+            # "not statically known" -- conservatively always dependent,
+            # exactly like a NaN/inf entry in the old numeric probe (never
+            # wrongly masks out a row that might actually be free-dependent).
+            # An empty (but non-None) read_cols -- a residual that reads no
+            # wp column at all, e.g. a pure param(id) constraint -- is
+            # correctly independent (`any` over an empty set is False).
+            out = []
+            for width, read_cols in zip(fn_widths, read_cols_list):
+                dependent = True if read_cols is None else any(
+                    rc not in dead_cols for rc in read_cols)
+                out.extend([dependent] * width)
+            return np.asarray(out, dtype=bool)
+
+        eq_read_cols = list(eq_read_cols) or [None] * len(self._eq_constraints)
+        ineq_read_cols = list(ineq_read_cols) or [None] * len(self._ineq_constraints)
+        self.eq_free_mask = _free_mask(eq_widths, eq_read_cols)
+        self.ineq_free_mask = _free_mask(ineq_widths, ineq_read_cols)
 
         self.n_assign_vars = self.n_variables * self.n_agents
         self.cond_offset = self.n_assign_vars

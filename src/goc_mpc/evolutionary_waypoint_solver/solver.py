@@ -41,6 +41,7 @@ under a dynamic-x0 trace, and `problem.x0` is itself only ever agent-shaped
 distinct problem shape, never on the warm-started hot path.
 """
 
+import inspect
 import time
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -51,9 +52,10 @@ import numpy as np
 import optax
 
 from .problem import (
-    apply_anchor, apply_projections, agent_depot, pad_to_state_dim,
+    apply_anchor, apply_projections, jit_apply_projections, agent_depot, pad_to_state_dim,
     gather_free_wp, scatter_free_wp, precompute_static_projections,
 )
+from .kernel import decode_rank_batched
 
 jax.config.update("jax_enable_x64", True)
 
@@ -74,9 +76,28 @@ def _make_merit_batched(problem, wp_shape):
     d_wp = problem.n_wp_free
     batched_kernel = problem._batched
     eq_fns, ineq_fns = problem._eq_constraints, problem._ineq_constraints
+    # Only the gated interior/stationary residual builders (spec.py) take a
+    # precomputed `node_rank`; the plain per-node/symbolic ones keep the bare
+    # 8-arg contract. Decided once here, not per merit call.
+    eq_wants_rank = [_accepts_node_rank(fn) for fn in eq_fns]
+    ineq_wants_rank = [_accepts_node_rank(fn) for fn in ineq_fns]
 
     def merit(wp_psi_flat, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
-              static_cache=None):
+              static_cache=None, node_rank_proj=None, node_rank_eff=None,
+              eq_free_mask=None, ineq_free_mask=None):
+        # node_rank_proj/node_rank_eff (optional): the priority->topological-
+        # rank decode (kernel._topological_rank, an O(n_nodes^2) differentiated
+        # scan) is loop-invariant within one local_refine call -- assign/
+        # cond_binary/t/node_active are all frozen there -- yet without this it
+        # re-runs on every merit_and_grad call (~200 per local_refine) at each
+        # of ~6 sites: the routing kernel, apply_projections' gated blend, and
+        # every gated interior/stationary residual. make_batched_local_refine
+        # decodes it once and threads it in, exactly like static_cache above.
+        # `_proj` is decoded from the raw `assign` (apply_projections' gate
+        # reads that), `_eff` from the anchor-spliced assign_eff (kernel +
+        # residuals read that); they differ only under a committed var_anchor
+        # whose ordering-edge gate depends on owner_variable. None => decode
+        # in-line as before (every non-local_refine caller).
         # wp_psi_flat is wp's FREE columns (flattened) ++ psi -- local
         # refinement gradient-descends the two together (psi is a genuine
         # continuous free parameter of whatever projection(s) declared it,
@@ -98,7 +119,7 @@ def _make_merit_batched(problem, wp_shape):
         # recomputed on every one of this function's own ~1000s-per-
         # generation calls.
         wp = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
-                                static_cache=static_cache,
+                                static_cache=static_cache, precomputed_rank=node_rank_proj,
                                 cond_binary=cond_binary, t=t, node_active=anchor.node_active, x0=x0)
         # anchor splices remaining_vertices state in once here: a node/
         # variable no longer in remaining_vertices reads back as either its
@@ -111,40 +132,86 @@ def _make_merit_batched(problem, wp_shape):
         # (problem.agent_depot).
         assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
         F, _g_kernel = batched_kernel(assign_eff, cond_binary, t, wp_eff_frozen, agent_depot(problem, x0),
-                                       anchor.node_active)
+                                       anchor.node_active, node_rank_eff)
 
         total = F
         if eq_fns:
             h = jnp.concatenate(
-                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0, params)
-                 for fn in eq_fns], axis=1)
+                [_call_residual(fn, wants, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
+                                anchor.node_active, x0, params, node_rank_eff)
+                 for fn, wants in zip(eq_fns, eq_wants_rank)], axis=1)
+            # eq_free_mask (optional, problem.eq_free_mask via
+            # make_batched_local_refine): zeroes any row that has NO
+            # structural dependence on a free wp/psi column at all -- one
+            # entirely determined by projection-pinned columns (and
+            # x0/params) is a structural CONSTANT, so it can never be driven
+            # to zero; keeping it in the AL sum would only ever grow `rho`
+            # (shared across every residual, see this function's own module
+            # docstring) without ever being satisfiable, inflating the
+            # quadratic penalty for every genuinely optimizable residual too.
+            if eq_free_mask is not None:
+                h = h * eq_free_mask[None, :]
             total = total + jnp.sum(mu * h, axis=1) + 0.5 * rho * jnp.sum(h * h, axis=1)
         if ineq_fns:
             g = jnp.concatenate(
-                [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0, params)
-                 for fn in ineq_fns], axis=1)
+                [_call_residual(fn, wants, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
+                                anchor.node_active, x0, params, node_rank_eff)
+                 for fn, wants in zip(ineq_fns, ineq_wants_rank)], axis=1)
+            if ineq_free_mask is not None:  # see eq_free_mask above
+                g = g * ineq_free_mask[None, :]
             z = jnp.maximum(0.0, lam + rho[:, None] * g)
             total = total + (jnp.sum(z * z, axis=1) - jnp.sum(lam * lam, axis=1)) / (2.0 * rho)
         return total
 
     def merit_and_grad(wp_psi_flat, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
-                       static_cache=None):
+                       static_cache=None, node_rank_proj=None, node_rank_eff=None,
+                       eq_free_mask=None, ineq_free_mask=None):
         value, vjp_fn = jax.vjp(
             lambda w: merit(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
-                             static_cache),
+                             static_cache, node_rank_proj, node_rank_eff, eq_free_mask, ineq_free_mask),
             wp_psi_flat)
         (grad,) = vjp_fn(jnp.ones_like(value))
+        # A projection's analytic formula (e.g. an IK solve) can sit exactly
+        # at a kinematic singularity for a given seed/config -- finite VALUE,
+        # undefined/infinite DERIVATIVE there (e.g. a 1/sqrt(reach) term at
+        # reach==0) -- so an occasional nan/inf row here is a real, expected
+        # possibility, not a sign the seed itself is bad. Zero it out rather
+        # than let it silently blow up the WHOLE wp_psi_flat vector on the
+        # very next optimizer update (nan/inf propagates through every other,
+        # perfectly fine coordinate via ordinary elementwise arithmetic) --
+        # equivalent to telling the optimizer "no information available
+        # along this direction right now," which is the correct reading of
+        # an undefined derivative, not "move infinitely far."
+        grad = jnp.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
         return value, grad
 
     return merit_and_grad
 
 
-def _eval_residuals_batched(fns, assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params):
+def _accepts_node_rank(fn):
+    """True iff `fn` (a batched residual closure from spec.py) declares a
+    `node_rank` parameter -- only the gated interior/stationary builders do."""
+    try:
+        return "node_rank" in inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
+
+
+def _call_residual(fn, wants_rank, assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params,
+                   node_rank):
+    if wants_rank:
+        return fn(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params, node_rank)
+    return fn(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params)
+
+
+def _eval_residuals_batched(fns, assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params,
+                            node_rank=None):
     pop = wp_frozen.shape[0]
     if not fns:
         return jnp.zeros((pop, 0))
     return jnp.concatenate(
-        [fn(assign, cond_binary, t, wp_frozen, wp_live, node_active, x0, params) for fn in fns], axis=1)
+        [_call_residual(fn, _accepts_node_rank(fn), assign, cond_binary, t, wp_frozen, wp_live,
+                        node_active, x0, params, node_rank) for fn in fns], axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -306,14 +373,34 @@ def barzilai_borwein(init_step=1e-2, min_step=1e-6, max_step=1.0, variant="long"
 # ---------------------------------------------------------------------------
 
 def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, rho_max,
-                                lbfgs_history=10, ls_max_trials=10, optimizer=None):
+                              lbfgs_history=10, ls_max_trials=10, optimizer=None):
     n_nodes, state_dim = problem.n_nodes, problem.state_dim
     # wp_psi_flat only ever carries wp's FREE columns (problem.n_wp_free) --
     # see gather_free_wp/scatter_free_wp (problem.py) and _make_merit_
     # batched's own comment -- so this function's own d_wp must match.
     d_wp = problem.n_wp_free
     eq_fns, ineq_fns = problem._eq_constraints, problem._ineq_constraints
+    eq_wants_rank = [_accepts_node_rank(fn) for fn in eq_fns]
+    ineq_wants_rank = [_accepts_node_rank(fn) for fn in ineq_fns]
     merit_and_grad = _make_merit_batched(problem, (n_nodes, state_dim))
+
+    # Which eq/ineq residual ROWS local_refine can actually move at all -- a
+    # row with no gradient path to wp_psi_flat (entirely determined by
+    # projection-pinned columns) must be excluded from the AL sum below
+    # rather than merely left in: it can never be satisfied, so it would
+    # otherwise force `rho` -- shared across every residual -- to escalate
+    # every outer iteration for no reason, destabilizing every genuinely
+    # optimizable residual along with it. A plain STRUCTURAL constant of
+    # `problem` (problem.eq_free_mask/ineq_free_mask, problem.py) -- computed
+    # once from each constraint's own (node, col) read set against
+    # problem.wp_pinned_mask when the problem was built, never from a
+    # runtime assign/cond_binary/t/anchor value -- so, unlike static_cache/
+    # node_rank_* below (both genuinely per-call, since they depend on THIS
+    # call's frozen discrete genome), this is hoisted all the way out here:
+    # computed once when this closure itself is built, not once per
+    # batched_local_refine call.
+    eq_free_mask = jnp.asarray(problem.eq_free_mask)
+    ineq_free_mask = jnp.asarray(problem.ineq_free_mask)
 
     # problem.xl/xu lay the FULL wp block then psi out contiguously
     # (psi_offset == wp_offset + n_nodes*state_dim, n_var == psi_offset +
@@ -364,15 +451,18 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
         see no difference from before this reduction existed.
 
         `optimizer` (make_batched_local_refine's own kwarg, closed over
-        here): `None` (default) uses `_lbfgs_solve`, the original hand-
-        rolled batched L-BFGS+Armijo-backtracking inner solve, unchanged;
-        an `optax.GradientTransformation` (e.g. `optax.sgd(...)`,
-        `optax.adam(...)`, `barzilai_borwein(...)`, above) instead runs
-        `_optax_inner_solve` -- no line search, one merit_and_grad
+        here): `None` (default) runs `_optax_inner_solve` with
+        `barzilai_borwein()` -- no line search, one merit_and_grad
         evaluation per inner_maxiter iteration rather than up to
-        max_ls_trials of them, trading L-BFGS's per-iteration quality for a
-        much cheaper iteration (see the profiling that motivated this).
-        `lbfgs_history`/`ls_max_trials` are ignored in that branch.
+        max_ls_trials of them; the spectral step self-adapts to local
+        curvature and, on the NTField-cost tabletop scenes, matches the
+        L-BFGS+Armijo solution at ~10x lower wall-clock (see the profiling
+        that motivated the default). Pass the string `"lbfgs"` to instead
+        use `_lbfgs_solve`, the original hand-rolled batched
+        L-BFGS+Armijo-backtracking inner solve (`lbfgs_history`/
+        `ls_max_trials` apply only there). Any other
+        `optax.GradientTransformation` (e.g. `optax.adam(...)`) also runs
+        `_optax_inner_solve`.
 
         `static_cache` (problem.precompute_static_projections) is computed
         ONCE here, before the outer AL loop even starts, since a
@@ -389,31 +479,60 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
         static_cache = precompute_static_projections(problem, wp0, proj_branch, params)
         wp_psi_flat = jnp.concatenate([gather_free_wp(problem, wp0), psi0], axis=1)
 
-        def merit_and_grad_fixed(w, assign=assign, cond_binary=cond_binary, proj_branch=proj_branch, t=t,
-                                  mu=mu, lam=lam, rho=rho, x0=x0, params=params, anchor=anchor,
-                                  static_cache=static_cache):
-            return merit_and_grad(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
-                                   static_cache)
+        # Decode the priority->topological visiting-order rank ONCE here, for
+        # the same reason static_cache is precomputed once: assign/cond_binary/
+        # t/node_active are all frozen for this whole call, so the O(n_nodes^2)
+        # differentiated scan (kernel._topological_rank) that merit otherwise
+        # re-runs on every merit_and_grad eval -- at the routing kernel,
+        # apply_projections' gated blend, and each gated interior/stationary
+        # residual -- yields the identical result each time. `_proj` uses the
+        # raw `assign` (apply_projections' gate reads that); `_eff` the
+        # anchor-spliced assign_eff (kernel + residuals read that).
+        _na = anchor.node_active
+        assign_eff0 = apply_anchor(problem, assign, jnp.zeros((pop, n_nodes, state_dim)), anchor, x0)[0]
+        node_rank_eff = decode_rank_batched(problem._decode_node_rank, assign_eff0, cond_binary, t, _na)
+        node_rank_proj = decode_rank_batched(problem._decode_node_rank, assign, cond_binary, t, _na)
 
-        for _ in range(outer_iters):
-            if optimizer is None:
-                wp_psi_flat = _lbfgs_solve(merit_and_grad_fixed, wp_psi_flat, lbfgs_history, inner_maxiter,
-                                            ls_max_trials)
+        def merit_and_grad_fixed(w, mu, lam, rho):
+            return merit_and_grad(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
+                                   static_cache, node_rank_proj, node_rank_eff, eq_free_mask, ineq_free_mask)
+
+        inner_optimizer = barzilai_borwein() if optimizer is None else optimizer
+        proj_fn = jit_apply_projections(problem)
+
+        # One outer AL iteration: inner solve (L-BFGS or optax) on the free
+        # wp/psi columns, then re-project + re-evaluate constraints to update
+        # rho/mu/lam. A jax.lax.scan (not a Python for loop) over outer_iters
+        # -- like every inner solve already is -- so this whole body traces
+        # ONCE regardless of outer_iters instead of being unrolled
+        # outer_iters times into the surrounding step()/generation scan,
+        # substantially cutting compile time. jit_apply_projections (cached,
+        # compiled once per problem -- problem.py) instead of the eager
+        # apply_projections used above/in merit: this call is only for the
+        # h1/g1/rho/mu/lam bookkeeping below (not the hot inner-solve path,
+        # which stays on eager apply_projections + static_cache/
+        # precomputed_rank), so it doesn't need those per-call caches.
+        def outer_step(carry, _):
+            wp_psi_flat, mu, lam, rho = carry
+            fixed = lambda w: merit_and_grad_fixed(w, mu, lam, rho)
+            if inner_optimizer == "lbfgs":
+                wp_psi_flat = _lbfgs_solve(fixed, wp_psi_flat, lbfgs_history, inner_maxiter, ls_max_trials)
             else:
-                wp_psi_flat = _optax_inner_solve(merit_and_grad_fixed, wp_psi_flat, optimizer, inner_maxiter)
+                wp_psi_flat = _optax_inner_solve(fixed, wp_psi_flat, inner_optimizer, inner_maxiter)
             wp_psi_flat = jnp.clip(wp_psi_flat, lo, hi)
 
             wp_free = wp_psi_flat[:, :d_wp]
             psi = wp_psi_flat[:, d_wp:]
             wp = scatter_free_wp(problem, wp_free, jnp.zeros((pop, n_nodes, state_dim)))
-            wp_proj = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
-                                         static_cache=static_cache,
-                                         cond_binary=cond_binary, t=t, node_active=anchor.node_active, x0=x0)
+            wp_proj = proj_fn(wp, psi, proj_branch, params, assign, cond_binary, t,
+                              anchor.node_active, x0, anchor.var_committed, anchor.var_anchor)
             assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp_proj, anchor, x0)
             h1 = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
-                                          anchor.node_active, x0, params)
+                                          anchor.node_active, x0, params, node_rank=node_rank_eff)
             g1 = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
-                                          anchor.node_active, x0, params)
+                                          anchor.node_active, x0, params, node_rank=node_rank_eff)
+            h1 = h1 * eq_free_mask[None, :]      # see eq_free_mask/_free_dependent_mask above
+            g1 = g1 * ineq_free_mask[None, :]
             v1 = _calc_cv_jax(pop, g1, h1)
 
             if eq_fns:
@@ -421,12 +540,10 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             if ineq_fns:
                 lam = jnp.maximum(0.0, lam + rho[:, None] * g1)
             rho = jnp.where(v1 <= cv_tol, rho, jnp.minimum(rho * rho_growth, rho_max))
+            return (wp_psi_flat, mu, lam, rho), None
 
-            def merit_and_grad_fixed(w, assign=assign, cond_binary=cond_binary, proj_branch=proj_branch, t=t,
-                                      mu=mu, lam=lam, rho=rho, x0=x0, params=params, anchor=anchor,
-                                      static_cache=static_cache):
-                return merit_and_grad(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
-                                       static_cache)
+        (wp_psi_flat, mu, lam, rho), _ = jax.lax.scan(
+            outer_step, (wp_psi_flat, mu, lam, rho), xs=None, length=outer_iters)
 
         wp_final = scatter_free_wp(problem, wp_psi_flat[:, :d_wp], jnp.zeros((pop, n_nodes, state_dim)))
         psi_final = wp_psi_flat[:, d_wp:]
@@ -647,8 +764,15 @@ def _calc_cv_jax(pop, G, H, eq_eps=1e-4):
 def _evaluate_population_jax(problem, X, x0, params, anchor):
     pop = X.shape[0]
     assign, cond_binary, proj_branch, t, wp, psi = problem._extract_batch(X)
-    wp = apply_projections(problem, wp, psi, proj_branch, params, assign=assign, anchor=anchor,
-                            cond_binary=cond_binary, t=t, node_active=anchor.node_active, x0=x0)
+    # jit_apply_projections (cached, compiled once per problem -- problem.py)
+    # instead of eager apply_projections: evosax_ga.py calls this function
+    # from three distinct textual sites (init/ask/tell), each of which would
+    # otherwise independently re-trace the whole projection chain (every
+    # analytic elimination, including any owner_aware multi-branch analytic
+    # IK) into its own surrounding scan/jit trace.
+    wp = jit_apply_projections(problem)(
+        wp, psi, proj_branch, params, assign, cond_binary, t, anchor.node_active, x0,
+        anchor.var_committed, anchor.var_anchor)
     assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
     F, _G_kernel = problem._batched(assign_eff, cond_binary, t, wp_eff_frozen, agent_depot(problem, x0),
                                      anchor.node_active)
