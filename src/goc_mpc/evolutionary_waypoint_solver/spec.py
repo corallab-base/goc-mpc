@@ -1097,6 +1097,13 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
     live_phi_ids = frozenset(graph.live_edge_phis)
     symbolic_constraints = []  # (node_locals_tuple, fn, kind, mode, name)
     interior_constraints = []  # (batched_fn, name) -- see _batch_along_edge_interior_fn
+    # Same shape as symbolic_constraints, but for the phi ids skip_node_phis/
+    # skip_edge_phis excludes from it (see _resolve_projections' own
+    # docstring) -- compiled the SAME way, just routed to problem.py's
+    # proj_eq_constraints/proj_ineq_constraints instead, for
+    # _evaluate_projection_cv_jax's read-only post-hoc check rather than
+    # local_refine's AL residual.
+    proj_check_constraints = []
     stationary_constraints = []  # (batched_fn, name) -- see _batch_stationary_edge_fn
     # Projection substitutions, accumulated across _resolve_projections (the
     # explicit `proj=` ones) then _resolve_holds / _resolve_stationary_objects
@@ -1567,8 +1574,6 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             for phi_id in graph.node_to_phis_map.get(node, []):
                 if phi_id not in node_formulas:
                     continue  # not a Formula-based (symbolic) constraint
-                if phi_id in skip_node_phis:
-                    continue  # projected instead -- see _resolve_projections
                 formula = node_formulas[phi_id]
                 # Always frozen, never checked against live_phi_ids: a
                 # node constraint can only reference its own node's
@@ -1586,8 +1591,11 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     {v.get_id() for v in formula.GetFreeVariables()}, node_locals,
                     static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
                     var_map=var_map, num_agents=graph.num_agents)
-                symbolic_constraints.append(
-                    (node_locals, fn, kind, mode, f"phi_{phi_id}", read_cols))
+                entry = (node_locals, fn, kind, mode, f"phi_{phi_id}", read_cols)
+                if phi_id in skip_node_phis:
+                    proj_check_constraints.append(entry)  # projected -- see above
+                else:
+                    symbolic_constraints.append(entry)
 
         edge_formulas = graph.edge_phi_to_formula_map
         edge_along_edge = graph.edge_phi_to_along_edge_map
@@ -1595,12 +1603,14 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             for phi_id in phi_ids:
                 if phi_id not in edge_formulas:
                     continue  # not a Formula-based (symbolic) edge constraint
-                if phi_id in skip_edge_phis:
-                    continue  # projected instead -- see _resolve_projections
                 formula = edge_formulas[phi_id]
                 mode = "live" if phi_id in live_phi_ids else "frozen"
 
                 if edge_along_edge.get(phi_id, False):
+                    # skip_edge_phis can never reach here -- _resolve_
+                    # projections' own docstring: "along the edge" + proj
+                    # raises there, so an along-edge phi is never projected.
+                    #
                     # "Along the edge" -- built from the plain agent_q/
                     # object_q/var_agent_q placeholders (same as a node
                     # constraint), so compile it ONCE against a single-slot
@@ -1636,8 +1646,11 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     {v_.get_id() for v_ in formula.GetFreeVariables()}, node_locals,
                     static_map, link_pos_map, link_rot_map, agent_widths, slot_width,
                     var_map=var_map, num_agents=graph.num_agents)
-                symbolic_constraints.append(
-                    (node_locals, fn, kind, mode, f"edge_phi_{phi_id}", read_cols))
+                entry = (node_locals, fn, kind, mode, f"edge_phi_{phi_id}", read_cols)
+                if phi_id in skip_edge_phis:
+                    proj_check_constraints.append(entry)  # projected -- see above
+                else:
+                    symbolic_constraints.append(entry)
 
     def _resolve_holds():
         """Auto-derives rigid-carry (translation-only) constraints from the
@@ -2029,6 +2042,16 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         ineq_constraints.append(batched)
         ineq_read_cols.append(None)
 
+    # proj_check_constraints' own compiled batch -- no read_cols tracking
+    # needed (unlike eq_constraints/ineq_constraints above): nothing here
+    # ever feeds local_refine's free/dead-column masking, only solver.py's
+    # _evaluate_projection_cv_jax (see proj_check_constraints' own comment
+    # above).
+    proj_eq_constraints, proj_ineq_constraints = [], []
+    for node_locals, fn, kind, mode, _name, _read_cols in proj_check_constraints:
+        batched = _batch_symbolic_constraint_fn(fn, node_locals, mode=mode)
+        (proj_eq_constraints if kind == "eq" else proj_ineq_constraints).append(batched)
+
     return GraphOrderingRelaxed(
         instance_sources=instance_sources,
         n_variables=n_variables,
@@ -2045,6 +2068,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         ineq_constraints=ineq_constraints,
         eq_read_cols=eq_read_cols,
         ineq_read_cols=ineq_read_cols,
+        proj_eq_constraints=proj_eq_constraints,
+        proj_ineq_constraints=proj_ineq_constraints,
         # Structural shape only (n_params) -- fixes the jitted GA's
         # `params` argument width for this problem's whole lifetime, same
         # as x0 fixes n_agents/dim. The actual VALUES a live solve() reads

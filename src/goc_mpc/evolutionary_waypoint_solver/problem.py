@@ -593,7 +593,8 @@ class GraphOrderingRelaxed:
                  n_cond_vars=0, objective="avg", edge_cost_fn=None,
                  eq_constraints=(), ineq_constraints=(), params=None,
                  instance_list=(), var_id_to_slot=None, projections=(),
-                 categorical_ne=(), eq_read_cols=(), ineq_read_cols=()):
+                 categorical_ne=(), eq_read_cols=(), ineq_read_cols=(),
+                 proj_eq_constraints=(), proj_ineq_constraints=()):
         self.instance_sources = list(instance_sources)
         # Raw (node, (kind, val)) routing-instance pairs and the GA-slot
         # assignment for each assignable variable id -- unlike
@@ -666,6 +667,21 @@ class GraphOrderingRelaxed:
 
         self._eq_constraints = list(eq_constraints)
         self._ineq_constraints = list(ineq_constraints)
+        # Compiled from the SAME symbolic Formulas as any other constraint,
+        # but specifically the ones spec.py's _resolve_projections excluded
+        # from eq_constraints/ineq_constraints above (a proj= constraint
+        # gets no AL residual/multiplier -- see that function's own
+        # docstring). Never read by local_refine/the AL loop -- only by
+        # solver.py's _evaluate_projection_cv_jax, a read-only, post-
+        # apply_projections check of whether a projection actually
+        # satisfied the relation it was meant to resolve exactly (e.g. a
+        # clipped/degenerate analytic-IK branch on an out-of-reach target
+        # -- see ur5e_ik.py's own docstring for why that case doesn't
+        # raise/NaN). No widths/free-mask bookkeeping needed here (unlike
+        # eq_constraints/ineq_constraints below) since nothing here ever
+        # feeds local_refine's rho/mu ramp or its free/dead-column masking.
+        self._proj_eq_constraints = list(proj_eq_constraints)
+        self._proj_ineq_constraints = list(proj_ineq_constraints)
         widths = lambda fns: [_infer_constraint_size(fn, self.n_variables, self.n_agents,
                                                        self.n_nodes, self.state_dim, self.n_cond_vars,
                                                        self.n_params)

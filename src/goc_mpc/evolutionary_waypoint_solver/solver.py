@@ -788,6 +788,50 @@ def _evaluate_population_jax(problem, X, x0, params, anchor):
     return F, CV
 
 
+def _evaluate_projection_cv_jax(problem, X, x0, params, anchor):
+    """Read-only, post-`apply_projections` CV over exactly the constraints
+    spec.py's `_resolve_projections` excluded from `_eq_constraints`/
+    `_ineq_constraints` above (a `proj=` constraint gets no AL residual/
+    multiplier at all -- see that function's own docstring) -- compiled
+    into `problem._proj_eq_constraints`/`_proj_ineq_constraints` instead,
+    from the SAME symbolic Formulas.
+
+    This is NOT another AL term: it's never passed to local_refine, so it
+    never drives mu/lam/rho (a projection-pinned column has zero
+    local_refine gradient regardless -- problem.py's wp_pinned_mask
+    comment). It exists purely to answer "did the projection actually
+    satisfy the relation it was meant to resolve exactly" -- e.g. UR5e's
+    closed-form analytic IK deliberately clips its `acos` arguments to stay
+    finite on an out-of-reach target instead of raising/NaN (ur5e_ik.py's
+    own docstring), silently returning a joint config that does NOT
+    actually satisfy the FK==target Formula. `_evaluate_population_jax`'s
+    own CV is structurally blind to exactly this failure mode; this
+    function is what `reseed` (small_continuous_vrp.py) and
+    `EvolutionaryWaypointSolver.get_last_fitness()` (mpc.py) use instead,
+    to rank/report it.
+
+    Zero for every individual whenever every projection genuinely
+    succeeded -- and whenever this problem has no projections at all
+    (`problem._proj_eq_constraints`/`_proj_ineq_constraints` both empty),
+    same all-zero convention as `_evaluate_population_jax`'s own G/H
+    handling above."""
+    pop = X.shape[0]
+    assign, cond_binary, proj_branch, t, wp, psi = problem._extract_batch(X)
+    wp = jit_apply_projections(problem)(
+        wp, psi, proj_branch, params, assign, cond_binary, t, anchor.node_active, x0,
+        anchor.var_committed, anchor.var_anchor)
+    assign_eff, wp_eff_frozen, wp_eff_live = apply_anchor(problem, assign, wp, anchor, x0)
+    G = (jnp.concatenate(
+            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0, params)
+             for fn in problem._proj_ineq_constraints], axis=1)
+         if problem._proj_ineq_constraints else None)
+    H = (jnp.concatenate(
+            [fn(assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live, anchor.node_active, x0, params)
+             for fn in problem._proj_eq_constraints], axis=1)
+         if problem._proj_eq_constraints else None)
+    return _calc_cv_jax(pop, G, H)
+
+
 # ---------------------------------------------------------------------------
 # Smooth soft-penalty ranking/selection
 # ---------------------------------------------------------------------------

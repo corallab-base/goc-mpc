@@ -128,7 +128,7 @@ from .problem import AnchorState, jit_apply_projections
 from .evosax_ga import build_evosax_ga, build_initial_carry_fn as _build_evosax_initial_carry_fn
 from .lamarckian_ga import LamarckianGA
 from .small_continuous_vrp import SmallContinuousVRPSolver
-from .solver import _evaluate_population_jax
+from .solver import _evaluate_population_jax, _evaluate_projection_cv_jax
 
 # `algorithm=` constructor choices -- both evosax PopulationBasedAlgorithm
 # subclasses (lamarckian_ga.py/small_continuous_vrp.py), built through the
@@ -235,6 +235,7 @@ class EvolutionaryWaypointSolver:
         self._last_solve_time = 0.0
         self._last_F = None
         self._last_CV = None
+        self._last_CV_proj = None
 
         # Built once, on the first solve()/warmup() call -- see module
         # docstring -- and never rebuilt again.
@@ -517,8 +518,18 @@ class EvolutionaryWaypointSolver:
         # never-trust-stale-fitness reason.
         F_best, CV_best = _evaluate_population_jax(
             problem, jnp.asarray(best_X)[None, :], x0_arr, params_arr, anchor)
+        # CV_best alone is structurally blind to a projection (e.g. UR5e's
+        # closed-form analytic IK) that silently failed to hold -- a
+        # `proj=` constraint gets no AL residual at all (spec.py's
+        # _resolve_projections), so CV_best can't see it either. CV_proj_
+        # best (_evaluate_projection_cv_jax) is the read-only, post-hoc
+        # check of exactly those excluded constraints -- see that
+        # function's own docstring.
+        CV_proj_best = _evaluate_projection_cv_jax(
+            problem, jnp.asarray(best_X)[None, :], x0_arr, params_arr, anchor)
         self._last_F = float(F_best[0])
         self._last_CV = float(CV_best[0])
+        self._last_CV_proj = float(CV_proj_best[0])
 
         assign, cond_binary, proj_branch, t, wp, psi = problem._extract_single(best_X)
         # A projected node's own pinned columns are never actually driven
@@ -607,11 +618,17 @@ class EvolutionaryWaypointSolver:
         return self._t_by_node_id
 
     def get_last_fitness(self):
-        """(F, CV) of the population member solve() last selected, raw and
-        freshly evaluated against that solve() call's own x0/anchor (see the
-        comment at its computation in solve() for why this can't just read
-        `state.best_fitness`). None, None before the first solve()."""
-        return self._last_F, self._last_CV
+        """(F, CV, CV_proj) of the population member solve() last selected,
+        raw and freshly evaluated against that solve() call's own x0/anchor
+        (see the comment at its computation in solve() for why this can't
+        just read `state.best_fitness`). CV_proj (_evaluate_projection_cv_
+        jax, solver.py) is a SEPARATE read-only check of whatever
+        constraints were resolved by a `proj=` analytic projection instead
+        of an ordinary AL residual -- CV alone is structurally blind to one
+        of those silently failing to hold (e.g. a clipped/degenerate
+        analytic-IK branch on an out-of-reach target -- see that function's
+        own docstring). None, None, None before the first solve()."""
+        return self._last_F, self._last_CV, self._last_CV_proj
 
     def get_last_solve_time(self):
         return self._last_solve_time

@@ -99,7 +99,10 @@ from flax import struct
 from .lamarckian_ga import LamarckianGA, State as _LamarckianState
 from .evosax_ga import _split_genome, _join_genome
 from .problem import jit_apply_projections
-from .solver import _write_wp_batch_jax, _write_psi_batch_jax, _evaluate_population_jax
+from .solver import (
+    _write_wp_batch_jax, _write_psi_batch_jax,
+    _evaluate_population_jax, _evaluate_projection_cv_jax,
+)
 from ..logic_based_benders_solver.dp_master_jax import make_dp_master_jax
 from ..logic_based_benders_solver.structure import warm_start_wp
 
@@ -209,19 +212,33 @@ class SmallContinuousVRPSolver(LamarckianGA):
         identical skeletons every generation for `n_gen`x the cost.
 
         Ranks the CURRENT population by a hard CV-dominant score (`F + 1e6
-        * max(0, CV - reseed_cv_tol)` -- mirrors solver.py's own
-        `_carry_from_population` seed-selection, not the softly-annealed
-        `_combined_score` `_tell` uses for tournament/elitism: this decision
-        wants a confident feasible-beats-infeasible split, not something
-        still mid-anneal). `reseed_cv_tol` (default 1e-4, matching
-        _calc_cv_jax's own eq_eps) is exactly this score's `cv_tol`: two
-        candidates both under it are compared on `F` alone, so an
-        incumbent whose only "violation" is analytic/quantization-floor
-        noise below that line isn't evicted just because some other
-        candidate randomly rolled a CV a few floating-point ulps lower --
-        without it, CV noise this small would dominate every ranking
-        decision here even though it's invisible to `_combined_score`'s own
-        softly-annealed ranking everywhere else in this class. Takes the
+        * max(0, CV_total - reseed_cv_tol)`, `CV_total = CV +
+        CV_proj` -- mirrors solver.py's own `_carry_from_population`
+        seed-selection, not the softly-annealed `_combined_score` `_tell`
+        uses for tournament/elitism: this decision wants a confident
+        feasible-beats-infeasible split, not something still mid-anneal).
+        `reseed_cv_tol` (default 1e-4, matching _calc_cv_jax's own eq_eps)
+        is exactly this score's `cv_tol`: two candidates both under it are
+        compared on `F` alone, so an incumbent whose only "violation" is
+        analytic/quantization-floor noise below that line isn't evicted
+        just because some other candidate randomly rolled a CV a few
+        floating-point ulps lower -- without it, CV noise this small would
+        dominate every ranking decision here even though it's invisible to
+        `_combined_score`'s own softly-annealed ranking everywhere else in
+        this class.
+
+        `CV_proj` (`_evaluate_projection_cv_jax`, solver.py) is folded in
+        alongside the ordinary `CV` (`_evaluate_population_jax`) precisely
+        because CV alone is structurally blind to a projection that
+        silently failed to hold -- e.g. UR5e's closed-form analytic IK
+        clips its `acos` arguments to stay finite on an out-of-reach
+        target instead of raising/NaN (ur5e_ik.py's own docstring), and
+        that clipped joint config's FK==target Formula is EXCLUDED from
+        ordinary CV by design (`proj=` gets no AL residual at all -- see
+        spec.py's `_resolve_projections`). Without `CV_proj`, a candidate
+        assigned to a now-unreachable robot would score identically to one
+        assigned to a robot that can actually reach it -- exactly the
+        scenario `reseed` exists to fix in the first place. Takes the
         `n_evict` worst slots by that score, and re-runs `_seed_population`
         against the LIVE `params.x0`/`anchor` (unlike `state.seed_disc`/
         `seed_wp`, frozen from `init`, `_seed_population` was always
@@ -262,7 +279,9 @@ class SmallContinuousVRPSolver(LamarckianGA):
         X_old = _split_genome(problem, state.population)[0]
         F_old, CV_old = _evaluate_population_jax(
             problem, X_old, params.x0, params.problem_params, params.anchor)
-        hard_old = hard_score(F_old, CV_old)
+        CV_proj_old = _evaluate_projection_cv_jax(
+            problem, X_old, params.x0, params.problem_params, params.anchor)
+        hard_old = hard_score(F_old, CV_old + CV_proj_old)
         worst = jnp.argsort(-hard_old)[:n_evict]                      # worst-first slots
 
         seed_disc, seed_wp = self._seed_population(params, n_evict)
@@ -289,7 +308,9 @@ class SmallContinuousVRPSolver(LamarckianGA):
 
         F_cand, CV_cand = _evaluate_population_jax(
             problem, cand_X, params.x0, params.problem_params, params.anchor)
-        hard_cand = hard_score(F_cand, CV_cand)
+        CV_proj_cand = _evaluate_projection_cv_jax(
+            problem, cand_X, params.x0, params.problem_params, params.anchor)
+        hard_cand = hard_score(F_cand, CV_cand + CV_proj_cand)
 
         take_cand = (hard_cand < hard_old[worst])[:, None]
         new_slots = jnp.where(take_cand, cand_genome, state.population[worst])
