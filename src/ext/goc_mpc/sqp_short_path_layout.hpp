@@ -365,10 +365,22 @@ class SphereEvalCache {
 // per-sphere distance check narrowing to `[step_lo, step_hi)` (the
 // ActiveObstacle range above). An obstacle that clears neither filter is
 // omitted from `per_agent_obstacles[ag]` entirely.
+//
+// `max_obstacle_pairs_per_step` (0 = unlimited): after the per-step distance
+// filter, keep only the this-many CLOSEST (obstacle, sphere) rows for this
+// agent at each step, ranked ACROSS every candidate obstacle at that step
+// (not per-obstacle) -- an agent's body can sit near several distinct
+// obstacle primitives at once (e.g. a wall meshed into several boxes), each
+// contributing up to `num_spheres` rows on its own, so unlike
+// `PruneAgentPairsByDistance`'s per-pair cap (bounded by the OTHER agent
+// count) this is the more consequential prune in a heavily-obstacled scene.
+// Mirrors `PruneAgentPairsByDistance`'s own `max_pairs_per_step`: same
+// "only a few are ever the binding contact" reasoning, same
+// `std::nth_element` top-k selection.
 std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 	int num_steps, int num_agents, int workspace_dim,
 	const std::vector<AgentReferenceSpheres>& ref_spheres, const AgentCollisionModels& models,
-	const ObstacleSet& obstacles, double prune_margin);
+	const ObstacleSet& obstacles, double prune_margin, int max_obstacle_pairs_per_step = 0);
 
 // Same idea for inter-agent pairs, over each agent's swept collision
 // spheres: (ag_a, ag_b) survives the coarse filter if their bounding

@@ -94,7 +94,8 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 				  double min_trust_radius,
 				  double grad_tol,
 				  double constraint_prune_margin,
-				  int max_collision_pairs_per_step)
+				  int max_collision_pairs_per_step,
+				  int max_obstacle_pairs_per_step)
 	: _graph(&graph),
 	  _num_steps(num_steps),
 	  _num_agents(num_agents),
@@ -109,7 +110,8 @@ GraphShortPathMPC::GraphShortPathMPC(const GraphOfConstraints& graph,
 	  _min_trust_radius(min_trust_radius),
 	  _grad_tol(grad_tol),
 	  _constraint_prune_margin(constraint_prune_margin),
-	  _max_collision_pairs_per_step(max_collision_pairs_per_step) {
+	  _max_collision_pairs_per_step(max_collision_pairs_per_step),
+	  _max_obstacle_pairs_per_step(max_obstacle_pairs_per_step) {
 
 	if (_agent_radii.size() != static_cast<int>(num_agents)) {
 		throw std::runtime_error(
@@ -941,7 +943,7 @@ bool GraphShortPathMPC::solve(const Eigen::VectorXd& x0,
 		const std::vector<std::vector<ActiveObstacle>> per_agent_obstacles =
 			PruneObstaclesByDistance(H, num_agents, workspace_dim, ref_spheres,
 						  _agent_collision_models, *_obstacles,
-						  _constraint_prune_margin);
+						  _constraint_prune_margin, _max_obstacle_pairs_per_step);
 		const std::vector<ActivePair> active_pairs =
 			PruneAgentPairsByDistance(H, num_agents, ref_spheres, _agent_collision_models,
 						   _agent_radii, _constraint_prune_margin,

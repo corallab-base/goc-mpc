@@ -118,6 +118,18 @@ struct GraphShortPathMPC {
 	// broadphase margin while only a few are ever the binding contact.
 	int _max_collision_pairs_per_step;
 
+	// 0 = unlimited. When > 0, PruneObstaclesByDistance keeps only this many
+	// closest (obstacle, sphere) rows PER AGENT PER STEP, ranked across every
+	// nearby obstacle at once (see its own comment) -- the obstacle-side
+	// analogue of `_max_collision_pairs_per_step` above. An agent's whole
+	// body can sit near several distinct obstacle primitives at the same
+	// step (e.g. a wall meshed into several boxes), each contributing up to
+	// `num_spheres` rows on its own -- unlike the inter-agent cap, which is
+	// bounded by however many OTHER agents exist, this one has no such
+	// natural ceiling in an obstacle-dense scene, so it's the more
+	// consequential of the two prunes there.
+	int _max_obstacle_pairs_per_step;
+
 	// Fixed for this instance's whole lifetime (depend only on `graph`/
 	// `time_per_step`, never on a particular solve() call's
 	// references/obstacles) -- built once in the constructor. Agents are
@@ -227,7 +239,8 @@ struct GraphShortPathMPC {
 			 double min_trust_radius = 1.0e-6,
 			 double grad_tol = 1.0e-6,
 			 double constraint_prune_margin = 1.0,
-			 int max_collision_pairs_per_step = 0);
+			 int max_collision_pairs_per_step = 0,
+			 int max_obstacle_pairs_per_step = 0);
 
 	// Explicit (not defaulted inline) for the same reason as
 	// GraphTimingMPC's: QpState is only complete in the .cpp, and pybind's

@@ -496,7 +496,7 @@ std::vector<AgentReferenceSpheres> BuildAgentReferenceSpheres(
 std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 	int num_steps, int num_agents, int workspace_dim,
 	const std::vector<AgentReferenceSpheres>& ref_spheres, const AgentCollisionModels& models,
-	const ObstacleSet& obstacles, double prune_margin) {
+	const ObstacleSet& obstacles, double prune_margin, int max_obstacle_pairs_per_step) {
 	std::vector<std::vector<ActiveObstacle>> per_agent_obstacles(num_agents);
 	if (obstacles.obstacles().empty()) {
 		return per_agent_obstacles;
@@ -505,29 +505,75 @@ std::vector<std::vector<ActiveObstacle>> PruneObstaclesByDistance(
 		const AgentReferenceSpheres& rs = ref_spheres[ag];
 		const double margin =
 			EffectiveMargin(prune_margin, models[ag]->broadphase_margin_hint());
+		const int K = static_cast<int>(rs.radii.size());
+
+		// Coarse whole-trajectory filter, same test as before, but collected
+		// into a candidate list first (rather than settling each obstacle's
+		// row set immediately) so the per-step cap below can rank ACROSS
+		// every candidate obstacle at once, not just within one.
+		struct Candidate {
+			const Obstacle* obstacle;
+			Eigen::VectorXd center;
+			double extent;
+		};
+		std::vector<Candidate> candidates;
 		for (const Obstacle& obstacle : obstacles.obstacles()) {
-			const Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
+			Eigen::VectorXd center = obstacle.params.segment(0, workspace_dim);
 			const double extent = ObstacleExtent(obstacle, workspace_dim);
 			if ((center - rs.bound.center).norm() >
 			    rs.bound.radius + rs.max_radius + extent + margin) {
 				continue;  // coarse whole-trajectory filter
 			}
-			auto near_at = [&](int i, int k) {
-				return (rs.centers[i].row(k).transpose() - center).norm() - rs.radii(k) <=
-				       extent + margin;
-			};
-			const int K = static_cast<int>(rs.radii.size());
+			candidates.push_back(Candidate{&obstacle, std::move(center), extent});
+		}
+		if (candidates.empty()) continue;
+
+		auto near_at = [&](const Candidate& c, int i, int k) {
+			return (rs.centers[i].row(k).transpose() - c.center).norm() - rs.radii(k) - c.extent;
+		};
+
+		// Per-candidate, per-step sphere lists, sized to the full horizon for
+		// now (trimmed to each candidate's own [lo, hi) below) -- built one
+		// step at a time so a step with more near (obstacle, sphere) pairs
+		// than `max_obstacle_pairs_per_step` can be capped to the CLOSEST
+		// ones overall, the same "only a few are ever the binding contact"
+		// reasoning PruneAgentPairsByDistance already applies to inter-agent
+		// pairs (see its own comment) -- an agent's whole body can sit near
+		// several distinct obstacle primitives (e.g. a wall meshed into
+		// several boxes) at the same step, and unlike the inter-agent case
+		// there is only ever ONE other agent per pair to bound the count, so
+		// this is the more consequential of the two prunes in a
+		// heavily-obstacled scene.
+		std::vector<std::vector<std::vector<int>>> spheres_by_candidate(
+			candidates.size(), std::vector<std::vector<int>>(num_steps));
+		for (int i = 0; i < num_steps; ++i) {
+			std::vector<std::pair<double, std::pair<int, int>>> near;  // {dist, {candidate_idx, k}}
+			for (int c = 0; c < static_cast<int>(candidates.size()); ++c) {
+				for (int k = 0; k < K; ++k) {
+					const double d = near_at(candidates[c], i, k);
+					if (d <= margin) near.emplace_back(d, std::make_pair(c, k));
+				}
+			}
+			if (near.empty()) continue;
+			if (max_obstacle_pairs_per_step > 0 &&
+			    static_cast<int>(near.size()) > max_obstacle_pairs_per_step) {
+				std::nth_element(near.begin(), near.begin() + max_obstacle_pairs_per_step,
+						 near.end(),
+						 [](const auto& x, const auto& y) { return x.first < y.first; });
+				near.resize(max_obstacle_pairs_per_step);
+			}
+			for (const auto& [d, ck] : near) spheres_by_candidate[ck.first][i].push_back(ck.second);
+		}
+
+		for (int c = 0; c < static_cast<int>(candidates.size()); ++c) {
 			const auto [lo, hi] = StepRange(num_steps, [&](int i) {
-				for (int k = 0; k < K; ++k)
-					if (near_at(i, k)) return true;
-				return false;
+				return !spheres_by_candidate[c][i].empty();
 			});
 			if (lo >= hi) continue;
-			std::vector<std::vector<int>> spheres(hi - lo);
-			for (int i = lo; i < hi; ++i)
-				for (int k = 0; k < K; ++k)
-					if (near_at(i, k)) spheres[i - lo].push_back(k);
-			per_agent_obstacles[ag].push_back(ActiveObstacle{&obstacle, lo, hi, std::move(spheres)});
+			std::vector<std::vector<int>> spheres(
+				spheres_by_candidate[c].begin() + lo, spheres_by_candidate[c].begin() + hi);
+			per_agent_obstacles[ag].push_back(
+				ActiveObstacle{candidates[c].obstacle, lo, hi, std::move(spheres)});
 		}
 	}
 	return per_agent_obstacles;
