@@ -49,17 +49,33 @@ before the genome is stored (matters only when a projection actually
 declares `psi`; a no-`psi` scene like `dual_ur5e_block_stacking` gets the
 identical result either way).
 
-`_tell` (inherited, mu+lambda elitist truncation) keeps the better of each
-parent and its refined self, so a bad discrete skeleton is not a dead end:
-the top-`k` skeletons all sit in the population at once and the best
-continuously-feasible one wins ("keep the top-k members with different
-assignments, optimise the continuous problem for each, reject the infeasible
-ones, keep the best").
+`_tell` is OVERRIDDEN (not inherited from `LamarckianGA`): plain mu+lambda
+elitist truncation ranks the WHOLE pooled (parents + offspring) set by raw
+score and keeps the globally best `population_size` -- a population-wide
+competition, not "keep the better of each parent and its refined self"
+despite that having once been this docstring's own claim. Confirmed
+empirically: when one skeleton's routing cost is merely cheaper than
+another's (regardless of which is actually continuously feasible), plain
+global truncation collapses the WHOLE population to that one skeleton
+within a handful of generations -- a fresh `_seed_population` call shows a
+healthy, even mix of every skeleton, but after even one generation of
+plain `_tell` the split already skews, and after a few more it's 100/0.
+Once a skeleton has zero representatives left, `reseed`'s own
+beat-the-incumbent gate can't reliably reintroduce it either (a fresh
+single-refine candidate typically only TIES a well-refined incumbent, not
+beats it), so the loss is effectively permanent -- this, not a discrete
+top-k that never generated the right skeleton in the first place, is the
+real explanation for "the search doesn't reliably switch to the feasible
+assignment". This override instead guarantees at least one surviving
+representative of every DISTINCT discrete skeleton present in the pool
+(the frozen `assign | cond_binary | proj_branch | t` prefix `_ask` never
+touches past generation 0) before filling any remaining slots by plain
+global rank -- see `_tell`'s own docstring for the mechanism.
 
-Still a `LamarckianGA` subclass: same Params / `_tell`, same
-`local_refine`. `State` is extended with the once-enumerated skeletons
-(`seed_disc`/`seed_wp`). Reintroducing search over the continuous axes is
-a later step; periodic bottom-`k` eviction/reseeding is `reseed`, above.
+Same Params / `local_refine` as `LamarckianGA` otherwise. `State` is
+extended with the once-enumerated skeletons (`seed_disc`/`seed_wp`).
+Reintroducing search over the continuous axes is a later step; periodic
+bottom-`k` eviction/reseeding is `reseed`, above.
 
 Scope: whatever `make_dp_master_jax` accepts -- a jnp-traceable
 `edge_cost_fn`, an assignment space within `max_assign_combos`, orderings
@@ -108,7 +124,7 @@ from .evosax_ga import _split_genome, _join_genome
 from .problem import jit_apply_projections
 from .solver import (
     _write_wp_batch_jax, _write_psi_batch_jax,
-    _evaluate_population_jax, _evaluate_projection_cv_jax,
+    _evaluate_population_jax, _evaluate_projection_cv_jax, _combined_score,
 )
 from ..logic_based_benders_solver.dp_master_jax import make_dp_master_jax
 from ..logic_based_benders_solver.structure import warm_start_wp
@@ -273,7 +289,20 @@ class SmallContinuousVRPSolver(LamarckianGA):
         pre-filter, not the final word: a candidate that wins the gate but
         is still not fully refined gets the same `n_gen` further `_ask`/
         `_tell` generations as everyone else, later this call, to prove
-        itself for real."""
+        itself for real.
+
+        Which `n_evict` slots are even up for replacement is ALSO
+        skeleton-aware, for the same reason `_tell` is (see its own
+        docstring): `worst` prefers a slot whose discrete skeleton has
+        another representative elsewhere in the population, only reaching
+        into a skeleton's SOLE remaining slot once every such spare slot is
+        already claimed. Without this, `_tell`'s own per-generation
+        guarantee is not enough to keep a skeleton alive across MANY
+        external calls -- reseed runs BEFORE `_tell` each call and can
+        overwrite a slot directly, with no notion of how many other members
+        currently share its discrete genome; confirmed empirically to
+        erode a skeleton down to zero over repeated calls even with
+        `_tell`'s guarantee already in place."""
         problem = self.problem
         pop = self.population_size
         n_evict = self._n_evict if n_evict is None else n_evict
@@ -290,7 +319,27 @@ class SmallContinuousVRPSolver(LamarckianGA):
         CV_proj_old = _evaluate_projection_cv_jax(
             problem, X_old, params.x0, params.problem_params, params.anchor)
         hard_old = hard_score(F_old, CV_old + CV_proj_old)
-        worst = jnp.argsort(-hard_old)[:n_evict]                      # worst-first slots
+
+        # Never pick a skeleton's SOLE remaining representative for
+        # eviction while a non-representative slot is available instead --
+        # the same guarantee `_tell` makes every generation (see its own
+        # docstring for the mechanism/rationale), applied here to reseed's
+        # separate eviction step: without it, `_tell`'s guarantee alone
+        # doesn't stop a skeleton from going extinct, since reseed runs
+        # BEFORE `_tell` each external call and can overwrite a slot
+        # directly regardless of how many other members currently share
+        # its discrete genome. `same_old`/`is_representative_old` mirror
+        # `_tell`'s computation exactly, over `state.population` alone (no
+        # offspring pool here -- reseed only ever replaces EXISTING slots).
+        disc_old = X_old[:, :problem.wp_offset]
+        same_old = jnp.all(disc_old[:, None, :] == disc_old[None, :, :], axis=-1)  # (pop,pop)
+        rep_idx_old = jnp.argmin(jnp.where(same_old, hard_old[None, :], jnp.inf), axis=1)
+        is_representative_old = jnp.arange(pop) == rep_idx_old
+        # non-representatives first (worst-first among them), representatives
+        # only once every non-representative slot is already spoken for
+        # (worst-scoring representative first, same graceful degradation as
+        # _tell when there are more distinct skeletons than free slots).
+        worst = jnp.lexsort((-hard_old, is_representative_old))[:n_evict]
 
         seed_disc, seed_wp = self._seed_population(params, n_evict)
         wp_offset, psi_offset = problem.wp_offset, problem.psi_offset
@@ -367,3 +416,84 @@ class SmallContinuousVRPSolver(LamarckianGA):
 
         child_genome = _join_genome(off_X, off_mu, off_lam, off_rho)
         return child_genome, state
+
+    def _tell(self, key, population, fitness, state, params):
+        """Skeleton-aware mu+lambda elitist truncation -- overrides
+        `LamarckianGA._tell` (module docstring explains why: that version's
+        plain global-rank truncation can and does eliminate a whole
+        discrete skeleton from the population within a handful of
+        generations, before continuous refinement ever gets to judge
+        whether it's actually the feasible one).
+
+        Same pooling/rescoring as the base class: parents (`state.
+        population`) and offspring (`population`) are concatenated and
+        BOTH sides' raw (F, CV) are recomputed fresh under the CURRENT
+        `w`/`cv_tol` (see `LamarckianGA._tell`'s own docstring for why raw,
+        not the passed-in `fitness`/`state.fitness`). Only the TRUNCATION
+        step differs:
+
+        1. `same[i, j]` -- exact match of individual i and j's frozen
+           discrete prefix (`assign | cond_binary | proj_branch | t`,
+           `problem.wp_offset` wide -- the part `_ask` only ever splices at
+           generation 0 and never touches again). This is an equivalence
+           relation (reflexive/symmetric/transitive), so it partitions the
+           pool into skeleton groups.
+        2. `group_rep_idx[i]` -- the index of the BEST-scoring member of
+           i's own group; `is_representative` flags exactly that one index
+           per group (ties broken by argmin's own first-occurrence rule).
+           The pool's single globally-best individual is necessarily its
+           own group's representative too (its score can't exceed its own
+           group's minimum), so it's always among the flagged set.
+        3. `jnp.lexsort((pool_S, ~is_representative))` ranks every
+           representative ahead of every non-representative (ties among
+           representatives, and separately among non-representatives,
+           broken by score) -- ONE argsort-equivalent call, no
+           scale-dependent bonus/penalty constant to tune. Truncating to
+           `population_size` therefore keeps every distinct skeleton's
+           best individual first, and only starts dropping a skeleton
+           entirely (the worst-scoring one(s) first) if there are more
+           distinct skeletons in the pool than population slots --
+           graceful degradation of the same guarantee, not a crash.
+
+        With no discrete variables/aux/branches at all (`wp_offset == 0`),
+        every individual trivially shares one "skeleton" (`same` is
+        all-True) and this reduces exactly to LamarckianGA's own plain
+        global truncation -- no special-casing needed."""
+        problem = self.problem
+        X_old = _split_genome(problem, state.population)[0]
+        X_new = _split_genome(problem, population)[0]
+        F_old, CV_old = _evaluate_population_jax(problem, X_old, params.x0, params.problem_params, params.anchor)
+        F_new, CV_new = _evaluate_population_jax(problem, X_new, params.x0, params.problem_params, params.anchor)
+
+        pool_pop = jnp.concatenate([state.population, population], axis=0)
+        pool_X = jnp.concatenate([X_old, X_new], axis=0)
+        pool_F = jnp.concatenate([F_old, F_new])
+        pool_CV = jnp.concatenate([CV_old, CV_new])
+        pool_S = _combined_score(pool_F, pool_CV, params.w, params.cv_tol)
+
+        pool_disc = pool_X[:, :problem.wp_offset]
+        same = jnp.all(pool_disc[:, None, :] == pool_disc[None, :, :], axis=-1)  # (P,P)
+        group_rep_idx = jnp.argmin(jnp.where(same, pool_S[None, :], jnp.inf), axis=1)  # (P,)
+        is_representative = jnp.arange(pool_S.shape[0]) == group_rep_idx
+
+        keep = jnp.lexsort((pool_S, ~is_representative))[:self.population_size]
+        population_new, F_kept, CV_kept, S_kept = (
+            pool_pop[keep], pool_F[keep], pool_CV[keep], pool_S[keep])
+
+        # Best-so-far: same raw-(F, CV)-rescaled-fresh convention as the
+        # base class (see its docstring) -- S_kept[0] is still the pool's
+        # TRUE global minimum here (the global best is always its own
+        # group's representative, so it always sorts first even among
+        # representatives), not just the base class's own plain top-rank.
+        best_S_old = _combined_score(state.best_F, state.best_CV, params.w, params.cv_tol)
+        improved = S_kept[0] < best_S_old
+        best_solution = jnp.where(improved, population_new[0], state.best_solution)
+        best_F = jnp.where(improved, F_kept[0], state.best_F)
+        best_CV = jnp.where(improved, CV_kept[0], state.best_CV)
+        best_fitness = jnp.where(improved, S_kept[0], best_S_old)
+
+        return state.replace(
+            population=population_new, fitness=S_kept,
+            best_solution=best_solution, best_fitness=best_fitness,
+            best_F=best_F, best_CV=best_CV,
+        )
