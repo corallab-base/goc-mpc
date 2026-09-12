@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -301,6 +302,39 @@ std::vector<AgentReferenceSpheres> BuildAgentReferenceSpheres(
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim,
 	const AgentCollisionModels& models);
 
+// Memoizes `AgentCollisionModel::Eval` (a real Drake FK + Jacobian query for
+// a non-trivial/articulated agent -- not free) per (agent, horizon step),
+// for ONE fixed absolute configuration (some `points` matrix). Every
+// consumer below that needs agent `ag`'s spheres at step `i` for that same
+// `points` -- Evaluate*Violation AND Linearize*Constraints alike -- goes
+// through the same cache instance instead of calling `Eval` itself, so an
+// agent whose spheres both an obstacle row and a pair row need at the same
+// step pays for the FK query once, not twice.
+//
+// One cache instance is tied to ONE `points` matrix (the caller is
+// responsible for using a fresh instance whenever `points` changes, and may
+// keep reusing the same instance across an outer SQP iteration boundary
+// when `points` itself didn't change -- see RunTrustRegionSqp's own use:
+// the merit function's violation-at-candidate pass and the NEXT iteration's
+// linearization-at-that-same-candidate pass are the same configuration, so
+// a solve that accepts every step now pays for each (agent, step) FK query
+// once per outer iteration instead of twice).
+class SphereEvalCache {
+   public:
+	SphereEvalCache(int num_agents, int num_steps) : cache_(num_agents, Row(num_steps)) {}
+
+	// Agent `ag`'s workspace spheres at horizon step `i`, computed via
+	// `model.Eval` on first request and cached thereafter. `points`/
+	// `ambient_offset`/`model` must describe the SAME configuration this
+	// cache instance was constructed for on every call.
+	const std::vector<WorkspaceSphere>& Get(int ag, int i, const Eigen::MatrixXd& points, int ambient_offset,
+						const AgentCollisionModel& model);
+
+   private:
+	using Row = std::vector<std::optional<std::vector<WorkspaceSphere>>>;
+	std::vector<Row> cache_;  // [ag][i]
+};
+
 // Per-agent obstacle list "close enough to plausibly matter" over this
 // solve() call's horizon: agent ag's swept-collision-sphere bounding sphere
 // (BuildAgentReferenceSpheres) vs each registered obstacle's extent (sphere:
@@ -359,7 +393,7 @@ std::vector<ActivePair> PruneAgentPairsByDistance(
 double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				  int workspace_dim, const Eigen::MatrixXd& points,
 				  const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles,
-				  const AgentCollisionModels& models);
+				  const AgentCollisionModels& models, SphereEvalCache& sphere_cache);
 
 // Every (step, agent, obstacle) row for `per_agent_obstacles[ag]` (see
 // PruneObstaclesByDistance's own comment), linearized at the current
@@ -376,7 +410,7 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
 	const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles,
-	const AgentCollisionModels& models);
+	const AgentCollisionModels& models, SphereEvalCache& sphere_cache);
 
 // Inter-agent avoidance: every (step, agent-pair) SURVIVING
 // PruneAgentPairsByDistance is treated as a sphere constraint on the
@@ -403,12 +437,14 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 // columns, no fk chain rule.
 double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_ambient_offsets, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-				   const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models);
+				   const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models,
+				   SphereEvalCache& sphere_cache);
 
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, const std::vector<int>& agent_ambient_offsets,
 	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-	const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models);
+	const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models,
+	SphereEvalCache& sphere_cache);
 
 // Value + gradient of one AgentSdfGrid, multilinearly interpolated
 // (bilinear for workspace_dim=2, trilinear for workspace_dim=3) at world
@@ -465,7 +501,8 @@ std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
 // role as EvaluateObstacleViolation but for grid obstacles.
 double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				      int workspace_dim, const Eigen::MatrixXd& points,
-				      const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models);
+				      const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models,
+				      SphereEvalCache& sphere_cache);
 
 // One (step, agent) row per non-null `active_grids[ag].grid`, over its
 // `[step_lo, step_hi)` range, linearized at the current iterate `points` --
@@ -476,6 +513,7 @@ double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::v
 std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
-	const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models);
+	const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models,
+	SphereEvalCache& sphere_cache);
 
 }  // namespace sqp_short_path

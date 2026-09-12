@@ -613,6 +613,19 @@ Eigen::VectorXd AgentConfigRow(const Eigen::MatrixXd& points, int i, int ambient
 	return points.row(i).segment(ambient_offset, model.ambient_dim()).transpose();
 }
 
+}  // namespace
+
+const std::vector<WorkspaceSphere>& SphereEvalCache::Get(int ag, int i, const Eigen::MatrixXd& points,
+							 int ambient_offset, const AgentCollisionModel& model) {
+	std::optional<std::vector<WorkspaceSphere>>& slot = cache_[ag][i];
+	if (!slot) {
+		slot = model.Eval(AgentConfigRow(points, i, ambient_offset, model));
+	}
+	return *slot;
+}
+
+namespace {
+
 // Chain d(value)/d(centre) (workspace_dim) through a body sphere's tangent
 // Jacobian (workspace_dim x agent_tangent_dim) and append the nonzero
 // coefficients to `row`, at flat index IdxP(axis_off + j, step) with the
@@ -640,14 +653,13 @@ void AppendSphereJacobianRow(ConstraintRow* row, const Eigen::VectorXd& grad_c,
 double EvaluateObstacleViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				  int workspace_dim, const Eigen::MatrixXd& points,
 				  const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles,
-				  const AgentCollisionModels& models) {
+				  const AgentCollisionModels& models, SphereEvalCache& sphere_cache) {
 	double violation = 0.0;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
 			if (per_agent_obstacles[ag].empty()) continue;
-			const Eigen::VectorXd q_ag =
-				AgentConfigRow(points, i, agent_ambient_offsets[ag], *models[ag]);
-			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
+			const std::vector<WorkspaceSphere>& spheres =
+				sphere_cache.Get(ag, i, points, agent_ambient_offsets[ag], *models[ag]);
 			for (const ActiveObstacle& ao : per_agent_obstacles[ag]) {
 				if (i < ao.step_lo || i >= ao.step_hi) continue;
 				for (int k : ao.spheres[i - ao.step_lo]) {
@@ -670,15 +682,14 @@ std::vector<ConstraintRow> LinearizeObstacleConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
 	const std::vector<std::vector<ActiveObstacle>>& per_agent_obstacles,
-	const AgentCollisionModels& models) {
+	const AgentCollisionModels& models, SphereEvalCache& sphere_cache) {
 	std::vector<ConstraintRow> rows;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
 			if (per_agent_obstacles[ag].empty()) continue;
 			const int axis_off = agent_axis_offsets[ag];
-			const Eigen::VectorXd q_ag =
-				AgentConfigRow(points, i, agent_ambient_offsets[ag], *models[ag]);
-			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
+			const std::vector<WorkspaceSphere>& spheres =
+				sphere_cache.Get(ag, i, points, agent_ambient_offsets[ag], *models[ag]);
 			for (const ActiveObstacle& ao : per_agent_obstacles[ag]) {
 				if (i < ao.step_lo || i >= ao.step_hi) continue;
 				for (int k : ao.spheres[i - ao.step_lo]) {
@@ -715,16 +726,17 @@ double PairRadius(const AgentCollisionModel& model, const WorkspaceSphere& sph, 
 
 double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_ambient_offsets, int workspace_dim,
 				   const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-				   const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models) {
+				   const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models,
+				   SphereEvalCache& sphere_cache) {
 	double violation = 0.0;
 	for (int i = 0; i < num_steps; ++i) {
 		for (const ActivePair& ap : active_pairs) {
 			if (i < ap.step_lo || i >= ap.step_hi) continue;
 			const int ag_a = ap.ag_a, ag_b = ap.ag_b;
-			const std::vector<WorkspaceSphere> sph_a =
-				models[ag_a]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_a], *models[ag_a]));
-			const std::vector<WorkspaceSphere> sph_b =
-				models[ag_b]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_b], *models[ag_b]));
+			const std::vector<WorkspaceSphere>& sph_a =
+				sphere_cache.Get(ag_a, i, points, agent_ambient_offsets[ag_a], *models[ag_a]);
+			const std::vector<WorkspaceSphere>& sph_b =
+				sphere_cache.Get(ag_b, i, points, agent_ambient_offsets[ag_b], *models[ag_b]);
 			for (const auto& [ka, kb] : ap.sphere_pairs[i - ap.step_lo]) {
 				const WorkspaceSphere& sa = sph_a[ka];
 				const WorkspaceSphere& sb = sph_b[kb];
@@ -743,16 +755,17 @@ double EvaluateAgentPairViolation(int num_steps, const std::vector<int>& agent_a
 std::vector<ConstraintRow> LinearizeAgentPairConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, const std::vector<int>& agent_ambient_offsets,
 	int workspace_dim, const Eigen::MatrixXd& points, const Eigen::VectorXd& agent_radii,
-	const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models) {
+	const std::vector<ActivePair>& active_pairs, const AgentCollisionModels& models,
+	SphereEvalCache& sphere_cache) {
 	std::vector<ConstraintRow> rows;
 	for (int i = 0; i < num_steps; ++i) {
 		for (const ActivePair& ap : active_pairs) {
 			if (i < ap.step_lo || i >= ap.step_hi) continue;
 			const int ag_a = ap.ag_a, ag_b = ap.ag_b;
-			const std::vector<WorkspaceSphere> sph_a =
-				models[ag_a]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_a], *models[ag_a]));
-			const std::vector<WorkspaceSphere> sph_b =
-				models[ag_b]->Eval(AgentConfigRow(points, i, agent_ambient_offsets[ag_b], *models[ag_b]));
+			const std::vector<WorkspaceSphere>& sph_a =
+				sphere_cache.Get(ag_a, i, points, agent_ambient_offsets[ag_a], *models[ag_a]);
+			const std::vector<WorkspaceSphere>& sph_b =
+				sphere_cache.Get(ag_b, i, points, agent_ambient_offsets[ag_b], *models[ag_b]);
 			for (const auto& [ka, kb] : ap.sphere_pairs[i - ap.step_lo]) {
 				const WorkspaceSphere& sa = sph_a[ka];
 				const WorkspaceSphere& sb = sph_b[kb];
@@ -933,15 +946,15 @@ std::vector<ActiveGrid> PruneAgentSdfGridsByDistance(
 
 double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::vector<int>& agent_ambient_offsets,
 				      int workspace_dim, const Eigen::MatrixXd& points,
-				      const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models) {
+				      const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models,
+				      SphereEvalCache& sphere_cache) {
 	double violation = 0.0;
 	for (int ag = 0; ag < num_agents; ++ag) {
 		const ActiveGrid& ag_grid = active_grids[ag];
 		if (!ag_grid.grid) continue;
 		for (int i = ag_grid.step_lo; i < ag_grid.step_hi; ++i) {
-			const Eigen::VectorXd q_ag =
-				AgentConfigRow(points, i, agent_ambient_offsets[ag], *models[ag]);
-			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
+			const std::vector<WorkspaceSphere>& spheres =
+				sphere_cache.Get(ag, i, points, agent_ambient_offsets[ag], *models[ag]);
 			for (int k : ag_grid.spheres[i - ag_grid.step_lo]) {
 				const WorkspaceSphere& sph = spheres[k];
 				const Eigen::VectorXd c = sph.center.head(workspace_dim);
@@ -957,16 +970,16 @@ double EvaluateAgentSdfGridViolation(int num_steps, int num_agents, const std::v
 std::vector<ConstraintRow> LinearizeAgentSdfGridConstraints(
 	const std::vector<int>& agent_axis_offsets, int num_steps, int num_agents,
 	const std::vector<int>& agent_ambient_offsets, int workspace_dim, const Eigen::MatrixXd& points,
-	const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models) {
+	const std::vector<ActiveGrid>& active_grids, const AgentCollisionModels& models,
+	SphereEvalCache& sphere_cache) {
 	std::vector<ConstraintRow> rows;
 	for (int i = 0; i < num_steps; ++i) {
 		for (int ag = 0; ag < num_agents; ++ag) {
 			const ActiveGrid& ag_grid = active_grids[ag];
 			if (!ag_grid.grid || i < ag_grid.step_lo || i >= ag_grid.step_hi) continue;
 			const int axis_off = agent_axis_offsets[ag];
-			const Eigen::VectorXd q_ag =
-				AgentConfigRow(points, i, agent_ambient_offsets[ag], *models[ag]);
-			const std::vector<WorkspaceSphere> spheres = models[ag]->Eval(q_ag);
+			const std::vector<WorkspaceSphere>& spheres =
+				sphere_cache.Get(ag, i, points, agent_ambient_offsets[ag], *models[ag]);
 			for (int k : ag_grid.spheres[i - ag_grid.step_lo]) {
 				const WorkspaceSphere& sph = spheres[k];
 				const Eigen::VectorXd c = sph.center.head(workspace_dim);

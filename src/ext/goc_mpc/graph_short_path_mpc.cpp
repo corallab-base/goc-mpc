@@ -569,13 +569,26 @@ SqpResult RunTrustRegionSqp(
 
 	double f_current = TotalSmoothCost(agent_shapes, agent_axis_offsets, agent_ambient_offsets, num_steps, tau,
 					    smooth_cost_weights, x0, v0, points, vels, ref_points, ref_velocities);
+	// Memoizes AgentCollisionModel::Eval (a real Drake FK + Jacobian query
+	// for a non-trivial agent) per (agent, step) for the CURRENT `points`.
+	// Threaded into every Evaluate*/Linearize* call below instead of each
+	// one calling Eval() itself, so an agent whose spheres both an
+	// obstacle/grid row and a pair row need at the same step pays for that
+	// FK query once per outer iteration, not once per consumer. Carried
+	// across the iteration boundary at the bottom of the loop: on an
+	// accepted step it becomes next iteration's cache (the merit function
+	// just evaluated candidate_points at the exact configuration next
+	// iteration will linearize at); on a rejected step `points` didn't
+	// change, so it's simply left as-is and reused unmodified.
+	std::unique_ptr<SphereEvalCache> sphere_cache =
+		std::make_unique<SphereEvalCache>(num_agents, num_steps);
 	double violation_current =
 		EvaluateObstacleViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-					   per_agent_obstacles, models) +
+					   per_agent_obstacles, models, *sphere_cache) +
 		EvaluateAgentPairViolation(num_steps, agent_ambient_offsets, workspace_dim, points, agent_radii,
-					    active_pairs, models) +
+					    active_pairs, models, *sphere_cache) +
 		EvaluateAgentSdfGridViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-					       active_grids, models);
+					       active_grids, models, *sphere_cache);
 	double phi_current = f_current + penalty_weight * violation_current;
 
 	double trust_radius = initial_trust_radius;
@@ -636,15 +649,15 @@ SqpResult RunTrustRegionSqp(
 
 		std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
 			agent_axis_offsets, num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-			per_agent_obstacles, models);
+			per_agent_obstacles, models, *sphere_cache);
 		std::vector<ConstraintRow> pair_rows = LinearizeAgentPairConstraints(
 			agent_axis_offsets, num_steps, agent_ambient_offsets, workspace_dim, points, agent_radii,
-			active_pairs, models);
+			active_pairs, models, *sphere_cache);
 		rows.insert(rows.end(), std::make_move_iterator(pair_rows.begin()),
 			    std::make_move_iterator(pair_rows.end()));
 		std::vector<ConstraintRow> grid_row_list = LinearizeAgentSdfGridConstraints(
 			agent_axis_offsets, num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-			active_grids, models);
+			active_grids, models, *sphere_cache);
 		rows.insert(rows.end(), std::make_move_iterator(grid_row_list.begin()),
 			    std::make_move_iterator(grid_row_list.end()));
 
@@ -751,13 +764,20 @@ SqpResult RunTrustRegionSqp(
 		const double f_new = TotalSmoothCost(agent_shapes, agent_axis_offsets, agent_ambient_offsets, num_steps,
 						      tau, smooth_cost_weights, x0, v0, candidate_points, candidate_vels,
 						      ref_points, ref_velocities);
+		// Fresh cache for `candidate_points` -- a genuinely different
+		// configuration from `points` (this iteration's Linearize* calls
+		// above), so nothing here can reuse `*sphere_cache`. But if this
+		// step is ACCEPTED below, `candidate_cache` becomes `points`' cache
+		// for the NEXT outer iteration (see the accept branch) instead of
+		// being thrown away and rebuilt from scratch.
+		auto candidate_cache = std::make_unique<SphereEvalCache>(num_agents, num_steps);
 		const double violation_new =
 			EvaluateObstacleViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim,
-						   candidate_points, per_agent_obstacles, models) +
+						   candidate_points, per_agent_obstacles, models, *candidate_cache) +
 			EvaluateAgentPairViolation(num_steps, agent_ambient_offsets, workspace_dim, candidate_points,
-						    agent_radii, active_pairs, models) +
+						    agent_radii, active_pairs, models, *candidate_cache) +
 			EvaluateAgentSdfGridViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim,
-						       candidate_points, active_grids, models);
+						       candidate_points, active_grids, models, *candidate_cache);
 		const double phi_new = f_new + penalty_weight * violation_new;
 
 		// Uses H_smooth_total (THIS iteration's smooth Hessian, including
@@ -795,10 +815,19 @@ SqpResult RunTrustRegionSqp(
 			f_current = f_new;
 			violation_current = violation_new;
 			phi_current = phi_new;
+			// `candidate_cache` was built AT `candidate_points`, which
+			// `points` now equals -- exactly what the next outer
+			// iteration's Linearize* calls need, so carry it forward
+			// instead of rebuilding (see this loop's earlier comment).
+			sphere_cache = std::move(candidate_cache);
 		}
 		// else: reject -- points/vels/f_current/violation_current/
 		// phi_current stay at the previous (still fully valid) iterate;
-		// only trust_radius moved.
+		// only trust_radius moved. `sphere_cache` is untouched too: it was
+		// already built at (unchanged) `points`, so it stays valid for the
+		// next outer iteration's Linearize* calls with no rebuild at all;
+		// `candidate_cache` (built at the now-discarded candidate_points)
+		// just goes out of scope.
 
 		// Sℓ1QP first-order convergence (Nocedal & Wright Sec. 18.5):
 		// `predicted_reduction` -- the QP model's own predicted decrease of
