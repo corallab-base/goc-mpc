@@ -319,6 +319,16 @@ std::vector<AgentReferenceSpheres> BuildAgentReferenceSpheres(
 // linearization-at-that-same-candidate pass are the same configuration, so
 // a solve that accepts every step now pays for each (agent, step) FK query
 // once per outer iteration instead of twice).
+//
+// The [ag][i] slot grid itself (num_agents * num_steps `optional`s) is
+// allocated once at construction and never resized again: `Reset` (for
+// re-tying an existing instance to a NEW `points`) clears every slot back
+// to disengaged in place rather than reallocating the grid, so a caller
+// that needs one cache per iteration (RunTrustRegionSqp's candidate-point
+// cache) can keep a single long-lived instance across the whole solve and
+// `Reset` it every iteration instead of paying two nested heap allocations
+// (the outer per-agent vector, and one inner per-step vector per agent) on
+// every single outer iteration regardless of whether the step is accepted.
 class SphereEvalCache {
    public:
 	SphereEvalCache(int num_agents, int num_steps) : cache_(num_agents, Row(num_steps)) {}
@@ -329,6 +339,18 @@ class SphereEvalCache {
 	// cache instance was constructed for on every call.
 	const std::vector<WorkspaceSphere>& Get(int ag, int i, const Eigen::MatrixXd& points, int ambient_offset,
 						const AgentCollisionModel& model);
+
+	// Disengages every [ag][i] slot (`optional::reset()`, each) so this
+	// instance can be re-tied to a DIFFERENT `points` without reallocating
+	// the [ag][i] grid itself (the per-agent vector of per-step slots) --
+	// that's the allocation `make_unique<SphereEvalCache>(num_agents,
+	// num_steps)` pays every time, which Reset lets a caller amortize
+	// across a whole solve() instead of repeating every outer iteration.
+	// Each individual slot's `vector<WorkspaceSphere>` is still freshly
+	// allocated by `model.Eval()` the next time that (agent, step) is
+	// asked for -- Reset does not, and cannot, avoid that part of the
+	// cost, since `Eval()` returns its result by value.
+	void Reset();
 
    private:
 	using Row = std::vector<std::optional<std::vector<WorkspaceSphere>>>;

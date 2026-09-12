@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 #include <Eigen/Sparse>
 #include <proxsuite/proxqp/sparse/sparse.hpp>
@@ -580,15 +581,26 @@ SqpResult RunTrustRegionSqp(
 	// just evaluated candidate_points at the exact configuration next
 	// iteration will linearize at); on a rejected step `points` didn't
 	// change, so it's simply left as-is and reused unmodified.
-	std::unique_ptr<SphereEvalCache> sphere_cache =
-		std::make_unique<SphereEvalCache>(num_agents, num_steps);
+	//
+	// `sphere_cache`/`candidate_cache` are each allocated exactly ONCE for
+	// the whole solve (below and just before the loop, respectively) and
+	// re-tied to a new `points` via `Reset()` instead of being torn down
+	// and reallocated every outer iteration -- max_iterations solves can
+	// run plenty of iterations, and re-`make_unique`ing the [ag][i] grid
+	// every single one of them (even on a rejected step, whose candidate
+	// cache is immediately thrown away) was pure allocator overhead with
+	// nothing to show for it.
+	SphereEvalCache sphere_cache(num_agents, num_steps);
 	double violation_current =
 		EvaluateObstacleViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-					   per_agent_obstacles, models, *sphere_cache) +
+					   per_agent_obstacles, models, sphere_cache) +
 		EvaluateAgentPairViolation(num_steps, agent_ambient_offsets, workspace_dim, points, agent_radii,
-					    active_pairs, models, *sphere_cache) +
+					    active_pairs, models, sphere_cache) +
 		EvaluateAgentSdfGridViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-					       active_grids, models, *sphere_cache);
+					       active_grids, models, sphere_cache);
+	// Reset (not allocated) at the top of every iteration below -- see the
+	// comment there.
+	SphereEvalCache candidate_cache(num_agents, num_steps);
 	double phi_current = f_current + penalty_weight * violation_current;
 
 	double trust_radius = initial_trust_radius;
@@ -649,15 +661,15 @@ SqpResult RunTrustRegionSqp(
 
 		std::vector<ConstraintRow> rows = LinearizeObstacleConstraints(
 			agent_axis_offsets, num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-			per_agent_obstacles, models, *sphere_cache);
+			per_agent_obstacles, models, sphere_cache);
 		std::vector<ConstraintRow> pair_rows = LinearizeAgentPairConstraints(
 			agent_axis_offsets, num_steps, agent_ambient_offsets, workspace_dim, points, agent_radii,
-			active_pairs, models, *sphere_cache);
+			active_pairs, models, sphere_cache);
 		rows.insert(rows.end(), std::make_move_iterator(pair_rows.begin()),
 			    std::make_move_iterator(pair_rows.end()));
 		std::vector<ConstraintRow> grid_row_list = LinearizeAgentSdfGridConstraints(
 			agent_axis_offsets, num_steps, num_agents, agent_ambient_offsets, workspace_dim, points,
-			active_grids, models, *sphere_cache);
+			active_grids, models, sphere_cache);
 		rows.insert(rows.end(), std::make_move_iterator(grid_row_list.begin()),
 			    std::make_move_iterator(grid_row_list.end()));
 
@@ -764,20 +776,23 @@ SqpResult RunTrustRegionSqp(
 		const double f_new = TotalSmoothCost(agent_shapes, agent_axis_offsets, agent_ambient_offsets, num_steps,
 						      tau, smooth_cost_weights, x0, v0, candidate_points, candidate_vels,
 						      ref_points, ref_velocities);
-		// Fresh cache for `candidate_points` -- a genuinely different
-		// configuration from `points` (this iteration's Linearize* calls
-		// above), so nothing here can reuse `*sphere_cache`. But if this
-		// step is ACCEPTED below, `candidate_cache` becomes `points`' cache
-		// for the NEXT outer iteration (see the accept branch) instead of
-		// being thrown away and rebuilt from scratch.
-		auto candidate_cache = std::make_unique<SphereEvalCache>(num_agents, num_steps);
+		// `candidate_points` is a genuinely different configuration from
+		// `points` (this iteration's Linearize* calls above), so nothing
+		// here can reuse `sphere_cache` -- re-tie the long-lived
+		// `candidate_cache` to it via Reset() (no allocation) instead of
+		// the make_unique this loop used to pay every single iteration
+		// regardless of accept/reject. If this step is ACCEPTED below,
+		// `candidate_cache` becomes `points`' cache for the NEXT outer
+		// iteration (see the accept branch) instead of being thrown away
+		// and rebuilt from scratch.
+		candidate_cache.Reset();
 		const double violation_new =
 			EvaluateObstacleViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim,
-						   candidate_points, per_agent_obstacles, models, *candidate_cache) +
+						   candidate_points, per_agent_obstacles, models, candidate_cache) +
 			EvaluateAgentPairViolation(num_steps, agent_ambient_offsets, workspace_dim, candidate_points,
-						    agent_radii, active_pairs, models, *candidate_cache) +
+						    agent_radii, active_pairs, models, candidate_cache) +
 			EvaluateAgentSdfGridViolation(num_steps, num_agents, agent_ambient_offsets, workspace_dim,
-						       candidate_points, active_grids, models, *candidate_cache);
+						       candidate_points, active_grids, models, candidate_cache);
 		const double phi_new = f_new + penalty_weight * violation_new;
 
 		// Uses H_smooth_total (THIS iteration's smooth Hessian, including
@@ -817,9 +832,13 @@ SqpResult RunTrustRegionSqp(
 			phi_current = phi_new;
 			// `candidate_cache` was built AT `candidate_points`, which
 			// `points` now equals -- exactly what the next outer
-			// iteration's Linearize* calls need, so carry it forward
-			// instead of rebuilding (see this loop's earlier comment).
-			sphere_cache = std::move(candidate_cache);
+			// iteration's Linearize* calls need, so SWAP it into
+			// `sphere_cache` (O(1), no allocation) instead of rebuilding.
+			// `sphere_cache`'s old contents (now sitting in
+			// `candidate_cache`) are stale for anything going forward;
+			// the Reset() at the top of the next iteration's candidate
+			// pass clears them before they'd ever be read.
+			std::swap(sphere_cache, candidate_cache);
 		}
 		// else: reject -- points/vels/f_current/violation_current/
 		// phi_current stay at the previous (still fully valid) iterate;
@@ -827,7 +846,8 @@ SqpResult RunTrustRegionSqp(
 		// already built at (unchanged) `points`, so it stays valid for the
 		// next outer iteration's Linearize* calls with no rebuild at all;
 		// `candidate_cache` (built at the now-discarded candidate_points)
-		// just goes out of scope.
+		// is simply left as-is -- Reset() at the top of the next
+		// iteration's candidate pass clears it before reuse.
 
 		// Sℓ1QP first-order convergence (Nocedal & Wright Sec. 18.5):
 		// `predicted_reduction` -- the QP model's own predicted decrease of

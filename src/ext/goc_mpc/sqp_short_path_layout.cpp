@@ -624,6 +624,11 @@ const std::vector<WorkspaceSphere>& SphereEvalCache::Get(int ag, int i, const Ei
 	return *slot;
 }
 
+void SphereEvalCache::Reset() {
+	for (Row& row : cache_)
+		for (std::optional<std::vector<WorkspaceSphere>>& slot : row) slot.reset();
+}
+
 namespace {
 
 // Chain d(value)/d(centre) (workspace_dim) through a body sphere's tangent
