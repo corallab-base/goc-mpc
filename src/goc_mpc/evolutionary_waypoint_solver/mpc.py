@@ -554,23 +554,23 @@ class EvolutionaryWaypointSolver:
         # improved (see lamarckian_ga.py's own State docstring) -- not the
         # raw, CURRENT-scene (F, CV) a caller wants to inspect (e.g. "does
         # the solver even know this pick is now infeasible after I moved a
-        # block"). Recompute both fresh against this call's x0/anchor,
-        # exactly like reseed()/_ask()/_tell() already do for the same
-        # never-trust-stale-fitness reason.
-        F_best, CV_best = _evaluate_population_jax(
-            problem, jnp.asarray(best_X)[None, :], x0_arr, params_arr, anchor)
-        # CV_best alone is structurally blind to a projection (e.g. UR5e's
-        # closed-form analytic IK) that silently failed to hold -- a
-        # `proj=` constraint gets no AL residual at all (spec.py's
-        # _resolve_projections), so CV_best can't see it either. CV_proj_
-        # best (_evaluate_projection_cv_jax) is the read-only, post-hoc
-        # check of exactly those excluded constraints -- see that
-        # function's own docstring.
-        CV_proj_best = _evaluate_projection_cv_jax(
-            problem, jnp.asarray(best_X)[None, :], x0_arr, params_arr, anchor)
-        self._last_F = float(F_best[0])
-        self._last_CV = float(CV_best[0])
-        self._last_CV_proj = float(CV_proj_best[0])
+        # block"). `state_out.best_F`/`best_CV`/`best_CV_proj` ARE that raw,
+        # current-scene readout: `_tell` (lamarckian_ga.py) re-evaluates the
+        # carried-over `best_solution` fresh against THIS call's x0/anchor
+        # every generation (not just when a new individual beats it), for
+        # exactly this reason -- so no separate recomputation is needed
+        # here. This used to be a bare eager `_evaluate_population_jax`/
+        # `_evaluate_projection_cv_jax` call at batch size 1, which (being
+        # outside any persistent jax.jit) silently repaid a full XLA
+        # retrace/recompile of `decode_rank_batched`'s `_topological_rank`
+        # scan on every solve() call -- confirmed via profiling to cost
+        # ~1.4s/cycle, dwarfing the GA search's own ~1s. Reading it off
+        # `state_out` instead means it's computed once, batched, inside the
+        # already-jitted `_step_fn`, exactly like every other per-
+        # generation quantity here.
+        self._last_F = float(state_out.best_F)
+        self._last_CV = float(state_out.best_CV)
+        self._last_CV_proj = float(state_out.best_CV_proj)
 
         assign, cond_binary, proj_branch, t, wp, psi = problem._extract_single(best_X)
         # A projected node's own pinned columns are never actually driven

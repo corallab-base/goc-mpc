@@ -464,11 +464,21 @@ class SmallContinuousVRPSolver(LamarckianGA):
         X_new = _split_genome(problem, population)[0]
         F_old, CV_old = _evaluate_population_jax(problem, X_old, params.x0, params.problem_params, params.anchor)
         F_new, CV_new = _evaluate_population_jax(problem, X_new, params.x0, params.problem_params, params.anchor)
+        # Read-only diagnostic, not part of the ranking below -- tracked
+        # here (batched over the pool, in the already-jitted step) so a
+        # caller (mpc.py's solve()) can read state.best_CV_proj instead of
+        # re-running this eagerly on just the winner -- see State.
+        # best_CV_proj's own comment (lamarckian_ga.py) for why that
+        # eager path is expensive (an uncached retrace/recompile every
+        # external solve() call, not just the first).
+        CV_proj_old = _evaluate_projection_cv_jax(problem, X_old, params.x0, params.problem_params, params.anchor)
+        CV_proj_new = _evaluate_projection_cv_jax(problem, X_new, params.x0, params.problem_params, params.anchor)
 
         pool_pop = jnp.concatenate([state.population, population], axis=0)
         pool_X = jnp.concatenate([X_old, X_new], axis=0)
         pool_F = jnp.concatenate([F_old, F_new])
         pool_CV = jnp.concatenate([CV_old, CV_new])
+        pool_CV_proj = jnp.concatenate([CV_proj_old, CV_proj_new])
         pool_S = _combined_score(pool_F, pool_CV, params.w, params.cv_tol)
 
         pool_disc = pool_X[:, :problem.wp_offset]
@@ -477,23 +487,32 @@ class SmallContinuousVRPSolver(LamarckianGA):
         is_representative = jnp.arange(pool_S.shape[0]) == group_rep_idx
 
         keep = jnp.lexsort((pool_S, ~is_representative))[:self.population_size]
-        population_new, F_kept, CV_kept, S_kept = (
-            pool_pop[keep], pool_F[keep], pool_CV[keep], pool_S[keep])
+        population_new, F_kept, CV_kept, CV_proj_kept, S_kept = (
+            pool_pop[keep], pool_F[keep], pool_CV[keep], pool_CV_proj[keep], pool_S[keep])
 
-        # Best-so-far: same raw-(F, CV)-rescaled-fresh convention as the
-        # base class (see its docstring) -- S_kept[0] is still the pool's
-        # TRUE global minimum here (the global best is always its own
-        # group's representative, so it always sorts first even among
-        # representatives), not just the base class's own plain top-rank.
-        best_S_old = _combined_score(state.best_F, state.best_CV, params.w, params.cv_tol)
+        # Best-so-far: same raw-(F, CV, CV_proj)-rescaled-fresh convention
+        # as the base class (see its docstring, including why the carried-
+        # over `state.best_solution` is re-evaluated fresh here too rather
+        # than trusted from `state.best_F`/`best_CV`/`best_CV_proj`
+        # directly) -- S_kept[0] is still the pool's TRUE global minimum
+        # here (the global best is always its own group's representative,
+        # so it always sorts first even among representatives), not just
+        # the base class's own plain top-rank.
+        X_best_old = _split_genome(problem, state.best_solution[None, :])[0]
+        F_best_old, CV_best_old = _evaluate_population_jax(
+            problem, X_best_old, params.x0, params.problem_params, params.anchor)
+        CV_proj_best_old = _evaluate_projection_cv_jax(
+            problem, X_best_old, params.x0, params.problem_params, params.anchor)
+        best_S_old = _combined_score(F_best_old[0], CV_best_old[0], params.w, params.cv_tol)
         improved = S_kept[0] < best_S_old
         best_solution = jnp.where(improved, population_new[0], state.best_solution)
-        best_F = jnp.where(improved, F_kept[0], state.best_F)
-        best_CV = jnp.where(improved, CV_kept[0], state.best_CV)
+        best_F = jnp.where(improved, F_kept[0], F_best_old[0])
+        best_CV = jnp.where(improved, CV_kept[0], CV_best_old[0])
+        best_CV_proj = jnp.where(improved, CV_proj_kept[0], CV_proj_best_old[0])
         best_fitness = jnp.where(improved, S_kept[0], best_S_old)
 
         return state.replace(
             population=population_new, fitness=S_kept,
             best_solution=best_solution, best_fitness=best_fitness,
-            best_F=best_F, best_CV=best_CV,
+            best_F=best_F, best_CV=best_CV, best_CV_proj=best_CV_proj,
         )

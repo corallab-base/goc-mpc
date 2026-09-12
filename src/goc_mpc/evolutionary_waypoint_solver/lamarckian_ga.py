@@ -91,6 +91,7 @@ from .solver import (
     _ox_crossover_batched,
     _rank_jax,
     _evaluate_population_jax,
+    _evaluate_projection_cv_jax,
     _combined_score,
 )
 
@@ -104,6 +105,17 @@ class State(BaseState):
     # best_solution/best_fitness.
     best_F: jax.Array
     best_CV: jax.Array
+    # Read-only post-projection CV (_evaluate_projection_cv_jax) for the
+    # SAME best_solution, updated in lockstep with best_F/best_CV in
+    # `_tell` -- tracked here (computed once per generation, inside this
+    # already-jitted step) so a caller wanting it (mpc.py's solve(), for
+    # its own diagnostic self._last_CV_proj) can just read it off the
+    # returned state instead of re-running the eager, uncached
+    # `_evaluate_projection_cv_jax(problem, best_X[None, :], ...)` call
+    # that used to pay a full XLA retrace/recompile on every external
+    # solve() call (confirmed via profiling: ~1.4s/cycle, dwarfing the
+    # rest of the search).
+    best_CV_proj: jax.Array
 
 
 @struct.dataclass
@@ -173,23 +185,25 @@ class LamarckianGA(PopulationBasedAlgorithm):
             best_fitness=jnp.inf,
             best_F=jnp.inf,
             best_CV=jnp.inf,
+            best_CV_proj=jnp.inf,
             generation_counter=0,
         )
 
     def init(self, key, population, fitness, params):
-        """Seeds `best_F`/`best_CV` (raw) for the SAME individual the base
-        class's `init` already picked as `best_solution`/`best_fitness`
-        (`argmin` over `fitness`, NaN-safe) -- `params.x0`/`problem_params`/
-        `anchor` must already be the real, live values by this point (see
-        evosax_ga.py's `build_initial_carry_fn`, which threads them in
-        before calling `algo.init`), not this class's own placeholder
-        `_default_params`."""
+        """Seeds `best_F`/`best_CV`/`best_CV_proj` (raw) for the SAME
+        individual the base class's `init` already picked as
+        `best_solution`/`best_fitness` (`argmin` over `fitness`,
+        NaN-safe) -- `params.x0`/`problem_params`/`anchor` must already be
+        the real, live values by this point (see evosax_ga.py's
+        `build_initial_carry_fn`, which threads them in before calling
+        `algo.init`), not this class's own placeholder `_default_params`."""
         state = super().init(key, population, fitness, params)
         problem = self.problem
         X0 = _split_genome(problem, population)[0]
         F0, CV0 = _evaluate_population_jax(problem, X0, params.x0, params.problem_params, params.anchor)
+        CV_proj0 = _evaluate_projection_cv_jax(problem, X0, params.x0, params.problem_params, params.anchor)
         best_idx = jnp.argmin(jnp.where(jnp.isnan(fitness), jnp.inf, fitness))
-        return state.replace(best_F=F0[best_idx], best_CV=CV0[best_idx])
+        return state.replace(best_F=F0[best_idx], best_CV=CV0[best_idx], best_CV_proj=CV_proj0[best_idx])
 
     def _ask(self, key, state, params):
         problem = self.problem
@@ -290,28 +304,56 @@ class LamarckianGA(PopulationBasedAlgorithm):
         X_new = _split_genome(problem, population)[0]
         F_old, CV_old = _evaluate_population_jax(problem, X_old, params.x0, params.problem_params, params.anchor)
         F_new, CV_new = _evaluate_population_jax(problem, X_new, params.x0, params.problem_params, params.anchor)
+        # Read-only diagnostic, not part of the ranking below -- see
+        # State.best_CV_proj's own comment for why this is tracked here
+        # (batched over the pool, in the already-jitted step) rather than
+        # left for a caller to recompute eagerly on just the winner.
+        CV_proj_old = _evaluate_projection_cv_jax(problem, X_old, params.x0, params.problem_params, params.anchor)
+        CV_proj_new = _evaluate_projection_cv_jax(problem, X_new, params.x0, params.problem_params, params.anchor)
 
         pool_pop = jnp.concatenate([state.population, population], axis=0)
         pool_F = jnp.concatenate([F_old, F_new])
         pool_CV = jnp.concatenate([CV_old, CV_new])
+        pool_CV_proj = jnp.concatenate([CV_proj_old, CV_proj_new])
         pool_S = _combined_score(pool_F, pool_CV, params.w, params.cv_tol)
 
         keep = _rank_jax(pool_S)[:self.population_size]
-        population_new, F_kept, CV_kept, S_kept = (
-            pool_pop[keep], pool_F[keep], pool_CV[keep], pool_S[keep])
+        population_new, F_kept, CV_kept, CV_proj_kept, S_kept = (
+            pool_pop[keep], pool_F[keep], pool_CV[keep], pool_CV_proj[keep], pool_S[keep])
 
-        # Best-so-far: raw (F, CV), rescaled fresh -- see module docstring
-        # for why this overrides (rather than trusts) the base class's own
-        # best_solution/best_fitness, already set on `state` by this point.
-        best_S_old = _combined_score(state.best_F, state.best_CV, params.w, params.cv_tol)
+        # Best-so-far: raw (F, CV, CV_proj), rescaled fresh -- see module
+        # docstring for why this overrides (rather than trusts) the base
+        # class's own best_solution/best_fitness. `state.best_solution`
+        # itself may not be IN `state.population` any more (mu+lambda
+        # truncation only guarantees survival within a generation's own
+        # top-`population_size`; the carried-over best is tracked
+        # separately and can persist for many generations/external calls
+        # after being evicted from the visible population) -- so re-
+        # evaluate it fresh here too, against THIS call's x0/anchor/params,
+        # rather than trusting `state.best_F`/`best_CV`/`best_CV_proj`
+        # (which would otherwise stay frozen at whatever scene state was
+        # live the last time something actually beat it, silently going
+        # stale across an x0/anchor change -- e.g. a moved block -- until
+        # some new individual happens to beat it again). This is also
+        # exactly the fresh-under-current-scene value mpc.py's solve()
+        # wants for its own diagnostic self._last_F/_last_CV/_last_CV_proj
+        # readout, computed once here instead of via a separate eager,
+        # uncached call there.
+        X_best_old = _split_genome(problem, state.best_solution[None, :])[0]
+        F_best_old, CV_best_old = _evaluate_population_jax(
+            problem, X_best_old, params.x0, params.problem_params, params.anchor)
+        CV_proj_best_old = _evaluate_projection_cv_jax(
+            problem, X_best_old, params.x0, params.problem_params, params.anchor)
+        best_S_old = _combined_score(F_best_old[0], CV_best_old[0], params.w, params.cv_tol)
         improved = S_kept[0] < best_S_old
         best_solution = jnp.where(improved, population_new[0], state.best_solution)
-        best_F = jnp.where(improved, F_kept[0], state.best_F)
-        best_CV = jnp.where(improved, CV_kept[0], state.best_CV)
+        best_F = jnp.where(improved, F_kept[0], F_best_old[0])
+        best_CV = jnp.where(improved, CV_kept[0], CV_best_old[0])
+        best_CV_proj = jnp.where(improved, CV_proj_kept[0], CV_proj_best_old[0])
         best_fitness = jnp.where(improved, S_kept[0], best_S_old)
 
         return state.replace(
             population=population_new, fitness=S_kept,
             best_solution=best_solution, best_fitness=best_fitness,
-            best_F=best_F, best_CV=best_CV,
+            best_F=best_F, best_CV=best_CV, best_CV_proj=best_CV_proj,
         )
