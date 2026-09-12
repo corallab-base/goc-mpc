@@ -190,6 +190,16 @@ class PopulationDiagnostics:
     rank: np.ndarray             # (pop,) int, 0 = best (lowest hard_score)
     will_be_evicted: np.ndarray  # (pop,) bool -- the n_evict worst by hard_score
     n_evict: int
+    # Per-VARIABLE (not per-member -- one committed/anchor state governs the
+    # WHOLE population, see AnchorState in problem.py), read straight off the
+    # anchor this diagnostic snapshot was evaluated against. A committed slot
+    # is not searched at all by the discrete solver (dp_master_jax's
+    # `slot_agent = jnp.where(var_committed, var_anchor, A)`): every skeleton
+    # it can offer already has that slot pinned to `var_anchor`, so a
+    # population where every member shares the same owner for a slot is
+    # expected, not a search failure, exactly when that slot is committed.
+    var_committed: np.ndarray   # (n_variables,) bool
+    var_anchor: np.ndarray      # (n_variables,) int -- committed agent id (meaningless where not committed)
 
 
 class EvolutionaryWaypointSolver:
@@ -687,6 +697,13 @@ class EvolutionaryWaypointSolver:
         `assign`) -- e.g. `[0, 1]` means variable slot 0 went to agent 0
         ("r0") and slot 1 to agent 1 ("r1").
 
+        `var_committed`/`var_anchor` are read straight off this call's
+        anchor (problem.AnchorState) -- see PopulationDiagnostics' own
+        comment for why a committed slot means the WHOLE population sharing
+        one owner for it is expected, not a search failure: a committed
+        slot is never actually offered as free by the discrete solver in
+        the first place.
+
         None before the first solve()/warmup() call."""
         if self._carry is None:
             return None
@@ -716,10 +733,13 @@ class EvolutionaryWaypointSolver:
             worst_first = np.argsort(-hard_score)        # mirrors reseed()'s own selection
             will_be_evicted[worst_first[:n_evict]] = True
 
+        var_committed = np.asarray(self._last_anchor.var_committed, dtype=bool)
+        var_anchor = np.asarray(self._last_anchor.var_anchor, dtype=int)
+
         return PopulationDiagnostics(
             F=F, CV=CV, CV_proj=CV_proj, owner_variable=owner_variable,
             hard_score=hard_score, rank=rank, will_be_evicted=will_be_evicted,
-            n_evict=n_evict)
+            n_evict=n_evict, var_committed=var_committed, var_anchor=var_anchor)
 
     def get_last_solve_time(self):
         return self._last_solve_time
