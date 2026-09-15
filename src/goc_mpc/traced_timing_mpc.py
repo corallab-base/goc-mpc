@@ -223,6 +223,80 @@ class TracedTimingMPC:
         # fill_cubic_splines(splines, x0, v0), delegated straight to
         # self._timing below.
         self._timing = GraphTimingMPC(graph, list(splines), *cost_args)
+        # Largest number of segments (`len(starts)`) `_trace_segments` has
+        # ever batched for a given agent -- see its own doc comment for why
+        # this matters and how it's used.
+        self._max_segments_seen: dict = {}
+
+    def _trace_segments(self, agent, starts, goals):
+        """Traces every (start, goal) pair in `starts`/`goals` (same-length
+        sequences of this agent's own ambient-dim positions) for `agent`.
+
+        One batched `field.trace_paths(agent, starts, goals)` call when
+        `self.field` supports it (duck-typed -- see `EdgeCostTimeToGoField.
+        trace_paths`'s own doc comment: a `jax.vmap` of the same per-segment
+        gradient descent, agent held fixed/broadcast) instead of a Python
+        loop issuing one `field.trace_path` call -- and one device dispatch
+        -- per segment; falls back to that sequential loop for any
+        `TimeToGoField`-protocol adapter that doesn't implement `trace_paths`
+        (e.g. `NTFieldTimeToGo`, `PerAgentTimeToGoField`,
+        `_InterpolateExtraDimsField`) -- correctness is identical either
+        way, batching only removes the K-1 extra round trips.
+
+        The batch size K (= this agent's current remaining-segment count)
+        is PADDED, here, up to the largest K ever seen for this `agent`,
+        BEFORE calling `field.trace_paths` -- a jax backend's batch size is
+        part of its compiled program's shape signature, so a genuinely new
+        K recompiles (confirmed directly: ~65-70ms on a toy case, vs <1ms
+        for a repeated K) every time an agent's remaining real-node count
+        changes, i.e. every time a node gets consumed over the mission.
+        Padding is done in PLAIN NUMPY, entirely before any jax array
+        exists, deliberately NOT via `jnp.concatenate`/`jnp.broadcast_to`
+        on an already-jax-side array (an earlier version of this fix did
+        exactly that, inside `EdgeCostTimeToGoField.trace_paths` itself) --
+        measured directly that those ops are THEMSELVES separate per-shape
+        JAX dispatches with their own non-trivial one-time cost (tens of
+        ms on a toy case): XLA's per-op compile overhead is dominated by
+        fixed cost, not the op's own trivial complexity, so a "cheap"
+        concatenate is not actually cheap the first time a given shape
+        crosses into jax. Building the final fixed-shape array in numpy
+        first and handing jax exactly one already-final-shaped array
+        avoids paying that at all. Padding uses `goals[-1]` repeated
+        (start == goal exactly, so the descent is already converged at
+        step 0 -- cheap and side-effect-free); the extra rows are sliced
+        back off, also in plain numpy, before returning. Safe because an
+        agent's own remaining-segment count only ever SHRINKS across one
+        `TracedTimingMPC`'s lifetime (nodes get consumed, never re-added),
+        so whichever K is seen FIRST for a given agent is the max forever
+        after in practice -- but stays correct even if some caller's K did
+        grow later (just re-establishes a new, larger max), only forgoing
+        the "one recompile ever" property in that (currently nonexistent)
+        case.
+        """
+        if hasattr(self.field, "trace_paths"):
+            starts_arr = np.stack([np.asarray(s) for s in starts])
+            goals_arr = np.stack([np.asarray(g) for g in goals])
+            k = starts_arr.shape[0]
+            max_k = max(k, self._max_segments_seen.get(agent, 0))
+            self._max_segments_seen[agent] = max_k
+            if k < max_k:
+                pad = max_k - k
+                pad_point = goals_arr[-1]
+                pad_block = np.tile(pad_point, (pad, 1))
+                starts_arr = np.concatenate([starts_arr, pad_block], axis=0)
+                goals_arr = np.concatenate([goals_arr, pad_block], axis=0)
+            batched = self.field.trace_paths(agent, starts_arr, goals_arr)
+            # Indexed, NOT wrapped in np.asarray(batched): a plain
+            # EdgeCostTimeToGoField's own trace_paths returns one uniform
+            # (max_k, max_steps+2, dim) array (every segment the same fixed
+            # length -- see its own doc comment), but a wrapper like
+            # b1_multiroom's _FallbackField can substitute a variable-length
+            # grid-route path for whichever segments its own descent didn't
+            # converge on, returning a RAGGED Python list instead -- forcing
+            # that into one array here would raise (or silently object-dtype)
+            # on exactly the fallback case this exists to handle correctly.
+            return [np.asarray(batched[i]) for i in range(k)]  # drop the padding rows
+        return [np.asarray(self.field.trace_path(agent, s, g)) for s, g in zip(starts, goals)]
 
     def _agent_dense_wps_and_ids(self, agent, x0_i, coarse_node_ids, coarse_wps_i):
         """Traces every consecutive (position, position) pair on this
@@ -242,16 +316,19 @@ class TracedTimingMPC:
         positions = [x0_i] + [coarse_wps_i[j] for j in range(len(coarse_node_ids))]
         node_ids = [None] + list(coarse_node_ids)
 
+        starts = [positions[k] for k in range(len(positions) - 1)]
+        goals = [positions[k + 1] for k in range(len(positions) - 1)]
+        traced_segments = self._trace_segments(agent, starts, goals)
+
         dense_positions = []
         dense_ids = []
         for k in range(len(positions) - 1):
-            start, goal = positions[k], positions[k + 1]
             goal_node_id = node_ids[k + 1]
 
-            traced = np.asarray(self.field.trace_path(agent, start, goal))
+            traced = np.asarray(traced_segments[k])
             traced = _trim_trailing_duplicates(traced)
             if self.rdp_tolerance is not None:
-                chord = np.linalg.norm(np.asarray(goal) - np.asarray(start))
+                chord = np.linalg.norm(np.asarray(goals[k]) - np.asarray(starts[k]))
                 traced = _rdp(traced, self.rdp_tolerance * chord)
                 if (self.max_points_per_segment is not None
                         and len(traced) > self.max_points_per_segment):

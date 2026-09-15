@@ -276,12 +276,52 @@ class GraphOfConstraintsMPC():
             # legitimately and correctly stay OUTSIDE the deadband the
             # whole time, not a bug to chase by loosening it further.
             spline_velocity_deadband: float = 0.0,
+            # Step 2 of PLAN_collision_aware_timing.md: an opt-in
+            # inter-agent/environment collision-cost refinement pass run
+            # right after fill_cubic_splines each cycle, over
+            # self.last_cycle_splines -- see collision_cost_jax.py's own
+            # module doc comment and CollisionRefinementConfig's doc
+            # comment for the mechanism (a jax.lax.scan gradient descent)
+            # and default weights/step size/iteration count. None (the
+            # default) leaves this OFF entirely -- mirrors short_path_mpc/
+            # obstacles' own "absent by default" pattern -- since it needs
+            # real per-agent sphere geometry and an environment speed field
+            # this general-purpose class has no way to supply on its own.
+            collision_refinement=None,
     ):
         # problem definition data
         num_agents = graph.num_agents
 
         # persistent data
         self.graph = graph
+        self.collision_refinement = collision_refinement
+        # Built ONCE here (not per-cycle) and reused for the controller's
+        # whole lifetime -- collision_cost_jax.CollisionRefiner compiles
+        # its jax.lax.scan exactly once (lazily, on its first .refine()
+        # call) and every subsequent cycle reuses that SAME compiled
+        # executable, since every agent's per-cycle arrays are padded to a
+        # fixed collision_refinement.max_nodes shape regardless of how
+        # many knots the timing solve actually produced that cycle (see
+        # CollisionRefiner's own doc comment) -- rebuilding a fresh
+        # CollisionRefiner (or jax.jit call) every cycle, as an earlier
+        # version of this wiring did, would retrace/recompile every single
+        # controller.step(), which is why this is a persistent attribute
+        # rather than something _solve_for_timing constructs itself.
+        self._collision_refiner = None
+        if collision_refinement is not None:
+            # Lazy import: collision_cost_jax pulls in jax, and this whole
+            # feature is opt-in -- a caller that never sets
+            # collision_refinement shouldn't pay for it.
+            from . import collision_cost_jax
+            self._collision_refiner = collision_cost_jax.CollisionRefiner(graph, collision_refinement)
+        # Last collision-refinement pass's {"initial", "final"} cost
+        # breakdown (see CollisionRefiner.refine), for callers that want
+        # to log it -- matches last_cycle_solve_times's own "absent this
+        # cycle" convention: None when collision_refinement is unset, or
+        # when a cycle's refinement was skipped (fewer than 2 agents in
+        # the graph at all -- see CollisionRefiner.refine's own doc
+        # comment).
+        self.last_cycle_collision_refinement = None
         self.last_cycle_time = 0.0
         self.last_cycle_splines = [CubicConfigurationSpline(spec) for spec in graph._robot_specs]
         for s in self.last_cycle_splines:
@@ -586,6 +626,9 @@ class GraphOfConstraintsMPC():
             success = self.timing_mpc.solve(x, v0_for_spline, self.remaining_phases, waypoints, var_assignments, t_by_node)
             if success:
                 self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, v0_for_spline)
+                if self._collision_refiner is not None:
+                    self.last_cycle_collision_refinement = self._collision_refiner.refine(
+                        self.timing_mpc, self.last_cycle_splines, x, v0_for_spline)
                 self._prev_spline_time = self.last_cycle_time
                 self._has_prior_spline = True
                 return True

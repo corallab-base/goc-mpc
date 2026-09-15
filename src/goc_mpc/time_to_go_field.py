@@ -175,6 +175,22 @@ class EdgeCostTimeToGoField:
         self.goal_tol = goal_tol
         self.momentum = momentum
         self._trace_jit = _build_tracer(edge_cost_fn, max_steps, step_size, goal_tol, momentum)
+        # vmap of the SAME jitted `trace` -- `agent` stays `in_axes=None`
+        # (broadcast, not batched: `_trace_jit`'s own `static_argnums=(0,)`
+        # requires a single concrete Python int, not a per-row value), only
+        # `start`/`goal` are batched over a new leading axis.
+        #
+        # IMPORTANT, confirmed empirically (not just by inspection): the
+        # batch size K is part of the compiled program's shape signature --
+        # a NEW K genuinely recompiles (~65-70ms measured for a toy 2D
+        # cost), while a REPEATED K dispatches an already-compiled
+        # executable (<1ms) -- jax keeps a cache entry per DISTINCT K it has
+        # seen, not just the most recent one, but a K it has never seen
+        # before is a real, uncached compile every time. This class does
+        # NOT pad against that itself -- see `trace_paths`'s own doc
+        # comment for why that's the CALLER's job (`TracedTimingMPC`),
+        # not this one's.
+        self._trace_paths_jit = jax.vmap(self._trace_jit, in_axes=(None, 0, 0))
 
     def trace_path(self, agent, start, goal):
         """Returns path: (max_steps + 2, dim) numpy array, `path[0] ==
@@ -184,6 +200,34 @@ class EdgeCostTimeToGoField:
         start = jnp.asarray(start, dtype=jnp.float64)
         goal = jnp.asarray(goal, dtype=jnp.float64)
         return np.asarray(self._trace_jit(agent, start, goal))
+
+    def trace_paths(self, agent, starts, goals):
+        """Batched `trace_path`: `starts`/`goals` are `(K, dim)`, one row
+        per (start, goal) pair for the SAME `agent` -- returns `(K, max_steps
+        + 2, dim)`. One `jax.vmap`'d call over K independent gradient
+        descents instead of K sequential Python-level `trace_path` calls
+        (each its own device dispatch): `TracedTimingMPC._agent_dense_wps_
+        and_ids` builds exactly this shape (every inter-node segment for one
+        agent shares that agent's own tracer), and `trace_path`'s per-call
+        output is already fixed-length (`max_steps + 2`, regardless of how
+        quickly any one segment's descent converges -- see this class's own
+        docstring), so there is no ragged-shape obstacle to batching them.
+
+        Deliberately does NOT pad/cache against `K` changing cycle to cycle
+        itself (an earlier version of this method did, internally, via
+        `jnp.concatenate`/`jnp.broadcast_to`+a final `batched[:k]` slice) --
+        measured directly that those padding/slicing ops are THEMSELVES
+        separate per-shape JAX dispatches with their own non-trivial
+        one-time cost (tens of ms on a toy case, same order of magnitude as
+        the thing they were meant to avoid), because XLA's per-op
+        compilation overhead is dominated by fixed cost, not the op's own
+        trivial complexity. Padding in plain numpy BEFORE this method is
+        ever called avoids that entirely -- see `TracedTimingMPC`'s own
+        `_trace_segments`, which is where that now lives; this method
+        just runs whatever fixed-shape batch it's given."""
+        starts = jnp.asarray(starts, dtype=jnp.float64)
+        goals = jnp.asarray(goals, dtype=jnp.float64)
+        return np.asarray(self._trace_paths_jit(agent, starts, goals))
 
 
 class NTFieldTimeToGo:
