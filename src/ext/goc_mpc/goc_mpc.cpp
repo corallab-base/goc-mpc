@@ -262,6 +262,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_static("reindex_agent_interactions", &GraphOfConstraints::reindex_agent_interactions,
 		     py::arg("agent_interactions"), py::arg("agent_node_ids"))
 		.def("evaluate_phi", &GraphOfConstraints::evaluate_phi)
+		.def("evaluate_phi_value", &GraphOfConstraints::evaluate_phi_value)
 		.def("evaluate_edge_phi", &GraphOfConstraints::evaluate_edge_phi)
 		.def("get_edge_phi_agent", &GraphOfConstraints::get_edge_phi_agent)
 		.def("add_backtrack_links", &GraphOfConstraints::add_backtrack_links)

@@ -484,9 +484,10 @@ class GraphOfConstraintsMPC():
                            for phi_id in self.graph.get_phi_ids(node)}
             if not all(phi_results.values()):
                 if logger.isEnabledFor(logging.DEBUG):
-                    failed_phi_ids = [phi_id for phi_id, ok in phi_results.items() if not ok]
-                    logger.debug("Did not complete %s -- failed phi id(s): %s",
-                                 self.graph.get_node_name(node), failed_phi_ids)
+                    failed = {phi_id: self.graph.evaluate_phi_value(phi_id, x, assignments)
+                              for phi_id, ok in phi_results.items() if not ok}
+                    logger.debug("Did not complete %s -- failed phi id(s) [tol=%.3f]: %s",
+                                 self.graph.get_node_name(node), self.phi_tolerance, failed)
                 continue
             logger.info("Completed %s", self.graph.get_node_name(node))
             self.completed_phases |= {node}

@@ -939,6 +939,12 @@ struct GraphOfConstraints {
 			  const Eigen::VectorXi& assignments,
 			  double tol) const;
 
+	// Same residual `evaluate_phi` thresholds against `tol`, returned raw --
+	// for logging/debugging how far a failed phi actually is from passing.
+	double evaluate_phi_value(int phi_id,
+				   const Eigen::VectorXd& x,
+				   const Eigen::VectorXi& assignments) const;
+
 	bool evaluate_edge_phi(int phi_id,
 			       const Eigen::VectorXd& x,
 			       const Eigen::VectorXi& var_assignments,

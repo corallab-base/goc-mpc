@@ -943,6 +943,18 @@ bool GraphOfConstraints::evaluate_phi(int phi_id,
 	return true;
 }
 
+double GraphOfConstraints::evaluate_phi_value(int phi_id,
+                                              const Eigen::VectorXd& x,
+                                              const Eigen::VectorXi& assignments) const {
+	if (ops.contains(phi_id)) {
+		const DeferredOp& op = ops.at(phi_id);
+		return op.eval(x, assignments(phi_id));
+	} else if (symbolic_ops.contains(phi_id)) {
+		return EvaluateSymbolicNodeConstraint(*this, symbolic_ops.at(phi_id), x, assignments(phi_id));
+	}
+	return 0.0;
+}
+
 bool GraphOfConstraints::evaluate_edge_phi(int phi_id,
 					   const Eigen::VectorXd& x,
 					   const Eigen::VectorXi& var_assignments,
