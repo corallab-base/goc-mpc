@@ -217,6 +217,17 @@ struct HoldDeclaration {
 	std::vector<int> held_point_ids;
 	std::optional<int> robot_ag;  // set iff statically assigned
 	std::optional<int> var_id;    // set iff assignable
+	// How the carry constrains the held point at PLANNING time (the runtime
+	// drift check is rotation-aware either way -- GraphOfConstraintsMPC's
+	// _hold_violated). false (default): translation-only, the held point's
+	// world displacement equals the holder's end-effector displacement --
+	// MILP's linear Constraint 14a, so the only form MILP can express. true:
+	// rigid carry, the held point keeps its offset in the END-EFFECTOR'S OWN
+	// frame (`R_ee^T (point - p_ee)` equal at both nodes), so the carry
+	// survives the holder turning between pick-up and release. Nonlinear in
+	// the holder's configuration: honoured by the evolutionary waypoint
+	// solver (spec.py's _resolve_holds), rejected by MILP.
+	bool rigid = false;
 };
 
 struct AgentInteraction {
@@ -1125,8 +1136,10 @@ struct GraphOfConstraints {
 	// add_assignable_hold also auto-registers `u` as a commit trigger for
 	// `var` (see add_variable_commit) -- once pick-up completes, the
 	// routing solve can no longer reassign the hold's holder mid-grasp.
-	int add_hold(int u, int v, int robot_ag, std::vector<int> held_point_ids);
-	int add_assignable_hold(int u, int v, int var, std::vector<int> held_point_ids);
+	int add_hold(int u, int v, int robot_ag, std::vector<int> held_point_ids,
+		     bool rigid = false);
+	int add_assignable_hold(int u, int v, int var, std::vector<int> held_point_ids,
+				bool rigid = false);
 
 	// Timing (Edge) Constraints
 

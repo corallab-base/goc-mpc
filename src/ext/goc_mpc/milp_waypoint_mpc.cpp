@@ -1439,6 +1439,18 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		// 14a: rigidity — the held point's pose relative to the holding
 		// end-effector must stay fixed from pick-up to put-down.
 		for (const auto& [hold_id, hold] : subgraph.get_subgraph_hold_ops()) {
+			// A rigid carry (HoldDeclaration.rigid) constrains the held
+			// point's offset in the end-effector's OWN frame, which is
+			// nonlinear in the holder's configuration -- 14a below is the
+			// linear translation-only form. Raise rather than silently
+			// enforce the weaker relation.
+			if (hold.rigid) {
+				throw std::runtime_error(
+					"MILPWaypointMPC: hold " + std::to_string(hold_id) +
+					" was declared rigid=True (offset fixed in the end-effector's own "
+					"frame); that relation is nonlinear -- use the evolutionary "
+					"waypoint solver, or declare the hold translation-only.");
+			}
 			const bool is_static = hold.robot_ag.has_value();
 
 			const int sg_v14 = subgraph.subgraph_id(hold.v_node);

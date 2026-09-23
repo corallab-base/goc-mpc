@@ -1114,23 +1114,25 @@ std::string GraphOfConstraints::get_node_name(int k) const {
 //                                   HOLDS                                   //
 ///////////////////////////////////////////////////////////////////////////////
 
-int GraphOfConstraints::add_hold(int u, int v, int robot_ag, std::vector<int> held_point_ids) {
+int GraphOfConstraints::add_hold(int u, int v, int robot_ag, std::vector<int> held_point_ids,
+				 bool rigid) {
 	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
 	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
 	DRAKE_DEMAND(robot_ag >= 0 && robot_ag < num_agents);
 
 	const int id = num_holds++;
-	hold_ops[id] = HoldDeclaration{id, u, v, held_point_ids, robot_ag, std::nullopt};
+	hold_ops[id] = HoldDeclaration{id, u, v, held_point_ids, robot_ag, std::nullopt, rigid};
 	return id;
 }
 
-int GraphOfConstraints::add_assignable_hold(int u, int v, int var, std::vector<int> held_point_ids) {
+int GraphOfConstraints::add_assignable_hold(int u, int v, int var,
+					    std::vector<int> held_point_ids, bool rigid) {
 	DRAKE_DEMAND(u >= 0 && u < structure.num_nodes());
 	DRAKE_DEMAND(v >= 0 && v < structure.num_nodes());
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
 
 	const int id = num_holds++;
-	hold_ops[id] = HoldDeclaration{id, u, v, held_point_ids, std::nullopt, var};
+	hold_ops[id] = HoldDeclaration{id, u, v, held_point_ids, std::nullopt, var, rigid};
 
 	// Once `u` (pick-up) completes, `var` is physically committed -- the
 	// routing solve must not reassign the hold's holder mid-grasp. Reuses

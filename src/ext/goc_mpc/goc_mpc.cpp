@@ -33,7 +33,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("v_node", &HoldDeclaration::v_node)
 		.def_readonly("held_point_ids", &HoldDeclaration::held_point_ids)
 		.def_readonly("robot_ag", &HoldDeclaration::robot_ag)
-		.def_readonly("var_id", &HoldDeclaration::var_id);
+		.def_readonly("var_id", &HoldDeclaration::var_id)
+		.def_readonly("rigid", &HoldDeclaration::rigid);
 
 	py::class_<AgentInteraction> agent_interaction(goc_mpc, "AgentInteraction");
 	agent_interaction
@@ -289,12 +290,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("u"),
 		     py::arg("v"),
 		     py::arg("robot_ag"),
-		     py::arg("held_point_ids"))
+		     py::arg("held_point_ids"),
+		     py::arg("rigid") = false)
 		.def("add_assignable_hold", &GraphOfConstraints::add_assignable_hold,
 		     py::arg("u"),
 		     py::arg("v"),
 		     py::arg("var"),
-		     py::arg("held_point_ids"))
+		     py::arg("held_point_ids"),
+		     py::arg("rigid") = false)
 		// Holds currently in progress given remaining_vertices -- see
 		// get_current_holds's own doc comment.
 		.def("get_current_holds", &GraphOfConstraints::get_current_holds,

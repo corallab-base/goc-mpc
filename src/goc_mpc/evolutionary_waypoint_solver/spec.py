@@ -1928,12 +1928,17 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
                     def fn(row_u, row_v, owner_variable, params, fk_fn=fk_fn,
                            agent_col0=agent_col0, agent_w=agent_w, obj_col0=obj_col0,
-                           workspace_dim=workspace_dim):
+                           workspace_dim=workspace_dim, rigid=hold.rigid):
                         del owner_variable, params  # robot_ag is static, not GA-searched; no param(id) here
-                        u_pos, _u_rot = fk_fn(row_u[agent_col0:agent_col0 + agent_w])
-                        v_pos, _v_rot = fk_fn(row_v[agent_col0:agent_col0 + agent_w])
+                        u_pos, u_rot = fk_fn(row_u[agent_col0:agent_col0 + agent_w])
+                        v_pos, v_rot = fk_fn(row_v[agent_col0:agent_col0 + agent_w])
                         obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
                         obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
+                        if rigid:
+                            # Offset in the END-EFFECTOR's own frame, so the
+                            # carry survives the holder turning between u and
+                            # v (HoldDeclaration.rigid).
+                            return (v_rot.T @ (obj_v - v_pos)) - (u_rot.T @ (obj_u - u_pos))
                         return (obj_v - obj_u) - (v_pos - u_pos)
 
                     # Structural (node, col) read set -- see
@@ -1966,7 +1971,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     def fn(row_u, row_v, owner_variable, params,
                            branch_cols=branch_cols, branch_widths=branch_widths,
                            branch_fks=branch_fks, slot=slot,
-                           obj_col0=obj_col0, workspace_dim=workspace_dim):
+                           obj_col0=obj_col0, workspace_dim=workspace_dim,
+                           rigid=hold.rigid):
                         del params  # no param(id) placeholder in this residual
                         # Every candidate's (v_pos - u_pos), stacked -- same
                         # per-candidate enumeration MILP does explicitly via
@@ -1974,6 +1980,20 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                         # just gathered instead of gated. num_agents is
                         # always small, so this is a handful of extra fk
                         # evaluations, not a real cost.
+                        obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
+                        obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
+                        if rigid:
+                            # Per candidate, the offset difference in that
+                            # candidate's own end-effector frame at u and v
+                            # (HoldDeclaration.rigid) -- the residual itself,
+                            # so the gather below returns it directly.
+                            deltas = jnp.stack([
+                                (lambda pu, ru, pv, rv: (rv.T @ (obj_v - pv)) - (ru.T @ (obj_u - pu)))(
+                                    *fk(row_u[col:col + w]), *fk(row_v[col:col + w]))
+                                for col, w, fk in zip(branch_cols, branch_widths, branch_fks)
+                            ])  # (num_agents, workspace_dim)
+                            return jax.lax.dynamic_index_in_dim(
+                                deltas, owner_variable[slot], axis=0, keepdims=False)
                         deltas = jnp.stack([
                             fk(row_v[col:col + w])[0] - fk(row_u[col:col + w])[0]
                             for col, w, fk in zip(branch_cols, branch_widths, branch_fks)
@@ -1986,8 +2006,6 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                         # already true of every other assignable-var
                         # resolution in this file, not a new tradeoff.
                         delta = jax.lax.dynamic_index_in_dim(deltas, agent, axis=0, keepdims=False)
-                        obj_u = row_u[obj_col0:obj_col0 + workspace_dim]
-                        obj_v = row_v[obj_col0:obj_col0 + workspace_dim]
                         return (obj_v - obj_u) - delta
 
                     # Every candidate agent's own slice is genuinely read
@@ -2029,29 +2047,43 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 pin_cols = list(range(obj_col0, obj_col0 + wd))
                 if hold.robot_ag is not None:
                     def rc_read(rows, params, ov, x0, fk_fn=fk_fn,
-                               ac0=agent_col0, aw=agent_w, oc0=obj_col0, wd=wd):
+                               ac0=agent_col0, aw=agent_w, oc0=obj_col0, wd=wd,
+                               rigid=hold.rigid):
                         obj_u = rows[0][oc0:oc0 + wd]
-                        ee_u = fk_fn(rows[0][ac0:ac0 + aw])[0][:wd]
-                        ee_v = fk_fn(rows[1][ac0:ac0 + aw])[0][:wd]
-                        return (obj_u + (ee_v - ee_u),)
+                        pu, ru = fk_fn(rows[0][ac0:ac0 + aw])
+                        pv, rv = fk_fn(rows[1][ac0:ac0 + aw])
+                        if rigid:  # carry the u-frame offset into v's frame
+                            return (pv[:wd] + rv[:wd, :wd] @ (ru[:wd, :wd].T @ (obj_u - pu[:wd])),)
+                        return (obj_u + (pv[:wd] - pu[:wd]),)
                     rc_reads = ([(u, c) for c in range(agent_col0, agent_col0 + agent_w)]
                                 + [(v, c) for c in range(agent_col0, agent_col0 + agent_w)]
                                 + [(u, c) for c in range(obj_col0, obj_col0 + wd)])
                 else:
                     def rc_read(rows, params, ov, x0, bc=branch_cols, bw=branch_widths,
-                               bfk=branch_fks, slot=slot, oc0=obj_col0, wd=wd):
+                               bfk=branch_fks, slot=slot, oc0=obj_col0, wd=wd,
+                               rigid=hold.rigid):
+                        obj_u = rows[0][oc0:oc0 + wd]
+                        if rigid:  # see the static branch above
+                            rows_v = jnp.stack([
+                                (lambda pu, ru, pv, rv: pv[:wd] + rv[:wd, :wd] @ (
+                                    ru[:wd, :wd].T @ (obj_u - pu[:wd])))(
+                                    *fk(rows[0][c:c + w]), *fk(rows[1][c:c + w]))
+                                for c, w, fk in zip(bc, bw, bfk)])
+                            return (jax.lax.dynamic_index_in_dim(
+                                rows_v, ov[slot], axis=0, keepdims=False),)
                         deltas = jnp.stack([
                             fk(rows[1][c:c + w])[0][:wd] - fk(rows[0][c:c + w])[0][:wd]
                             for c, w, fk in zip(bc, bw, bfk)])
                         delta = jax.lax.dynamic_index_in_dim(deltas, ov[slot], axis=0, keepdims=False)
-                        return (rows[0][oc0:oc0 + wd] + delta,)
+                        return (obj_u + delta,)
                     rc_reads = ([(nd, c) for nd in (u, v) for k in range(graph.num_agents)
                                  for c in range(branch_cols[k], branch_cols[k] + branch_widths[k])]
                                 + [(u, c) for c in range(obj_col0, obj_col0 + wd)])
                 _emit_auto_projection(
                     f"{name}_rigidcarry", v, pin_cols, (u, v),
                     read_fn=rc_read, func=(lambda val, psi, b: val),
-                    gate_fn=_always_on_gate, read_cols=frozenset(rc_reads))
+                    gate_fn=_always_on_gate, read_cols=frozenset(rc_reads),
+                    gate_nodes=frozenset())
 
     def _resolve_stationary_objects():
         """Auto-derives the default "an object not currently being held must
