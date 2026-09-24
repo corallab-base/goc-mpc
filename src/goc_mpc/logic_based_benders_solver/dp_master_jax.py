@@ -50,6 +50,7 @@ non-full / full-resolve distinction `solve_dp_master` draws does not apply
 here.
 """
 
+import heapq
 import itertools
 
 import numpy as np
@@ -57,10 +58,12 @@ import numpy as np
 from .structure import (
     build_depot_cost_table, build_edge_cost_table, entry_owner, node_instances)
 from .cpsat_model import _agent_sliced_cost_fn
+from .coupled_dp import build_coupled_dp
 from .dp_master import (
     _BIG, _agent_owned_nodes, _ensure_x64, _ext_full_avg_minmax_score,
     _ext_full_makespan_score, _ext_nonfull_avg_minmax, _ext_nonfull_makespan,
     _extensions_matrix, _full_ext_resolve, _inst_key, _linear_extensions,
+    _needs_full_resolve,
     _makespan_arr_jax, _resolve_precedence, _resolve_schedule_wp,
 )
 
@@ -109,13 +112,118 @@ def _agent_route_dp(order, act, EDGE_j, DEPOT_j):
     return jnp.where(seen, jnp.min(cost), 0.0), branch_of_node
 
 
+def _order_dependent_rows(problem):
+    """The projections writing an AGENT column whose candidate rows depend on
+    something the coupled DP decides, as `[(index, write_node, reason), ...]`
+    -- empty when the coupled backend is safe.  Built on
+    `structure.projection_dependencies`, which traces each entry's inputs
+    transitively and says exactly what they depend on:
+
+      * the VISITING ORDER, through a gated pin whose gate can actually change
+        value.  A gate is evaluated over every rank it can really be handed,
+        anchors included; one that never changes (e.g. a stationary-object pin
+        whose hold span hard precedence already fixes) is not a source of
+        order dependence, however it reads.
+      * a ROBOT CONFIGURATION, through an agent-column read (e.g. a rigid-carry
+        pin, `obj_u + FK(q_v) - FK(q_u)`) -- i.e. on another node's branch.
+
+    The coupled backend resolves rows once per (assignment, aux) against a
+    single representative order and the warm-start robot rows, so either
+    dependence would price the wrong rows.  Dependence on the ASSIGNMENT
+    (a dynamic `var_agent_q` pin) is fine: the assignment is a grid axis and
+    every cell is resolved with its own."""
+    from .structure import projection_dependencies
+    agent_hi = problem.n_agents * problem.dim
+    out = []
+    for i, (e, d) in enumerate(zip(problem.projections, projection_dependencies(problem))):
+        if not any(c < agent_hi for (_n, c) in e.write_cols):
+            continue
+        why = []
+        if d.varying_gates:
+            nodes = "the whole order" if d.order_nodes is None else sorted(d.order_nodes)
+            why.append(f"the order of nodes {nodes} via gated pin(s) {list(d.varying_gates)}")
+        if d.robot_reads:
+            why.append(f"robot configuration at node(s) "
+                       f"{sorted({n for (n, _c) in d.robot_reads})}")
+        if why:
+            out.append((i, int(e.write_node), " and ".join(why)))
+    return out
+
+
+def _one_topo_order(n_nodes, hard_edges):
+    """One topological order of the hard precedence edges (Kahn, lowest id
+    first so it is deterministic).  The coupled backend chooses the real
+    visiting order itself, so it needs a single representative order only --
+    to feed `apply_projections` a `t`, which it is fenced to never read --
+    and never enumerates the factorially many others."""
+    succ = {i: [] for i in range(n_nodes)}
+    indeg = [0] * n_nodes
+    for (u, v) in hard_edges:
+        succ[u].append(v)
+        indeg[v] += 1
+    q = [i for i in range(n_nodes) if indeg[i] == 0]
+    heapq.heapify(q)
+    out = []
+    while q:
+        u = heapq.heappop(q)
+        out.append(u)
+        for v in succ[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                heapq.heappush(q, v)
+    if len(out) != n_nodes:
+        raise ValueError("dp_master_jax: the hard precedence edges contain a "
+                         "cycle -- no schedule exists")
+    return out
+
+
 class _DpMasterJax:
     """Holds the exhaustive static enumeration for one `problem` + objective
     + caps. `run` (piece 1: Python; later: jitted) consumes a cycle's
     continuous data against it."""
 
     def __init__(self, problem, objective, edge_cost_fn, max_assign_combos,
-                 max_orders, max_branch_combos, cv_proj_bias=False, cv_proj_tol=1e-4):
+                 max_orders, max_branch_combos, cv_proj_bias=False, cv_proj_tol=1e-4,
+                 route_backend="enumerate", max_coupled_structures=512,
+                 coupled_kwargs=None, lazy_kwargs=None):
+        # "enumerate" (default): all linear extensions x, for makespan, all
+        # branch combos -- the original path.  "coupled": coupled_dp.py's
+        # exact DP chooses order AND branch per (assignment, aux), so neither
+        # axis is enumerated at all; `max_orders` / `max_branch_combos` stop
+        # binding.  See `_coupled_host`.
+        # "lazy": lazy_dp.py's order-aware engine -- resolves every node's
+        # candidate rows when the DP schedules it, so pins whose value
+        # depends on the order or on an upstream branch are priced exactly.
+        self.route_backend = route_backend
+        self._coupled = route_backend == "coupled"
+        self._lazy_backend = route_backend == "lazy"
+        if route_backend not in ("enumerate", "coupled", "lazy"):
+            raise ValueError(f"unknown route_backend {route_backend!r}")
+        if self._lazy_backend and objective != "makespan":
+            raise NotImplementedError(
+                "dp_master_jax: route_backend='lazy' is a makespan DP -- "
+                f"objective={objective!r} is already exact and cheap on the "
+                "per-agent Viterbi the enumerate backend uses")
+        if self._coupled:
+            if objective != "makespan":
+                raise NotImplementedError(
+                    "dp_master_jax: route_backend='coupled' is a makespan DP "
+                    f"-- objective={objective!r} is already exact and cheap on "
+                    "the per-agent Viterbi the enumerate backend uses")
+            bad = _order_dependent_rows(problem)
+            if bad:
+                listed = ", ".join(f"#{i} @node {n} ({why})" for i, n, why in bad)
+                raise NotImplementedError(
+                    "dp_master_jax: route_backend='coupled' resolves each "
+                    "node's candidate rows once per (assignment, aux), so they "
+                    "must not depend on what the DP itself decides -- the "
+                    "visiting order or another node's robot configuration. "
+                    f"These agent-column projections do: {listed}")
+        self._coupled_cache = {}
+        self._coupled_kwargs = dict(coupled_kwargs or {})
+        self.max_coupled_structures = int(max_coupled_structures)
+        self.coupled_front = 0
+        self.coupled_exact = True
         self._prepped = None
         self._jitted = {}
         self.problem = problem
@@ -153,6 +261,8 @@ class _DpMasterJax:
         self.branch_cols = [np.asarray(sorted(int(c) for c in e.pinned_cols), dtype=int)
                             for e in self.branched]
         for e in self.branched:
+            if self._lazy_backend:
+                break      # lazy_dp resolves a reader after its writer's branch
             others = set().union(*(o.write_cols for o in self.branched if o is not e)) \
                 if len(self.branched) > 1 else set()
             if e.read_cols & others:
@@ -191,7 +301,7 @@ class _DpMasterJax:
         # node apart -- the grid tracks one branch per (node, owner), so two
         # entries there landing on the same agent would need that agent's
         # branch product.
-        for grp in self._shared_wn:
+        for grp in ([] if self._lazy_backend else self._shared_wn):
             wnn = int(self.branched[grp[0]].write_node)
             slots = sorted({self.branched[bi].owner_var_slot for bi in grp
                             if self.branched[bi].owner_var_slot is not None})
@@ -215,8 +325,13 @@ class _DpMasterJax:
         # -- hard-graph linear extensions ------------------------------
         self.hard_edges = [(int(u), int(v)) for (u, v, g) in self.ordering_edges if g is None]
         self.gated = [(int(u), int(v), g) for (u, v, g) in self.ordering_edges if g is not None]
-        self.EXT, self.n_ext, self.E = _extensions_matrix(
-            range(n_nodes), set(self.hard_edges), max_orders)               # (E, n_nodes)
+        if self._coupled or self._lazy_backend:
+            self.EXT = np.asarray([_one_topo_order(n_nodes, self.hard_edges)],
+                                  dtype=np.int32)
+            self.n_ext, self.E = 1, 1
+        else:
+            self.EXT, self.n_ext, self.E = _extensions_matrix(
+                range(n_nodes), set(self.hard_edges), max_orders)           # (E, n_nodes)
         # position of each node in each extension row -> feasibility + `t`
         self.POS = np.zeros((self.E, n_nodes), dtype=np.int32)
         for e in range(self.E):
@@ -240,7 +355,8 @@ class _DpMasterJax:
         ks = [int(e.discrete_params) for e in self.branched]
         n_bc = int(np.prod(ks, dtype=object)) if ks else 1
         self.branch_ks = ks
-        if objective == "makespan" and n_bc > max(max_branch_combos, 100000):
+        if (objective == "makespan" and not (self._coupled or self._lazy_backend)
+                and n_bc > max(max_branch_combos, 100000)):
             raise NotImplementedError(
                 f"dp_master_jax makespan: {n_bc} branch combos > "
                 f"{max(max_branch_combos, 100000)} -- makespan couples the branch "
@@ -248,6 +364,12 @@ class _DpMasterJax:
         self.BC_grid = (np.array(list(itertools.product(*[range(k) for k in ks])), dtype=np.int32)
                         if ks else np.zeros((1, 0), dtype=np.int32))         # (BC, n_branched)
         self.n_bc = self.BC_grid.shape[0]
+        self._branched_idx = [i for i, e in enumerate(proj) if e.discrete_params > 1]
+        self._lazy = None
+        if self._lazy_backend:
+            from .lazy_dp import LazyMakespanDP
+            self._lazy = LazyMakespanDP(problem, edge_cost_fn=ecf, **dict(lazy_kwargs or {}))
+        self.lazy_exact, self.lazy_front, self.lazy_stats = True, 0, []
 
     # ------------------------------------------------------------------
     def feasible_ext_mask(self, c, a, node_active):
@@ -395,10 +517,11 @@ class _DpMasterJax:
     def skeleton_grid_fn(self, k):
         """A jittable pure function
         `(params, wp_template, x0_full, X0, node_active, var_committed,
-        var_anchor) -> (obj, assign_oh, cond, t, proj_branch, wp0, cell)` for
-        the `k` best discrete skeletons (distinct `(assignment, aux)`,
-        ascending by objective). Safe to call inside another `jax.jit` trace
-        (e.g. `SmallContinuousVRPSolver._ask`). See `_score_grid_core`."""
+        var_anchor, skel_penalty=None) -> (obj, assign_oh, cond, t,
+        proj_branch, wp0, cell)` for the `k` best discrete skeletons (distinct
+        `(assignment, aux)`, ascending by objective). Safe to call inside
+        another `jax.jit` trace (e.g. `SmallContinuousVRPSolver._ask`). See
+        `_score_grid_core`."""
         from functools import partial
         _ensure_x64()
         self._prep()
@@ -420,7 +543,7 @@ class _DpMasterJax:
                                node_active, var_committed, var_anchor)
 
     def _score_grid_core(self, params, wp_template, x0_full, X0,
-                         node_active, var_committed, var_anchor, n_top):
+                         node_active, var_committed, var_anchor, n_top, skel_penalty=None):
         """The whole grid search, one `jax.jit` per `n_top`. Enumerates every
         `(assignment, aux, ordering)` cell (`G = NC*NA*E`), resolves each
         through `apply_projections`, prices it with a per-agent branch Viterbi
@@ -429,7 +552,15 @@ class _DpMasterJax:
         `min` over orderings so each `(assignment, aux)` skeleton has one
         score, and returns the `n_top` cheapest skeletons with the genome
         pieces needed to seed a GA individual. See `_skeleton_grid` for the
-        return shape."""
+        return shape.
+
+        `wp_template` is one `(N, S)` template shared by every cell, or one
+        per `(assignment, aux)` skeleton, `(NC*NA, N, S)` (row `c*NA + a`).
+        `skel_penalty` (optional, `(NC*NA,)`) is added to each skeleton's
+        cells' score before the top-k."""
+        if self._lazy_backend:
+            return self._score_grid_lazy(params, wp_template, x0_full, X0, node_active,
+                                         var_committed, var_anchor, n_top, skel_penalty)
         import jax
         import jax.numpy as jnp
         from ..evolutionary_waypoint_solver.problem import jit_apply_projections
@@ -438,7 +569,7 @@ class _DpMasterJax:
         NC, NA, E = self.NC, self.NA, self.E
         n_var, n_cond = self.n_var, self.n_cond
         n_psi, n_branch = p.n_psi, p.n_branch
-        S = wp_template.shape[1]
+        S = wp_template.shape[-1]
         gc, ga, ge = st["gc"], st["ga"], st["ge"]
         G = gc.shape[0]
         max_k = st["max_k"]
@@ -464,6 +595,14 @@ class _DpMasterJax:
             feas = jnp.ones((NC, NA, E), bool)
         feas = (feas & combo_ok[:, None, None]
                 & (jnp.arange(E) < st["n_ext"])[None, None, :])
+        if self._coupled:
+            # The coupled DP's states ARE order ideals of the resolved
+            # precedence DAG, so it enforces the gated edges itself and
+            # reports infeasibility as an infinite makespan.  The "does
+            # extension e respect them" mask is meaningless here: there is a
+            # single representative extension and it is never used as the
+            # visiting order.
+            feas = jnp.broadcast_to(combo_ok[:, None, None], (NC, NA, E))
         feas_g = feas[gc, ga, ge]                                         # (G,)
 
         # PRED (NC,NA,N,N) via active gated edges
@@ -481,7 +620,9 @@ class _DpMasterJax:
         cond_g = cond[ga]                                                 # (G,n_cond)
         T_g = st["POS"][ge].astype(float)                                 # (G,N)
         f0 = jit_apply_projections(p, only_entries=self.layer0)
-        wp0_g = f0(jnp.broadcast_to(wp_template[None], (G, N, S)),
+        wp_t_g = (wp_template[gc * NA + ga] if wp_template.ndim == 3
+                  else jnp.broadcast_to(wp_template[None], (G, N, S)))
+        wp0_g = f0(wp_t_g,
                    jnp.zeros((G, n_psi)), jnp.zeros((G, n_branch)), params,
                    assign_g, cond_g, T_g, node_active, x0_full)           # (G,N,S)
 
@@ -548,12 +689,30 @@ class _DpMasterJax:
             costs, br_gj = route(order_g, actmask, EDGE, DEPOT)           # (G,J), (G,J,N)
             cost_g = costs.sum(1) if self.objective == "avg" else costs.max(1)
             score_g = jnp.where(feas_g, cost_g, jnp.inf)                  # (G,)
+            order_dp = order_g
             if n_br:
                 own_g = st["owner_per_combo"][gc]                        # (G,n_br)
                 branch_of_entry = br_gj[jnp.arange(G)[:, None], own_g,
                                         wn_j[None, :]]                   # (G,n_br)
             else:
                 branch_of_entry = jnp.zeros((G, 0), jnp.int32)
+        elif self._coupled:
+            # coupled_dp.py: ONE exact DP per (assignment, aux) picks the
+            # visiting order and every branch together, so neither the
+            # extension axis nor the BC axis exists any more.  Its state graph
+            # depends on the RESOLVED ownership / precedence / branch counts,
+            # and `node_active` is a traced value here, so the structure is
+            # built and cached host-side behind a `pure_callback`.  That keeps
+            # every shape in this trace fixed, which is what preserves
+            # evosax_ga's "a new anchor never retraces `step`" contract -- see
+            # `_coupled_host`.
+            out_shape = (jax.ShapeDtypeStruct((G,), jnp.float64),
+                         jax.ShapeDtypeStruct((G, N), jnp.int32),
+                         jax.ShapeDtypeStruct((G, n_br), jnp.int32))
+            score_g, order_dp, branch_of_entry = jax.pure_callback(
+                self._coupled_host, out_shape,
+                EDGE, DEPOT, Kof, OWN_act[gc], pred[gc, ga], own_per_g)
+            score_g = jnp.where(feas_g, score_g, jnp.inf)                 # (G,)
         else:
             # makespan: branch combos couple with cross-agent waiting, so the
             # branch combo stays an explicit grid axis and its winner is the
@@ -579,6 +738,7 @@ class _DpMasterJax:
             score_g = jnp.min(ms, axis=1)                                 # (G,)
             branch_of_entry = (st["BC_grid"][bc_star_g] if n_br
                                else jnp.zeros((G, 0), jnp.int32))         # (G,n_br)
+            order_dp = order_g
 
         # -- CV_proj bias: every cell's fully-resolved wp (layer0 +
         # each branched entry spliced at its now-known winning branch,
@@ -630,6 +790,8 @@ class _DpMasterJax:
                   if p._proj_eq_constraints else None)
             cv_proj_g = _calc_cv_jax(G, cv_G, cv_H)                       # (G,)
             score_g = score_g + 1e6 * jnp.maximum(0.0, cv_proj_g - self.cv_proj_tol)
+        if skel_penalty is not None:
+            score_g = score_g + skel_penalty[gc * NA + ga]
 
         # -- reduce over orderings: one score per (assignment, aux) ----
         s2 = score_g.reshape(NC * NA, E)
@@ -647,7 +809,12 @@ class _DpMasterJax:
         assign_k = assign_oh[c_star] if n_var else jnp.zeros((kk, 0, J))  # (kk,n_var,J)
         cond_k = (st["AUX"][a_star].astype(float) if n_cond
                   else jnp.zeros((kk, 0)))                                # (kk,n_cond)
-        t_k = st["POS"][e_sel].astype(float)                             # (kk,N) rank/node
+        # rank-per-node: for the enumerate backend `order_k` IS `EXT[e_sel]`
+        # and this scatter reproduces `POS[e_sel]` exactly; for the coupled
+        # backend it is the sequence the DP itself chose.
+        order_k = order_dp[g_sel]                                        # (kk,N)
+        t_k = jnp.zeros((kk, N)).at[jnp.arange(kk)[:, None], order_k].set(
+            jnp.broadcast_to(jnp.arange(N, dtype=float)[None, :], (kk, N)))
         be_k = branch_of_entry[g_sel]                                    # (kk,n_br)
         own_k = st["owner_per_combo"][c_star] if n_br else None          # (kk,n_br)
         proj_branch_k = jnp.zeros((kk, n_branch))
@@ -669,7 +836,13 @@ class _DpMasterJax:
                 band = own_k[:, bi:bi + 1] * dim + jnp.arange(dim)[None, :]  # (kk,dim)
                 wp0_k = wp0_k.at[jnp.arange(kk)[:, None], wn, band].set(
                     jnp.take_along_axis(row_bi, band, axis=1))
-        cell_k = jnp.stack([c_star, a_star, e_sel], axis=1)             # (kk,3)
+        # (kk, 3+N): `[assignment, aux, extension]` as before, then the
+        # winning visiting order -- `_reconstruct_cell` reads the order from
+        # here rather than from `EXT[e]`, which is the same thing for the
+        # enumerate backend and the only correct thing for the coupled one.
+        cell_k = jnp.concatenate(
+            [jnp.stack([c_star, a_star, e_sel], axis=1), order_k.astype(jnp.int32)],
+            axis=1)
         return obj, assign_k, cond_k, t_k, proj_branch_k, wp0_k, cell_k
 
     def __call__(self, *a, **k):
@@ -726,13 +899,211 @@ class _DpMasterJax:
                 break
             c, a, e = int(cell[i, 0]), int(cell[i, 1]), int(cell[i, 2])
             d = self._reconstruct_cell(c, a, e, wp_template, x0_full, x0_of,
-                                       node_active, var_committed, var_anchor)
+                                       node_active, var_committed, var_anchor,
+                                       order=cell[i, 3:])
             if d is not None:
                 out.append(d)
         return out
 
+    def _score_grid_lazy(self, params, wp_template, x0_full, X0, node_active,
+                         var_committed, var_anchor, n_top, skel_penalty=None):
+        """`_score_grid_core` for `route_backend="lazy"`.  One exact
+        `lazy_dp` solve per (assignment, aux) cell, run host-side behind a
+        `pure_callback` (the engine's state graph is data-dependent, and
+        this keeps every traced shape fixed so evosax_ga's jitted `step`
+        still never retraces on an anchor change).  The engine returns each
+        cell's order, branches and FULLY RESOLVED `wp` under that order --
+        so the CV_proj bias and the seeded waypoints use the winner's own
+        rank, not a representative one.  Same 7-tuple as `_skeleton_grid`."""
+        import jax
+        import jax.numpy as jnp
+        st = self._prep()
+        p, N, J = self.problem, self.n_nodes, self.n_agents
+        NC, NA = self.NC, self.NA
+        n_var, n_cond, n_branch = self.n_var, self.n_cond, p.n_branch
+        S = wp_template.shape[-1]
+        G = NC * NA
+        n_br = len(self.branched)
+        slot_agent = (jnp.where(var_committed[None, :], var_anchor[None, :], st["A"])
+                      if n_var else jnp.zeros((NC, 0), jnp.int32))
+        combo_ok = (jnp.all(jnp.where(var_committed[None, :],
+                                      st["A"] == var_anchor[None, :], True), axis=1)
+                    if n_var else jnp.ones((NC,), bool))
+        assign_oh = jax.nn.one_hot(slot_agent, J) if n_var else jnp.zeros((NC, 0, J))
+        cond = st["AUX"].astype(float) if n_cond else jnp.zeros((NA, 0))
+
+        out_shape = (jax.ShapeDtypeStruct((G,), jnp.float64),
+                     jax.ShapeDtypeStruct((G, N), jnp.int32),
+                     jax.ShapeDtypeStruct((G, n_br), jnp.int32),
+                     jax.ShapeDtypeStruct((G, N, S), jnp.float64))
+        score_g, order_g, boe_g, wp_g = jax.pure_callback(
+            self._lazy_host, out_shape, params, wp_template, x0_full, X0,
+            node_active, slot_agent.astype(jnp.int32), combo_ok)
+        gc = jnp.arange(G) // NA
+        ga = jnp.arange(G) % NA
+        score_g = jnp.where(combo_ok[gc], score_g, jnp.inf)
+        assign_g, cond_g = assign_oh[gc], cond[ga]
+        T_g = jnp.zeros((G, N)).at[jnp.arange(G)[:, None], order_g].set(
+            jnp.broadcast_to(jnp.arange(N, dtype=float)[None, :], (G, N)))
+
+        if self.cv_proj_bias and (p._proj_ineq_constraints or p._proj_eq_constraints):
+            from ..evolutionary_waypoint_solver.solver import _calc_cv_jax
+            cv_G = (jnp.concatenate(
+                    [fn(assign_g, cond_g, T_g, wp_g, wp_g, node_active, x0_full, params)
+                     for fn in p._proj_ineq_constraints], axis=1)
+                  if p._proj_ineq_constraints else None)
+            cv_H = (jnp.concatenate(
+                    [fn(assign_g, cond_g, T_g, wp_g, wp_g, node_active, x0_full, params)
+                     for fn in p._proj_eq_constraints], axis=1)
+                  if p._proj_eq_constraints else None)
+            cv_proj_g = _calc_cv_jax(G, cv_G, cv_H)
+            score_g = score_g + 1e6 * jnp.maximum(0.0, cv_proj_g - self.cv_proj_tol)
+        if skel_penalty is not None:
+            score_g = score_g + skel_penalty
+
+        kk = min(int(n_top), G)
+        neg, s_star = jax.lax.top_k(-score_g, kk)
+        obj = -neg
+        c_star = (s_star // NA).astype(jnp.int32)
+        a_star = (s_star % NA).astype(jnp.int32)
+        assign_k = assign_oh[c_star] if n_var else jnp.zeros((kk, 0, J))
+        cond_k = st["AUX"][a_star].astype(float) if n_cond else jnp.zeros((kk, 0))
+        proj_branch_k = jnp.zeros((kk, n_branch))
+        for bi, kb in enumerate(self.branch_ks):
+            start = int(st["starts"][bi])
+            proj_branch_k = proj_branch_k.at[:, start:start + kb].set(
+                jax.nn.one_hot(boe_g[s_star, bi], kb))
+        cell_k = jnp.concatenate(
+            [jnp.stack([c_star, a_star, jnp.zeros_like(c_star)], axis=1),
+             order_g[s_star].astype(jnp.int32)], axis=1)
+        return obj, assign_k, cond_k, T_g[s_star], proj_branch_k, wp_g[s_star], cell_k
+
+    def _lazy_host(self, params, wp_template, x0_full, X0, node_active, slot_agent,
+                   combo_ok):
+        """Host side of `route_backend="lazy"`: one `lazy_dp.solve_cell` per
+        allowed (assignment, aux) cell.  An infeasible cell is `inf`.
+        Records `lazy_exact` / `lazy_front` / `lazy_stats` on `self` as
+        side-channel diagnostics (not part of the traced value)."""
+        params = np.asarray(params)
+        wpt = np.asarray(wp_template, float)
+        x0 = np.asarray(x0_full, float)
+        X0 = np.asarray(X0, float)
+        na = np.asarray(node_active, bool)
+        slot_agent = np.asarray(slot_agent, int)
+        combo_ok = np.asarray(combo_ok, bool)
+        NC, NA, N = self.NC, self.NA, self.n_nodes
+        G = NC * NA
+        n_br = len(self._branched_idx)
+        score = np.full(G, np.inf)
+        order = np.tile(np.arange(N, dtype=np.int32), (G, 1))
+        boe = np.zeros((G, n_br), np.int32)
+        wpt_g = wpt if wpt.ndim == 3 else np.broadcast_to(wpt[None], (G,) + wpt.shape)
+        wp = np.array(wpt_g)
+        self.lazy_exact, self.lazy_front, self.lazy_stats = True, 0, []
+        for c in range(NC):
+            if not combo_ok[c]:
+                continue
+            for a in range(NA):
+                g = c * NA + a
+                r = self._lazy.solve_cell(slot_agent[c], self.AUX[a], params, wpt_g[g], x0, X0, na)
+                if r is None:
+                    continue
+                score[g] = r.makespan
+                order[g] = r.order
+                wp[g] = r.wp
+                boe[g] = [r.branch.get(i, 0) for i in self._branched_idx]
+                self.lazy_exact &= r.exact
+                self.lazy_front = max(self.lazy_front, r.max_front)
+                self.lazy_stats.append(r.stats)
+        return score, order, boe, wp
+
+    def _coupled_host(self, EDGE, DEPOT, Kof, OWN_act, PRED, own_per_g):
+        """Host side of `route_backend="coupled"`: price every grid cell with
+        `coupled_dp`'s exact DP.
+
+        One cell is one `(assignment, aux)` -- the extension axis is gone --
+        and its DP *structure* is fixed by the three resolved tensors this
+        gets handed: `OWN_act[g]` (who visits what, already masked by
+        `node_active`), `PRED[g]` (the resolved precedence DAG, likewise) and
+        `Kof[g]` (branch counts).  Those bytes are the cache key, so the
+        structure is built once per distinct scene shape and every later
+        cycle only re-prices it -- which is the whole point of
+        `coupled_dp.build_coupled_dp` keeping cost lookups as indices.
+
+        Returns `(score (G,), order (G,N), branch_of_entry (G,n_br))`.  An
+        infeasible cell comes back as `inf` and keeps its placeholder order.
+
+        Called through `jax.pure_callback`: pure in its outputs, but it does
+        memoise structures and record `coupled_front` / `coupled_exact` as
+        diagnostics on `self`, which are side-channel and not part of the
+        traced value."""
+        EDGE = np.asarray(EDGE)
+        DEPOT = np.asarray(DEPOT)
+        Kof = np.asarray(Kof)
+        OWN_act = np.asarray(OWN_act)
+        PRED = np.asarray(PRED)
+        own_per_g = np.asarray(own_per_g)
+
+        G, N, J = OWN_act.shape[0], self.n_nodes, self.n_agents
+        n_br = len(self.branched)
+        wn = [int(en.write_node) for en in self.branched]
+        max_k = int(EDGE.shape[-1])
+
+        score = np.full(G, np.inf)
+        order = np.tile(np.arange(N, dtype=np.int32), (G, 1))
+        be = np.zeros((G, n_br), np.int32)
+        self.coupled_front, self.coupled_exact = 0, True
+
+        for g in range(G):
+            own_g, pred_g, k_g = OWN_act[g], PRED[g], Kof[g]
+            key = (own_g.tobytes(), pred_g.tobytes(), k_g.tobytes())
+            dp = self._coupled_cache.get(key)
+            if dp is None:
+                if len(self._coupled_cache) >= self.max_coupled_structures:
+                    raise NotImplementedError(
+                        "dp_master_jax: route_backend='coupled' has built "
+                        f"{len(self._coupled_cache)} distinct DP structures "
+                        "(> max_coupled_structures) -- the scene shape is "
+                        "changing far more than an MPC anchor should, so the "
+                        "build cost is no longer amortized")
+                # PRED[v, u] is "u precedes v" (dp_master's `hard_pred`).
+                dp = build_coupled_dp(
+                    N, J,
+                    [[j for j in range(J) if own_g[v, j]] for v in range(N)],
+                    [[u for u in range(N) if pred_g[v, u]] for v in range(N)],
+                    k_g, max_k=max_k, **self._coupled_kwargs)
+                self._coupled_cache[key] = dp
+
+            best, o, bc, ow, front = dp._route_jit()(EDGE[g], DEPOT[g])
+            best = float(best)
+            self.coupled_front = max(self.coupled_front, int(front))
+            self.coupled_exact &= int(front) <= dp.max_labels
+            if not np.isfinite(best) or best >= 1e11:
+                continue
+            score[g] = best
+            o, bc, ow = np.asarray(o), np.asarray(bc), np.asarray(ow)
+            order[g] = o
+            if n_br:
+                pick = {}
+                for r in range(o.shape[0]):
+                    for m in range(ow.shape[1]):
+                        if ow[r, m] >= 0:
+                            pick[(int(o[r]), int(ow[r, m]))] = int(bc[r, m])
+                for bi in range(n_br):
+                    # A branched entry whose owning agent does not actually
+                    # VISIT its write node has no routed branch to read, so
+                    # it falls back to 0.  Its branch cannot affect the
+                    # makespan (no leg touches it); it can still move the
+                    # spliced `wp0` row, and hence `CV_proj`, where the
+                    # enumerate backend would have taken whichever branch its
+                    # BC argmin happened to land on.  Deterministic here,
+                    # arbitrary there -- neither is a minimization.
+                    be[g, bi] = pick.get((wn[bi], int(own_per_g[g, bi])), 0)
+
+        return score, order, be
+
     def _reconstruct_cell(self, c, a, e, wp_template, x0_full, x0_of,
-                          node_active, var_committed, var_anchor):
+                          node_active, var_committed, var_anchor, order=None):
         """Reconstruct one grid cell `(A[c], AUX[a], EXT[e])` into a
         `solve_dp_master`-shaped dict, or `None` if the cell has no feasible
         branch DP solution."""
@@ -741,7 +1112,8 @@ class _DpMasterJax:
         n_nodes, n_var, n_cond = self.n_nodes, self.n_var, self.n_cond
         ov = _np.where(var_committed, var_anchor, _np.asarray(self.A[c], int))
         aux = tuple(int(x) for x in self.AUX[a])
-        ext = tuple(int(x) for x in self.EXT[e] if node_active[int(x)])
+        seq = self.EXT[e] if order is None else order
+        ext = tuple(int(x) for x in seq if node_active[int(x)])
         owned = {j: {n for n in ns if node_active[n]}
                  for j, ns in _agent_owned_nodes(p, self.instances, ov).items()}
         P = {(u, v) for (u, v) in _resolve_precedence(p, self.ordering_edges, ov, aux)
@@ -819,7 +1191,9 @@ class _DpMasterJax:
 
 def make_dp_master_jax(problem, *, objective="makespan", edge_cost_fn=None,
                        max_assign_combos=4096, max_orders=20000, max_branch_combos=4096,
-                       cv_proj_bias=False, cv_proj_tol=1e-4):
+                       cv_proj_bias=False, cv_proj_tol=1e-4,
+                       route_backend="enumerate", max_coupled_structures=512,
+                       coupled_kwargs=None, lazy_kwargs=None):
     """Build the exhaustive static enumeration for `problem` and return an
     object whose `run_python` (piece 1) / `run` (piece 3) solves the discrete
     subproblem for a cycle's continuous data. See the module docstring."""
@@ -827,4 +1201,7 @@ def make_dp_master_jax(problem, *, objective="makespan", edge_cost_fn=None,
         raise ValueError(f"unknown objective {objective!r}")
     return _DpMasterJax(problem, objective, edge_cost_fn, max_assign_combos,
                         max_orders, max_branch_combos,
-                        cv_proj_bias=cv_proj_bias, cv_proj_tol=cv_proj_tol)
+                        cv_proj_bias=cv_proj_bias, cv_proj_tol=cv_proj_tol,
+                        route_backend=route_backend,
+                        max_coupled_structures=max_coupled_structures,
+                        coupled_kwargs=coupled_kwargs, lazy_kwargs=lazy_kwargs)

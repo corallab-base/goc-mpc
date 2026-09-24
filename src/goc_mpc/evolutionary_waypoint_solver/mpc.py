@@ -164,7 +164,8 @@ _ALGO_KWARGS = ("tournament_k", "wp_mut_scale", "outer_iters", "inner_maxiter",
                 "rho_growth", "rho_progress_factor", "al_grad_tol", "rho_group_tol",
                 "lbfgs_history", "ls_max_trials", "optimizer",
                 "n_2opt_trials", "or_opt_prob", "max_or_opt_seg_len",
-                "reseed_frac", "reseed_rho0", "reseed_cv_tol")
+                "reseed_frac", "reseed_rho0", "reseed_cv_tol",
+                "route_backend", "max_coupled_structures", "coupled_kwargs", "lazy_kwargs")
 # build_evosax_ga's own top-level annealed-schedule kwargs.
 _SCHEDULE_KWARGS = ("w", "cv_tol", "w_frac", "cv_tol_frac", "w_growth", "cv_tol_floor_frac")
 # LamarckianGA.Params fields with no constructor-kwarg home -- applied via

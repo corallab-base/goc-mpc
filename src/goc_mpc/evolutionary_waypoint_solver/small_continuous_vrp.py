@@ -83,6 +83,22 @@ within `max_orders`, branch combos within `max_branch_combos`, and no two
 multi-branch projections writing the same node. It raises (not silently
 degrades) otherwise.
 
+`route_backend="coupled"` (default `"enumerate"`) replaces the last two of
+those limits: `logic_based_benders_solver.coupled_dp` solves the order and
+every branch together with one exact DP per `(assignment, aux)`, so neither
+the linear extensions nor the branch combinations are enumerated. The
+optimum is identical -- both backends are exact, A/B'd against each other
+and against `solve_dp_master` in `examples/test_coupled_backend.py`. It is
+makespan-only, and fenced off any problem whose candidate rows depend on the
+visiting order (a gated / dynamic / edge / chained projection writing an
+agent column), since the DP is what picks that order.
+
+`route_backend="lazy"` (logic_based_benders_solver.lazy_dp) lifts that fence:
+it resolves every node's rows at the moment the DP schedules it, so a pin
+whose value depends on the visiting order (a gated stationary / rigid-carry
+pin) or on an upstream robot's branch (a rigid carry feeding a later IK -- a
+hand-off) is priced exactly. Makespan only.
+
 Known limitations:
   - `_ask`'s own generation-0 seed (`state.seed_disc`/`seed_wp`) is still
     the ONE-TIME `init`-time skeleton search -- correct at true generation
@@ -152,13 +168,27 @@ class SmallContinuousVRPSolver(LamarckianGA):
     def __init__(self, population_size, solution, problem,
                  max_assign_combos=4096, max_orders=20000, max_branch_combos=4096,
                  reseed_frac=0.2, reseed_rho0=1.0, reseed_cv_tol=1e-4,
-                 **kwargs):
+                 route_backend="enumerate", max_coupled_structures=512,
+                 coupled_kwargs=None, lazy_kwargs=None, **kwargs):
         super().__init__(population_size, solution, problem, **kwargs)
+        # `route_backend="coupled"` swaps the skeleton search's makespan
+        # pricing from "enumerate every linear extension x every branch
+        # combination" to coupled_dp.py's exact DP, which chooses the order
+        # and the branches together. Same optimum (both are exact -- A/B'd in
+        # examples/test_coupled_backend.py), but `max_orders` /
+        # `max_branch_combos` stop being the thing that decides whether a
+        # scene is solvable at all. Makespan only, and only when no
+        # projection's candidate rows depend on the visiting order; it raises
+        # otherwise rather than pricing the wrong rows.
         self._dp = make_dp_master_jax(
             problem, objective=problem.objective, edge_cost_fn=problem.edge_cost_fn,
             max_assign_combos=max_assign_combos, max_orders=max_orders,
             max_branch_combos=max_branch_combos,
-            cv_proj_bias=True, cv_proj_tol=reseed_cv_tol)
+            cv_proj_bias=True, cv_proj_tol=reseed_cv_tol,
+            route_backend=route_backend,
+            max_coupled_structures=max_coupled_structures,
+            coupled_kwargs=coupled_kwargs, lazy_kwargs=lazy_kwargs)
+        self.route_backend = route_backend
         # one skeleton per population member, capped at the number of
         # distinct (assignment, aux) skeletons that actually exist.
         self._n_skeletons = int(min(population_size, self._dp.NC * self._dp.NA))

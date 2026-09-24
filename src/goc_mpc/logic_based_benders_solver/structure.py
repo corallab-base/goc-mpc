@@ -360,6 +360,175 @@ def build_depot_cost_table(rows_by_node, wp_template, x0_row, nodes, edge_cost_f
     return out
 
 
+# What a discrete solver needs to know about one projection entry before it
+# can decide WHEN that entry's rows are fixed -- see projection_dependencies.
+#   gate: "none" (ungated); "on" / "off" (gated, but provably constant under
+#       every schedule hard precedence allows, anchors included); or
+#       "varying".
+#   upstream: frozenset of entry indices this entry reads the output of,
+#       transitively (a writer's write_cols meets a reader's read_cols).
+#   varying_gates: sorted tuple of indices -- this entry itself and/or its
+#       upstream closure -- whose gate is "varying": the pins that make this
+#       entry's value depend on the visiting order.
+#   order_nodes: union of those gates' gate_nodes -- the nodes whose relative
+#       order this entry's value can depend on. None if some varying gate
+#       has unknown gate_nodes (assume the whole order); empty if none.
+#   robot_reads: frozenset of (node, col) agent-configuration columns read
+#       by this entry or anything upstream of it -- the robot rows (hence,
+#       for a branched writer, the branch choices) its value depends on.
+ProjectionDeps = namedtuple(
+    "ProjectionDeps",
+    ["gate", "upstream", "varying_gates", "order_nodes", "robot_reads"])
+
+
+def _hard_reach(n_nodes, hard_edges):
+    """`reach[u]` = every node that must come after `u` under the hard
+    precedence edges (transitive)."""
+    succ = [[] for _ in range(n_nodes)]
+    for u, v in hard_edges:
+        succ[int(u)].append(int(v))
+    reach = []
+    for u in range(n_nodes):
+        seen, stack = set(), list(succ[u])
+        while stack:
+            w = stack.pop()
+            if w not in seen:
+                seen.add(w)
+                stack.extend(succ[w])
+        reach.append(seen)
+    return reach
+
+
+def _gate_rank_batch(n_nodes, gate_nodes, reach, cap):
+    """Every rank vector a gate over `gate_nodes` can actually be evaluated
+    against, restricted to those nodes, as an `(B, n_nodes)` int32 array --
+    or None if there are more than `cap`.
+
+    `kernel._topological_rank` gives active nodes distinct ranks in a
+    topological order and EVERY passed node the same rank -1, and in MPC the
+    passed set is always down-closed under hard precedence (execution
+    respected it). So the reachable relative orders of `gate_nodes` are:
+    a down-closed subset D (tied at -1) x a linear extension of the rest.
+    Only hard edges are used -- conditional ones only ever remove orders, so
+    this is a superset, which is the safe direction for proving a gate
+    constant. Nodes outside `gate_nodes` get distinct ranks above every
+    gate node; by the gate_nodes contract they are never read."""
+    G = sorted(int(n) for n in gate_nodes)
+    k = len(G)
+    if k > 20:
+        return None
+    before = {x: {y for y in G if x in reach[y]} for x in G}   # y must precede x
+    base = np.arange(n_nodes, dtype=np.int32) + n_nodes
+    rows = []
+
+    def extensions(rest, prefix, out):
+        if len(out) > cap:
+            return
+        if not rest:
+            out.append(list(prefix))
+            return
+        for x in sorted(rest):
+            if before[x] & rest:
+                continue
+            prefix.append(x)
+            extensions(rest - {x}, prefix, out)
+            prefix.pop()
+
+    for mask in range(1 << k):
+        D = {G[i] for i in range(k) if (mask >> i) & 1}
+        if any(not before[x] <= D for x in D):
+            continue                                   # not down-closed
+        exts = []
+        extensions(set(G) - D, [], exts)
+        for order in exts:
+            r = base.copy()
+            for x in D:
+                r[x] = -1
+            for pos, x in enumerate(order):
+                r[x] = pos
+            rows.append(r)
+            if len(rows) > cap:
+                return None
+    return np.stack(rows) if rows else np.zeros((0, n_nodes), np.int32)
+
+
+def _classify_gate(entry, n_nodes, reach, cap):
+    if entry.gate_fn is None:
+        return "none"
+    if entry.gate_nodes is None:
+        return "varying"                  # unknown reads: assume the worst
+    ranks = _gate_rank_batch(n_nodes, entry.gate_nodes, reach, cap)
+    if ranks is None:
+        return "varying"                  # too many orders to prove anything
+    if ranks.shape[0] == 0:
+        ranks = np.zeros((1, n_nodes), np.int32)
+    g = np.asarray(entry.gate_fn(jnp.asarray(ranks)))
+    if np.all(g == g[0]):
+        return "on" if g[0] > 0.5 else "off"
+    return "varying"
+
+
+def projection_dependencies(problem, max_gate_orders=20000):
+    """`list[ProjectionDeps]`, one per `problem.projections` entry: what each
+    entry's value depends on that a routing solver DECIDES -- the visiting
+    order (through gated pins) and robot configurations (through agent-
+    column reads) -- traced transitively through the entries it reads.
+
+    A gated pin is only order-dependent if its gate can actually change
+    value. Each gate is evaluated over every rank it can really be handed
+    (`_gate_rank_batch`: hard-precedence-consistent orders of its
+    `gate_nodes`, with any down-closed subset tied at the passed-node rank
+    -1). If the value never changes it is classified "on"/"off" and is not
+    a source of order dependence at all. That is exact for the gate as
+    written -- it runs the real `gate_fn` -- and sound for every assignment,
+    aux vector and anchor, since it only ever considers a superset of the
+    reachable orders. A gate with unknown `gate_nodes`, or too many orders
+    to enumerate (`max_gate_orders`), is conservatively "varying".
+
+    This is the analysis a discrete solver needs to decide when a node's
+    candidate rows are fixed: rows with empty `varying_gates` and empty
+    `robot_reads` can be resolved once per (assignment, aux), independent
+    of the order and of every branch choice."""
+    entries = list(problem.projections)
+    n_nodes = int(problem.n_nodes)
+    hard = [(u, v) for (u, v, g) in problem.ordering_edges if g is None]
+    reach = _hard_reach(n_nodes, hard)
+    agent_hi = int(problem.n_agents) * int(problem.dim)
+
+    gate = [_classify_gate(e, n_nodes, reach, max_gate_orders) for e in entries]
+    direct = [{j for j, w in enumerate(entries) if j != i and (w.write_cols & e.read_cols)}
+              for i, e in enumerate(entries)]
+
+    memo = {}
+
+    def closure(i, stack=()):
+        if i in memo:
+            return memo[i]
+        if i in stack:
+            raise ValueError(f"projection_dependencies: entries {stack + (i,)} "
+                             "read each other's output in a cycle")
+        up = set()
+        for j in direct[i]:
+            up.add(j)
+            up |= closure(j, stack + (i,))
+        memo[i] = frozenset(up)
+        return memo[i]
+
+    out = []
+    for i, e in enumerate(entries):
+        up = closure(i)
+        scope = sorted(up | {i})
+        varying = tuple(k for k in scope if gate[k] == "varying")
+        if any(entries[k].gate_nodes is None for k in varying):
+            order_nodes = None
+        else:
+            order_nodes = frozenset().union(*(entries[k].gate_nodes for k in varying))
+        robot = frozenset((int(n), int(c)) for k in scope
+                          for (n, c) in entries[k].read_cols if c < agent_hi)
+        out.append(ProjectionDeps(gate[i], up, varying, order_nodes, robot))
+    return out
+
+
 def conditional_edge_data(graph, problem):
     """(cond_formulas, var_sym_ids, cond_sym_ids) for CP-SAT's conditional
     ordering edges -- everything compile_gate_cpsat needs, read straight off
