@@ -207,6 +207,31 @@ class GraphOfConstraintsMPC():
             short_path_mpc=None,
             # misc. options
             solve_for_waypoints_once: bool = False,
+            # Callables run after each waypoint solve, in order, each
+            # `stage(graph, waypoints) -> bool`: given the just-solved
+            # waypoints, a stage may edit the graph's runtime PARAMETERS
+            # (GraphOfConstraints::set_param -- no retrace, no rebuild) and
+            # return True to say the problem it just changed is worth
+            # re-solving. _solve_for_waypoints then solves again and runs
+            # the stages again, up to max_waypoint_passes solves total.
+            #
+            # This is the general form of a staged kinematic solve: a stage
+            # whose constraints are switched off by a parameter (a `ready`
+            # flag multiplying them, see ProjOperator's gate_param) is
+            # invisible to the first solve, then switched on by the stage
+            # callback once the earlier solve has determined whatever that
+            # stage needed. A loco-manipulator's grasp is the motivating
+            # case -- solve for WHERE TO STAND first, then, holding that
+            # stance, for the arm configuration that reaches the object --
+            # and a perception update (re-point the target params at where
+            # the object REALLY is, now that it's in view, then re-solve)
+            # is the same shape.
+            waypoint_stages=(),
+            # Upper bound on solves per cycle under waypoint_stages, since
+            # a stage that keeps returning True would otherwise loop
+            # forever. Reaching it is not an error (a stage may legitimately
+            # still have more to say), it just ends the cycle.
+            max_waypoint_passes: int = 4,
             linear_interpolation: bool = False,
             # Runtime drift check for add_hold/add_assignable_hold spans (see
             # _hold_violated): how far (per-axis, same units as x) a held
@@ -362,6 +387,11 @@ class GraphOfConstraintsMPC():
         # configuration
         self.phi_tolerance = phi_tolerance
         self.solve_for_waypoints_once = solve_for_waypoints_once
+        self.waypoint_stages = list(waypoint_stages)
+        if max_waypoint_passes < 1:
+            raise ValueError(
+                f"max_waypoint_passes must be at least 1, got {max_waypoint_passes}")
+        self.max_waypoint_passes = int(max_waypoint_passes)
         self.time_cost = time_cost
         self.time_cost2 = time_cost2
         self.short_path_length = short_path_length
@@ -417,12 +447,25 @@ class GraphOfConstraintsMPC():
                                                     max_obstacle_pairs_per_step)
 
     def _solve_for_waypoints(self, x: np.ndarray):
+        """Solves for this cycle's waypoints, then gives each
+        `waypoint_stages` callback the solution and re-solves for as long as
+        any stage says it changed something (see that constructor argument).
+        Returns the LAST solve's success -- a stage that fires only makes
+        sense against waypoints that solved, so a failed solve short-circuits
+        the rest of the passes."""
         if (self.solve_for_waypoints_once and self.last_cycle_waypoints is not None):
             return True
-        else:
+        for _pass in range(self.max_waypoint_passes):
             success = self.waypoint_mpc.solve(self.remaining_phases, x)
             self.last_cycle_waypoints = self.waypoint_mpc.view_waypoints()
-            return success
+            if not success or not self.waypoint_stages:
+                return success
+            changed = False
+            for stage in self.waypoint_stages:
+                changed |= bool(stage(self.graph, self.last_cycle_waypoints))
+            if not changed:
+                return success
+        return success
 
     def pass_node(self, node: int, assignments: np.ndarray):
         logger.info("Completed %s", self.graph.get_node_name(node))
