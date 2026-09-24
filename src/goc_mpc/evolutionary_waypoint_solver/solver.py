@@ -492,6 +492,16 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
         assign_eff0 = apply_anchor(problem, assign, jnp.zeros((pop, n_nodes, state_dim)), anchor, x0)[0]
         node_rank_eff = decode_rank_batched(problem._decode_node_rank, assign_eff0, cond_binary, t, _na)
         node_rank_proj = decode_rank_batched(problem._decode_node_rank, assign, cond_binary, t, _na)
+        if any(e.refine_cached for e in problem.projections):
+            # One walk at the starting wp: every refine_cached projection's
+            # value (ProjOperator.refine_cached) is then reused, like a
+            # static entry's, for the whole call.
+            captured = {}
+            apply_projections(problem, wp0, psi0, proj_branch, params, assign=assign, anchor=anchor,
+                              static_cache=static_cache, precomputed_rank=node_rank_proj,
+                              cond_binary=cond_binary, t=t, node_active=_na, x0=x0,
+                              capture=captured)
+            static_cache = {**static_cache, **captured}
 
         def merit_and_grad_fixed(w, mu, lam, rho):
             return merit_and_grad(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,

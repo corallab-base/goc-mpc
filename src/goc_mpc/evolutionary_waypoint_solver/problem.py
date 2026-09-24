@@ -113,6 +113,11 @@ from .kernel import make_graph_kernel, decode_rank_batched
 #       own docstrings for how this is used to avoid recomputing a
 #       potentially expensive analytic elimination (e.g. an 8-branch
 #       closed-form IK) on every one of a generation's many merit calls.
+#   gate_param_idx: None, or the index into `params` of the projection.
+#       ProjOperator.gate_param switch (see its docstring) -- the pin is
+#       blended in only where that param reads > 0.5, exactly like gate_fn's
+#       rank-derived mask, and its columns likewise stay searched (they are
+#       excluded from wp_pinned_mask, below).
 #   gate_fn: None (unconditional -- the pin always applies) OR an UNBATCHED-
 #       over-nothing callable `gate_fn(rank) -> (pop,)` returning a hard
 #       {0.0, 1.0} mask, `rank` the decoded node-rank `(pop, n_nodes)` int
@@ -134,14 +139,27 @@ from .kernel import make_graph_kernel, decode_rank_batched
 #       analytic IK). apply_projections passes owner_variable[owner_var_slot]
 #       to `func`. Forces is_static/table off (the value depends on a
 #       runtime assignment).
+#   gate_nodes: for a GATED entry, the frozenset of node ids whose ranks
+#       `gate_fn` reads. Contract: the gate's value depends on `rank` ONLY
+#       through the relative order of these nodes' ranks (including ties at
+#       the passed-node rank -1), never on any other node's rank. An empty
+#       set means the gate is constant (e.g. `_always_on_gate`). `None` --
+#       the default, and always the case for an ungated entry -- means
+#       "unknown": a consumer must then assume the gate can read the whole
+#       rank. Lets a discrete solver decide what ordering information a pin
+#       needs (logic_based_benders_solver.structure.projection_dependencies)
+#       without introspecting the closure.
 ProjectionEntry = namedtuple(
     "ProjectionEntry",
     ["write_node", "pinned_cols", "node_locals", "read_fn", "func",
      "continuous_params", "psi_slice", "psi_bounds", "branch_slice",
      "discrete_params", "table", "is_static",
      "owner_var_slot", "owner_cols_per_agent",
-     "read_cols", "write_cols", "gate_fn", "owner_aware"],
-    defaults=[None, False])  # gate_fn (unconditional), owner_aware
+     "read_cols", "write_cols", "gate_fn", "owner_aware", "gate_nodes",
+     "reads_x0", "refine_cached", "gate_param_idx"],
+    # gate_fn (unconditional), owner_aware, gate_nodes, reads_x0,
+    # refine_cached, gate_param_idx
+    defaults=[None, False, None, False, False, None])
 
 
 # Bundles remaining_vertices' runtime effect on an otherwise-fixed-size
@@ -341,7 +359,8 @@ def precompute_static_projections(problem, wp0, proj_branch, params):
 
 def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor=None, static_cache=None,
                       cond_binary=None, t=None, node_active=None, x0=None, only_entries=None,
-                      var_committed=None, var_anchor=None, precomputed_rank=None):
+                      var_committed=None, var_anchor=None, precomputed_rank=None,
+                      capture=None):
     """Splices every registered analytic-elimination substitution
     (spec.py's _resolve_projections, projection.ProjOperator) into batched
     `(pop, n_nodes, state_dim)` wp, reading batched `psi`
@@ -425,7 +444,11 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
     self-contained projection's candidate rows without running the rest of
     the chain (and, when the subset carries no gate, without the rank
     decode). The caller is responsible for passing a subset that is
-    self-contained (reads nothing another, un-included, entry pins)."""
+    self-contained (reads nothing another, un-included, entry pins).
+
+    `capture` (optional dict): filled with `{id(entry): value}` (pre-gate,
+    gradient-stopped) for every `refine_cached` entry this walk evaluates --
+    make_batched_local_refine merges it into its `static_cache`."""
     # `only_entries`: apply just this subset (structure.node_candidates
     # resolving ONE self-contained projection's row -- skips the rest of the
     # chain and, when the subset is gate-free, the rank decode entirely).
@@ -472,14 +495,19 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
 
             def _one(rows_1, psi_1, branch_1, ov_1, entry=entry, params=params, x0=x0):
                 read_vals = entry.read_fn(rows_1, params, ov_1, x0)
+                extra = ()
                 if entry.owner_aware:
                     # DYNAMIC pin whose elimination differs per agent -- hand
                     # `func` the resolved owner id (see ProjOperator.func).
-                    return jnp.asarray(entry.func(
-                        *read_vals, psi_1, branch_1, ov_1[entry.owner_var_slot]))
-                return jnp.asarray(entry.func(*read_vals, psi_1, branch_1))
+                    extra += (ov_1[entry.owner_var_slot],)
+                if entry.reads_x0:
+                    extra += (x0,)
+                return jnp.asarray(entry.func(*read_vals, psi_1, branch_1, *extra))
 
             value = jax.vmap(_one, in_axes=(0, 0, 0, 0))(rows, psi_i, branch, owner_variable)
+            if capture is not None and entry.refine_cached:
+                value = jax.lax.stop_gradient(value)
+                capture[id(entry)] = value
 
         if entry.gate_fn is not None:
             if entry.owner_var_slot is not None:
@@ -488,6 +516,20 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
                     "pin (ProjectionEntry.owner_var_slot) is not supported")
             g = entry.gate_fn(rank)[:, None]  # (pop, 1) hard {0, 1}
             cur = wp[:, entry.write_node, entry.pinned_cols]  # (pop, w)
+            value = g * value + (1.0 - g) * cur
+        if entry.gate_param_idx is not None:
+            # Same blend, switched by a runtime-editable param instead of the
+            # visiting order (ProjOperator.gate_param).
+            g = jnp.where(params[entry.gate_param_idx] > 0.5, 1.0, 0.0)
+            if entry.owner_var_slot is None:
+                cur = wp[:, entry.write_node, entry.pinned_cols]
+            else:
+                # Resolved owner, same as the write below -- a raw argmax here
+                # would blend against a DIFFERENT agent's current columns than
+                # the ones this pin actually writes.
+                owner_g = owner_variable[:, entry.owner_var_slot]
+                cols_g = jnp.asarray(entry.owner_cols_per_agent)[owner_g]
+                cur = jnp.take_along_axis(wp[:, entry.write_node, :], cols_g, axis=1)
             value = g * value + (1.0 - g) * cur
 
         if entry.owner_var_slot is None:
@@ -785,7 +827,8 @@ class GraphOrderingRelaxed:
         # searched variable.
         wp_pinned_mask = np.zeros((n_nodes, state_dim), dtype=bool)
         for p in self.projections:
-            if p.owner_var_slot is not None or p.gate_fn is not None:
+            if (p.owner_var_slot is not None or p.gate_fn is not None
+                    or p.gate_param_idx is not None):
                 continue
             wp_pinned_mask[p.write_node, p.pinned_cols] = True
         self.wp_pinned_mask = wp_pinned_mask
@@ -817,7 +860,8 @@ class GraphOrderingRelaxed:
         # below excludes exactly those.
         psi_pinned_mask = np.zeros((n_nodes, state_dim), dtype=bool)
         for p in self.projections:
-            if p.owner_var_slot is not None or p.gate_fn is not None or p.continuous_params == 0:
+            if (p.owner_var_slot is not None or p.gate_fn is not None
+                    or p.gate_param_idx is not None or p.continuous_params == 0):
                 continue
             psi_pinned_mask[p.write_node, p.pinned_cols] = True
         dead_mask = wp_pinned_mask & ~psi_pinned_mask  # truly constant for local_refine's whole call

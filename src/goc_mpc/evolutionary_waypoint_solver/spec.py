@@ -1126,6 +1126,19 @@ def _make_interval_overlap_gate(lo_node, hi_node, intervals):
     return gate_fn
 
 
+def _interval_overlap_gate_nodes(lo_node, hi_node, intervals):
+    """The `ProjectionEntry.gate_nodes` of `_make_interval_overlap_gate(
+    lo_node, hi_node, intervals)`: every node whose rank that gate reads.
+    It compares only min/max/`<` of these ranks (and the constant -1 for a
+    depot `lo_node=None`), so its value is a function of their relative
+    order alone -- the contract `gate_nodes` promises. Kept beside the gate
+    constructor so the two cannot drift apart."""
+    nodes = {int(hi_node)} | {int(n) for pair in intervals for n in pair}
+    if lo_node is not None:
+        nodes.add(int(lo_node))
+    return frozenset(nodes)
+
+
 def _always_on_gate(rank):
     """Trivial gate for an auto projection that always applies but should
     still be treated as GATED -- its blended column stays a free decision
@@ -1676,9 +1689,22 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             totals["psi"] += proj.continuous_params
             totals["branch"] += proj.discrete_params
 
+            # ProjOperator.gate_param: which params entry this pin's blend
+            # switches on (apply_projections). A gated pin needs the live
+            # column alongside its value, so it is never tabled/static.
+            gate_param_idx = None
+            if proj.gate_param is not None:
+                gid = as_variable(proj.gate_param).get_id()
+                if gid not in param_map:
+                    raise ValueError(
+                        f"proj for phi {phi_id}: gate_param must be a graph.param(id) "
+                        "placeholder")
+                gate_param_idx = param_map[gid]
+
             table = None
             func = proj.func
-            if proj.continuous_params == 0 and not proj.reads and not proj.owner_aware:
+            if (proj.continuous_params == 0 and not proj.reads and not proj.owner_aware
+                    and not proj.reads_x0 and gate_param_idx is None):
                 # Fully static: func needs no row input, and has no
                 # continuous freedom to sweep -- enumerate every branch
                 # ONCE, in plain numpy, at spec-build time (see
@@ -1696,7 +1722,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             # so is_static is unconditionally False there (see
             # _classify_static_projection's own docstring). An owner_aware
             # entry is likewise never static: precompute zeroes owner_variable.
-            is_static = (table is None and not proj.owner_aware
+            is_static = (table is None and not proj.owner_aware and not proj.reads_x0
+                         and gate_param_idx is None
                          and _classify_static_projection(proj, param_map))
 
             # `write_cols`: every (node, col) this pin COULD claim -- exactly
@@ -1711,7 +1738,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 owner_var_slot=owner_var_slot, owner_cols_per_agent=owner_cols_per_agent,
                 read_cols=frozenset(read_cols),
                 write_cols=frozenset((write_node, c) for c in possible_cols),
-                owner_aware=proj.owner_aware)
+                owner_aware=proj.owner_aware, reads_x0=proj.reads_x0,
+                refine_cached=proj.refine_cached, gate_param_idx=gate_param_idx)
             pending.append(dict(phi_id=phi_id, entry=entry))
 
         for node in node_list:
@@ -1739,14 +1767,17 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
 
     projection_pending, skip_node_phis, skip_edge_phis = _resolve_projections()
 
-    def _emit_auto_projection(name, write_node, cols, node_locals, read_fn, func, gate_fn, read_cols):
+    def _emit_auto_projection(name, write_node, cols, node_locals, read_fn, func, gate_fn,
+                              read_cols, *, gate_nodes):
         """Append one auto-derived GATED ProjectionEntry (a stationary-object
         or rigid-carry substitution) to projection_pending -- UNLESS an
         explicit `proj=` or an earlier auto projection already claims any of
         its target columns at write_node, in which case that pin wins and
         only the (still-registered) gated residual covers the column.
         continuous_params=0, discrete_params=1 (no branch choice), never
-        tabled, never is_static (its gate is per-individual)."""
+        tabled, never is_static (its gate is per-individual). `gate_nodes`
+        is required (no default) so a new call site cannot forget it -- see
+        ProjectionEntry.gate_nodes for the contract."""
         claimed = projection_claims.setdefault(write_node, set())
         cols = [int(c) for c in cols]
         if claimed & set(cols):
@@ -1763,7 +1794,7 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             table=None, is_static=False, owner_var_slot=None, owner_cols_per_agent=None,
             read_cols=frozenset(read_cols),
             write_cols=frozenset((write_node, c) for c in cols),
-            gate_fn=gate_fn)
+            gate_fn=gate_fn, gate_nodes=frozenset(int(n) for n in gate_nodes))
         projection_pending.append({"phi_id": name, "entry": entry})
 
     # -- symbolic constraints -----------------------------------------------
@@ -2216,10 +2247,19 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         edge_targets = {v for _u, v in hard_edges}
         source_nodes = [n for n in node_list if n not in edge_targets]
 
-        # Only objects that a hold touches somewhere get the gated
-        # PROJECTION treatment -- an object with no hold anywhere keeps just
-        # its (unconditional) residual, exactly as before, so this feature
-        # can't perturb any hold-free scene.
+        # Columns some other part of the problem already has an opinion
+        # about: every symbolic constraint's read set (including the ones a
+        # `proj=` resolves, which are still the builder's own statements
+        # about where things go) and every explicit/rigid-carry projection's
+        # writes. An object touching any of these is NOT untouched, however
+        # few holds it has -- see the unconditional-pin comment below.
+        claimed_cols = set()
+        for _nl, _fn, _k, _m, _nm, rc in (*symbolic_constraints, *proj_check_constraints):
+            if rc:
+                claimed_cols |= {int(c) for _n, c in rc}
+        for pending in projection_pending:
+            claimed_cols |= {int(c) for _n, c in pending["entry"].write_cols}
+
         incoming = {}
         for u, v in hard_edges:
             incoming.setdefault(v, []).append(u)
@@ -2238,8 +2278,6 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     v, seg_slice, hold_node_pairs, decode_node_rank, mode="live")
                 stationary_constraints.append((depot_batched, f"stationary_obj_{oid}_depot_{v}"))
 
-            if not hold_node_pairs:
-                continue
             # Gated PROJECTIONS mirroring the residuals: they SPLICE the
             # stationary value in (warm start where something refines, hard
             # determination where nothing does) so a downstream projection --
@@ -2249,13 +2287,46 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
             # pin per source node; edge pin only where the target node has
             # exactly ONE incoming hard edge (a clean predecessor to chain
             # from) -- multi-incoming nodes keep just the residual.
+            #
+            # Also emitted for an UNTOUCHED object -- no hold, and no
+            # constraint or projection anywhere referencing its columns.
+            # Such an object sits at its depot for the whole plan, so pinning
+            # it there is both correct and the strongest statement available.
+            # Skipping these (this used to `continue` on an empty hold list)
+            # left its columns FREE and read by nothing else, so the search
+            # left them wherever it initialised them inside the wp box --
+            # while the residuals above, emitted for EVERY object regardless,
+            # reported the full distance back to the depot as a violation.
+            # That row is then constant and gradient-free: never satisfiable,
+            # never masked (a stationary constraint registers
+            # `read_cols=None`, which problem._free_mask must treat as
+            # conservatively dependent), and it holds the AL's `rho` growth
+            # trigger down for EVERY other constraint in the problem.
+            #
+            # Untouched means UNCONDITIONAL, not a vacuously-always-on gate,
+            # and the distinction is load-bearing: problem.wp_pinned_mask
+            # deliberately skips any projection carrying a gate_fn (a gated
+            # pin's columns stay searched, since the gate may be off), so a
+            # trivially-true gate would leave the columns free and the
+            # mirroring residual permanently unsatisfied.
+            #
+            # `claimed_cols` is what keeps this from overriding the builder:
+            # an object with no hold can still be MOVED, by an ordinary
+            # constraint or by an explicit `proj=`, and depot-pinning one of
+            # those would silently overwrite the answer it was given.
+            gated = bool(hold_node_pairs)
+            if not gated and (claimed_cols & set(cols)):
+                continue
             for v in source_nodes:
                 _emit_auto_projection(
                     f"stationary_obj_{oid}_depot_{v}", v, cols, (v,),
                     read_fn=(lambda rows, params, ov, x0, s=seg_slice: (x0[s],)),
                     func=(lambda ox, psi, b: ox),
-                    gate_fn=_make_interval_overlap_gate(None, v, hold_node_pairs),
-                    read_cols=frozenset())
+                    gate_fn=(_make_interval_overlap_gate(None, v, hold_node_pairs)
+                             if gated else None),
+                    read_cols=frozenset(),
+                    gate_nodes=(_interval_overlap_gate_nodes(None, v, hold_node_pairs)
+                                if gated else frozenset()))
             for v, us in incoming.items():
                 if len(us) != 1:
                     continue
@@ -2264,8 +2335,11 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                     f"stationary_obj_{oid}_{u}_{v}", v, cols, (u, v),
                     read_fn=(lambda rows, params, ov, x0, s=seg_slice: (rows[0][s],)),
                     func=(lambda ou, psi, b: ou),
-                    gate_fn=_make_interval_overlap_gate(u, v, hold_node_pairs),
-                    read_cols=frozenset((u, c) for c in cols))
+                    gate_fn=(_make_interval_overlap_gate(u, v, hold_node_pairs)
+                             if gated else None),
+                    read_cols=frozenset((u, c) for c in cols),
+                    gate_nodes=(_interval_overlap_gate_nodes(u, v, hold_node_pairs)
+                                if gated else frozenset()))
 
     _resolve_symbolic_constraints()
     _resolve_holds()

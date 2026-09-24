@@ -103,6 +103,33 @@ class ProjOperator:
         otherwise. An owner_aware entry is never tabled or treated as
         generation-static (its value depends on a runtime-decided
         assignment).
+
+    reads_x0: pass the live full-state `x0` `(state_dim,)` to `func` as its
+        LAST arg (after `owner`, if owner_aware) -- e.g. a numerical IK
+        warm-started at the robot's current configuration. Never tabled or
+        generation-static.
+
+    gate_param: a `graph.param(id)` Expression whose CURRENT VALUE switches
+        this pin on (> 0.5) or off. While off, the pinned columns keep
+        whatever value they already hold and stay ordinary searched decision
+        variables -- exactly the blend (`g*value + (1-g)*cur`) the
+        auto-derived gated substitutions use, driven by a runtime-editable
+        param instead of the decoded visiting order. For a pin that only
+        applies once something outside the solve has happened (a perceived
+        grasp resolved into a configuration, say), so the same graph can be
+        solved before and after with `set_param`. Never tabled or
+        generation-static (its value is only half the story -- the blend
+        needs the live column too).
+
+    refine_cached: evaluate `func` once per `local_refine` call (at the
+        call's starting wp, with its frozen assignment/branch/order and live
+        x0) and reuse that value, gradient-stopped, for every merit
+        evaluation inside it -- for an expensive or non-differentiable
+        elimination (an iterative IK solve). Every other caller, including
+        the re-resolve after each refine, still evaluates it fresh, so a
+        stored individual stays consistent; only within one refine does a
+        free column this projection reads (e.g. an unpinned object) move
+        without the pin following it.
     """
     pins: object
     reads: tuple = ()
@@ -111,6 +138,9 @@ class ProjOperator:
     psi_bounds: tuple = (-1.0, 1.0)
     func: Callable = None
     owner_aware: bool = False
+    reads_x0: bool = False
+    gate_param: object = None
+    refine_cached: bool = False
 
     def __post_init__(self):
         if self.continuous_params < 0:
