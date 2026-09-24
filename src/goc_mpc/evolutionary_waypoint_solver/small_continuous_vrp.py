@@ -93,6 +93,20 @@ makespan-only, and fenced off any problem whose candidate rows depend on the
 visiting order (a gated / dynamic / edge / chained projection writing an
 agent column), since the DP is what picks that order.
 
+`kinematic_seed=True` (kinematic_seed.py) replaces the single shared wp
+template the skeleton search prices routes on with one per `(assignment,
+aux)` skeleton: a batched Levenberg-Marquardt solve of the problem's own
+node/edge constraints, started at the live `x0`, so each skeleton is routed
+through configurations that actually satisfy its constraints (e.g. the IK of
+an FK-reach node with no analytic projection), and a skeleton whose seed
+still violates them is pushed down the ranking by the same `1e6 * max(0, CV
+- reseed_cv_tol)` hard score `reseed` uses. Re-run on every `reseed` call
+against the live `x0`, so later cycles' challengers are re-seeded too. The
+seeds also enter selection UNREFINED -- as `init`'s generation-0 parents,
+and as `reseed`'s challenger whenever that beats its once-refined version --
+since one early, low-`rho` `local_refine` pass can trade an exactly-feasible
+seed's CV for route cost, and `_tell` only ever compares what's in the pool.
+
 `route_backend="lazy"` (logic_based_benders_solver.lazy_dp) lifts that fence:
 it resolves every node's rows at the moment the DP schedules it, so a pin
 whose value depends on the visiting order (a gated stationary / rigid-carry
@@ -137,6 +151,7 @@ from flax import struct
 
 from .lamarckian_ga import LamarckianGA, State as _LamarckianState
 from .evosax_ga import _split_genome, _join_genome
+from .kinematic_seed import make_kinematic_seed
 from .problem import jit_apply_projections
 from .solver import (
     _write_wp_batch_jax, _write_psi_batch_jax,
@@ -168,9 +183,26 @@ class SmallContinuousVRPSolver(LamarckianGA):
     def __init__(self, population_size, solution, problem,
                  max_assign_combos=4096, max_orders=20000, max_branch_combos=4096,
                  reseed_frac=0.2, reseed_rho0=1.0, reseed_cv_tol=1e-4,
-                 route_backend="enumerate", max_coupled_structures=512,
-                 coupled_kwargs=None, lazy_kwargs=None, **kwargs):
+                 wp_init_random_frac=0.0, route_backend="enumerate",
+                 max_coupled_structures=512, coupled_kwargs=None, lazy_kwargs=None,
+                 kinematic_seed=False, kinematic_seed_kwargs=None, **kwargs):
         super().__init__(population_size, solution, problem, **kwargs)
+        # Every population member sharing a skeleton (`i % n_skeletons`,
+        # below) otherwise gets the BIT-IDENTICAL `wp` from `wp0_s` --
+        # skeletons differ only in `assign`/`cond_binary`/`proj_branch`/`t`,
+        # so a wp column with no branch-selecting projection writing it
+        # (e.g. a plain free `wp` column driven only by a real, non-proj FK
+        # residual) is byte-identical across every skeleton too, giving
+        # `local_refine`'s deterministic AL+L-BFGS descent exactly ONE
+        # starting point regardless of `population_size`. `wp_init_random_
+        # frac` (0 = today's exact behavior) blends that shared template
+        # `frac` of the way toward an independent, per-member uniform
+        # sample of its own box (`problem.xl`/`xu`) in `_seed_population`
+        # below -- i.e. "sample `pop_size` random in-bound configurations",
+        # applied ONCE at generation 0 so `local_refine` still does the
+        # actual convergence work per member, just from `pop_size` distinct
+        # starts instead of one.
+        self._wp_init_random_frac = float(wp_init_random_frac)
         # `route_backend="coupled"` swaps the skeleton search's makespan
         # pricing from "enumerate every linear extension x every branch
         # combination" to coupled_dp.py's exact DP, which chooses the order
@@ -197,6 +229,9 @@ class SmallContinuousVRPSolver(LamarckianGA):
         # (nodes unreachable from any projection anchor fall back to x0=0).
         self._wp_template = jnp.asarray(
             warm_start_wp(problem, np.zeros(problem.state_dim)))
+        self._kinematic_seed = (make_kinematic_seed(
+            problem, self._dp.A, self._dp.AUX, self._dp.POS[0], **dict(kinematic_seed_kwargs or {}))
+            if kinematic_seed else None)
         # `reseed`'s own default eviction count/AL-reset value -- see that
         # method's docstring.
         self._n_evict = int(max(1, min(population_size, round(reseed_frac * population_size))))
@@ -226,22 +261,37 @@ class SmallContinuousVRPSolver(LamarckianGA):
         one per population member) on the `State` for every later `_ask` and
         every resumed MPC cycle. See module docstring."""
         state = super().init(key, population, fitness, params)
-        seed_disc, seed_wp = self._seed_population(params, self.population_size)
-        return state.replace(seed_disc=seed_disc, seed_wp=seed_wp)
+        seed_key, _ = jax.random.split(key)
+        seed_disc, seed_wp = self._seed_population(params, self.population_size, seed_key)
+        state = state.replace(seed_disc=seed_disc, seed_wp=seed_wp)
+        if self._kinematic_seed is not None:
+            problem = self.problem
+            X, mu, lam, rho = _split_genome(problem, state.population)
+            X = (X.at[:, :problem.wp_offset].set(seed_disc)
+                  .at[:, problem.wp_offset:problem.psi_offset].set(seed_wp)
+                  .at[:, problem.psi_offset:].set(0.0))
+            state = state.replace(population=_join_genome(X, mu, lam, rho))
+        return state
 
-    def _seed_population(self, params, pop_size):
+    def _seed_population(self, params, pop_size, key=None):
         """`(disc (pop, wp_offset), wp (pop, n_nodes*state_dim))` -- for
         member `i`, cost-ordered skeleton `i % n_skeletons`'s discrete genome
         (`assign | cond_binary | proj_branch | t`) and its analytically-
         resolved waypoints. An infeasible skeleton is remapped to the best
-        feasible one."""
+        feasible one. `key` is only consumed when `wp_init_random_frac > 0`
+        (see `__init__`'s doc comment); `None` is only valid then too."""
         problem = self.problem
         J = problem.n_agents
         X0 = jnp.broadcast_to(params.x0[None, :], (J, problem.state_dim))
         anchor = params.anchor
+        wp_template, skel_penalty = self._wp_template, None
+        if self._kinematic_seed is not None:
+            wp_template, cv_seed = self._kinematic_seed(params.x0, params.problem_params, anchor)
+            skel_penalty = 1e6 * jnp.maximum(0.0, cv_seed - self._reseed_cv_tol)
         obj_s, assign_s, cond_s, t_s, pb_s, wp0_s, _cell = self._skeleton_fn(
-            params.problem_params, self._wp_template, params.x0, X0,
-            anchor.node_active, anchor.var_committed, anchor.var_anchor)
+            params.problem_params, wp_template, params.x0, X0,
+            anchor.node_active, anchor.var_committed, anchor.var_anchor,
+            skel_penalty=skel_penalty)
         Sn = obj_s.shape[0]
         feas = jnp.isfinite(obj_s)
         remap = jnp.where(feas, jnp.arange(Sn), jnp.argmax(feas))     # -> best feasible
@@ -251,6 +301,22 @@ class SmallContinuousVRPSolver(LamarckianGA):
         disc = jnp.concatenate(
             [assign_flat, cond_s[src], pb_s[src], t_s[src]], axis=1)  # (pop, wp_offset)
         wp = wp0_s[src].reshape(pop_size, -1)                         # (pop, n_nodes*state_dim)
+
+        if self._wp_init_random_frac > 0.0:
+            frac = self._wp_init_random_frac
+            wp_lo = jnp.asarray(problem.xl[problem.wp_offset:problem.psi_offset])
+            wp_hi = jnp.asarray(problem.xu[problem.wp_offset:problem.psi_offset])
+            # Columns with no real box (unbounded object_q/etc.) keep the
+            # shared template value untouched -- `jax.random.uniform` needs
+            # finite bounds, and an unbounded column has no meaningful
+            # "in-box" sample to draw anyway.
+            finite = jnp.isfinite(wp_lo) & jnp.isfinite(wp_hi)
+            safe_lo = jnp.where(finite, wp_lo, 0.0)
+            safe_hi = jnp.where(finite, wp_hi, 0.0)
+            uniform = jax.random.uniform(
+                key, wp.shape, minval=safe_lo[None, :], maxval=safe_hi[None, :])
+            blended = (1.0 - frac) * wp + frac * uniform
+            wp = jnp.where(finite[None, :], blended, wp)
         return disc, wp
 
     def reseed(self, key, state, params, n_evict=None):
@@ -371,7 +437,7 @@ class SmallContinuousVRPSolver(LamarckianGA):
         # _tell when there are more distinct skeletons than free slots).
         worst = jnp.lexsort((-hard_old, is_representative_old))[:n_evict]
 
-        seed_disc, seed_wp = self._seed_population(params, n_evict)
+        seed_disc, seed_wp = self._seed_population(params, n_evict, key)
         wp_offset, psi_offset = problem.wp_offset, problem.psi_offset
         cand_X = jnp.zeros((n_evict, problem.n_var))
         cand_X = cand_X.at[:, :wp_offset].set(seed_disc)
@@ -382,6 +448,7 @@ class SmallContinuousVRPSolver(LamarckianGA):
         cand_lam = jnp.zeros((n_evict, n_ineq))
         cand_rho = jnp.full((n_evict, problem.n_constraint_groups), self._reseed_rho0)
 
+        raw_genome = _join_genome(cand_X, cand_mu, cand_lam, cand_rho)
         assign, cond_binary, proj_branch, t, wp0, psi0 = problem._extract_batch(cand_X)
         wp_star, psi_star, cand_mu, cand_lam, cand_rho = self.local_refine(
             wp0, psi0, assign, cond_binary, proj_branch, t, cand_mu, cand_lam, cand_rho,
@@ -398,6 +465,16 @@ class SmallContinuousVRPSolver(LamarckianGA):
         CV_proj_cand = _evaluate_projection_cv_jax(
             problem, cand_X, params.x0, params.problem_params, params.anchor)
         hard_cand = hard_score(F_cand, CV_cand + CV_proj_cand)
+        if self._kinematic_seed is not None:
+            X_raw = _split_genome(problem, raw_genome)[0]
+            F_raw, CV_raw = _evaluate_population_jax(
+                problem, X_raw, params.x0, params.problem_params, params.anchor)
+            CV_proj_raw = _evaluate_projection_cv_jax(
+                problem, X_raw, params.x0, params.problem_params, params.anchor)
+            hard_raw = hard_score(F_raw, CV_raw + CV_proj_raw)
+            use_raw = hard_raw < hard_cand
+            cand_genome = jnp.where(use_raw[:, None], raw_genome, cand_genome)
+            hard_cand = jnp.minimum(hard_raw, hard_cand)
 
         take_cand = (hard_cand < hard_old[worst])[:, None]
         new_slots = jnp.where(take_cand, cand_genome, state.population[worst])

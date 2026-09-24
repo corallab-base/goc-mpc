@@ -78,14 +78,23 @@ def warm_start_wp(problem, x0):
     falls back to the flattened x0 (agent_depot padded to state_dim), i.e.
     "stay where you already are" rather than the origin.
     """
+    const, from_x0 = warm_start_wp_parts(problem)
+    x0_flat = np.zeros(problem.state_dim)
+    n = min(problem.state_dim, np.asarray(x0).reshape(-1).shape[0])
+    x0_flat[:n] = np.asarray(x0).reshape(-1)[:n]
+    return np.where(from_x0, x0_flat[None, :], const)
+
+
+def warm_start_wp_parts(problem):
+    """`(const, from_x0)`, both `(n_nodes, state_dim)`, with
+    `warm_start_wp(problem, x0) == where(from_x0, x0_flat, const)`: which
+    template entries are x0 fallbacks (propagated or not) and the constant
+    value of the rest -- lets a jitted caller rebuild the template from a
+    traced x0."""
     n_nodes, state_dim = problem.n_nodes, problem.state_dim
     wp = np.zeros((n_nodes, state_dim))
+    from_x0 = np.ones((n_nodes, state_dim), dtype=bool)
     known = np.zeros(n_nodes, dtype=bool)
-
-    x0_flat = np.zeros(state_dim)
-    n = min(state_dim, np.asarray(x0).reshape(-1).shape[0])
-    x0_flat[:n] = np.asarray(x0).reshape(-1)[:n]
-    wp[:] = x0_flat  # fallback for nodes unreachable from any known anchor
 
     for entry in problem.projections:
         if len(entry.node_locals) != 1:
@@ -101,6 +110,7 @@ def warm_start_wp(problem, x0):
         # known without an assignment -- but the node is still marked known.
         if entry.table is not None and entry.owner_var_slot is None:
             wp[node, np.asarray(entry.pinned_cols)] = np.asarray(entry.table)[0]
+            from_x0[node, np.asarray(entry.pinned_cols)] = False
         known[node] = True
 
     u = np.array([e[0] for e in problem.hard_edges], dtype=int)
@@ -116,10 +126,12 @@ def warm_start_wp(problem, x0):
         for a, b in zip(u, v):
             if known[a] and not known[b]:
                 wp[b] = wp[a]
+                from_x0[b] = from_x0[a]
                 known[b] = True
                 changed = True
             elif known[b] and not known[a]:
                 wp[a] = wp[b]
+                from_x0[a] = from_x0[b]
                 known[a] = True
                 changed = True
             elif known[a] and known[b]:
@@ -128,7 +140,7 @@ def warm_start_wp(problem, x0):
         if not changed:
             break
 
-    return wp
+    return wp, from_x0
 
 
 def static_entry_owner(problem, entry):

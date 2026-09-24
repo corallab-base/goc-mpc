@@ -911,6 +911,7 @@ class GraphOrderingRelaxed:
 
         eq_read_cols = list(eq_read_cols) or [None] * len(self._eq_constraints)
         ineq_read_cols = list(ineq_read_cols) or [None] * len(self._ineq_constraints)
+        self.eq_read_cols, self.ineq_read_cols = eq_read_cols, ineq_read_cols
         self.eq_free_mask = _free_mask(eq_widths, eq_read_cols)
         self.ineq_free_mask = _free_mask(ineq_widths, ineq_read_cols)
 
