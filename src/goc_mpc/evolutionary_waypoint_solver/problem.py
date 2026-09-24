@@ -457,8 +457,29 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
     pop = wp.shape[0]
     if x0 is None:
         x0 = jnp.zeros((problem.state_dim,))
+    # A COMMITTED variable's owner is the anchor's, not the GA's raw argmax:
+    # once any instance of that variable has been passed (mpc.py's
+    # _build_anchor), its agent is settled and the search is no longer free to
+    # re-pick it. `apply_anchor` already resolves `assign_eff` this way -- this
+    # is the same resolution for the owner `owner_variable` carries, which is
+    # what an owner_aware projection's `func` switches on (e.g. WHICH arm's
+    # analytic IK runs) and what `read_fn` resolves its reads through.
+    #
+    # It has to be the SAME owner the write below resolves `cols` with: that
+    # one has always honored the commit, so leaving this one on the raw argmax
+    # let a committed variable get a value computed for one agent written into
+    # ANOTHER agent's columns. With two arms mounted 180 degrees apart that is
+    # a silently valid-looking joint config whose FK is exactly 180 degrees
+    # off -- an unsatisfiable full-pose node phi, intermittent because it only
+    # bites when the search's raw argmax disagrees with the anchor.
+    vc = var_committed if var_committed is not None else (
+        anchor.var_committed if anchor is not None else None)
+    vanc = var_anchor if var_anchor is not None else (
+        anchor.var_anchor if anchor is not None else None)
     if problem.n_variables > 0 and assign is not None:
         owner_variable = jnp.argmax(assign, axis=-1)  # (pop, n_variables)
+        if vc is not None:
+            owner_variable = jnp.where(vc[None, :], vanc[None, :], owner_variable)
     else:
         owner_variable = jnp.zeros((pop, problem.n_variables), dtype=jnp.int32)
 
@@ -541,13 +562,10 @@ def apply_projections(problem, wp, psi, proj_branch, params, assign=None, anchor
                     "owner_var_slot is not None) needs apply_projections' own "
                     "`assign` argument to resolve which agent's row to write "
                     "into -- see this function's docstring")
-            owner = jnp.argmax(assign[:, entry.owner_var_slot, :], axis=-1)  # (pop,)
-            vc = var_committed if var_committed is not None else (
-                anchor.var_committed if anchor is not None else None)
-            vanc = var_anchor if var_anchor is not None else (
-                anchor.var_anchor if anchor is not None else None)
-            if vc is not None:
-                owner = jnp.where(vc[entry.owner_var_slot], vanc[entry.owner_var_slot], owner)
+            # The SAME resolved owner `func`/`read_fn` above were handed, not a
+            # second argmax of its own -- see owner_variable's own comment for
+            # what a divergence between the two costs.
+            owner = owner_variable[:, entry.owner_var_slot]  # (pop,)
             cols = jnp.asarray(entry.owner_cols_per_agent)[owner]  # (pop, w) -- per-individual ABSOLUTE cols
             row = wp[:, entry.write_node, :]
             new_row = jax.vmap(lambda r, c, v: r.at[c].set(v))(row, cols, value)
