@@ -342,6 +342,114 @@ def _optax_inner_solve(merit_and_grad_fixed, wp_flat0, optimizer, inner_maxiter)
     return x_final
 
 
+def _lm_inner_solve(residual_fixed, merit_and_grad_fixed, w0, inner_maxiter, lo, hi,
+                    damp0=1.0, damp_min=1e-9, damp_max=1e9):
+    """Levenberg-Marquardt inner solve: a second-order alternative to the
+    first-order `_optax_inner_solve`, using the AL constraint residuals'
+    JACOBIAN rather than only the merit's gradient.
+
+    The merit is not a pure sum of squares -- it is `F(w) + AL penalty`, and
+    `F` (the routing/edge cost, in general a trained network) is no residual --
+    so this is a HYBRID: `J^T J` supplies curvature for the constraint half,
+    while `F` enters through its own gradient alone, as in a damped
+    steepest-descent step. The damping `mu` doubles as `F`'s missing Hessian,
+    which is exactly what makes the accept/reject test below load-bearing
+    rather than cosmetic: the step is only trusted when the TRUE merit
+    improves.
+
+        (J^T J + mu I) delta = -(J^T r + grad F)
+
+    Why this can pay at all: a Jacobian normally costs `min(rows, D)` times a
+    gradient, which would be fatal here. But the residual vector is
+    BLOCK-DIAGONAL across the population -- member `i`'s rows read only
+    `w[i]` -- so a tangent lighting column `j` for every member at once yields
+    column `j` of every member's Jacobian, and all `D` of them vmap into ONE
+    forward pass. Since the residual evaluation is launch-latency bound rather
+    than FLOP bound, that wider batch is nearly free: measured at 1.8x a
+    gradient on the G1 cabinet scene, against a dense-mode ~162x.
+
+    With `R <= D` the normal equations are solved in Woodbury form -- an `R x R`
+    system instead of `D x D`, never forming `J^T J` -- the same choice
+    `kinematic_seed.py` makes for the same reason. That matters more than it
+    looks: the dense `D x D` solve, not the Jacobian, was the dominant cost
+    when this was first measured.
+
+    `merit_and_grad_fixed` is evaluated ONCE per iteration, at the trial point:
+    it returns value and gradient together, so an ACCEPTED trial's gradient is
+    already the next iteration's RHS and is carried forward rather than
+    recomputed. That gradient is the FULL merit's, not `F`'s alone -- and since
+    the merit's AL half is `0.5*||residual_fixed||^2` up to mu/lam-only
+    constants, it already equals `grad F + J^T r`, i.e. the whole right-hand
+    side above. `gnorm` below reads it as the merit gradient norm for the same
+    reason.
+
+    `damp0` starts at 1.0, not at the small value a textbook LM would use,
+    because `D > R` here makes `J^T J` rank-deficient and the merit gradient --
+    unlike `J^T r`, which lies in `J`'s row space -- has a component in that
+    nullspace, where the effective Hessian is `damp * I` alone. A small `damp0`
+    therefore scales that component by `1/damp`, producing a wild first step
+    that is clipped, rejected, and recovered from only after several iterations
+    of growth -- affordable at 150 iterations, not at the 10-20 this exists to
+    run in. Starting damped costs a conservative first step instead, and the
+    accept/reject adaptation finds the scale within a few iterations.
+    """
+    pop, D = w0.shape
+    R = int(jax.eval_shape(residual_fixed, w0).shape[1])
+    if R == 0:
+        raise ValueError(
+            "optimizer='lm' needs constraint residual rows to build a Jacobian from, "
+            "but this problem has none (no equality or inequality constraints reach "
+            "the free columns) -- use the default first-order inner solve instead.")
+    eye_D = jnp.eye(D)
+    eye_R = jnp.eye(R)
+
+    def residual_and_jacobian(w):
+        """`(r, J)` with the primal evaluated once -- see the block-diagonal
+        argument above for why one vmapped pass gives every column."""
+        r, jvp_fn = jax.linearize(residual_fixed, w)
+        tangents = jnp.broadcast_to(eye_D[:, None, :], (D, pop, D))
+        cols = jax.vmap(jvp_fn)(tangents)                       # (D, pop, R)
+        return r, jnp.transpose(cols, (1, 2, 0))                # (pop, R, D)
+
+    def body(carry, _):
+        w, damp, m, gF = carry
+        _r, J = residual_and_jacobian(w)
+        # `gF` is the gradient of the WHOLE merit, and the merit's AL half is
+        # exactly `0.5*||residual_fixed||^2` up to mu/lam-only constants (see
+        # residual_fixed) -- so `gF` already equals `grad F + J^T r` and IS the
+        # RHS above. Adding `J^T r` to it would weight the constraint half
+        # twice against the `J^T J` curvature meant to match it.
+        b = gF
+        if R <= D:
+            # (J^T J + mu I)^-1 b via an R x R solve (Woodbury), so the D x D
+            # matrix is never formed.
+            A = jnp.einsum("bri,bsi->brs", J, J) + damp[:, None, None] * eye_R[None]
+            inner = jnp.linalg.solve(A, jnp.einsum("bri,bi->br", J, b)[:, :, None])[:, :, 0]
+            delta = -(b - jnp.einsum("bri,br->bi", J, inner)) / damp[:, None]
+        else:
+            A = jnp.einsum("bri,brj->bij", J, J) + damp[:, None, None] * eye_D[None]
+            delta = -jnp.linalg.solve(A, b[:, :, None])[:, :, 0]
+
+        w_new = jnp.clip(w + delta, lo, hi)
+        m_new, gF_new = merit_and_grad_fixed(w_new)
+        accept = jnp.isfinite(m_new) & (m_new < m)
+        w = jnp.where(accept[:, None], w_new, w)
+        m = jnp.where(accept, m_new, m)
+        gF = jnp.where(accept[:, None], gF_new, gF)
+        damp = jnp.clip(jnp.where(accept, damp * 0.3, damp * 5.0), damp_min, damp_max)
+        return (w, damp, m, gF), None
+
+    m0, gF0 = merit_and_grad_fixed(w0)
+    damp0_arr = jnp.full((pop,), damp0, dtype=w0.dtype)
+    (w_final, _damp, _m, gF_final), _ = jax.lax.scan(
+        body, (w0, damp0_arr, m0, gF0), xs=None, length=inner_maxiter)
+    # Also the merit gradient norm at the point returned, per member: the
+    # caller's test for "was this augmented subproblem actually SOLVED", which
+    # gates the multiplier update (outer_step). Free here -- `body` already
+    # carries the accepted point's gradient forward.
+    return w_final, jnp.linalg.norm(gF_final, axis=1)
+
+
 class _BBState(NamedTuple):
     prev_w: jax.Array
     prev_g: jax.Array
@@ -489,9 +597,13 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
         that motivated the default). Pass the string `"lbfgs"` to instead
         use `_lbfgs_solve`, the original hand-rolled batched
         L-BFGS+Armijo-backtracking inner solve (`lbfgs_history`/
-        `ls_max_trials` apply only there). Any other
-        `optax.GradientTransformation` (e.g. `optax.adam(...)`) also runs
-        `_optax_inner_solve`.
+        `ls_max_trials` apply only there). Pass `"lm"` for
+        `_lm_inner_solve`, the second-order Levenberg-Marquardt step built
+        on the constraint residuals' Jacobian -- far more expensive per
+        iteration than either first-order option, and worth it only where
+        it converges in correspondingly fewer (see its own docstring). Any
+        other `optax.GradientTransformation` (e.g. `optax.adam(...)`) also
+        runs `_optax_inner_solve`.
 
         `static_cache` (problem.precompute_static_projections) is computed
         ONCE here, before the outer AL loop even starts, since a
@@ -536,6 +648,35 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             return merit_and_grad(w, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
                                    static_cache, node_rank_proj, node_rank_eff, eq_free_mask, ineq_free_mask)
 
+        def residual_fixed(w, mu, lam, rho):
+            """The AL penalty written as a RESIDUAL VECTOR, for `_lm_inner_solve`
+            to take a Jacobian of: `sqrt(rho) * (h + mu/rho)` for the equalities
+            and `sqrt(rho) * relu(g + lam/rho)` for the inequalities, whose
+            squared norm is that penalty up to multiplier-only constants. The
+            same masks the merit applies are applied here, so a row local
+            refinement cannot move contributes no Jacobian column either."""
+            wp_ = scatter_free_wp(problem, w[:, :d_wp], jnp.zeros((pop, n_nodes, state_dim)))
+            wp_ = apply_projections(problem, wp_, w[:, d_wp:], proj_branch, params, assign=assign,
+                                    anchor=anchor, static_cache=static_cache,
+                                    precomputed_rank=node_rank_proj, cond_binary=cond_binary,
+                                    t=t, node_active=_na, x0=x0)
+            assign_eff, wp_f, wp_l = apply_anchor(problem, assign, wp_, anchor, x0)
+            parts = []
+            if eq_fns:
+                h = _eval_residuals_batched(eq_fns, assign_eff, cond_binary, t, wp_f, wp_l,
+                                             _na, x0, params, node_rank=node_rank_eff)
+                rho_eq = rho[:, eq_group_idx]
+                inv_rho_eq = 1.0 / jnp.maximum(rho_eq, 1e-12)
+                parts.append(jnp.sqrt(rho_eq) * (h * eq_free_mask[None, :] + mu * inv_rho_eq))
+            if ineq_fns:
+                g = _eval_residuals_batched(ineq_fns, assign_eff, cond_binary, t, wp_f, wp_l,
+                                             _na, x0, params, node_rank=node_rank_eff)
+                rho_ineq = rho[:, ineq_group_idx]
+                inv_rho_ineq = 1.0 / jnp.maximum(rho_ineq, 1e-12)
+                parts.append(jnp.sqrt(rho_ineq) * jnp.maximum(
+                    0.0, g * ineq_free_mask[None, :] + lam * inv_rho_ineq))
+            return jnp.concatenate(parts, axis=1) if parts else jnp.zeros((pop, 0))
+
         inner_optimizer = barzilai_borwein() if optimizer is None else optimizer
         proj_fn = jit_apply_projections(problem)
 
@@ -555,12 +696,16 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             wp_psi_flat, mu, lam, rho, v_prev = carry
             fixed = lambda w: merit_and_grad_fixed(w, mu, lam, rho)
             # `gnorm` is the merit gradient norm at the inner solve's final
-            # point -- "was this subproblem actually solved". These first-order
-            # solves don't produce one, so they report 0.0, i.e. always
+            # point -- "was this subproblem actually solved". Only the LM path
+            # produces one for free; the others report 0.0, i.e. always
             # converged, which reproduces their existing behaviour exactly.
             if inner_optimizer == "lbfgs":
                 wp_psi_flat = _lbfgs_solve(fixed, wp_psi_flat, lbfgs_history, inner_maxiter, ls_max_trials)
                 gnorm = jnp.zeros(pop)
+            elif inner_optimizer == "lm":
+                wp_psi_flat, gnorm = _lm_inner_solve(
+                    lambda w: residual_fixed(w, mu, lam, rho), fixed, wp_psi_flat,
+                    inner_maxiter, lo, hi)
             else:
                 wp_psi_flat = _optax_inner_solve(fixed, wp_psi_flat, inner_optimizer, inner_maxiter)
                 gnorm = jnp.zeros(pop)
