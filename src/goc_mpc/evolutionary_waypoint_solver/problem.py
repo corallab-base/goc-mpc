@@ -697,6 +697,7 @@ class GraphOrderingRelaxed:
                  eq_constraints=(), ineq_constraints=(), params=None,
                  instance_list=(), var_id_to_slot=None, projections=(),
                  categorical_ne=(), eq_read_cols=(), ineq_read_cols=(),
+                 eq_names=(), ineq_names=(),
                  proj_eq_constraints=(), proj_ineq_constraints=()):
         self.instance_sources = list(instance_sources)
         # Raw (node, (kind, val)) routing-instance pairs and the GA-slot
@@ -912,6 +913,35 @@ class GraphOrderingRelaxed:
         ineq_read_cols = list(ineq_read_cols) or [None] * len(self._ineq_constraints)
         self.eq_free_mask = _free_mask(eq_widths, eq_read_cols)
         self.ineq_free_mask = _free_mask(ineq_widths, ineq_read_cols)
+
+        # Per-residual-ROW constraint GROUP index, so the AL loop can carry one
+        # `rho` per constraint instead of one shared by the whole problem
+        # (solver.py's outer_step). A "group" is one compiled constraint fn --
+        # the same unit `eq_widths` counts and the same one jaxls calls a
+        # constraint instance -- so every row a single add_constraint emitted
+        # shares a penalty, and two unrelated constraints do not.
+        #
+        # Why this matters: with one global `rho`, any row that stays violated
+        # -- including one that may never be satisfiable -- stiffens EVERY
+        # other row, so a well-behaved constraint inherits the conditioning of
+        # the worst-behaved one in the problem.
+        #
+        # Equalities come first, then inequalities, in one shared group
+        # numbering: `rho` is a single `(pop, n_constraint_groups)` array
+        # covering both, and these index its second axis.
+        #: Per-CONSTRAINT diagnostic labels (spec.py's own `phi_<id>` /
+        #: `hold_<...>` names), parallel to the group numbering below. Purely
+        #: for reporting -- naming the group behind a violation is otherwise
+        #: impossible once everything is a flat residual vector.
+        self.eq_names = list(eq_names)
+        self.ineq_names = list(ineq_names)
+        self.eq_group_idx = np.repeat(np.arange(len(eq_widths)), eq_widths).astype(int)
+        self.ineq_group_idx = (
+            np.repeat(np.arange(len(ineq_widths)), ineq_widths) + len(eq_widths)).astype(int)
+        #: Number of independent AL penalty groups. At least 1 even when the
+        #: problem has no constraint rows at all, so `rho` is never 0-width.
+        self.n_constraint_groups = max(1, len(eq_widths) + len(ineq_widths))
+
 
         self.n_assign_vars = self.n_variables * self.n_agents
         self.cond_offset = self.n_assign_vars

@@ -2361,22 +2361,27 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
     # see that class's own docstring/problem.py.
     eq_constraints, ineq_constraints = [], []
     eq_read_cols, ineq_read_cols = [], []
+    eq_names, ineq_names = [], []
     for node, fn, kind, _name in python_constraints:
         if kind not in ("eq", "ineq"):
             raise ValueError(f"Unknown constraint kind {kind!r}, expected 'eq' or 'ineq'")
         batched = _batch_python_constraint_fn(fn, node)
         (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
         (eq_read_cols if kind == "eq" else ineq_read_cols).append(None)
+        (eq_names if kind == "eq" else ineq_names).append(_name)
     for node_locals, fn, kind, mode, _name, read_cols in symbolic_constraints:
         batched = _batch_symbolic_constraint_fn(fn, node_locals, mode=mode)
         (eq_constraints if kind == "eq" else ineq_constraints).append(batched)
         (eq_read_cols if kind == "eq" else ineq_read_cols).append(read_cols)
+        (eq_names if kind == "eq" else ineq_names).append(_name)
     for batched, _name in interior_constraints:
         ineq_constraints.append(batched)
         ineq_read_cols.append(None)
+        ineq_names.append(_name)
     for batched, _name in stationary_constraints:
         ineq_constraints.append(batched)
         ineq_read_cols.append(None)
+        ineq_names.append(_name)
 
     # proj_check_constraints' own compiled batch -- no read_cols tracking
     # needed (unlike eq_constraints/ineq_constraints above): nothing here
@@ -2404,6 +2409,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
         ineq_constraints=ineq_constraints,
         eq_read_cols=eq_read_cols,
         ineq_read_cols=ineq_read_cols,
+        eq_names=eq_names,
+        ineq_names=ineq_names,
         proj_eq_constraints=proj_eq_constraints,
         proj_ineq_constraints=proj_ineq_constraints,
         # Structural shape only (n_params) -- fixes the jitted GA's

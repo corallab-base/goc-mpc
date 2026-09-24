@@ -350,7 +350,7 @@ class SmallContinuousVRPSolver(LamarckianGA):
         n_eq, n_ineq = problem.n_eq_constr, problem.n_ieq_constr
         cand_mu = jnp.zeros((n_evict, n_eq))
         cand_lam = jnp.zeros((n_evict, n_ineq))
-        cand_rho = jnp.full((n_evict,), self._reseed_rho0)
+        cand_rho = jnp.full((n_evict, problem.n_constraint_groups), self._reseed_rho0)
 
         assign, cond_binary, proj_branch, t, wp0, psi0 = problem._extract_batch(cand_X)
         wp_star, psi_star, cand_mu, cand_lam, cand_rho = self.local_refine(

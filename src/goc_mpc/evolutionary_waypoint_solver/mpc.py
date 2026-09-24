@@ -161,7 +161,8 @@ _CARRY_KWARGS = ("rho0", "n_seed_individuals", "seed_jitter_t", "seed_jitter_wp_
 # these under algorithm="lamarckian_al" fails loudly with a plain
 # TypeError from that constructor, rather than silently doing nothing.
 _ALGO_KWARGS = ("tournament_k", "wp_mut_scale", "outer_iters", "inner_maxiter",
-                "rho_growth", "lbfgs_history", "ls_max_trials", "optimizer",
+                "rho_growth", "rho_progress_factor", "al_grad_tol", "rho_group_tol",
+                "lbfgs_history", "ls_max_trials", "optimizer",
                 "n_2opt_trials", "or_opt_prob", "max_or_opt_seg_len",
                 "reseed_frac", "reseed_rho0", "reseed_cv_tol")
 # build_evosax_ga's own top-level annealed-schedule kwargs.

@@ -81,16 +81,21 @@ def _genome_dims(problem):
 
 
 def _split_genome(problem, genome):
+    # `rho` is the trailing problem.n_constraint_groups columns, not one
+    # column: the AL carries one penalty per CONSTRAINT GROUP (see
+    # problem.eq_group_idx), so a group whose violation is shrinking is not
+    # stiffened by some unrelated row that is stuck.
     n_var, n_eq, n_ineq = _genome_dims(problem)
+    n_groups = problem.n_constraint_groups
     X = genome[:, :n_var]
     mu = genome[:, n_var:n_var + n_eq]
     lam = genome[:, n_var + n_eq:n_var + n_eq + n_ineq]
-    rho = genome[:, -1]
+    rho = genome[:, n_var + n_eq + n_ineq:n_var + n_eq + n_ineq + n_groups]
     return X, mu, lam, rho
 
 
 def _join_genome(X, mu, lam, rho):
-    return jnp.concatenate([X, mu, lam, rho[:, None]], axis=1)
+    return jnp.concatenate([X, mu, lam, rho], axis=1)
 
 
 def _genome_bounds(problem, rho_max):
@@ -104,18 +109,19 @@ def _genome_bounds(problem, rho_max):
     before that), rho in (a small positive floor, rho_max] (an AL penalty
     weight must stay strictly positive)."""
     n_var, n_eq, n_ineq = _genome_dims(problem)
+    n_groups = problem.n_constraint_groups
     mu_bound = 1e6
     lo = jnp.concatenate([
         jnp.asarray(problem.xl),
         jnp.full((n_eq,), -mu_bound),
         jnp.zeros((n_ineq,)),
-        jnp.array([1e-8]),
+        jnp.full((n_groups,), 1e-8),
     ])
     hi = jnp.concatenate([
         jnp.asarray(problem.xu),
         jnp.full((n_eq,), mu_bound),
         jnp.full((n_ineq,), mu_bound),
-        jnp.array([rho_max]),
+        jnp.full((n_groups,), rho_max),
     ])
     return lo, hi
 
@@ -157,7 +163,9 @@ def build_evosax_ga(problem, algo_cls, pop_size, n_gen, algo_kwargs=None, algo_p
     """
     algo_kwargs = {} if algo_kwargs is None else algo_kwargs
     n_var, n_eq, n_ineq = _genome_dims(problem)
-    genome_dim = n_var + n_eq + n_ineq + 1
+    # ... + one rho per CONSTRAINT GROUP, not a single shared one -- see
+    # _split_genome and problem.eq_group_idx.
+    genome_dim = n_var + n_eq + n_ineq + problem.n_constraint_groups
     lo, hi = _genome_bounds(problem, rho_max)
 
     algo = algo_cls(population_size=pop_size, solution=jnp.zeros(genome_dim), **algo_kwargs)
@@ -261,7 +269,7 @@ def build_initial_carry_fn(problem, algo, algo_params, pop_size, anchor, x0=None
         X0 = _seed_initial_population(problem, k_seed, X0, n_seed, seed_jitter_t, seed_jitter_wp_frac)
         mu0 = jnp.zeros((pop_size, n_eq))
         lam0 = jnp.zeros((pop_size, n_ineq))
-        rho_arr0 = jnp.full((pop_size,), rho0)
+        rho_arr0 = jnp.full((pop_size, problem.n_constraint_groups), rho0)
         genome0 = _join_genome(X0, mu0, lam0, rho_arr0)
 
         F0, CV0 = _evaluate_population_jax(problem, X0, x0, params, anchor)

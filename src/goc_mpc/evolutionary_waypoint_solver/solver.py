@@ -42,6 +42,7 @@ distinct problem shape, never on the warm-started hot path.
 """
 
 import inspect
+import os
 import time
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -50,6 +51,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
+#: Set GOC_AL_TRACE=1 to have the AL outer loop print, per outer iteration,
+#: population member 0's constraint state: the summed violation `cv_tol` is
+#: judged against, the worst single GROUP's violation, the spread of the
+#: per-group penalties, and the inner solve's final gradient norm. A
+#: diagnostic for "is this row unconverged, or converged to the wrong place",
+#: which the pass/fail of a whole run cannot distinguish.
+_AL_TRACE = bool(int(os.environ.get("GOC_AL_TRACE", "0")))
 
 from .problem import (
     apply_anchor, apply_projections, jit_apply_projections, agent_depot, pad_to_state_dim,
@@ -81,6 +90,11 @@ def _make_merit_batched(problem, wp_shape):
     # 8-arg contract. Decided once here, not per merit call.
     eq_wants_rank = [_accepts_node_rank(fn) for fn in eq_fns]
     ineq_wants_rank = [_accepts_node_rank(fn) for fn in ineq_fns]
+    # `rho` is (pop, n_constraint_groups) -- one penalty per CONSTRAINT, not
+    # one per problem. These gather it out to per-ROW; see
+    # problem.eq_group_idx for why the grouping is per compiled constraint fn.
+    eq_group_idx = jnp.asarray(problem.eq_group_idx)
+    ineq_group_idx = jnp.asarray(problem.ineq_group_idx)
 
     def merit(wp_psi_flat, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
               static_cache=None, node_rank_proj=None, node_rank_eff=None,
@@ -151,7 +165,8 @@ def _make_merit_batched(problem, wp_shape):
             # quadratic penalty for every genuinely optimizable residual too.
             if eq_free_mask is not None:
                 h = h * eq_free_mask[None, :]
-            total = total + jnp.sum(mu * h, axis=1) + 0.5 * rho * jnp.sum(h * h, axis=1)
+            rho_eq = rho[:, eq_group_idx]
+            total = total + jnp.sum(mu * h, axis=1) + 0.5 * jnp.sum(rho_eq * h * h, axis=1)
         if ineq_fns:
             g = jnp.concatenate(
                 [_call_residual(fn, wants, assign_eff, cond_binary, t, wp_eff_frozen, wp_eff_live,
@@ -159,8 +174,9 @@ def _make_merit_batched(problem, wp_shape):
                  for fn, wants in zip(ineq_fns, ineq_wants_rank)], axis=1)
             if ineq_free_mask is not None:  # see eq_free_mask above
                 g = g * ineq_free_mask[None, :]
-            z = jnp.maximum(0.0, lam + rho[:, None] * g)
-            total = total + (jnp.sum(z * z, axis=1) - jnp.sum(lam * lam, axis=1)) / (2.0 * rho)
+            rho_ineq = rho[:, ineq_group_idx]
+            z = jnp.maximum(0.0, lam + rho_ineq * g)
+            total = total + jnp.sum((z * z - lam * lam) / (2.0 * rho_ineq), axis=1)
         return total
 
     def merit_and_grad(wp_psi_flat, assign, cond_binary, proj_branch, t, mu, lam, rho, x0, params, anchor,
@@ -373,7 +389,9 @@ def barzilai_borwein(init_step=1e-2, min_step=1e-6, max_step=1.0, variant="long"
 # ---------------------------------------------------------------------------
 
 def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, rho_max,
-                              lbfgs_history=10, ls_max_trials=10, optimizer=None):
+                              lbfgs_history=10, ls_max_trials=10, optimizer=None,
+                              rho_progress_factor=None, al_grad_tol=None,
+                              rho_group_tol=None):
     n_nodes, state_dim = problem.n_nodes, problem.state_dim
     # wp_psi_flat only ever carries wp's FREE columns (problem.n_wp_free) --
     # see gather_free_wp/scatter_free_wp (problem.py) and _make_merit_
@@ -401,6 +419,17 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
     # batched_local_refine call.
     eq_free_mask = jnp.asarray(problem.eq_free_mask)
     ineq_free_mask = jnp.asarray(problem.ineq_free_mask)
+    # See _make_merit_batched -- `rho` is per CONSTRAINT GROUP, these gather it
+    # per row, and `n_groups` sizes the carry.
+    eq_group_idx = jnp.asarray(problem.eq_group_idx)
+    ineq_group_idx = jnp.asarray(problem.ineq_group_idx)
+    n_eq_groups = len(problem._eq_constraints)
+    n_groups = problem.n_constraint_groups
+    if _AL_TRACE:
+        names = list(problem.eq_names) + list(problem.ineq_names)
+        print("[AL trace] constraint groups (index: name):")
+        for i, nm in enumerate(names):
+            print(f"  {i}: {nm}")
 
     # problem.xl/xu lay the FULL wp block then psi out contiguously
     # (psi_offset == wp_offset + n_nodes*state_dim, n_var == psi_offset +
@@ -523,12 +552,18 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
         # which stays on eager apply_projections + static_cache/
         # precomputed_rank), so it doesn't need those per-call caches.
         def outer_step(carry, _):
-            wp_psi_flat, mu, lam, rho = carry
+            wp_psi_flat, mu, lam, rho, v_prev = carry
             fixed = lambda w: merit_and_grad_fixed(w, mu, lam, rho)
+            # `gnorm` is the merit gradient norm at the inner solve's final
+            # point -- "was this subproblem actually solved". These first-order
+            # solves don't produce one, so they report 0.0, i.e. always
+            # converged, which reproduces their existing behaviour exactly.
             if inner_optimizer == "lbfgs":
                 wp_psi_flat = _lbfgs_solve(fixed, wp_psi_flat, lbfgs_history, inner_maxiter, ls_max_trials)
+                gnorm = jnp.zeros(pop)
             else:
                 wp_psi_flat = _optax_inner_solve(fixed, wp_psi_flat, inner_optimizer, inner_maxiter)
+                gnorm = jnp.zeros(pop)
             wp_psi_flat = jnp.clip(wp_psi_flat, lo, hi)
 
             wp_free = wp_psi_flat[:, :d_wp]
@@ -545,15 +580,77 @@ def make_batched_local_refine(problem, outer_iters, inner_maxiter, rho_growth, r
             g1 = g1 * ineq_free_mask[None, :]
             v1 = _calc_cv_jax(pop, g1, h1)
 
+            # Per-GROUP violation (max-norm over that constraint's own rows),
+            # used ONLY for the progress test below. The absolute growth gate
+            # stays `v1 > cv_tol` -- the summed measure `cv_tol` was actually
+            # calibrated against, see this function's own docstring for why
+            # that yardstick must remain absolute.
+            v_group = jnp.zeros((pop, n_groups))
             if eq_fns:
-                mu = mu + rho[:, None] * h1
+                v_group = v_group.at[:, eq_group_idx].max(jnp.abs(h1))
             if ineq_fns:
-                lam = jnp.maximum(0.0, lam + rho[:, None] * g1)
-            rho = jnp.where(v1 <= cv_tol, rho, jnp.minimum(rho * rho_growth, rho_max))
-            return (wp_psi_flat, mu, lam, rho), None
+                v_group = v_group.at[:, ineq_group_idx].max(jnp.maximum(0.0, g1))
 
-        (wp_psi_flat, mu, lam, rho), _ = jax.lax.scan(
-            outer_step, (wp_psi_flat, mu, lam, rho), xs=None, length=outer_iters)
+            # Progress test: a group that is SHRINKING its own violation fast
+            # enough is left alone even while the problem as a whole is still
+            # infeasible. `rho_progress_factor=None` disables it, restoring the
+            # old "grow every group whenever anything is violated" rule
+            # exactly. This only ever REDUCES growth relative to that rule, so
+            # it cannot revive the failure mode the docstring warns about (a
+            # self-relative bar that lets rho stall while the absolute gap
+            # stands still) -- the absolute gate still has to pass first.
+            # The absolute gate. Global by default -- `v1 > cv_tol`, the
+            # summed measure `cv_tol` is calibrated against -- which
+            # broadcasts the SAME verdict to every group and so keeps every
+            # per-group `rho` locked together, reproducing the old single
+            # shared penalty exactly.
+            #
+            # `rho_group_tol` makes it per GROUP instead: a group grows only
+            # while IT is violated, by its own absolute satisfaction test
+            # (`_calc_cv_jax`'s `eq_eps` is the natural scale). This is what
+            # actually cashes in the per-constraint `rho` -- without it the
+            # split is structural only. Still an ABSOLUTE, fixed threshold,
+            # so it does not revive the moving-bar failure this function's
+            # docstring warns about; only the relative test below can do that.
+            if rho_group_tol is None:
+                grow = jnp.broadcast_to((v1 > cv_tol)[:, None], v_group.shape)
+            else:
+                grow = v_group > rho_group_tol
+            if rho_progress_factor is not None:
+                grow = grow & (v_group > rho_progress_factor * v_prev)
+            rho_next = jnp.where(grow, jnp.minimum(rho * rho_growth, rho_max), rho)
+
+            # Only advance the multipliers when the inner solve actually SOLVED
+            # this subproblem. Updating `mu`/`rho` off an unconverged iterate
+            # is what makes a fixed inner budget starve: each outer iteration
+            # hands the next a stiffer problem it had no chance to track.
+            # Skipping instead spends the next outer iteration's inner budget
+            # at the SAME mu/rho, continuing from the improved point.
+            # `al_grad_tol=None` means always update -- the old behaviour.
+            solved = (jnp.ones(pop, dtype=bool) if al_grad_tol is None
+                      else gnorm <= al_grad_tol)
+            upd = solved[:, None]
+            if eq_fns:
+                mu = jnp.where(upd, mu + rho[:, eq_group_idx] * h1, mu)
+            if ineq_fns:
+                lam = jnp.where(
+                    upd, jnp.maximum(0.0, lam + rho[:, ineq_group_idx] * g1), lam)
+            rho = jnp.where(upd, rho_next, rho)
+            v_prev = jnp.where(upd, v_group, v_prev)
+            if _AL_TRACE:
+                jax.debug.print(
+                    "AL outer  cv_sum={v:.6f}  worst_group[{gi}]={wg:.6f}  "
+                    "rho[min/max]={rlo:.3g}/{rhi:.3g}  |grad|={g:.4g}  solved={s}",
+                    v=v1[0], gi=jnp.argmax(v_group[0]), wg=jnp.max(v_group[0]),
+                    rlo=jnp.min(rho[0]), rhi=jnp.max(rho[0]), g=gnorm[0], s=solved[0])
+            return (wp_psi_flat, mu, lam, rho, v_prev), None
+
+        # v_prev starts at 0 so the first outer iteration's progress test can
+        # never pass -- with no history there is no progress to have made, and
+        # that reproduces the old rule on iteration one.
+        (wp_psi_flat, mu, lam, rho, _v_prev), _ = jax.lax.scan(
+            outer_step, (wp_psi_flat, mu, lam, rho, jnp.zeros((pop, n_groups))),
+            xs=None, length=outer_iters)
 
         wp_final = scatter_free_wp(problem, wp_psi_flat[:, :d_wp], jnp.zeros((pop, n_nodes, state_dim)))
         psi_final = wp_psi_flat[:, d_wp:]
@@ -1072,7 +1169,8 @@ def _carry_from_population(problem, key, X, pop_size, x0, params, anchor, mu=Non
         n_eq, n_ineq = problem.n_eq_constr, problem.n_ieq_constr
         mu = jnp.zeros((pop_size, n_eq)) if mu is None else mu
         lam = jnp.zeros((pop_size, n_ineq)) if lam is None else lam
-        rho = jnp.full((pop_size,), rho0) if rho is None else rho
+        rho = (jnp.full((pop_size, problem.n_constraint_groups), rho0)
+               if rho is None else rho)
 
     F0, CV0 = _evaluate_population_jax(problem, X, x0, params, anchor)
 
@@ -1177,6 +1275,7 @@ def build_initial_carry_fn(problem, pop_size, anchor, rho0=1.0,
 
 def build_lamarckian_ga(problem, pop_size, n_gen, outer_iters=1, inner_maxiter=20,
                          rho_growth=10.0, rho_max=1e6,
+                         rho_progress_factor=None, al_grad_tol=None, rho_group_tol=None,
                          mut_sigma=0.1, cx_prob=0.9,
                          lbfgs_history=10, ls_max_trials=10, tournament_k=2,
                          w=None, cv_tol=None, w_frac=1.0, cv_tol_frac=0.05,
@@ -1224,6 +1323,8 @@ def build_lamarckian_ga(problem, pop_size, n_gen, outer_iters=1, inner_maxiter=2
     local_refine = make_batched_local_refine(
         problem, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
         rho_growth=rho_growth, rho_max=rho_max,
+        rho_progress_factor=rho_progress_factor, al_grad_tol=al_grad_tol,
+        rho_group_tol=rho_group_tol,
         lbfgs_history=lbfgs_history, ls_max_trials=ls_max_trials, optimizer=optimizer)
 
     def step(carry_in, x0, params, anchor):
@@ -1262,6 +1363,7 @@ class Result:
 def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
                        outer_iters=1, inner_maxiter=20,
                        rho0=1.0, rho_growth=10.0, rho_max=1e6,
+                       rho_progress_factor=None, al_grad_tol=None, rho_group_tol=None,
                        mut_sigma=0.1, cx_prob=0.9,
                        lbfgs_history=10, ls_max_trials=10,
                        w=None, cv_tol=None, w_frac=1.0, cv_tol_frac=0.05,
@@ -1291,6 +1393,7 @@ def run_lamarckian_al(problem, anchor, pop_size=30, n_gen=60, seed=1,
     params_arr = jnp.asarray(params) if params is not None else jnp.asarray(problem.params)
     ga_fn = _ga_fn if _ga_fn is not None else build_lamarckian_ga(
         problem, pop_size, n_gen, outer_iters=outer_iters, inner_maxiter=inner_maxiter,
+        rho_progress_factor=rho_progress_factor, al_grad_tol=al_grad_tol,
         rho_growth=rho_growth, rho_max=rho_max,
         mut_sigma=mut_sigma, cx_prob=cx_prob,
         lbfgs_history=lbfgs_history, ls_max_trials=ls_max_trials,
