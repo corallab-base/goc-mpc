@@ -142,6 +142,50 @@ def _object_slot_width(object_widths):
     return max(object_widths) if object_widths else 0
 
 
+def padded_column_bounds(graph, default_bound, per_agent=None, per_object=None):
+    """A `(lo, hi)` pair of `(state_dim,)` per-column waypoint bounds, laid
+    out in this module's PADDED-SLOT row convention (`_slot_width`), ready to
+    hand to `EvolutionaryWaypointSolver(wp_bounds=...)`.
+
+    Every column starts at `+-default_bound`. `per_agent` maps an agent index
+    to an `(agent_width, 2)` `[lo, hi]` array for THAT agent's own columns,
+    and `per_object` does the same for objects; either may be omitted. A
+    slot's PADDING columns -- the ones past an agent's real width, which
+    exist only so every slot is the same stride -- keep the default, since
+    nothing reads them.
+
+    This lives here, beside the layout helpers, so a caller that knows what
+    its columns MEAN (a scene knows its robots' joint limits) does not also
+    have to know where padding puts them. Bounding a column here is strictly
+    stronger than constraining it: the search clips to these at every
+    iterate, so they cannot be traded off the way a penalty row can."""
+    agent_widths = _agent_widths(graph)
+    slot_width = _slot_width(agent_widths)
+    object_widths = _object_widths(graph)
+    object_slot_width = _object_slot_width(object_widths)
+    agents_width = len(agent_widths) * slot_width
+    state_dim = agents_width + len(object_widths) * object_slot_width
+
+    lo = np.full(state_dim, -float(default_bound))
+    hi = np.full(state_dim, float(default_bound))
+
+    for name, widths, col0_of, table in (
+            ("agent", agent_widths, lambda k: k * slot_width, per_agent or {}),
+            ("object", object_widths,
+             lambda k: agents_width + k * object_slot_width, per_object or {})):
+        for index, bounds in dict(table).items():
+            width = widths[index]
+            bounds = np.asarray(bounds, dtype=float)
+            if bounds.shape != (width, 2):
+                raise ValueError(
+                    f"per_{name}[{index}] must have shape ({width}, 2) to match "
+                    f"that {name}'s own declared config width, got {bounds.shape}")
+            col0 = col0_of(index)
+            lo[col0:col0 + width] = bounds[:, 0]
+            hi[col0:col0 + width] = bounds[:, 1]
+    return lo, hi
+
+
 def _unsupported_placeholder(var):
     raise ValueError(
         f"Symbolic constraint references placeholder variable {var!r} that "

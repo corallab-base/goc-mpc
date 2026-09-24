@@ -587,6 +587,49 @@ def _infer_constraint_size(fn, n_variables, n_agents, n_nodes, state_dim, n_cond
     return out_shape.shape[1]
 
 
+def resolve_wp_bounds(wp_bounds, state_dim):
+    """`wp_bounds` as an explicit per-column `(lo, hi)` pair of `(state_dim,)`
+    arrays.
+
+    Each half is either a SCALAR -- one box shared by every waypoint column,
+    the original and still the default meaning -- or a `(state_dim,)` array
+    giving each column its own bound.
+
+    The per-column form is what lets a genuinely BOXED quantity, a robot's
+    joint limits above all, be enforced by the search itself instead of by a
+    penalty. Every inner solve already clips to these bounds (solver.py's
+    `_lm_inner_solve` and the `jnp.clip` after it, the GA's own mutation
+    clipping, and `_seed_population`'s sampling), so a limit expressed here
+    holds by CONSTRUCTION at every iterate. The same limit written as an
+    inequality residual is only ever one term the augmented Lagrangian trades
+    off against the others, which is exactly how a G1 grasp solve ends up
+    0.1 rad outside its own arm limits.
+
+    Bounds are per COLUMN, not per `(node, column)`: a joint limit is a
+    property of the robot, not of where the node sits in the plan.
+    """
+    resolved = []
+    for name, value in zip(("lower", "upper"), wp_bounds):
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim == 0:
+            arr = np.full(state_dim, float(arr))
+        elif arr.shape != (state_dim,):
+            raise ValueError(
+                f"wp_bounds' {name} half must be a scalar or a (state_dim,) = "
+                f"({state_dim},) array of per-column bounds, got shape {arr.shape}")
+        resolved.append(arr)
+    lo, hi = resolved
+    # Loud, not clamped: a crossed bound means the caller's column layout and
+    # the solver's disagree, and silently repairing it would hand the search a
+    # box that is not the one the caller meant.
+    bad = np.nonzero(~(lo <= hi))[0]
+    if bad.size:
+        raise ValueError(
+            f"wp_bounds is empty or NaN at column(s) {bad.tolist()}: lower "
+            f"{lo[bad].tolist()} is not <= upper {hi[bad].tolist()}")
+    return lo, hi
+
+
 class GraphOrderingRelaxed:
     def __init__(self, instance_sources, n_variables, ordering_edges, x0, wp_bounds,
                  instance_node, n_nodes, state_dim,
@@ -819,9 +862,9 @@ class GraphOrderingRelaxed:
 
         xl = np.zeros(n_var)
         xu = np.ones(n_var)
-        wp_lo, wp_hi = wp_bounds
-        xl[self.wp_offset:self.psi_offset] = wp_lo
-        xu[self.wp_offset:self.psi_offset] = wp_hi
+        wp_lo, wp_hi = resolve_wp_bounds(wp_bounds, self.state_dim)
+        xl[self.wp_offset:self.psi_offset] = np.tile(wp_lo, self.n_nodes)
+        xu[self.wp_offset:self.psi_offset] = np.tile(wp_hi, self.n_nodes)
         xl[self.t_offset:self.wp_offset] = 0.0
         xu[self.t_offset:self.wp_offset] = float(self.n_nodes - 1)
         # proj_branch (branch_offset:t_offset) keeps the [0, 1] default,

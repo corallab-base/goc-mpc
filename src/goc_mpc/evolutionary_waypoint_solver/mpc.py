@@ -218,6 +218,10 @@ class EvolutionaryWaypointSolver:
         # them (one entry per graph agent) for per-agent obstacle costs --
         # see kernel.make_graph_kernel's docstring.
         self._edge_cost_fn = edge_cost_fn
+        # `(lo, hi)`, each a scalar (one box for every waypoint column) or a
+        # `(state_dim,)` array of PER-COLUMN bounds -- see
+        # problem.resolve_wp_bounds. Per-column is how a robot's joint limits
+        # get enforced by construction rather than by an AL penalty.
         self._wp_bounds = wp_bounds
         self._pop_size = pop_size
         self._n_gen = n_gen
