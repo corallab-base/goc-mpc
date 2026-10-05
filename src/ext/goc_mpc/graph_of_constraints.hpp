@@ -521,6 +521,30 @@ struct GraphOfConstraints {
 	std::map<int, py::object> phi_to_projection;
 	std::map<int, py::object> edge_phi_to_projection;
 
+	// Node phi id -> the runtime parameter (add_param id) that ACTIVATES it
+	// (add_constraint(..., active_param=...)). A phi with an entry is active
+	// while that parameter reads > 0.5; one without is always active. An
+	// inactive phi constrains nothing (the evolutionary solver scales its
+	// residual rows by the parameter) and blocks its node from being passed
+	// (GraphOfConstraintsMPC._check_progression) -- so a node whose phis are
+	// switched on over time is solved against its active subset, warm-started
+	// from what the earlier subset produced, and only completes once every
+	// phi is active and satisfied. Populated by the add_constraint pybind
+	// wrapper, like phi_to_projection above.
+	std::map<int, int> phi_to_active_param;
+	bool is_phi_active(int phi_id) const {
+		auto it = phi_to_active_param.find(phi_id);
+		return it == phi_to_active_param.end() || _param_values(it->second) > 0.5;
+	}
+	void set_phi_active(int phi_id, bool active) {
+		auto it = phi_to_active_param.find(phi_id);
+		if (it == phi_to_active_param.end())
+			throw std::invalid_argument(
+				"set_phi_active: phi " + std::to_string(phi_id) +
+				" was not declared with active_param= and is always active");
+		_param_values(it->second) = active ? 1.0 : 0.0;
+	}
+
 	// Node phi ids the caller flagged as NOT implying the referenced agent
 	// must route through / be assigned to the node
 	// (add_constraint(..., routes=false)) -- a global validity bound, e.g. a

@@ -954,6 +954,16 @@ def _make_row_resolver(graph, var_id_to_slot, agent_widths, slot_width,
 _decode_rank_batched = decode_rank_batched
 
 
+def _scale_by_param(fn, idx):
+    """A compiled residual `fn(*rows, owner_variable, params) -> (k,)` scaled
+    by `params[idx]` -- a phi's activation parameter (GraphOfConstraints.
+    phi_to_active_param): 0 makes every row vanish, 1 leaves them unchanged,
+    and `set_param` between solves switches it without a retrace."""
+    def scaled(*args, fn=fn, idx=idx):
+        return fn(*args) * args[-1][idx]
+    return scaled
+
+
 def _batch_symbolic_constraint_fn(fn, node_locals, mode="frozen"):
     """Wraps a compiled symbolic-constraint residual fn(*rows, owner_variable,
     params) -> (k,) into the batched (assign, cond_binary, t, wp_frozen,
@@ -1498,6 +1508,9 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
     link_pos_map = _make_link_pos_map(graph)
     link_rot_map = _make_link_rot_map(graph)
     param_map = _build_param_map(graph)
+    # node phi id -> activation param index (add_constraint(..., active_param=)):
+    # such a phi's rows are scaled by that param, and its proj= gated by it.
+    phi_active_param = dict(graph.phi_to_active_param_map)
     # var_agent_link_pos/_rot(var, link_name) counterparts of link_pos_map/
     # link_rot_map above -- see _make_var_link_pos_map's own docstring.
     # var_id_to_slot is already available in this scope (build_graph_
@@ -1700,6 +1713,10 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                         f"proj for phi {phi_id}: gate_param must be a graph.param(id) "
                         "placeholder")
                 gate_param_idx = param_map[gid]
+            elif len(node_locals) == 1 and phi_id in phi_active_param:
+                # An activatable phi's substitution switches with the phi
+                # itself unless the proj names its own gate.
+                gate_param_idx = phi_active_param[phi_id]
 
             table = None
             func = proj.func
@@ -1842,6 +1859,8 @@ def build_graph_ordering_problem(graph, x0, wp_bounds,
                 # why. Raise immediately instead, same as any other
                 # constraint here.
                 fn, kind = compile_relational_formula(formula, resolver)
+                if phi_id in phi_active_param:
+                    fn = _scale_by_param(fn, phi_active_param[phi_id])
                 read_cols = _free_var_read_cols(
                     {v.get_id() for v in formula.GetFreeVariables()}, node_locals,
                     static_map, link_pos_map, link_rot_map, agent_widths, slot_width,

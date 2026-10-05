@@ -178,6 +178,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// actually passed proj=; absent entries mean "no projection,
 		// compile the formula as an ordinary residual" everywhere.
 		.def_readonly("phi_to_projection_map", &GraphOfConstraints::phi_to_projection)
+		// Activation parameter per node phi id (add_constraint's
+		// active_param= kwarg) -- see GraphOfConstraints::phi_to_active_param.
+		.def_readonly("phi_to_active_param_map", &GraphOfConstraints::phi_to_active_param)
+		.def("is_phi_active", &GraphOfConstraints::is_phi_active, py::arg("phi_id"))
+		.def("set_phi_active", &GraphOfConstraints::set_phi_active,
+		     py::arg("phi_id"), py::arg("active"))
 		.def_readonly("edge_phi_to_projection_map", &GraphOfConstraints::edge_phi_to_projection)
 		// Which compiled form each edge_phi_to_formula_map entry is: True
 		// for an "along the edge" formula (plain agent_q/object_q/
@@ -349,8 +355,11 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// validity bound -- e.g. a joint-limit box stamped on every node);
 		// get_agent_paths then won't treat it as agent-node ownership. See
 		// GraphOfConstraints::_phi_routing_exempt.
+		// active_param: an add_param id that switches this phi on (> 0.5) and
+		// off at runtime -- see GraphOfConstraints::phi_to_active_param.
 		.def("add_constraint", [](GraphOfConstraints& self, int node,
-		                          py::object formula_obj, py::object proj, bool routes) -> int {
+		                          py::object formula_obj, py::object proj, bool routes,
+		                          py::object active_param) -> int {
 			drake::symbolic::Formula f;
 			try {
 				f = py::cast<drake::symbolic::Formula>(formula_obj);
@@ -362,12 +371,20 @@ void init_submodule_goc_mpc(py::module_& m) {
 					else        f = f && fh;
 				}
 			}
+			if (!active_param.is_none()) {
+				const int pid = py::cast<int>(active_param);
+				if (pid < 0 || pid >= self.num_params())
+					throw std::invalid_argument("add_constraint: active_param " +
+						std::to_string(pid) + " is not an add_param id");
+			}
 			int phi_id = self.add_constraint(node, f);
 			if (!proj.is_none()) self.phi_to_projection[phi_id] = proj;
 			if (!routes) self._phi_routing_exempt.insert(phi_id);
+			if (!active_param.is_none())
+				self.phi_to_active_param[phi_id] = py::cast<int>(active_param);
 			return phi_id;
 		}, py::arg("node"), py::arg("formula"), py::arg("proj") = py::none(),
-		   py::arg("routes") = true)
+		   py::arg("routes") = true, py::arg("active_param") = py::none())
 		.def("add_edge_constraint", [](GraphOfConstraints& self, int u, int v,
 					       py::object formula_obj, bool live, py::object proj) -> int {
 			drake::symbolic::Formula f;
