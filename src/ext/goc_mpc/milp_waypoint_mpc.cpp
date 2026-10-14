@@ -1111,6 +1111,93 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		cond_binary_vars.push_back(prog.NewBinaryVariables(1, "bv_" + std::to_string(i))(0));
 	}
 
+	// Which agents and roles each task node references (Constraint 8 below
+	// turns these into visits): a node references a role/agent through its
+	// own symbolic constraints, an edge constraint at either endpoint (u_/v_
+	// placeholders at their own endpoint, plain ones at both), or a hold's
+	// endpoints. required_at: agents that must visit the node.
+	std::vector<std::set<int>> roles_at(n_V), required_at(n_V);
+	auto add_refs = [&](int node, const drake::symbolic::Variables& free_vars,
+			    const PlaceholderVarFamily<int>& var_family,
+			    const PlaceholderVarFamily<int>& agent_family) {
+		const int sg = subgraph.subgraph_id(node);
+		if (sg < 0) return;
+		for (int var : var_family.KeysReferencedBy(free_vars)) roles_at[sg].insert(var);
+		for (int ag : agent_family.KeysReferencedBy(free_vars)) required_at[sg].insert(ag);
+	};
+
+	for (const auto& [phi_id, rec] : subgraph.get_subgraph_symbolic_ops()) {
+		if (graph->_phi_routing_exempt.count(phi_id)) continue;
+		const auto free_vars = rec.formula.GetFreeVariables();
+		add_refs(rec.node, free_vars, graph->_var_agent_q, graph->_agent_q);
+		const int sg = subgraph.subgraph_id(rec.node);
+		if (sg < 0) continue;
+		for (const auto& key : graph->_var_agent_link_pos.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
+		for (const auto& key : graph->_var_agent_link_rot.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
+		for (const auto& key : graph->_agent_link_pos.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
+		for (const auto& key : graph->_agent_link_rot.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
+		if (graph->_phi_to_static_assignment_map.contains(phi_id))
+			required_at[sg].insert(graph->_phi_to_static_assignment_map.at(phi_id));
+	}
+	for (const auto& [edge_phi_id, rec] : subgraph.get_subgraph_symbolic_edge_ops()) {
+		const auto free_vars = rec.formula.GetFreeVariables();
+		for (int node : {rec.u_node, rec.v_node})
+			add_refs(node, free_vars, graph->_var_agent_q, graph->_agent_q);
+		add_refs(rec.u_node, free_vars, graph->_var_agent_q_u, graph->_agent_q_u);
+		add_refs(rec.v_node, free_vars, graph->_var_agent_q_v, graph->_agent_q_v);
+	}
+	for (const auto& [hold_id, hold] : subgraph.get_subgraph_hold_ops()) {
+		for (int node : {hold.u_node, hold.v_node}) {
+			const int sg = subgraph.subgraph_id(node);
+			if (sg < 0) continue;
+			if (hold.robot_ag.has_value()) required_at[sg].insert(*hold.robot_ag);
+			else roles_at[sg].insert(*hold.var_id);
+		}
+	}
+
+	// Arc pruning: arcs no optimal route needs, given the hard orderings
+	// (structure edges, Constraint 10). before[u][v]: u must come no later
+	// than v (transitive closure over the remaining task nodes). Agent j's
+	// arc a -> b is pruned if
+	//   - b must come before a, or
+	//   - some node c that j must visit has to come between them (a before
+	//     c before b; the depot comes before, and the sink after, everything).
+	// Sound: with the orderings non-strict (t(u) <= t(v)), a route can only
+	// take such an arc at equal times, over zero-length arcs (Constraint 9),
+	// i.e. between waypoints equal in every distance-measured block; visiting
+	// those in the ordered sequence instead costs the same. Pruned arcs keep
+	// Z = 0 and e = 0, and get no distance (Constraint 2) or time
+	// propagation (Constraint 9) rows. For a chain visited by one agent only
+	// the n+1 consecutive arcs remain, instead of ~n^2 binaries with big-M
+	// rows that the solver would branch over.
+	std::vector<std::vector<bool>> before(n_V, std::vector<bool>(n_V, false));
+	for (const auto& edge : subgraph.structure.edges()) {
+		const int sg_u = subgraph.subgraph_id(edge.u);
+		const int sg_v = subgraph.subgraph_id(edge.e->to);
+		if (sg_u >= 0 && sg_v >= 0 && sg_u != sg_v) before[sg_u][sg_v] = true;
+	}
+	for (int k = 0; k < n_V; ++k)
+		for (int u = 0; u < n_V; ++u)
+			if (before[u][k])
+				for (int v = 0; v < n_V; ++v)
+					if (before[k][v]) before[u][v] = true;
+	// Routing indices: depot before everything, sink after everything
+	auto precedes = [&](int a, int b) -> bool {
+		if (a == depot_idx || b == sink_idx) return a != b;
+		if (a == sink_idx || b == depot_idx) return false;
+		return before[a - 1][b - 1];
+	};
+	auto arc_allowed = [&](int j, int a, int b) -> bool {
+		if (a != depot_idx && a != sink_idx && b != depot_idx && b != sink_idx && precedes(b, a))
+			return false;
+		for (int sg_c = 0; sg_c < n_V; ++sg_c) {
+			const int c = ri(sg_c);
+			if (c != a && c != b && required_at[sg_c].contains(j) && precedes(a, c) && precedes(c, b))
+				return false;
+		}
+		return true;
+	};
+
 	///////////////////////////////////////////////////////////////////////
         //                             Constraints                           //
         ///////////////////////////////////////////////////////////////////////
@@ -1167,6 +1254,15 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 			for (int b = 0; b < n_N; ++b) {
 				// Skip self loops
 				if (a == b) continue;
+
+				// Pruned arcs (see arc_allowed above): unused, no cost
+				if (!arc_allowed(j, a, b)) {
+					prog.AddBoundingBoxConstraint(0.0, 0.0, Z_var(z_idx_fn(j, a, b)));
+					prog.AddLinearEqualityConstraint(
+						Eigen::RowVectorXd::Ones(1), 0.0,
+						e_var.segment(e_idx_fn(j, a, b), 1));
+					continue;
+				}
 
 				// Constraint 3: arcs touching sink carry no cost
 				if (a == sink_idx || b == sink_idx) {
@@ -1251,49 +1347,8 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	// node, and every role goes to exactly one agent:
 	//   required:  inflow(k,v) = 1,  Σ_{r at v} A(r,k) ≤ 1
 	//   otherwise: inflow(k,v) = Σ_{r at v} A(r,k) ≤ 1  (0 at a node with no roles)
-	// A node references a role/agent through its own symbolic constraints,
-	// an edge constraint at either endpoint (u_/v_ placeholders at their own
-	// endpoint, plain ones at both), or a hold's endpoints.
+	// (roles_at / required_at: computed above, before the arc pruning.)
 	{
-		std::vector<std::set<int>> roles_at(n_V), required_at(n_V);
-		auto add_refs = [&](int node, const drake::symbolic::Variables& free_vars,
-				    const PlaceholderVarFamily<int>& var_family,
-				    const PlaceholderVarFamily<int>& agent_family) {
-			const int sg = subgraph.subgraph_id(node);
-			if (sg < 0) return;
-			for (int var : var_family.KeysReferencedBy(free_vars)) roles_at[sg].insert(var);
-			for (int ag : agent_family.KeysReferencedBy(free_vars)) required_at[sg].insert(ag);
-		};
-
-		for (const auto& [phi_id, rec] : subgraph.get_subgraph_symbolic_ops()) {
-			if (graph->_phi_routing_exempt.count(phi_id)) continue;
-			const auto free_vars = rec.formula.GetFreeVariables();
-			add_refs(rec.node, free_vars, graph->_var_agent_q, graph->_agent_q);
-			const int sg = subgraph.subgraph_id(rec.node);
-			if (sg < 0) continue;
-			for (const auto& key : graph->_var_agent_link_pos.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
-			for (const auto& key : graph->_var_agent_link_rot.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
-			for (const auto& key : graph->_agent_link_pos.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
-			for (const auto& key : graph->_agent_link_rot.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
-			if (graph->_phi_to_static_assignment_map.contains(phi_id))
-				required_at[sg].insert(graph->_phi_to_static_assignment_map.at(phi_id));
-		}
-		for (const auto& [edge_phi_id, rec] : subgraph.get_subgraph_symbolic_edge_ops()) {
-			const auto free_vars = rec.formula.GetFreeVariables();
-			for (int node : {rec.u_node, rec.v_node})
-				add_refs(node, free_vars, graph->_var_agent_q, graph->_agent_q);
-			add_refs(rec.u_node, free_vars, graph->_var_agent_q_u, graph->_agent_q_u);
-			add_refs(rec.v_node, free_vars, graph->_var_agent_q_v, graph->_agent_q_v);
-		}
-		for (const auto& [hold_id, hold] : subgraph.get_subgraph_hold_ops()) {
-			for (int node : {hold.u_node, hold.v_node}) {
-				const int sg = subgraph.subgraph_id(node);
-				if (sg < 0) continue;
-				if (hold.robot_ag.has_value()) required_at[sg].insert(*hold.robot_ag);
-				else roles_at[sg].insert(*hold.var_id);
-			}
-		}
-
 		for (int var_k = 0; var_k < subgraph.num_variables(); ++var_k) {
 			Expression sum_A;
 			for (int k = 0; k < num_agents; ++k) sum_A += Expression(Assignments(var_k, k));
@@ -1350,7 +1405,7 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	for (int j = 0; j < num_agents; ++j) {
 		for (int a = 0; a <= n_V; ++a) {   // a ∈ {depot=0} ∪ task routing indices
 			for (int b = 1; b <= sink_idx; ++b) {  // b ∈ task nodes ∪ {sink}
-				if (a == b) continue;
+				if (a == b || !arc_allowed(j, a, b)) continue;
 				// t[b] - t[a] - e[j,a,b] + M_time*(1-Z[j,a,b]) ≥ 0
 				prog.AddLinearConstraint(
 					Expression(t_var(b)) - Expression(t_var(a))
