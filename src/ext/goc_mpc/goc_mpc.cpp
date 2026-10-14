@@ -319,6 +319,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// SYMBOLIC UNIFIED CONSTRAINT API ////////////////////////////
 		.def("object_q", &GraphOfConstraints::object_q, py::arg("object_q"))
 		.def("agent_q", &GraphOfConstraints::agent_q, py::arg("agent_q"))
+		// An agent's velocity at a node (tangent space) -- add_constraint
+		// on it constrains the timing solve's knot velocity there (see
+		// GraphOfConstraints::add_velocity_constraint).
+		.def("agent_v", &GraphOfConstraints::agent_v, py::arg("agent_id"))
 		.def("var_agent_q", &GraphOfConstraints::var_agent_q, py::arg("var"))
 		// Runtime-editable scalar parameters -- see GraphOfConstraints::_param's
 		// doc comment. add_param declares one (returning its id); param(id)
@@ -377,7 +381,13 @@ void init_submodule_goc_mpc(py::module_& m) {
 					throw std::invalid_argument("add_constraint: active_param " +
 						std::to_string(pid) + " is not an add_param id");
 			}
+			// A velocity constraint (agent_v) isn't a phi, so none of the phi
+			// options apply -- add_constraint returns its velocity_ops id.
+			const bool velocity = self._agent_v.ReferencesAny(f.GetFreeVariables());
+			if (velocity && (!proj.is_none() || !routes || !active_param.is_none()))
+				throw std::invalid_argument("add_constraint: proj/routes/active_param don't apply to agent_v (velocity) constraints");
 			int phi_id = self.add_constraint(node, f);
+			if (velocity) return phi_id;
 			if (!proj.is_none()) self.phi_to_projection[phi_id] = proj;
 			if (!routes) self._phi_routing_exempt.insert(phi_id);
 			if (!active_param.is_none())

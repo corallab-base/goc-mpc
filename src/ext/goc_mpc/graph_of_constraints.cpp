@@ -2,7 +2,11 @@
 #include "symbolic_constraint_compiler.hpp"
 #include "../utils.hpp"
 
+#include <drake/common/symbolic/decompose.h>
+
 #include <algorithm>
+#include <limits>
+#include <unordered_map>
 #include <numeric>
 #include <map>
 #include <optional>
@@ -72,6 +76,8 @@ GraphOfConstraints::GraphOfConstraints(
 		_agent_widths.push_back(robot_ambient_dim(ag));
 		_agent_col_offsets[ag + 1] = _agent_col_offsets[ag] + _agent_widths[ag];
 	}
+	_agent_tangent_widths.reserve(num_agents);
+	for (int ag = 0; ag < num_agents; ++ag) _agent_tangent_widths.push_back(robot_tangent_dim(ag));
 	_object_widths.reserve(num_objects);
 	_object_col_offsets.assign(num_objects + 1, _agent_col_offsets[num_agents]);
 	for (int ob = 0; ob < num_objects; ++ob) {
@@ -104,6 +110,7 @@ GraphOfConstraints::GraphOfConstraints(
 	_agent_q = PlaceholderVarFamily<int>(&_agent_widths, [](const int& i) { return fmt::format("agent_{}_q", i); });
 	_object_q = PlaceholderVarFamily<int>(&_object_widths, [](const int& o) { return fmt::format("object_{}_q", o); });
 	_var_agent_q = PlaceholderVarFamily<int>(&_var_widths, [](const int& v) { return fmt::format("var_{}_agent_q", v); });
+	_agent_v = PlaceholderVarFamily<int>(&_agent_tangent_widths, [](const int& i) { return fmt::format("agent_{}_v", i); });
 	_param = PlaceholderVarFamily<int>(1, [](const int& p) { return fmt::format("param_{}", p); });
 	_agent_link_pos = PlaceholderVarFamily<std::pair<int, std::string>>(
 		workspace_dim, [](const std::pair<int, std::string>& k) {
@@ -1327,7 +1334,78 @@ GraphOfConstraints::v_var_agent_q(int var) {
 }
 
 
+drake::VectorX<drake::symbolic::Expression>
+GraphOfConstraints::agent_v(int agent_id) const {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	return _agent_v.Get(agent_id);
+}
+
+int GraphOfConstraints::add_velocity_constraint(int node, const drake::symbolic::Formula& f) {
+	using drake::symbolic::Expression;
+	if (node < 0 || node >= structure.num_nodes()) {
+		throw std::runtime_error("add_velocity_constraint: no node " + std::to_string(node));
+	}
+	const double inf = std::numeric_limits<double>::infinity();
+	std::vector<drake::symbolic::Formula> atoms;
+	FlattenConjunction(f, &atoms);
+	std::vector<VelocityRow> rows;
+	for (const auto& atom : atoms) {
+		Expression e;  // the row is lb <= e <= ub
+		double lb = -inf, ub = inf;
+		if (drake::symbolic::is_true(atom)) {
+			continue;
+		} else if (drake::symbolic::is_equal_to(atom)) {
+			e = drake::symbolic::get_lhs_expression(atom) - drake::symbolic::get_rhs_expression(atom);
+			lb = ub = 0.0;
+		} else if (drake::symbolic::is_less_than_or_equal_to(atom) || drake::symbolic::is_less_than(atom)) {
+			e = drake::symbolic::get_lhs_expression(atom) - drake::symbolic::get_rhs_expression(atom);
+			ub = 0.0;
+		} else if (drake::symbolic::is_greater_than_or_equal_to(atom) || drake::symbolic::is_greater_than(atom)) {
+			e = drake::symbolic::get_lhs_expression(atom) - drake::symbolic::get_rhs_expression(atom);
+			lb = 0.0;
+		} else {
+			throw std::runtime_error("add_velocity_constraint: only (in)equalities joined by And are supported, not " +
+						 atom.to_string());
+		}
+		// One agent's velocity placeholders, and nothing else
+		const drake::symbolic::Variables free_vars = e.GetVariables();
+		const std::vector<int> agents = _agent_v.KeysReferencedBy(free_vars);
+		if (agents.size() != 1) {
+			throw std::runtime_error("add_velocity_constraint: each (in)equality must be in exactly one agent's agent_v, not " +
+						 atom.to_string());
+		}
+		const auto& vars = _agent_v.Vars(agents[0]);
+		std::unordered_map<drake::symbolic::Variable::Id, int> index;
+		for (int j = 0; j < vars.size(); ++j) index.emplace(vars[j].get_id(), j);
+		for (const auto& var : free_vars) {
+			if (!index.contains(var.get_id())) {
+				throw std::runtime_error("add_velocity_constraint: " + atom.to_string() +
+							 " mixes agent_v with other placeholders (" + var.get_name() + ")");
+			}
+		}
+		Eigen::RowVectorXd a(vars.size());
+		double c = 0.0;
+		try {
+			drake::symbolic::DecomposeAffineExpression(e, index, &a, &c);
+		} catch (const std::exception&) {
+			throw std::runtime_error("add_velocity_constraint: " + atom.to_string() + " isn't linear in agent_v");
+		}
+		if (a.isZero()) continue;  // no velocity left (e.g. cancelled out)
+		rows.push_back({agents[0], a.transpose(), lb - c, ub - c});
+	}
+	const int id = num_velocity_phis++;
+	velocity_ops[id] = SymbolicVelocityConstraint{id, node, f, rows};
+	auto& node_rows = node_to_velocity_rows[node];
+	node_rows.insert(node_rows.end(), rows.begin(), rows.end());
+	return id;
+}
+
 int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula& f) {
+	// A formula on agent velocities constrains the timing solve, not the
+	// waypoints: kept apart from the phis (see add_velocity_constraint).
+	if (_agent_v.ReferencesAny(f.GetFreeVariables())) {
+		return add_velocity_constraint(node, f);
+	}
 	// Detect variable-agent placeholders in the formula -- var_agent_q(var)
 	// directly, or its assignable-FK counterparts var_agent_link_pos(var,
 	// ...) / var_agent_link_rot(var, ...) (a joint-space EE target on an
@@ -1356,6 +1434,9 @@ int GraphOfConstraints::add_constraint(int node, const drake::symbolic::Formula&
 
 int GraphOfConstraints::add_edge_constraint(int u, int v, const drake::symbolic::Formula& f, bool live) {
 	const drake::symbolic::Variables free_vars = f.GetFreeVariables();
+	if (_agent_v.ReferencesAny(free_vars)) {
+		throw std::runtime_error("add_edge_constraint: agent_v (velocity) constraints are node constraints only");
+	}
 
 	// u_var_agent_q/v_var_agent_q are relational-only (see their docstring):
 	// a formula referencing either is inherently a two-sided relation, same
@@ -1401,6 +1482,9 @@ int GraphOfConstraints::add_assignable_constraint(
 	int node, int var, const drake::symbolic::Formula& f) {
 
 	DRAKE_DEMAND(var >= 0 && var < num_variables);
+	if (_agent_v.ReferencesAny(f.GetFreeVariables())) {
+		throw std::runtime_error("add_assignable_constraint: agent_v (velocity) constraints can't be assignable");
+	}
 	// The formula must actually reference this variable through one of its
 	// placeholder families -- var_agent_q(var), or an assignable-FK
 	// var_agent_link_pos/_rot(var, ...) (see add_constraint).

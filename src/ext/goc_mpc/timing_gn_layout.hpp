@@ -74,11 +74,32 @@ struct InteractionRow {
 	AgentInteraction::Type type;
 };
 
+// A velocity constraint row (GraphOfConstraints::add_velocity_constraint)
+// on one knot-velocity column: a bound on that variable.
+struct VelocityBound {
+	int col = 0;
+	double lb = -kInf, ub = kInf;
+};
+
+// One on several columns: lb <= sum(coeffs * x[cols]) <= ub, relaxed like
+// the interaction rows (a nonnegative plus/minus slack pair, penalized), so
+// every QP subproblem stays feasible inside the trust region.
+struct VelocityConstraintRow {
+	std::vector<int> cols;
+	std::vector<double> coeffs;
+	double lb = -kInf, ub = kInf;
+};
+
 struct ProblemLayout {
 	int n = 0;
 	std::vector<AgentLayout> agents;
 	std::vector<BlockSegment> block_segments;
 	std::vector<InteractionRow> interactions;
+	// Velocity constraints at this cycle's knots: single-variable rows as
+	// bounds, the others as rows (see VelocityBound/VelocityConstraintRow).
+	// x_init already lies within velocity_bounds.
+	std::vector<VelocityBound> velocity_bounds;
+	std::vector<VelocityConstraintRow> velocity_rows;
 	Eigen::VectorXd x_init;
 	// Per-agent (K+1) x num_blocks active-knot mask (1 == real knot for that
 	// block, 0 == bridge the block past it; rows 0 and K forced to 1). The

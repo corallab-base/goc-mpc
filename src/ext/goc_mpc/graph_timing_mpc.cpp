@@ -18,6 +18,7 @@ using gn_timing::kInf;
 using gn_timing::kTauMax;
 using gn_timing::kTauMin;
 using gn_timing::ProblemLayout;
+using gn_timing::VelocityConstraintRow;
 
 namespace {
 using RealMat = Eigen::Matrix<qpOASES::real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -136,6 +137,13 @@ std::pair<double, double> InteractionGiGj(const Eigen::VectorXd& x, const Intera
 // predicted, violation at a candidate point) -- mirrors
 // graph_short_path_mpc.cpp's EvaluateObstacleViolation/
 // EvaluateAgentPairViolation's own role there.
+// A velocity constraint row's value at `x` (sum of coeffs * x[cols]).
+double VelocityRowValue(const Eigen::VectorXd& x, const VelocityConstraintRow& vr) {
+	double value = 0.0;
+	for (std::size_t c = 0; c < vr.cols.size(); ++c) value += vr.coeffs[c] * x(vr.cols[c]);
+	return value;
+}
+
 double TotalInteractionViolation(const Eigen::VectorXd& x, const ProblemLayout& layout) {
 	double violation = 0.0;
 	for (const auto& ir : layout.interactions) {
@@ -146,6 +154,12 @@ double TotalInteractionViolation(const Eigen::VectorXd& x, const ProblemLayout& 
 		} else {
 			violation += std::abs(g_val);
 		}
+	}
+	// Velocity constraint rows (layout.velocity_rows): how far a . x is
+	// outside [lb, ub]
+	for (const auto& vr : layout.velocity_rows) {
+		const double value = VelocityRowValue(x, vr);
+		violation += std::max(0.0, vr.lb - value) + std::max(0.0, value - vr.ub);
 	}
 	return violation;
 }
@@ -185,7 +199,10 @@ SqpResult RunTrustRegionSqp(
 	// split). Interaction-row slack columns (see below) are appended after
 	// these, purely a QP-assembly artifact the smooth cost model never
 	// sees.
-	const int m = static_cast<int>(layout.interactions.size());
+	// Interaction rows first, then the velocity constraint rows (both
+	// slack-relaxed -- see below).
+	const int m_interactions = static_cast<int>(layout.interactions.size());
+	const int m = m_interactions + static_cast<int>(layout.velocity_rows.size());
 	// qpOASES::SQProblem always gets at least one (possibly trivially-
 	// inactive, all-zero-row) constraint row rather than special-casing nC=0.
 	const int m_eff = std::max(m, 1);
@@ -203,7 +220,8 @@ SqpResult RunTrustRegionSqp(
 	int n_slack = 0;
 	for (int r = 0; r < m; ++r) {
 		slack_offset[r] = n_slack;
-		n_slack += (layout.interactions[r].type == AgentInteraction::Type::LESS_THAN) ? 1 : 2;
+		// A velocity row is two-sided in general (lb <= a . x <= ub): a pair
+		n_slack += (r < m_interactions && layout.interactions[r].type == AgentInteraction::Type::LESS_THAN) ? 1 : 2;
 	}
 	const int n_smooth = layout.n;
 	const int n = n_smooth + n_slack;
@@ -220,7 +238,33 @@ SqpResult RunTrustRegionSqp(
 	}
 	qpOASES::SQProblem& qp = (*qp_state)->qp;
 
-	Eigen::VectorXd x = layout.x_init;
+	// Per-variable box bounds (tau in [kTauMin, kTauMax]; v unbounded but
+	// for the single-variable velocity constraints, layout.velocity_bounds)
+	// -- smooth (tau/v) columns only; slack columns' own (>= 0) bound is
+	// applied directly to dx_lb/dx_ub below every iteration instead (no
+	// `var_lb`/`var_ub` entry needed since slack has no accumulated `x` of
+	// its own to clamp a step against -- see this file's header comment).
+	Eigen::VectorXd var_lb = Eigen::VectorXd::Constant(n_smooth, -kInf);
+	Eigen::VectorXd var_ub = Eigen::VectorXd::Constant(n_smooth, kInf);
+	for (const auto& al : layout.agents) {
+		for (int j = 0; j < al.K; ++j) {
+			var_lb(al.tau_offset + j) = kTauMin;
+			var_ub(al.tau_offset + j) = kTauMax;
+		}
+	}
+	for (const auto& vb : layout.velocity_bounds) {
+		var_lb(vb.col) = std::max(var_lb(vb.col), vb.lb);
+		var_ub(vb.col) = std::max(var_lb(vb.col), std::min(var_ub(vb.col), vb.ub));  // conflicting: lb wins
+	}
+	// Fixed columns (an equality velocity constraint): their gradient
+	// doesn't count towards convergence below
+	std::vector<int> fixed_cols;
+	for (int c = 0; c < n_smooth; ++c)
+		if (var_lb(c) == var_ub(c)) fixed_cols.push_back(c);
+
+	// The start inside the bounds (x_init already is, unless two velocity
+	// bounds on one column conflict)
+	Eigen::VectorXd x = layout.x_init.cwiseMax(var_lb).cwiseMin(var_ub);
 	double f_current;
 	Eigen::VectorXd grad;
 	std::vector<Eigen::Triplet<double>> hess_triplets;
@@ -239,10 +283,17 @@ SqpResult RunTrustRegionSqp(
 	// shift with the current iterate x).
 	RealMat A = RealMat::Zero(m_eff, n);
 	for (int r = 0; r < m; ++r) {
+		const int scol = n_smooth + slack_offset[r];
+		if (r >= m_interactions) {  // a velocity constraint row, elastic both ways
+			const auto& vr = layout.velocity_rows[r - m_interactions];
+			for (std::size_t c = 0; c < vr.cols.size(); ++c) A(r, vr.cols[c]) += vr.coeffs[c];
+			A(r, scol) = 1.0;       // s_plus
+			A(r, scol + 1) = -1.0;  // s_minus
+			continue;
+		}
 		const auto& ir = layout.interactions[r];
 		for (int k = 0; k < ir.count_i; ++k) A(r, ir.tau_offset_i + k) += 1.0;
 		for (int k = 0; k < ir.count_j; ++k) A(r, ir.tau_offset_j + k) -= 1.0;
-		const int scol = n_smooth + slack_offset[r];
 		if (ir.type == AgentInteraction::Type::LESS_THAN) {
 			A(r, scol) = -1.0;
 		} else {
@@ -251,25 +302,14 @@ SqpResult RunTrustRegionSqp(
 		}
 	}
 
-	// Per-variable box bounds (tau in [kTauMin, kTauMax]; v unbounded) --
-	// smooth (tau/v) columns only; slack columns' own (>= 0) bound is
-	// applied directly to dx_lb/dx_ub below every iteration instead (no
-	// `var_lb`/`var_ub` entry needed since slack has no accumulated `x` of
-	// its own to clamp a step against -- see this file's header comment).
-	Eigen::VectorXd var_lb = Eigen::VectorXd::Constant(n_smooth, -kInf);
-	Eigen::VectorXd var_ub = Eigen::VectorXd::Constant(n_smooth, kInf);
-	for (const auto& al : layout.agents) {
-		for (int j = 0; j < al.K; ++j) {
-			var_lb(al.tau_offset + j) = kTauMin;
-			var_ub(al.tau_offset + j) = kTauMax;
-		}
-	}
 
 	double trust_radius = initial_trust_radius;
 	int iter = 0;
 
 	for (; iter < max_iterations; ++iter) {
-		if (grad.norm() < grad_tol) break;
+		Eigen::VectorXd free_grad = grad;
+		for (int c : fixed_cols) free_grad(c) = 0.0;
+		if (free_grad.norm() < grad_tol) break;
 		// <=, not <: the clamp below (std::max(..., min_trust_radius)) can
 		// only ever land EXACTLY at the floor, never strictly below it, so
 		// a strict "<" here would never fire -- silently defeating this
@@ -313,6 +353,13 @@ SqpResult RunTrustRegionSqp(
 		RealVec lbA = RealVec::Constant(m_eff, qpOASES::real_t(-kInf));
 		RealVec ubA = RealVec::Constant(m_eff, qpOASES::real_t(kInf));
 		for (int r = 0; r < m; ++r) {
+			if (r >= m_interactions) {
+				const auto& vr = layout.velocity_rows[r - m_interactions];
+				const double value = VelocityRowValue(x, vr);
+				lbA(r) = static_cast<qpOASES::real_t>(vr.lb <= -kInf ? -kInf : vr.lb - value);
+				ubA(r) = static_cast<qpOASES::real_t>(vr.ub >= kInf ? kInf : vr.ub - value);
+				continue;
+			}
 			const auto& ir = layout.interactions[r];
 			const auto [gi, gj] = InteractionGiGj(x, ir);
 			const double g_val = gi - gj;

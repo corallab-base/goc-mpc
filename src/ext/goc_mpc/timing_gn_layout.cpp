@@ -4,6 +4,8 @@
 #include <cmath>
 #include <iostream>
 #include <map>
+#include <set>
+#include <tuple>
 #include <stdexcept>
 
 #include <unsupported/Eigen/AutoDiff>
@@ -245,7 +247,8 @@ ProblemLayout BuildProblemLayoutCore(
 		const std::vector<Eigen::MatrixXd>& prev_vs_list,
 		const std::vector<Eigen::VectorXd>& prev_time_deltas_list,
 		const std::vector<std::vector<int>>& prev_agent_nodes_list,
-		const std::map<int, int>& prev_agent_spline_length_map) {
+		const std::map<int, int>& prev_agent_spline_length_map,
+		const std::map<int, std::vector<VelocityRow>>& node_velocity_rows) {
 
 	ProblemLayout layout;
 	const int num_agents = static_cast<int>(splines.size());
@@ -523,6 +526,70 @@ ProblemLayout BuildProblemLayoutCore(
 		}
 	}
 
+	// Velocity constraints (GraphOfConstraints::add_velocity_constraint)
+	// at each agent's knots, on the knot-velocity columns: a component of
+	// a block bridged past the knot has no variable (warned once per node
+	// and block), and at the last knot every velocity is fixed at zero.
+	static std::set<std::tuple<int, int, int>> warned;
+	for (int i = 0; i < num_agents; ++i) {
+		const int K = layout.agents[i].K;
+		const auto& offs = splines[i].block_offsets_;
+		for (int k = 1; k <= K; ++k) {
+			const int node = agent_node_ids[i][k - 1];
+			const auto it = node < 0 ? node_velocity_rows.end() : node_velocity_rows.find(node);
+			if (it == node_velocity_rows.end()) continue;
+			for (const VelocityRow& row : it->second) {
+				if (row.agent != i) continue;
+				std::vector<int> cols;
+				std::vector<double> coeffs;
+				bool bridged = false;
+				for (int c = 0; c < row.a.size(); ++c) {
+					if (row.a(c) == 0.0) continue;
+					int b = 0;
+					while (c >= offs[b].tangent_offset + offs[b].tangent_size) ++b;
+					if (k == K) continue;  // zero
+					const auto vit = vcol[i][b].find(k);
+					if (vit == vcol[i][b].end()) {
+						bridged = true;
+						if (warned.insert({node, i, b}).second) {
+							std::cout << "GraphTimingMPC: velocity constraint on agent " << i << " block " << b
+								  << " at node " << node << " ignored: the node doesn't constrain that "
+								  << "block's position, so its spline has no knot there.\n";
+						}
+						break;
+					}
+					cols.push_back(vit->second + c - offs[b].tangent_offset);
+					coeffs.push_back(row.a(c));
+				}
+				if (bridged) continue;
+				if (cols.empty()) {  // the last knot: every velocity is zero
+					if ((row.lb > 1e-9 || row.ub < -1e-9) && warned.insert({node, i, -1}).second) {
+						std::cout << "GraphTimingMPC: velocity constraint at node " << node << " (agent " << i
+							  << "'s last) can't hold: every velocity is zero there.\n";
+					}
+					continue;
+				}
+				if (cols.size() == 1) {
+					VelocityBound vb;
+					vb.col = cols[0];
+					vb.lb = (coeffs[0] > 0.0 ? row.lb : row.ub) / coeffs[0];
+					vb.ub = (coeffs[0] > 0.0 ? row.ub : row.lb) / coeffs[0];
+					if (!std::isfinite(vb.lb)) vb.lb = -kInf;
+					if (!std::isfinite(vb.ub)) vb.ub = kInf;
+					layout.x_init(vb.col) = std::clamp(layout.x_init(vb.col), vb.lb, std::max(vb.lb, vb.ub));
+					layout.velocity_bounds.push_back(vb);
+				} else {
+					VelocityConstraintRow vr;
+					vr.cols = std::move(cols);
+					vr.coeffs = std::move(coeffs);
+					vr.lb = std::isfinite(row.lb) ? row.lb : -kInf;
+					vr.ub = std::isfinite(row.ub) ? row.ub : kInf;
+					layout.velocity_rows.push_back(std::move(vr));
+				}
+			}
+		}
+	}
+
 	return layout;
 }
 
@@ -595,7 +662,7 @@ ProblemLayout BuildProblemLayout(
 		splines, *agent_nodes_list_out, agent_wps, agent_interactions,
 		agent_block_active, graph.edge_to_min_tau_map, x0, v0,
 		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
-		prev_agent_spline_length_map);
+		prev_agent_spline_length_map, graph.node_to_velocity_rows);
 	layout.agent_block_active = std::move(agent_block_active);
 	return layout;
 }
@@ -639,7 +706,7 @@ ProblemLayout BuildDenseProblemLayout(
 		splines, agent_dense_node_ids, agent_dense_wps, agent_interactions,
 		agent_block_active, edge_to_min_tau_map, x0, v0,
 		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
-		prev_agent_spline_length_map);
+		prev_agent_spline_length_map, graph.node_to_velocity_rows);
 	layout.agent_block_active = std::move(agent_block_active);
 	return layout;
 }

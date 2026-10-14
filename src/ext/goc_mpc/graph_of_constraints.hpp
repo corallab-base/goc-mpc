@@ -160,6 +160,29 @@ struct SymbolicNodeConstraint {
 	std::vector<drake::symbolic::Formula> ungrouped_leaves;
 };
 
+// One linear row of a velocity constraint (add_constraint with an agent_v
+// placeholder -- see add_velocity_constraint): lb <= a . v <= ub, `v` being
+// agent `agent`'s tangent-space velocity (robot_tangent_dim wide) at the
+// constraint's node. lb == ub for an equality; +/-inf for a one-sided row.
+struct VelocityRow {
+	int agent;
+	Eigen::VectorXd a;
+	double lb;
+	double ub;
+};
+
+// A node constraint on an agent's velocity at the node (agent_v(i)
+// placeholders only), compiled once at add time into linear rows. Only
+// GraphTimingMPC reads these -- the waypoint solvers and phi evaluation
+// (node progression) never see them, since they constrain the timing
+// solve's knot velocities, not where the agents are.
+struct SymbolicVelocityConstraint {
+	int id;
+	int node;
+	drake::symbolic::Formula formula;
+	std::vector<VelocityRow> rows;
+};
+
 struct SymbolicEdgeConstraint {
 	int id;
 	int u_node;
@@ -458,6 +481,13 @@ struct GraphOfConstraints {
 	std::map<int, int> _phi_to_static_assignment_map;
 	std::map<int, struct DeferredOp> ops;
 	std::map<int, struct SymbolicNodeConstraint> symbolic_ops;
+	// Velocity constraints (add_constraint with agent_v placeholders): ids
+	// from their own counter, not phi ids -- they are not phis (never
+	// evaluated for progression, never seen by the waypoint solvers).
+	// node_to_velocity_rows is every row at a node, for GraphTimingMPC.
+	int num_velocity_phis = 0;
+	std::map<int, struct SymbolicVelocityConstraint> velocity_ops;
+	std::map<int, std::vector<VelocityRow>> node_to_velocity_rows;
 	std::map<int, std::vector<std::tuple<std::string, std::string, std::string>>> _grasp_change_map;
 	std::map<int, std::vector<std::pair<std::string, std::string>>> _assignable_grasp_change_map;
 
@@ -610,6 +640,9 @@ struct GraphOfConstraints {
 	// from before this refactor); re-resolved (and validated -- throws if
 	// the narrowed candidate set STILL disagrees) in add_variable_constraint.
 	std::vector<int> _agent_widths, _object_widths, _var_widths;
+	// Per-agent tangent (velocity) width -- robot_tangent_dim(ag), what
+	// _agent_v's placeholders are sized to.
+	std::vector<int> _agent_tangent_widths;
 
 	// A fresh variable's implied candidate set is every agent (until/unless
 	// add_variable_constraint narrows it) -- computed ONCE in the
@@ -652,6 +685,12 @@ struct GraphOfConstraints {
 	PlaceholderVarFamily<int> _agent_q;
 	PlaceholderVarFamily<int> _object_q;
 	PlaceholderVarFamily<int> _var_agent_q;
+	// _agent_v: agent i's velocity at a node (tangent space,
+	// robot_tangent_dim wide) -- what agent_v(i) returns. Only usable in
+	// node constraints (add_constraint routes them to
+	// add_velocity_constraint), linear, and not mixed with any other
+	// placeholder.
+	PlaceholderVarFamily<int> _agent_v;
 
 	// _param: runtime-editable scalar placeholders (width 1, one Variable
 	// per declared id) -- what param(id) returns, and what set_param(id, .)
@@ -1183,6 +1222,20 @@ struct GraphOfConstraints {
 
 	// Symbolic unified constraint API
 	drake::VectorX<drake::symbolic::Expression> agent_q(int agent_id) const;
+	// Agent agent_id's velocity at a node, in its tangent space
+	// (robot_tangent_dim wide: Torus 1 per angle, SO3Quat 3, R as is) --
+	// see add_velocity_constraint.
+	drake::VectorX<drake::symbolic::Expression> agent_v(int agent_id) const;
+	// Constrains the timing solve's knot velocities at `node`: `f` may
+	// reference only agent_v placeholders, each atom (Eq/Leq/Geq/Lt/Gt,
+	// conjoined with And) linear and in one agent's velocity. Called by
+	// add_constraint for any formula referencing agent_v; returns an id in
+	// velocity_ops (not a phi id). A velocity is a knot of the agent's
+	// spline only for blocks the node also constrains the position of: a
+	// block the node leaves free is bridged past it, and rows on it are
+	// skipped (with a warning). At an agent's last remaining node every
+	// velocity is zero already.
+	int add_velocity_constraint(int node, const drake::symbolic::Formula& f);
 	drake::VectorX<drake::symbolic::Expression> object_q(int object_id) const;
 	drake::VectorX<drake::symbolic::Expression> var_agent_q(int var);
 	// World-position placeholder (workspace_dim-vector -- see that
