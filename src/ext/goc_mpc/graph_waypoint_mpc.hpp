@@ -9,8 +9,9 @@
 #include "../configuration_spline.hpp"
 
 // Solver-agnostic waypoint objective: MinMax variants minimize the makespan
-// (the worst per-agent route cost), Avg variants minimize the average route
-// cost across agents. L1/L2 select the per-edge distance metric.
+// (the time the last agent finishes, including any waiting forced by
+// orderings), Avg variants minimize the average route cost across agents.
+// L1/L2 select the per-edge distance metric.
 enum class WaypointObjective { kMinMaxL1, kAvgL1, kMinMaxL2, kAvgL2 };
 
 // Abstract base for a waypoint-phase solver: given the remaining graph

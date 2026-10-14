@@ -119,7 +119,7 @@ struct GraphWaypointProblem {
 	drake::solvers::VectorXDecisionVariable t;
 	// e[j*n_N^2 + a*n_N + b]: realized arc travel cost (L1 distance when arc used).
 	drake::solvers::VectorXDecisionVariable e;
-	// L_ms[0]: makespan scalar (objective).
+	// L_ms[0]: makespan t(sink) (objective of the MinMax variants).
 	drake::solvers::VectorXDecisionVariable L_ms;
 	// Routing graph size (cached for solution extraction).
 	int n_N{0};

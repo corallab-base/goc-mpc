@@ -1136,16 +1136,11 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				Eigen::RowVectorXd::Ones(1), 0.0,
 				Z_var.segment(z_idx_fn(j, i, i), 1));
 
-	// Constraint 1: makespan ≥ Σ_{a,b} e[j,a,b] for each agent j
-	for (int j = 0; j < num_agents; ++j) {
-		VectorXDecisionVariable ej_L(n_N * n_N + 1);
-		ej_L.head(n_N * n_N) = e_var.segment(j * n_N * n_N, n_N * n_N);
-		ej_L(n_N * n_N) = L_ms_var(0);
-		Eigen::RowVectorXd c(n_N * n_N + 1);
-		c.head(n_N * n_N).setOnes();
-		c(n_N * n_N) = -1.0;
-		prog.AddLinearConstraint(c, -kInf, 0.0, ej_L);
-	}
+	// Constraint 1: makespan = t(sink), the time the last agent finishes,
+	// waiting included (Constraint 9 bounds t(sink) by every agent's last
+	// task node time).
+	prog.AddLinearEqualityConstraint(
+		Expression(L_ms_var(0)) - Expression(t_var(sink_idx)), 0.0);
 
 	// Constraints 2 & 3: cost-linking (big-M) and zero cost on sink arcs
 	for (int j = 0; j < num_agents; ++j) {
@@ -1250,33 +1245,80 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		}
 	}
 
-	// Constraint 8: inflow(k,v) = A(variable_k, k) for each agent k.
-	// Equality (not just ≥) prevents zero-cost sub-tour phantoms: an agent may
-	// visit task node v if and only if it is assigned the variable at v.
-	// For static phis: inflow(static_agent→v) = 1 (forced visit).
-	for (const auto& [phi_id, op] : subgraph.get_subgraph_ops()) {
-		const int sg_v2 = subgraph.subgraph_id(op.node);
-		if (sg_v2 == -1) continue;
-		const int rv = ri(sg_v2);
-		if (graph->phi_to_variable_map.contains(phi_id)) {
-			const int var = graph->phi_to_variable_map.at(phi_id);
-			const int variable_k = subgraph.subgraph_variable_id(var);
-			if (variable_k < 0) continue;
-			for (int k = 0; k < num_agents; ++k) {
-				Expression in_flow;
-				for (int a2 = 0; a2 < n_N; ++a2)
-					if (a2 != rv) in_flow += Expression(Z_var(z_idx_fn(k, a2, rv)));
-				// inflow[k→v] = A(variable_k, k): assignment ↔ visit (no phantom sub-tours)
-				prog.AddLinearEqualityConstraint(
-					in_flow - Expression(Assignments(variable_k, k)), 0.0);
+	// Constraint 8: visits. Agent k visits task node v (inflow 1) iff it
+	// holds one of the roles referenced at v, or a constraint at v pins
+	// agent_q(k) directly (a required visit); it holds at most one role per
+	// node, and every role goes to exactly one agent:
+	//   required:  inflow(k,v) = 1,  Σ_{r at v} A(r,k) ≤ 1
+	//   otherwise: inflow(k,v) = Σ_{r at v} A(r,k) ≤ 1  (0 at a node with no roles)
+	// A node references a role/agent through its own symbolic constraints,
+	// an edge constraint at either endpoint (u_/v_ placeholders at their own
+	// endpoint, plain ones at both), or a hold's endpoints.
+	{
+		std::vector<std::set<int>> roles_at(n_V), required_at(n_V);
+		auto add_refs = [&](int node, const drake::symbolic::Variables& free_vars,
+				    const PlaceholderVarFamily<int>& var_family,
+				    const PlaceholderVarFamily<int>& agent_family) {
+			const int sg = subgraph.subgraph_id(node);
+			if (sg < 0) return;
+			for (int var : var_family.KeysReferencedBy(free_vars)) roles_at[sg].insert(var);
+			for (int ag : agent_family.KeysReferencedBy(free_vars)) required_at[sg].insert(ag);
+		};
+
+		for (const auto& [phi_id, rec] : subgraph.get_subgraph_symbolic_ops()) {
+			if (graph->_phi_routing_exempt.count(phi_id)) continue;
+			const auto free_vars = rec.formula.GetFreeVariables();
+			add_refs(rec.node, free_vars, graph->_var_agent_q, graph->_agent_q);
+			const int sg = subgraph.subgraph_id(rec.node);
+			if (sg < 0) continue;
+			for (const auto& key : graph->_var_agent_link_pos.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
+			for (const auto& key : graph->_var_agent_link_rot.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
+			for (const auto& key : graph->_agent_link_pos.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
+			for (const auto& key : graph->_agent_link_rot.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
+			if (graph->_phi_to_static_assignment_map.contains(phi_id))
+				required_at[sg].insert(graph->_phi_to_static_assignment_map.at(phi_id));
+		}
+		for (const auto& [edge_phi_id, rec] : subgraph.get_subgraph_symbolic_edge_ops()) {
+			const auto free_vars = rec.formula.GetFreeVariables();
+			for (int node : {rec.u_node, rec.v_node})
+				add_refs(node, free_vars, graph->_var_agent_q, graph->_agent_q);
+			add_refs(rec.u_node, free_vars, graph->_var_agent_q_u, graph->_agent_q_u);
+			add_refs(rec.v_node, free_vars, graph->_var_agent_q_v, graph->_agent_q_v);
+		}
+		for (const auto& [hold_id, hold] : subgraph.get_subgraph_hold_ops()) {
+			for (int node : {hold.u_node, hold.v_node}) {
+				const int sg = subgraph.subgraph_id(node);
+				if (sg < 0) continue;
+				if (hold.robot_ag.has_value()) required_at[sg].insert(*hold.robot_ag);
+				else roles_at[sg].insert(*hold.var_id);
 			}
 		}
-		if (graph->_phi_to_static_assignment_map.contains(phi_id)) {
-			const int k = graph->_phi_to_static_assignment_map.at(phi_id);
-			Expression in_flow;
-			for (int a2 = 0; a2 < n_N; ++a2)
-				if (a2 != rv) in_flow += Expression(Z_var(z_idx_fn(k, a2, rv)));
-			prog.AddLinearEqualityConstraint(in_flow, 1.0);
+
+		for (int var_k = 0; var_k < subgraph.num_variables(); ++var_k) {
+			Expression sum_A;
+			for (int k = 0; k < num_agents; ++k) sum_A += Expression(Assignments(var_k, k));
+			prog.AddLinearEqualityConstraint(sum_A, 1.0);
+		}
+
+		for (int sg_v2 = 0; sg_v2 < n_V; ++sg_v2) {
+			const int rv = ri(sg_v2);
+			for (int k = 0; k < num_agents; ++k) {
+				Expression in_flow, alpha;
+				int num_roles = 0;
+				for (int a2 = 0; a2 < n_N; ++a2)
+					if (a2 != rv) in_flow += Expression(Z_var(z_idx_fn(k, a2, rv)));
+				for (int var : roles_at[sg_v2]) {
+					const int variable_k = subgraph.subgraph_variable_id(var);
+					if (variable_k < 0) continue;
+					alpha += Expression(Assignments(variable_k, k));
+					++num_roles;
+				}
+				if (num_roles > 1) prog.AddLinearConstraint(alpha, -kInf, 1.0);
+				if (required_at[sg_v2].contains(k))
+					prog.AddLinearEqualityConstraint(in_flow, 1.0);
+				else
+					prog.AddLinearEqualityConstraint(in_flow - alpha, 0.0);
+			}
 		}
 	}
 
@@ -1304,9 +1346,10 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	}
 
 	// Constraint 9: time propagation — Z[j,a,b]=1 ⟹ t[b] ≥ t[a] + e[j,a,b]
+	// (into the sink e = 0 by Constraint 3, so t(sink) ≥ each agent's finish time)
 	for (int j = 0; j < num_agents; ++j) {
 		for (int a = 0; a <= n_V; ++a) {   // a ∈ {depot=0} ∪ task routing indices
-			for (int b = 1; b <= n_V; ++b) {  // b ∈ task nodes only
+			for (int b = 1; b <= sink_idx; ++b) {  // b ∈ task nodes ∪ {sink}
 				if (a == b) continue;
 				// t[b] - t[a] - e[j,a,b] + M_time*(1-Z[j,a,b]) ≥ 0
 				prog.AddLinearConstraint(
@@ -1662,9 +1705,10 @@ GraphWaypointProblem BuildGraphWaypointProblem(
         //                              Objective                            //
         ///////////////////////////////////////////////////////////////////////
 
-	// Objective: MinMax variants minimize the makespan (Constraint 1 forces
-	// L_ms_var to bound every agent's total route cost); Avg variants minimize
-	// the average total route cost across agents directly from e_var.
+	// Objective: MinMax variants minimize the makespan (Constraint 1 sets
+	// L_ms_var = t(sink), the time the last agent finishes, waiting
+	// included); Avg variants minimize the average total route cost across
+	// agents directly from e_var.
 	switch (objective) {
 	case WaypointObjective::kMinMaxL1:
 	case WaypointObjective::kMinMaxL2:
