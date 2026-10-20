@@ -75,7 +75,8 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	bool enforce_rigidity,
 	bool relax_binary_vars,
 	WaypointObjective objective = WaypointObjective::kMinMaxL1,
-	SubtourElimination subtour = SubtourElimination::kNone);
+	SubtourElimination subtour = SubtourElimination::kNone,
+	double length_weight = 0.0);
 
 // MILP-formulation waypoint solver: builds one Drake MathematicalProgram
 // (BuildGraphWaypointProblem, below) covering assignment, routing, and
@@ -93,6 +94,7 @@ struct MILPWaypointMPC : public GraphWaypointMPC {
 	WaypointSolver _solver;
 	bool _enforce_rigidity;
 	SubtourElimination _subtour;
+	double _length_weight;
 
 	// Constructor
 	MILPWaypointMPC(GraphOfConstraints& graph,
@@ -100,7 +102,8 @@ struct MILPWaypointMPC : public GraphWaypointMPC {
 			WaypointSolver solver = WaypointSolver::kGurobi,
 			bool enforce_rigidity = false,
 			WaypointObjective objective = WaypointObjective::kMinMaxL1,
-			SubtourElimination subtour = SubtourElimination::kNone);
+			SubtourElimination subtour = SubtourElimination::kNone,
+			double length_weight = 0.0);
 
 	// Core solve routine, based on the remaining vertices, computes a
 	// subgraph of graph of constraints, solves for the optimal agent

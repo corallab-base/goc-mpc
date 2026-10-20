@@ -692,7 +692,8 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	bool enforce_rigidity,
 	bool relax_binary_vars,
 	WaypointObjective objective,
-	SubtourElimination subtour) {
+	SubtourElimination subtour,
+	double length_weight) {
 
 	const int num_agents = graph->num_agents;
 
@@ -1206,12 +1207,16 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	// Objective: MinMax variants minimize the makespan (Constraint 1 sets
 	// L_ms_var = t(sink), the time the last agent finishes, waiting
 	// included); Avg variants minimize the average total route cost across
-	// agents directly from e_var.
+	// agents directly from e_var. length_weight adds that total, scaled, to
+	// the makespan (see MinMaxObjectiveCost).
 	switch (objective) {
 	case WaypointObjective::kMinMaxL1:
-	case WaypointObjective::kMinMaxL2:
-		prog.AddLinearCost(Eigen::VectorXd::Ones(1), 0.0, L_ms_var);
+	case WaypointObjective::kMinMaxL2: {
+		Expression total_cost;
+		for (int i = 0; i < e_var.size(); ++i) total_cost += Expression(e_var(i));
+		prog.AddLinearCost(MinMaxObjectiveCost(L_ms_var(0), total_cost, length_weight));
 		break;
+	}
 	case WaypointObjective::kAvgL1:
 	case WaypointObjective::kAvgL2: {
 		if (num_agents == 0) throw std::runtime_error("kAvg* objectives require num_agents > 0");
@@ -1236,11 +1241,14 @@ MILPWaypointMPC::MILPWaypointMPC(GraphOfConstraints& graph,
 				   WaypointSolver solver,
 				   bool enforce_rigidity,
 				   WaypointObjective objective,
-				   SubtourElimination subtour)
+				   SubtourElimination subtour,
+				   double length_weight)
 	: GraphWaypointMPC(graph, std::move(splines), objective),
 	  _solver(solver),
 	  _enforce_rigidity(enforce_rigidity),
-	  _subtour(subtour) {
+	  _subtour(subtour),
+	  _length_weight(length_weight) {
+	CheckLengthWeight(objective, length_weight);
 	// Routing outputs are sized on first successful solve.
 	_t_routing = Eigen::VectorXd();
 	_Z_routing = Eigen::VectorXd();
@@ -1271,7 +1279,7 @@ bool MILPWaypointMPC::SolveWith(
 
 	GraphWaypointProblem problem = BuildGraphWaypointProblem(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		_enforce_rigidity, _enforce_rigidity, _objective, _subtour);
+		_enforce_rigidity, _enforce_rigidity, _objective, _subtour, _length_weight);
 
 	drake::solvers::MathematicalProgramResult result;
 	solver.Solve(*problem.prog, std::nullopt, std::nullopt, &result);

@@ -11,6 +11,7 @@
 #include <drake/solvers/mathematical_program_result.h>
 
 #include "graph_of_constraints.hpp"
+#include "graph_waypoint_mpc.hpp"
 #include "../configuration_spline.hpp"
 
 // Builder pieces shared by the Drake waypoint-phase formulations
@@ -194,6 +195,19 @@ void AddMultiCommodityFlow(
 	const std::vector<int>& vertex_node,
 	const std::vector<drake::symbolic::Expression>& visit,
 	const std::string& tag);
+
+// MinMax cost: makespan + length_weight * total_cost, where total_cost sums
+// every agent's route cost. A small weight breaks the makespan objective's
+// ties toward short routes for the agents that don't set the makespan; it
+// can trade a makespan increase of about that weight for shorter routes.
+drake::symbolic::Expression MinMaxObjectiveCost(
+	const drake::symbolic::Variable& makespan,
+	const drake::symbolic::Expression& total_cost,
+	double length_weight);
+
+// Throws unless length_weight >= 0, and 0 for the Avg objectives (which
+// already minimize the total route cost).
+void CheckLengthWeight(WaypointObjective objective, double length_weight);
 
 void PrintSolverReport(const drake::solvers::MathematicalProgram& prog,
 		       const drake::solvers::MathematicalProgramResult& result,

@@ -61,7 +61,8 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	const Eigen::VectorXi& previous_var_assignments,
 	bool enforce_rigidity,
 	WaypointObjective objective,
-	SubtourElimination subtour);
+	SubtourElimination subtour,
+	double length_weight = 0.0);
 
 // Waypoint solver for the same problem as MILPWaypointMPC, sharing everything
 // that doesn't depend on the encoding (waypoint_common.*), but encoding
@@ -86,13 +87,15 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 	WaypointSolver _solver;
 	bool _enforce_rigidity;
 	SubtourElimination _subtour;
+	double _length_weight;
 
 	GCSWaypointMPC(GraphOfConstraints& graph,
 		       std::vector<CubicConfigurationSpline> splines,
 		       WaypointSolver solver = WaypointSolver::kGurobi,
 		       bool enforce_rigidity = false,
 		       WaypointObjective objective = WaypointObjective::kMinMaxL1,
-		       SubtourElimination subtour = SubtourElimination::kMCF);
+		       SubtourElimination subtour = SubtourElimination::kMCF,
+		       double length_weight = 0.0);
 
 	bool Solve(const std::vector<int>& remaining_vertices,
 		   const Eigen::VectorXd& x0) override;

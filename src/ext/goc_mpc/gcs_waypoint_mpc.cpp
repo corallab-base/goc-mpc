@@ -170,7 +170,8 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	const Eigen::VectorXi& previous_var_assignments,
 	bool enforce_rigidity,
 	WaypointObjective objective,
-	SubtourElimination subtour) {
+	SubtourElimination subtour,
+	double length_weight) {
 
 	const int num_agents = graph->num_agents;
 	const int num_objects = graph->num_objects;
@@ -756,7 +757,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	switch (objective) {
 	case WaypointObjective::kMinMaxL1:
 	case WaypointObjective::kMinMaxL2:
-		prog.AddLinearCost(Eigen::VectorXd::Ones(1), 0.0, L_ms_var);
+		prog.AddLinearCost(MinMaxObjectiveCost(L_ms_var(0), total_cost, length_weight));
 		break;
 	case WaypointObjective::kAvgL1:
 	case WaypointObjective::kAvgL2:
@@ -778,11 +779,15 @@ GCSWaypointMPC::GCSWaypointMPC(GraphOfConstraints& graph,
 			       WaypointSolver solver,
 			       bool enforce_rigidity,
 			       WaypointObjective objective,
-			       SubtourElimination subtour)
+			       SubtourElimination subtour,
+			       double length_weight)
 	: GraphWaypointMPC(graph, std::move(splines), objective),
 	  _solver(solver),
 	  _enforce_rigidity(enforce_rigidity),
-	  _subtour(subtour) {}
+	  _subtour(subtour),
+	  _length_weight(length_weight) {
+	CheckLengthWeight(objective, length_weight);
+}
 
 bool GCSWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 			   const Eigen::VectorXd& x0) {
@@ -805,7 +810,7 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 
 	GCSWaypointProblem problem = BuildGCSWaypointProblem(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		_enforce_rigidity, _objective, _subtour);
+		_enforce_rigidity, _objective, _subtour, _length_weight);
 
 	MathematicalProgramResult result;
 	solver.Solve(*problem.prog, std::nullopt, std::nullopt, &result);

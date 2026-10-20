@@ -783,3 +783,16 @@ void PrintSolverReport(const MathematicalProgram& prog,
 
 	cout << "=== End Report ===\n";
 }
+
+Expression MinMaxObjectiveCost(const Variable& makespan, const Expression& total_cost,
+			       double length_weight) {
+	return length_weight == 0.0 ? Expression(makespan) : makespan + length_weight * total_cost;
+}
+
+void CheckLengthWeight(WaypointObjective objective, double length_weight) {
+	if (!(length_weight >= 0.0))
+		throw std::runtime_error(fmt::format("length_weight must be >= 0, got {}", length_weight));
+	const bool minmax = objective == WaypointObjective::kMinMaxL1 || objective == WaypointObjective::kMinMaxL2;
+	if (length_weight != 0.0 && !minmax)
+		throw std::runtime_error("length_weight applies only to the kMinMax* objectives");
+}
