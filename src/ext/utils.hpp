@@ -76,30 +76,38 @@ PoseFromRow_PosRotMatrix(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
 
 // `workspace_dim` (2 or 3) is the robot's ambient Cartesian workspace --
 // see GraphOfConstraints::workspace_dim. Position is the row's leading
-// workspace_dim-wide block; rotation is the workspace_dim x workspace_dim
-// identity (a point mass has no orientation).
+// `pos_width` columns (the robot's own position block), padded with zeros up
+// to workspace_dim -- never reading past the robot's own slice of the row;
+// rotation is the workspace_dim x workspace_dim identity (a point mass has no
+// orientation).
 template <typename T>
 std::pair<Eigen::Matrix<T,Eigen::Dynamic,1>, Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>
 PoseFromRow_PointMass(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
-		      int robot_offset, int workspace_dim) {
-	Eigen::Matrix<T,Eigen::Dynamic,1> p_WE = row.segment(robot_offset, workspace_dim);
+		      int robot_offset, int pos_width, int workspace_dim) {
+	const int n = std::min(pos_width, workspace_dim);
+	Eigen::Matrix<T,Eigen::Dynamic,1> p_WE = Eigen::Matrix<T,Eigen::Dynamic,1>::Zero(workspace_dim);
+	p_WE.head(n) = row.segment(robot_offset, n);
 	Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> R_WE =
 		Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(workspace_dim, workspace_dim);
 	for (int i = 0; i < workspace_dim; ++i) R_WE(i, i) = T(1.0);
 	return std::make_pair(p_WE, R_WE);
 }
 
-// State layout: [x, y, θ] (workspace_dim == 2, R² × T¹) or [x, y, z, θ]
-// (workspace_dim == 3, R³ × T¹) -- yaw = rotation about the (2D) plane or
-// (3D) world Z axis, immediately following the position block either way.
+// State layout: [position (pos_width), θ], e.g. [x, y, θ] (R² × T¹) or
+// [x, y, z, θ] (R³ × T¹) -- yaw = rotation about the (2D) plane or (3D)
+// world Z axis, immediately following the position block either way. The
+// position is padded with zeros up to workspace_dim, as in
+// PoseFromRow_PointMass.
 template <typename T>
 std::pair<Eigen::Matrix<T,Eigen::Dynamic,1>, Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>
 PoseFromRow_PosYaw(const Eigen::Matrix<T,Eigen::Dynamic,1>& row,
-		   int robot_offset, int workspace_dim) {
+		   int robot_offset, int pos_width, int workspace_dim) {
 	using std::cos; using std::sin;
 	DRAKE_DEMAND(workspace_dim == 2 || workspace_dim == 3);
-	Eigen::Matrix<T,Eigen::Dynamic,1> p_WE = row.segment(robot_offset, workspace_dim);
-	const T theta = row(robot_offset + workspace_dim);
+	const int n = std::min(pos_width, workspace_dim);
+	Eigen::Matrix<T,Eigen::Dynamic,1> p_WE = Eigen::Matrix<T,Eigen::Dynamic,1>::Zero(workspace_dim);
+	p_WE.head(n) = row.segment(robot_offset, n);
+	const T theta = row(robot_offset + pos_width);
 	const T c = cos(theta);
 	const T s = sin(theta);
 	Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> R_WE(workspace_dim, workspace_dim);
@@ -163,6 +171,23 @@ PointPosFromRow(const struct GraphOfConstraints* graph,
 	return p_WC;
 }
 
+// Number of leading columns of agent `agent_index`'s own row slice that hold
+// its end-effector world position (before any orientation block).
+inline int EEPositionWidth(const struct GraphOfConstraints* graph, int agent_index) {
+	switch (graph->robot_kind(agent_index)) {
+	case RobotKind::kPointMass:
+		return graph->robot_ambient_dim(agent_index);
+	case RobotKind::kPosYaw:
+		return graph->robot_ambient_dim(agent_index) - 1;
+	case RobotKind::kPosQuat:
+	case RobotKind::kPosRotMat:
+		return 3;
+	case RobotKind::kArticulated:
+		break;
+	}
+	throw std::runtime_error("EEPositionWidth: articulated robots require FK, not yet supported.");
+}
+
 // Return size follows graph->workspace_dim (2 or 3 -- see GraphOfConstraints'
 // own doc comment on that member). kPointMass/kPosYaw are workspace_dim-aware
 // (PoseFromRow_PointMass/PoseFromRow_PosYaw above); kPosQuat/kPosRotMat are
@@ -196,9 +221,9 @@ PoseFromRow(const struct GraphOfConstraints* graph,
 						 "(3x3 rotation matrix has no 2D reduction).");
 		return PoseFromRow_PosRotMatrix(q, agent_config_offset);
 	case RobotKind::kPointMass:
-		return PoseFromRow_PointMass(q, agent_config_offset, workspace_dim);
+		return PoseFromRow_PointMass(q, agent_config_offset, EEPositionWidth(graph, agent_index), workspace_dim);
 	case RobotKind::kPosYaw:
-		return PoseFromRow_PosYaw(q, agent_config_offset, workspace_dim);
+		return PoseFromRow_PosYaw(q, agent_config_offset, EEPositionWidth(graph, agent_index), workspace_dim);
 	case RobotKind::kArticulated:
 		throw std::runtime_error("PoseFromRow: articulated robots require FK, not yet supported.");
 	}

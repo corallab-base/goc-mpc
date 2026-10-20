@@ -45,10 +45,15 @@ inline VectorXDecisionVariable GetARowForVar(const SubgraphOfConstraints& subgra
 	return Assignments.row(row);
 }
 
+// Per-axis bound width of the `width`-wide position block at `start3`,
+// padded with zeros up to `dim` (never reading past that block).
 inline Eigen::VectorXd seg_width3(const Eigen::VectorXd& lb,
                                   const Eigen::VectorXd& ub,
-                                  int start3, int dim) {
-	return (ub.segment(start3, dim) - lb.segment(start3, dim)).cwiseAbs();
+                                  int start3, int width, int dim) {
+	const int n = std::min(width, dim);
+	Eigen::VectorXd w = Eigen::VectorXd::Zero(dim);
+	w.head(n) = (ub.segment(start3, n) - lb.segment(start3, n)).cwiseAbs();
+	return w;
 }
 
 // Bound ||p_WP - p_WE||_2 on one “side” (0, u, or v).
@@ -58,15 +63,16 @@ inline Eigen::VectorXd seg_width3(const Eigen::VectorXd& lb,
 // workspace_dim-wide, matching PointWorldFromRow/PoseFromRow's own sizing.
 inline double bound_norm_obj_minus_ee_side(
 	const Eigen::VectorXd& lb, const Eigen::VectorXd& ub,
-	int obj_start3,
+	int obj_start3, int obj_width,
 	std::optional<int> ee_start3_in_X,              // std::nullopt if articulated
+	int ee_width,
 	const Eigen::VectorXd& ee_span_hint, /* meters */
 	int dim) {
 
-	const Eigen::VectorXd w_obj = seg_width3(lb, ub, obj_start3, dim);
+	const Eigen::VectorXd w_obj = seg_width3(lb, ub, obj_start3, obj_width, dim);
 	Eigen::VectorXd w_ee;
 	if (ee_start3_in_X) {
-		w_ee = seg_width3(lb, ub, *ee_start3_in_X, dim);
+		w_ee = seg_width3(lb, ub, *ee_start3_in_X, ee_width, dim);
 	} else {
 		w_ee = ee_span_hint.cwiseAbs();  // articulated, conservative workspace span
 	}
@@ -77,13 +83,14 @@ inline double bound_norm_obj_minus_ee_side(
 // 0 -> v (initial-layer) exact-rigidity M (identical per component)
 inline Eigen::VectorXd M_exact_toX0_componentwise(
 	const Eigen::VectorXd& lb, const Eigen::VectorXd& ub,
-	int obj_start3,
+	int obj_start3, int obj_width,
 	std::optional<int> ee_start3_in_X,      // free-body -> pos segment start; else nullopt
+	int ee_width,
 	const Eigen::VectorXd& ee_span_hint,    // used when articulated
 	int dim) {
 	// Both “sides” are 0 and v; the bound structure is the same for both,
 	// so the worst-case 2-norm can be upper-bounded the same way on each side.
-	const double B0 = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, ee_start3_in_X, ee_span_hint, dim);
+	const double B0 = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, obj_width, ee_start3_in_X, ee_width, ee_span_hint, dim);
 	const double Bv = B0;  // same bounding box globally
 	const double Mscalar = B0 + Bv;
 	return Eigen::VectorXd::Constant(dim, Mscalar);
@@ -92,14 +99,15 @@ inline Eigen::VectorXd M_exact_toX0_componentwise(
 // u -> v exact-rigidity M (identical per component)
 inline Eigen::VectorXd M_exact_edge_componentwise(
 	const Eigen::VectorXd& lb, const Eigen::VectorXd& ub,
-	int obj_start3,
+	int obj_start3, int obj_width,
 	std::optional<int> ee_start3_u_in_X,    // free-body u; else nullopt
 	std::optional<int> ee_start3_v_in_X,    // free-body v; else nullopt
+	int ee_width,
 	const Eigen::VectorXd& ee_span_hint_u,  // articulated u
 	const Eigen::VectorXd& ee_span_hint_v,  // articulated v
 	int dim) {
-	const double Bu = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, ee_start3_u_in_X, ee_span_hint_u, dim);
-	const double Bv = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, ee_start3_v_in_X, ee_span_hint_v, dim);
+	const double Bu = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, obj_width, ee_start3_u_in_X, ee_width, ee_span_hint_u, dim);
+	const double Bv = bound_norm_obj_minus_ee_side(lb, ub, obj_start3, obj_width, ee_start3_v_in_X, ee_width, ee_span_hint_v, dim);
 	const double Mscalar = Bu + Bv;
 	return Eigen::VectorXd::Constant(dim, Mscalar);
 }
@@ -357,9 +365,10 @@ void AddHoldRigidityAssignableToX0(
 
 			const Eigen::VectorXd Mvec = M_exact_toX0_componentwise(
 				graph->_global_x_lb, graph->_global_x_ub,
-				obj_start3,
+				obj_start3, graph->object_ambient_dim(objects[idx].id),
 				/*ee_start3_in_X=*/graph->robot_is_free_body(k) ? std::make_optional(ee_start3)
 				: std::nullopt,
+				EEPositionWidth(graph, k),
 				/*ee_span_hint=*/ee_span_hint, workspace_dim);
 
 			// Exact rigidity residual components:
@@ -475,9 +484,10 @@ void AddHoldRigidityAssignable(
 			// u->v:
 			const Eigen::VectorXd Mvec_uv = M_exact_edge_componentwise(
 				graph->_global_x_lb, graph->_global_x_ub,
-				obj_start3,
+				obj_start3, graph->object_ambient_dim(objects[idx].id),
 				/*ee_start3_u_in_X=*/graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
 				/*ee_start3_v_in_X=*/graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
+				EEPositionWidth(graph, k),
 				/*ee_span_hint_u=*/ee_span_hint,
 				/*ee_span_hint_v=*/ee_span_hint, workspace_dim);
 
@@ -553,9 +563,10 @@ static void AddHoldRigidityStaticGated(
 		const int obj_start3 = graph->object_col_offset(obj_id);
 		const Eigen::VectorXd Mvec = M_exact_edge_componentwise(
 			graph->_global_x_lb, graph->_global_x_ub,
-			obj_start3,
+			obj_start3, graph->object_ambient_dim(obj_id),
 			graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
 			graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
+			EEPositionWidth(graph, k),
 			ee_span_hint, ee_span_hint, workspace_dim);
 
 		for (int j = 0; j < workspace_dim; ++j) {
@@ -636,9 +647,10 @@ static void AddHoldRigidityAssignableGated(
 			const int obj_start3 = graph->object_col_offset(objects[idx].id);
 			const Eigen::VectorXd Mvec = M_exact_edge_componentwise(
 				graph->_global_x_lb, graph->_global_x_ub,
-				obj_start3,
+				obj_start3, graph->object_ambient_dim(objects[idx].id),
 				graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
 				graph->robot_is_free_body(k) ? std::make_optional(ee_start3) : std::nullopt,
+				EEPositionWidth(graph, k),
 				ee_span_hint, ee_span_hint, workspace_dim);
 
 			for (int j = 0; j < workspace_dim; ++j) {
