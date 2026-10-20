@@ -7,11 +7,9 @@
 // Compiles a stored SymbolicNodeConstraint/SymbolicEdgeConstraint record (as
 // produced by GraphOfConstraints::add_constraint / add_assignable_constraint /
 // add_edge_constraint) into real Drake MathematicalProgram constraints, at
-// MILPWaypointMPC build time. This is the same substitution/big-M-gating logic
-// that used to live inline in DeferredOp/DeferredEdgeOp builder closures —
-// relocated here (and parameterized by the stored record instead of captured
-// by a lambda) so the raw Formula stays introspectable for non-MILP consumers
-// (e.g. the JAX evolutionary solver's formula_compiler.py).
+// MILPWaypointMPC build time, parameterized by the stored record so the raw
+// Formula stays introspectable for non-MILP consumers (e.g. the JAX
+// evolutionary solver's formula_compiler.py).
 void CompileSymbolicNodeConstraint(
 	drake::solvers::MathematicalProgram& prog,
 	const SubgraphOfConstraints& subgraph,
@@ -25,9 +23,7 @@ void CompileSymbolicNodeConstraint(
 // relational (non-along_edge) formula's u_node/v_node when that endpoint
 // isn't in `subgraph` (it's already passed out of remaining_vertices; the
 // edge is still compiled here as long as the OTHER endpoint remains -- see
-// SubgraphOfConstraints' constructor). Mirrors the legacy DeferredEdgeOp
-// API's previous_X.row(u_node) fallback (Constraint 13 in
-// BuildGraphWaypointProblem). MILPWaypointMPC::Solve() keeps a passed node's
+// SubgraphOfConstraints' constructor). MILPWaypointMPC::Solve() keeps a passed node's
 // row in `previous_X` live-rebound to the real x0 as of the cycle it passed
 // (rather than merely its last-solved value), so this fallback reads the
 // real state, not a stale plan.
@@ -47,9 +43,7 @@ void CompileSymbolicEdgeConstraint(
 // nullptr, unconditional besides any assignable-var assignment gating); the
 // MILP build loop (BuildGraphWaypointProblem) additionally calls this
 // directly for every OTHER subgraph node the edge might span, passing a
-// betweenness-indicator expression as extra_gate -- mirroring how
-// DeferredEdgeOp::interior_builder re-applies a per-endpoint invariant at
-// interior nodes for the older add_robot_holding_cube_constraint-style API.
+// betweenness-indicator expression as extra_gate.
 void CompileAlongEdgeConstraintAtNode(
 	drake::solvers::MathematicalProgram& prog,
 	const SubgraphOfConstraints& subgraph,
@@ -61,8 +55,7 @@ void CompileAlongEdgeConstraintAtNode(
 	const drake::symbolic::Expression* extra_gate);
 
 // Numeric constraint-violation evaluators, used by
-// GraphOfConstraints::evaluate_phi/evaluate_edge_phi. Mirrors the eval_fn
-// closures the pre-refactor DeferredOp/DeferredEdgeOp used to carry.
+// GraphOfConstraints::evaluate_phi/evaluate_edge_phi.
 double EvaluateSymbolicNodeConstraint(
 	const GraphOfConstraints& graph,
 	const SymbolicNodeConstraint& rec,

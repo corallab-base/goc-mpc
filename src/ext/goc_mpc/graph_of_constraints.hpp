@@ -41,77 +41,6 @@ struct SubgraphOfConstraints;
 enum class RobotKind { kPointMass, kPosYaw, kPosQuat, kPosRotMat, kArticulated };
 enum class ConstraintDegree { kLinear, kQuadratic, kGeneral };
 
-enum class DeferredOpKind {
-	kLinearEq,
-	kLinearIneq,
-	kBoundingBox,
-	kNonlinearCost,
-	kQuadraticCost,
-	kNonlinearEq,
-	kOther,
-	// MultiAgent
-	kAgentLinearEq,
-	// Symbolic (unified path via drake::symbolic)
-	kSymbolic,
-};
-
-struct DeferredOp {
-	DeferredOpKind kind;
-	int id;
-	int node;
-	std::function<double(const Eigen::VectorXd&,
-			     const int)> eval;
-	std::function<void(drake::solvers::MathematicalProgram&,
-			   const struct SubgraphOfConstraints&,
-			   const int,
-			   const drake::solvers::MatrixXDecisionVariable&,
-			   const drake::solvers::MatrixXDecisionVariable&)> builder;
-};
-
-struct DeferredEdgeOp {
-	DeferredOpKind kind;
-	int id;
-	int u_node;
-	int v_node;
-	std::set<int> cubes; // edge constraints either do or don't involve a cube (keypoint)
-	std::function<double(const Eigen::VectorXd&,
-			     const Eigen::VectorXi&)> eval;
-	std::function<void(drake::solvers::MathematicalProgram&,
-			   const struct SubgraphOfConstraints&,
-			   const int,
-			   const drake::solvers::MatrixXDecisionVariable&,
-			   const drake::solvers::MatrixXDecisionVariable&,
-			   const Eigen::VectorXd&)> waypoint_builder;
-	std::function<void(drake::solvers::MathematicalProgram&,
-			   const int,
-			   const Eigen::VectorXi&,
-			   const drake::solvers::MatrixXDecisionVariable&)> short_path_builder;
-	// Optional: for edge constraints that check an independent invariant at
-	// each endpoint (rather than a single relation coupling both), applies
-	// that same per-node invariant at an interior subgraph node that may end
-	// up scheduled between u_node and v_node in the solved route. `gate` is
-	// a binary that is 1 whenever the interior node is (weakly) between the
-	// two endpoints in time; unset (default) for edge ops that don't have a
-	// well-defined per-node interior application (e.g. relational formulas).
-	std::function<void(drake::solvers::MathematicalProgram&,
-			   const struct SubgraphOfConstraints&,
-			   const int,
-			   const drake::solvers::MatrixXDecisionVariable&,
-			   const drake::solvers::MatrixXDecisionVariable&,
-			   int,
-			   const drake::symbolic::Variable&)> interior_builder;
-};
-
-struct DeferredVarOp {
-	DeferredOpKind kind;
-	int id;
-	std::function<void(drake::solvers::MathematicalProgram&,
-			   const struct SubgraphOfConstraints&,
-			   const int,
-			   const drake::solvers::MatrixXDecisionVariable&,
-			   const drake::solvers::MatrixXDecisionVariable&)> builder;
-};
-
 // A fully-covered manifold block (Torus/SO3Quat/SO3Mat) referenced by an
 // Eq-kind formula, detected once at add_constraint/add_edge_constraint time
 // (see PopulateBlockResidualGroups) and cached on the owning record below.
@@ -137,13 +66,12 @@ struct BlockResidualGroup {
 };
 
 // Raw, introspectable records for the unified symbolic constraint API
-// (add_constraint / add_assignable_constraint / add_edge_constraint). Unlike
-// DeferredOp/DeferredEdgeOp, these store the original drake::symbolic::Formula
-// (with placeholders unsubstituted) instead of a pre-built closure, so that
-// consumers other than MILPWaypointMPC (e.g. the JAX evolutionary solver) can
-// introspect and independently compile the same constraint. Compilation into
-// actual Drake constraints happens at build time in symbolic_constraint_compiler.*,
-// mirroring what the DeferredOp builder closures used to do inline.
+// (add_constraint / add_assignable_constraint / add_edge_constraint). These
+// store the original drake::symbolic::Formula (with placeholders
+// unsubstituted) instead of a pre-built closure, so that consumers other than
+// MILPWaypointMPC (e.g. the JAX evolutionary solver) can introspect and
+// independently compile the same constraint. Compilation into actual Drake
+// constraints happens at build time in symbolic_constraint_compiler.*.
 struct SymbolicNodeConstraint {
 	int id;
 	int node;
@@ -230,9 +158,7 @@ void PopulateBlockResidualGroups(
 // constraint (which otherwise only register a proximity check) so that
 // MILPWaypointMPC's Constraint 14 (rigid-hold + stationary-object dynamics)
 // and any other consumer (e.g. the JAX evolutionary solver) can read a
-// single source of truth for "which edges are holds", instead of each
-// re-deriving it from DeferredEdgeOp::cubes plus the static/assignable
-// edge-phi maps.
+// single source of truth for "which edges are holds".
 struct HoldDeclaration {
 	int id;
 	int u_node;
@@ -479,7 +405,6 @@ struct GraphOfConstraints {
 	// Node Phi maps
 	std::map<int, int> phi_to_variable_map;
 	std::map<int, int> _phi_to_static_assignment_map;
-	std::map<int, struct DeferredOp> ops;
 	std::map<int, struct SymbolicNodeConstraint> symbolic_ops;
 	// Velocity constraints (add_constraint with agent_v placeholders): ids
 	// from their own counter, not phi ids -- they are not phis (never
@@ -493,7 +418,6 @@ struct GraphOfConstraints {
 
 	// Edge phi maps
 	std::map<int, int> edge_phi_to_variable_map;
-	std::map<int, struct DeferredEdgeOp> edge_ops;
 	std::map<int, struct SymbolicEdgeConstraint> symbolic_edge_ops;
 	std::map<int, int> _edge_phi_to_static_assignment_map;
 
@@ -511,8 +435,12 @@ struct GraphOfConstraints {
 	// being solved for.
 	std::set<int> live_edge_phis;
 
-	// Var phi map
-	std::map<int, struct DeferredVarOp> var_ops;
+	// Assignment-variable constraints. var_candidates[var]: the agents var
+	// may be assigned to (absent == every agent; add_variable_constraint
+	// intersects on repeated calls). var_ineq_pairs: (var1, var2) that must
+	// be assigned to different agents (add_variable_ineq_constraint).
+	std::map<int, std::set<int>> var_candidates;
+	std::vector<std::pair<int, int>> var_ineq_pairs;
 
 	// Hold registry -- see HoldDeclaration.
 	std::map<int, struct HoldDeclaration> hold_ops;
@@ -605,7 +533,7 @@ struct GraphOfConstraints {
 	std::map<int, int> committed_assignments;
 
 	// Rest
-	int num_phis, num_edge_phis, num_var_phis, num_holds;
+	int num_phis, num_edge_phis, num_holds;
 	int num_variables, _num_total_assignables;
 	int num_agents, num_objects, total_dim;
 
@@ -855,8 +783,7 @@ struct GraphOfConstraints {
 	// range for the passed vector is skipped (so an empty vector simply
 	// ignores every assignable-constraint reference). "References" is
 	// literal Formula membership -- an inequality or a one-sided bound
-	// counts, not only an equality. A legacy non-symbolic DeferredOp is
-	// not introspectable and contributes nothing.
+	// counts, not only an equality.
 	//
 	// The spline builder uses this to decide, per block, whether `node` is
 	// a genuine knot for that block or a pass-through the interpolation
@@ -1002,10 +929,6 @@ struct GraphOfConstraints {
 		std::vector<AgentInteraction> agent_interactions,
 		const std::vector<std::vector<int>>& agent_node_ids);
 
-	const std::map<int, DeferredVarOp>& get_var_ops() const {
-		return var_ops;
-	}
-
 	std::vector<int> get_phi_ids(int node) const;
 
 	bool evaluate_phi(int phi_id,
@@ -1137,9 +1060,8 @@ struct GraphOfConstraints {
 	// DEPRECATED: superseded by add_hold below, which is now the canonical
 	// way to declare a hold. This still adds a proximity check (and
 	// dual-populates hold_ops for backward compat) but MILP's Constraint 14
-	// (rigid-hold + stationary-object dynamics) is moving to read hold_ops
-	// directly instead of edge_ops[phi].cubes + the static/assignable
-	// edge-phi maps -- prefer add_hold/add_assignable_hold in new code.
+	// (rigid-hold + stationary-object dynamics) reads hold_ops directly
+	// -- prefer add_hold/add_assignable_hold in new code.
 	int add_robot_holding_cube_constraint(int u,
 					      int v,
 					      int robot_id,
@@ -1213,12 +1135,12 @@ struct GraphOfConstraints {
 	// Variable Constraints
 
 	// 'var' can only be assigned to {robot_ids}
-	int add_variable_constraint(int var,
-				    std::set<int> robot_ids);
+	void add_variable_constraint(int var,
+				     std::set<int> robot_ids);
 
 	// var1 != var2
-	int add_variable_ineq_constraint(int var1,
-					 int var2);
+	void add_variable_ineq_constraint(int var1,
+					  int var2);
 
 	// Symbolic unified constraint API
 	drake::VectorX<drake::symbolic::Expression> agent_q(int agent_id) const;
@@ -1331,49 +1253,6 @@ struct GraphOfConstraints {
 
 private:
 
-	template <typename EF, typename F>
-	int _add_op(DeferredOpKind kind, int node, EF&& eval_f, F&& f) {
-		const int id = num_phis++;
-		node_to_phis_map[node].push_back(id);
-		ops[id] = DeferredOp{kind, id, node, std::forward<EF>(eval_f), std::forward<F>(f)};
-		return id;
-	}
-
-	template <typename EF, typename F>
-	int _add_assignable_op(DeferredOpKind kind, int node, int var, EF&& eval_f, F&& f) {
-		const int id = num_phis++;
-		node_to_phis_map[node].push_back(id);
-		phi_to_variable_map[id] = var;
-		ops[id] = DeferredOp{kind, id, node, std::forward<EF>(eval_f), std::forward<F>(f)};
-		return id;
-	}
-
-	template <typename EF, typename WF, typename SF>
-	int _add_edge_op(DeferredOpKind kind, int u, int v, std::set<int> cubes, EF&& eval_f, WF&& wp_f, SF&& sp_f) {
-		const int id = num_edge_phis++;
-		edge_to_phis_map[std::make_pair(u, v)].push_back(id);
-		edge_ops[id] = DeferredEdgeOp{kind, id, u, v, cubes,
-			std::forward<EF>(eval_f), std::forward<WF>(wp_f), std::forward<SF>(sp_f)};
-		return id;
-	}
-
-	template <typename EF, typename WF, typename SF>
-	int _add_assignable_edge_op(DeferredOpKind kind, int u, int v, int var, std::set<int> cubes, EF&& eval_f, WF&& wp_f, SF&& sp_f) {
-		const int id = num_edge_phis++;
-		edge_to_phis_map[std::make_pair(u, v)].push_back(id);
-		edge_phi_to_variable_map[id] = var;
-		edge_ops[id] = DeferredEdgeOp{kind, id, u, v, cubes,
-			std::forward<EF>(eval_f), std::forward<WF>(wp_f), std::forward<SF>(sp_f)};
-		return id;
-	}
-
-	template <typename F>
-	int _add_var_op(DeferredOpKind kind, F&& f) {
-		const int id = num_var_phis++;
-		var_ops[id] = DeferredVarOp{kind, id, std::forward<F>(f)};
-		return id;
-	}
-
 	int _add_symbolic_op(int node, const drake::symbolic::Formula& f) {
 		const int id = num_phis++;
 		node_to_phis_map[node].push_back(id);
@@ -1430,8 +1309,6 @@ private:
 struct SubgraphOfConstraints {
 	InducedSubgraphView<py::object> structure;
 	std::map<int, int> _variable_to_subgraph_variable_id; // unique ids for variables relevant to subgraph.
-	std::map<int, DeferredOp> _subgraph_ops;
-	std::map<int, DeferredEdgeOp> _subgraph_edge_ops;
 	std::map<int, SymbolicNodeConstraint> _subgraph_symbolic_ops;
 	std::map<int, SymbolicEdgeConstraint> _subgraph_symbolic_edge_ops;
 	std::map<int, HoldDeclaration> _subgraph_hold_ops;
@@ -1449,9 +1326,7 @@ struct SubgraphOfConstraints {
 			// if there is/are phi associated with v
 			if (graph->node_to_phis_map.contains(u)) {
 				for (int phi_id : graph->node_to_phis_map.at(u)) {
-					if (graph->ops.contains(phi_id)) {
-						_subgraph_ops[phi_id] = graph->ops.at(phi_id);
-					} else if (graph->symbolic_ops.contains(phi_id)) {
+					if (graph->symbolic_ops.contains(phi_id)) {
 						_subgraph_symbolic_ops[phi_id] = graph->symbolic_ops.at(phi_id);
 					}
 
@@ -1474,11 +1349,8 @@ struct SubgraphOfConstraints {
 			if (structure.contains_node(u) || structure.contains_node(v)) {
 				std::pair<int, int> e = std::make_pair(u, v);
 				if (graph->edge_to_phis_map.contains(e)) {
-					// Store the relevant edge ops so they can be applied
 					for (int edge_phi_id : graph->edge_to_phis_map.at(e)) {
-						if (graph->edge_ops.contains(edge_phi_id)) {
-							_subgraph_edge_ops[edge_phi_id] = graph->edge_ops.at(edge_phi_id);
-						} else if (graph->symbolic_edge_ops.contains(edge_phi_id)) {
+						if (graph->symbolic_edge_ops.contains(edge_phi_id)) {
 							_subgraph_symbolic_edge_ops[edge_phi_id] = graph->symbolic_edge_ops.at(edge_phi_id);
 						}
 					}
@@ -1487,21 +1359,13 @@ struct SubgraphOfConstraints {
 		}
 
 		// Hold registry entries (see HoldDeclaration) whose edge touches this
-		// subgraph -- unlike edge_ops above, each hold already carries its own
+		// subgraph -- unlike edge phis above, each hold already carries its own
 		// u_node/v_node directly, so no edge_to_phis_map indirection is needed.
 		for (const auto& [hold_id, hold] : graph->hold_ops) {
 			if (structure.contains_node(hold.u_node) || structure.contains_node(hold.v_node)) {
 				_subgraph_hold_ops[hold_id] = hold;
 			}
 		}
-	}
-
-	const std::map<int, DeferredOp>& get_subgraph_ops() const {
-		return _subgraph_ops;
-	}
-
-	const std::map<int, DeferredEdgeOp>& get_subgraph_edge_ops() const {
-		return _subgraph_edge_ops;
 	}
 
 	const std::map<int, SymbolicNodeConstraint>& get_subgraph_symbolic_ops() const {

@@ -21,10 +21,6 @@ namespace py = pybind11;
 void init_submodule_goc_mpc(py::module_& m) {
         py::module_ goc_mpc = m.def_submodule("goc_mpc", "GoC-MPC module.");
 
-	py::class_<DeferredEdgeOp>(goc_mpc, "DeferredEdgeOp")
-		.def_readonly("u_node", &DeferredEdgeOp::u_node)
-		.def_readonly("v_node", &DeferredEdgeOp::v_node);
-
 	// Canonical hold registry record -- see HoldDeclaration's own docstring
 	// (graph_of_constraints.hpp). Exactly one of robot_ag/var_id is set.
 	py::class_<HoldDeclaration>(goc_mpc, "HoldDeclaration")
@@ -150,8 +146,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// add_robot_holding_cube_constraint/add_assignable_robot_holding_
 		// point_constraint. Single source of truth for "which edges hold
 		// which objects" for non-MILP consumers (e.g. the JAX evolutionary
-		// solver), instead of each re-deriving it from the legacy
-		// DeferredEdgeOp::cubes + static/assignable edge-phi maps.
+		// solver).
 		.def_readonly("hold_ops", &GraphOfConstraints::hold_ops)
 		// Raw Formula records for the unified symbolic constraint API
 		// (add_constraint / add_assignable_constraint / add_edge_constraint),

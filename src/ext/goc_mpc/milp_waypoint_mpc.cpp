@@ -1449,61 +1449,40 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		add_ordering_constraint(uv.first, uv.second, &formula);
 	}
 
-	// Constraint 11: Add assignment variable constraints from registry
-	for (const auto& [var_phi_id, var_op] : graph->get_var_ops()) {
-		var_op.builder(prog, subgraph, var_phi_id, W, Assignments);
+	// Constraint 11: assignment-variable constraints (add_variable_constraint /
+	// add_variable_ineq_constraint), for variables present in this subgraph.
+	for (const auto& [var, allowed] : graph->var_candidates) {
+		const int variable_k = subgraph.subgraph_variable_id(var);
+		if (variable_k < 0) continue;
+		for (int k = 0; k < num_agents; ++k)
+			if (!allowed.contains(k))
+				prog.AddLinearEqualityConstraint(Expression(Assignments(variable_k, k)), 0.0);
+	}
+	for (const auto& [var1, var2] : graph->var_ineq_pairs) {
+		const int variable1_k = subgraph.subgraph_variable_id(var1);
+		const int variable2_k = subgraph.subgraph_variable_id(var2);
+		if (variable1_k < 0 || variable2_k < 0) continue;
+		for (int k = 0; k < num_agents; ++k)
+			prog.AddLinearEqualityConstraint(
+				Expression(Assignments(variable1_k, k)) + Expression(Assignments(variable2_k, k)), 1.0);
 	}
 
-
-	// Constraint 12: Add node constraints/costs from registry
-	for (const auto& [phi_id, op] : subgraph.get_subgraph_ops()) {
-		op.builder(prog, subgraph, phi_id, W, Assignments);
-	}
-
-	// Constraint 12b: node constraints from the unified symbolic API
-	// (add_constraint / add_assignable_constraint) — compiled directly from
-	// the stored Formula, mirroring what the retired DeferredOp builder
-	// closures used to do inline. See symbolic_constraint_compiler.*.
+	// Constraint 12: node constraints from the unified symbolic API
+	// (add_constraint / add_assignable_constraint), compiled from the stored
+	// Formula. See symbolic_constraint_compiler.*.
 	for (const auto& [phi_id, rec] : subgraph.get_subgraph_symbolic_ops()) {
 		CompileSymbolicNodeConstraint(prog, subgraph, *graph, rec, W, Assignments);
 	}
 
-	// Constraint 13: Add edge constraints/costs from edge registry
-
-	// Edge phis are registered against two specific graph nodes (u, v), but
-	// node order is a routing decision (Z/t above), not fixed identity: some
-	// other subgraph node w with no DAG relationship to u or v may end up
-	// scheduled (by any agent) with t(u) <= t(w) <= t(v). For edge ops whose
-	// constraint is an independent per-endpoint invariant (interior_builder
-	// set — see add_robot_holding_cube_constraint), re-apply that invariant,
-	// gated by a betweenness indicator, at every such interior node so it
-	// isn't silently unconstrained mid-hold.
-	std::map<std::tuple<int, int, int>, Variable> betweenness_cache;
-	for (const auto& [edge_phi_id, edge_op] : subgraph.get_subgraph_edge_ops()) {
-		edge_op.waypoint_builder(prog, subgraph, edge_phi_id, W, Assignments,
-					 previous_X.row(edge_op.u_node));
-
-		if (!edge_op.interior_builder) continue;
-		const int sg_u13 = subgraph.subgraph_id(edge_op.u_node);
-		const int sg_v13 = subgraph.subgraph_id(edge_op.v_node);
-		if (sg_u13 < 0 || sg_v13 < 0) continue;
-		for (int sg_w13 = 0; sg_w13 < n_V; ++sg_w13) {
-			if (sg_w13 == sg_u13 || sg_w13 == sg_v13) continue;
-			const Variable& b_between = GetOrAddBetweennessIndicator(
-				prog, t_var, ri(sg_u13), ri(sg_w13), ri(sg_v13), M_time, betweenness_cache);
-			edge_op.interior_builder(prog, subgraph, edge_phi_id, W, Assignments,
-						  sg_w13, b_between);
-		}
-	}
-
-	// Constraint 13b: edge constraints from the unified symbolic API
+	// Constraint 13: edge constraints from the unified symbolic API
 	// (add_edge_constraint). A relational formula (rec.along_edge == false)
-	// is a single relation coupling both endpoints — no interior_builder
-	// equivalent needed. An "along the edge" formula (rec.along_edge ==
-	// true) IS a per-endpoint invariant though, so — mirroring Constraint
-	// 13's interior_builder loop above for the older DeferredEdgeOp API —
-	// re-apply it, betweenness-gated, at every other subgraph node that
-	// could end up scheduled between u_node and v_node in the solved route.
+	// is a single relation coupling both endpoints. An "along the edge"
+	// formula (rec.along_edge == true) is a per-endpoint invariant, and node
+	// order is a routing decision (Z/t above), not fixed identity: another
+	// subgraph node w with no DAG relationship to u or v may end up scheduled
+	// with t(u) <= t(w) <= t(v). So re-apply it, betweenness-gated, at every
+	// other subgraph node so it isn't silently unconstrained mid-edge.
+	std::map<std::tuple<int, int, int>, Variable> betweenness_cache;
 	for (const auto& [edge_phi_id, rec] : subgraph.get_subgraph_symbolic_edge_ops()) {
 		CompileSymbolicEdgeConstraint(prog, subgraph, *graph, rec, W, Assignments, previous_X);
 

@@ -998,8 +998,8 @@ def _batch_symbolic_constraint_fn(fn, node_locals, mode="frozen"):
 
 
 def _batch_along_edge_interior_fn(fn, kind, u, v, decode_node_rank, mode="frozen"):
-    """JAX analogue of MILP's betweenness-gated interior_builder
-    re-application (see milp_waypoint_mpc.cpp's Constraint 13b): re-applies
+    """JAX analogue of MILP's betweenness-gated along-edge
+    re-application (see milp_waypoint_mpc.cpp's Constraint 13): re-applies
     an "along the edge" formula's residual at every OTHER node whose
     DECODED visiting-order rank (kernel.build_decode_node_rank -- an exact,
     per-individual topologically valid permutation, NOT raw `t`; see that

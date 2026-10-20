@@ -5,6 +5,7 @@
 #include <drake/common/symbolic/decompose.h>
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <unordered_map>
 #include <numeric>
@@ -35,7 +36,6 @@ GraphOfConstraints::GraphOfConstraints(
 	  _object_names(object_names),
 	  num_phis(0),
 	  num_edge_phis(0),
-	  num_var_phis(0),
 	  num_holds(0),
 	  num_variables(0),
 	  _num_total_assignables(0),
@@ -260,7 +260,7 @@ Eigen::VectorXi GraphOfConstraints::constrained_columns(
 	if (node_to_phis_map.contains(node)) {
 		for (int phi_id : node_to_phis_map.at(node)) {
 			auto it = symbolic_ops.find(phi_id);
-			if (it == symbolic_ops.end()) continue;  // legacy DeferredOp: opaque
+			if (it == symbolic_ops.end()) continue;
 			resolve(it->second.formula.GetFreeVariables(), false, false);
 		}
 	}
@@ -280,9 +280,9 @@ Eigen::VectorXi GraphOfConstraints::constrained_columns(
 	}
 
 	// Rigid-carry holds incident to `node` (add_hold / add_assignable_hold).
-	// A hold is pure bookkeeping (hold_ops) -- never routed through
-	// _add_edge_op, so it carries no symbolic formula the loops above could
-	// see -- but it DOES pin geometry at both its endpoints: the held
+	// A hold is pure bookkeeping (hold_ops) -- it carries no symbolic
+	// formula the loops above could see -- but it DOES pin geometry at both
+	// its endpoints: the held
 	// object's world position moves exactly as the holding agent's
 	// end-effector does (see the JAX solver's _resolve_holds / MILP's
 	// Constraint 14a). Without this, an INTERIOR node whose only claim on an
@@ -408,9 +408,8 @@ Eigen::VectorXd GraphOfConstraints::point_position(int point_id, const Eigen::Ve
 //      agent_link_rot FK constraint (the configuration-space analogue --
 //      the EE target in joint-space planning). Neither was routed through
 //      the assignable machinery, so neither has a phi_to_variable_map entry.
-//   otherwise kNone (a pure object-only phi, or a legacy DeferredOp with no
-//   Formula to introspect) -- callers must treat that as "this phi has no
-//   opinion", not "belongs to every agent".
+//   otherwise kNone (a pure object-only phi) -- callers must treat that as
+//   "this phi has no opinion", not "belongs to every agent".
 PhiAgentSource GraphOfConstraints::phi_agent_source(int phi_id) const {
 	PhiAgentSource src;
 	if (_phi_routing_exempt.count(phi_id)) return src;  // kNone
@@ -479,8 +478,7 @@ std::set<int> PhiOwningAgents(const GraphOfConstraints& graph, int phi_id,
 // EDGE constraint (edge_phi_to_variable_map) has its own separate phi-id
 // space and isn't covered here at all (its ownership would need
 // get_edge_phi_agent, which get_agent_paths doesn't consult). This only
-// covers constraints actually routed through
-// `_add_edge_op` (add_edge_constraint and friends); the canonical hold
+// covers edge phis (add_edge_constraint); the canonical hold
 // registry (add_hold/add_assignable_hold) bypasses that machinery entirely
 // -- see HoldOwningAgents below for its ownership resolution.
 std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_id) {
@@ -512,8 +510,8 @@ std::set<int> EdgePhiOwningAgents(const GraphOfConstraints& graph, int edge_phi_
 // by design -- its own node constraint pins just the held object (see
 // pyrobosim_gymnasium's _place_add), leaving the robot's position there to
 // come entirely from the transport edge back to Pick (_place_edge_add).
-// HoldDeclaration is pure bookkeeping (hold_ops), never routed through
-// _add_edge_op, so it has no phi_id and EdgePhiOwningAgents never sees it
+// HoldDeclaration is pure bookkeeping (hold_ops), not an edge phi, so it
+// has no phi_id and EdgePhiOwningAgents never sees it
 // -- checked here as a separate tier instead.
 //
 // A statically-assigned hold (add_hold, robot_ag set) resolves
@@ -938,12 +936,7 @@ bool GraphOfConstraints::evaluate_phi(int phi_id,
                                       const Eigen::VectorXd& x,
                                       const Eigen::VectorXi& assignments,
                                       double tol) const {
-	if (ops.contains(phi_id)) {
-		const DeferredOp& op = ops.at(phi_id);
-		double v = op.eval(x, assignments(phi_id));
-		std::cout << "violation: " << v << std::endl;
-		return v < tol;
-	} else if (symbolic_ops.contains(phi_id)) {
+	if (symbolic_ops.contains(phi_id)) {
 		double v = EvaluateSymbolicNodeConstraint(*this, symbolic_ops.at(phi_id), x, assignments(phi_id));
 		return v < tol;
 	}
@@ -953,10 +946,7 @@ bool GraphOfConstraints::evaluate_phi(int phi_id,
 double GraphOfConstraints::evaluate_phi_value(int phi_id,
                                               const Eigen::VectorXd& x,
                                               const Eigen::VectorXi& assignments) const {
-	if (ops.contains(phi_id)) {
-		const DeferredOp& op = ops.at(phi_id);
-		return op.eval(x, assignments(phi_id));
-	} else if (symbolic_ops.contains(phi_id)) {
+	if (symbolic_ops.contains(phi_id)) {
 		return EvaluateSymbolicNodeConstraint(*this, symbolic_ops.at(phi_id), x, assignments(phi_id));
 	}
 	return 0.0;
@@ -966,11 +956,7 @@ bool GraphOfConstraints::evaluate_edge_phi(int phi_id,
 					   const Eigen::VectorXd& x,
 					   const Eigen::VectorXi& var_assignments,
 					   double tol) const {
-	if (edge_ops.contains(phi_id)) {
-		const DeferredEdgeOp& op = edge_ops.at(phi_id);
-		double v = op.eval(x, var_assignments);
-		return v < tol;
-	} else if (symbolic_edge_ops.contains(phi_id)) {
+	if (symbolic_edge_ops.contains(phi_id)) {
 		double v = EvaluateSymbolicEdgeConstraint(*this, symbolic_edge_ops.at(phi_id), x, var_assignments);
 		return v < tol;
 	}
@@ -1172,7 +1158,7 @@ void GraphOfConstraints::add_edge_min_tau_constraint(int u,
 //                            VARIABLE CONSTRAINTS                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-int GraphOfConstraints::add_variable_constraint(
+void GraphOfConstraints::add_variable_constraint(
 	int var,
 	std::set<int> robot_ids) {
 
@@ -1202,59 +1188,26 @@ int GraphOfConstraints::add_variable_constraint(
 		_var_widths[var] = width;
 	}
 
- 	return _add_var_op(
-		DeferredOpKind::kLinearEq,
-		[=, this](auto& prog,
-			  const SubgraphOfConstraints& subgraph,
-			  const int phi_id,
-			  const auto& X,
-			  const auto & Assignments) {
-
-			// Get the variable row for this variable.
-			const int variable_k = subgraph.subgraph_variable_id(var);
-			if (variable_k < 0) return;
-
-			// For every robot (i) we want to constrain the Assignments to
-			// something like [0, 0, 0, 1, 1, 0, 1] where the 1 entries are the
-			// robots that are allowed
-			for (int i = 0; i < num_agents; i++) {
-				// If i is not in robot_ids (not allowed)
-				if (robot_ids.find(i) == robot_ids.end()) {
-					// Make sure it is constrained to NOT be assigned
-					const auto s = Assignments(variable_k, i);
-					prog.AddLinearEqualityConstraint(s, 0);
-				}
-			}
-		});
+	auto it = var_candidates.find(var);
+	if (it == var_candidates.end()) {
+		var_candidates[var] = std::move(robot_ids);
+	} else {
+		std::set<int> both;
+		std::set_intersection(it->second.begin(), it->second.end(),
+				      robot_ids.begin(), robot_ids.end(),
+				      std::inserter(both, both.begin()));
+		it->second = std::move(both);
+	}
 }
 
-int GraphOfConstraints::add_variable_ineq_constraint(
+void GraphOfConstraints::add_variable_ineq_constraint(
 	int var1,
 	int var2) {
 
 	DRAKE_DEMAND(var1 >= 0 && var1 < num_variables);
 	DRAKE_DEMAND(var2 >= 0 && var2 < num_variables);
 
- 	return _add_var_op(
-		DeferredOpKind::kLinearIneq,
-		[=, this](auto& prog,
-			  const SubgraphOfConstraints& subgraph,
-			  const int phi_id,
-			  const auto& X,
-			  const auto& Assignments) {
-
-			const int variable1_k = subgraph.subgraph_variable_id(var1);
-			const int variable2_k = subgraph.subgraph_variable_id(var2);
-
-			if (variable1_k >= 0 && variable2_k >= 0) {
-				for (int i = 0; i < num_agents; i++) {
-					const auto s = Assignments(variable1_k, i) + Assignments(variable2_k, i);
-					// 1 <= binary v1 + binary v2 <= 1 implies both
-					// cannot be zero and both cannot be one.
-					prog.AddLinearConstraint(s, 1, 1);
-				}
-			}
-		});
+	var_ineq_pairs.emplace_back(var1, var2);
 }
 
 // Symbolic unified constraint API
