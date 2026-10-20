@@ -8,6 +8,7 @@
 #include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
 #include "milp_waypoint_mpc.hpp"
+#include "gcs_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
 
@@ -454,6 +455,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_t_by_node", &GraphWaypointMPC::view_t_by_node, py::return_value_policy::reference_internal)
 		.def("get_last_solve_time", &GraphWaypointMPC::get_last_solve_time);
 
+	py::enum_<SubtourElimination>(goc_mpc, "SubtourElimination")
+		.value("kMCF",  SubtourElimination::kMCF)
+		.value("kNone", SubtourElimination::kNone);
+
         py::class_<MILPWaypointMPC, GraphWaypointMPC, std::shared_ptr<MILPWaypointMPC>>(goc_mpc, "MILPWaypointMPC")
                 .def(py::init<GraphOfConstraints&,
 			      std::vector<CubicConfigurationSpline>,
@@ -468,6 +473,24 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("objective")         = WaypointObjective::kMinMaxL1)
 		.def("view_t", &MILPWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		.def("view_Z", &MILPWaypointMPC::view_Z, py::return_value_policy::reference_internal);
+
+        py::class_<GCSWaypointMPC, GraphWaypointMPC, std::shared_ptr<GCSWaypointMPC>>(goc_mpc, "GCSWaypointMPC")
+                .def(py::init<GraphOfConstraints&,
+			      std::vector<CubicConfigurationSpline>,
+			      WaypointSolver,
+			      bool,
+			      WaypointObjective,
+			      SubtourElimination>(),
+		     py::keep_alive<1, 2>(),
+		     py::arg("graph"),
+		     py::arg("splines"),
+		     py::arg("solver")            = WaypointSolver::kGurobi,
+		     py::arg("enforce_rigidity")  = false,
+		     py::arg("objective")         = WaypointObjective::kMinMaxL1,
+		     py::arg("subtour")           = SubtourElimination::kMCF)
+		.def("view_t", &GCSWaypointMPC::view_t, py::return_value_policy::reference_internal)
+		// Per agent: graph node ids visited, in order.
+		.def("view_routes", &GCSWaypointMPC::view_routes);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
                 .def(py::init([](const GraphOfConstraints& graph,

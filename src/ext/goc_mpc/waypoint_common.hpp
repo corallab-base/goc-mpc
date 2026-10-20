@@ -4,6 +4,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <drake/solvers/mathematical_program.h>
@@ -20,6 +21,13 @@
 // are the decision variables these share.
 
 enum class WaypointSolver { kGurobi, kMosek, kIPOPT };
+
+// Subtour elimination. kMCF: a multi-commodity flow (one commodity per node
+// an agent may visit, routed from the depot within the arcs the agent uses),
+// the compact form of the generalized subtour elimination constraints.
+// kNone: rely on the time-propagation rows alone, which still allow a
+// detached cycle of zero-length arcs at equal times.
+enum class SubtourElimination { kMCF, kNone };
 
 // Routing graph N = {depot=0} ∪ task_nodes(1..n_V) ∪ {sink=n_V+1}: task node
 // with subgraph id sg has routing index sg + 1.
@@ -174,6 +182,18 @@ void AddStationaryObjectConstraints(
 	const Eigen::VectorXd& x0,
 	const drake::solvers::VectorXDecisionVariable& t_var,
 	double M_time);
+
+// kMCF rows for one agent's routing graph. `arcs` are (tail, head) vertex
+// indices, tail -1 for the depot and head -2 for the sink; `Z` holds one
+// binary per arc; vertex_node maps a vertex to its subgraph node and
+// visit[sg] is the agent's visit indicator for node sg.
+void AddMultiCommodityFlow(
+	drake::solvers::MathematicalProgram& prog,
+	const std::vector<std::pair<int, int>>& arcs,
+	const drake::solvers::VectorXDecisionVariable& Z,
+	const std::vector<int>& vertex_node,
+	const std::vector<drake::symbolic::Expression>& visit,
+	const std::string& tag);
 
 void PrintSolverReport(const drake::solvers::MathematicalProgram& prog,
 		       const drake::solvers::MathematicalProgramResult& result,

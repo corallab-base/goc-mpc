@@ -54,6 +54,22 @@ void CompileAlongEdgeConstraintAtNode(
 	int sg_node,
 	const drake::symbolic::Expression* extra_gate);
 
+// Conservative big-M: maximum absolute value any component of x could take.
+double ConservativeStateBigM(const GraphOfConstraints& graph);
+
+// Adds big-M gated linear equalities/inequalities for formula ff (a
+// conjunction of Eq/Leq/Geq atoms), enforced only when every expression in
+// `gates` evaluates to 1 (each gate contributes its own M*(1-gate) slack).
+void AddBigMGatedFormula(drake::solvers::MathematicalProgram& prog,
+                         const drake::symbolic::Formula& ff,
+                         const std::vector<drake::symbolic::Expression>& gates,
+                         double M);
+
+// Raises a clear error if `formula` still has free variables `sub` doesn't
+// cover (e.g. an agent_link_pos/agent_link_rot placeholder).
+void RequireFullySubstituted(const drake::symbolic::Formula& formula,
+                             const drake::symbolic::Substitution& sub);
+
 // Numeric constraint-violation evaluators, used by
 // GraphOfConstraints::evaluate_phi/evaluate_edge_phi.
 double EvaluateSymbolicNodeConstraint(

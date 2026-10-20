@@ -181,6 +181,8 @@ void InsertAgentLinkPoseEnv(const GraphOfConstraints& graph,
 	}
 }
 
+}  // namespace
+
 // Conservative big-M: maximum absolute value any component of x could take.
 double ConservativeStateBigM(const GraphOfConstraints& graph) {
 	return graph._global_x_ub.array().abs().maxCoeff() +
@@ -250,8 +252,6 @@ void RequireFullySubstituted(const drake::symbolic::Formula& formula,
 			var.get_name()));
 	}
 }
-
-}  // namespace
 
 void CompileSymbolicNodeConstraint(
 	drake::solvers::MathematicalProgram& prog,

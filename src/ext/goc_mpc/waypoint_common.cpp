@@ -639,6 +639,46 @@ void AddStationaryObjectConstraints(MathematicalProgram& prog,
 	}
 }
 
+void AddMultiCommodityFlow(MathematicalProgram& prog,
+			   const std::vector<std::pair<int, int>>& arcs,
+			   const VectorXDecisionVariable& Z,
+			   const std::vector<int>& vertex_node,
+			   const std::vector<Expression>& visit,
+			   const std::string& tag) {
+	const int L = arcs.size();
+	const int n_vert = vertex_node.size();
+	std::vector<std::vector<int>> out_arcs(n_vert), in_arcs(n_vert);
+	std::vector<bool> reachable(visit.size(), false);
+	for (int a = 0; a < L; ++a) {
+		const auto [tail, head] = arcs[a];
+		if (tail >= 0) out_arcs[tail].push_back(a);
+		if (head >= 0) { in_arcs[head].push_back(a); reachable[vertex_node[head]] = true; }
+	}
+	const double kInf = std::numeric_limits<double>::infinity();
+	for (int c = 0; c < static_cast<int>(visit.size()); ++c) {
+		if (!reachable[c]) continue;
+		const VectorXDecisionVariable F = prog.NewContinuousVariables(L, fmt::format("F_{}_{}", tag, c));
+		prog.AddBoundingBoxConstraint(0.0, kInf, F);
+		for (int a = 0; a < L; ++a) {
+			if (arcs[a].second < 0) prog.AddBoundingBoxConstraint(0.0, 0.0, F(a));
+			else prog.AddLinearConstraint(Expression(F(a)) - Expression(Z(a)), -kInf, 0.0);
+		}
+		Expression delivered;
+		for (int v = 0; v < n_vert; ++v) {
+			Expression net;
+			for (int a : in_arcs[v]) net += Expression(F(a));
+			for (int a : out_arcs[v]) net -= Expression(F(a));
+			if (vertex_node[v] == c) {
+				prog.AddLinearConstraint(net, 0.0, kInf);
+				delivered += net;
+			} else {
+				prog.AddLinearEqualityConstraint(net, 0.0);
+			}
+		}
+		prog.AddLinearEqualityConstraint(delivered - visit[c], 0.0);
+	}
+}
+
 void PrintSolverReport(const MathematicalProgram& prog,
 		       const MathematicalProgramResult& result,
 		       double tol) {

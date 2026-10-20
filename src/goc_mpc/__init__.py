@@ -11,6 +11,8 @@ from .goc_mpc import (
     WaypointObjective,
     GraphWaypointMPC,
     MILPWaypointMPC,
+    GCSWaypointMPC,
+    SubtourElimination,
     GraphTimingMPC,
     GraphShortPathMPC,
     ObstacleSet,
