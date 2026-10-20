@@ -1,9 +1,11 @@
 #pragma once
 
 #include <memory>
+#include <set>
 #include <vector>
 
 #include <drake/common/timer.h>
+#include <drake/solvers/mathematical_program_result.h>
 
 #include "graph_of_constraints.hpp"
 #include "../configuration_spline.hpp"
@@ -45,9 +47,29 @@ protected:
 	drake::SteadyTimer _timer;
 	double _last_solve_time;
 
+	// remaining_vertices as of the previous Solve() call -- lets BeginSolve()
+	// detect a node's active->passed transition instead of just its current
+	// active/passed state. Unset before the first Solve() call, so no
+	// transition is possible there (the initial remaining_vertices is the
+	// graph's starting condition, not something that "just passed").
+	std::set<int> _prev_remaining_set;
+	bool _has_prev_remaining_set{false};
+
 	GraphWaypointMPC(GraphOfConstraints& graph,
 			 std::vector<CubicConfigurationSpline> splines,
 			 WaypointObjective objective);
+
+	// Start of a Drake-backed Solve(): starts the timer, warm-starts
+	// _waypoints on the first cycle, and live-rebinds the rows of nodes that
+	// just passed to the real x0.
+	void BeginSolve(const std::vector<int>& remaining_vertices,
+			const Eigen::VectorXd& x0);
+
+	// Writes _assignments/_var_assignments from a solved Assignments matrix
+	// (one row per subgraph variable, one column per agent).
+	void StoreAssignments(const SubgraphOfConstraints& subgraph,
+			      const drake::solvers::MatrixXDecisionVariable& Assignments,
+			      const drake::solvers::MathematicalProgramResult& result);
 
 public:
 	virtual ~GraphWaypointMPC() = default;

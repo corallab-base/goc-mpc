@@ -64,6 +64,7 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/graph_of_constraints.cpp"
     "src/ext/goc_mpc/symbolic_constraint_compiler.cpp"
     "src/ext/goc_mpc/graph_waypoint_mpc.cpp"
+    "src/ext/goc_mpc/waypoint_common.cpp"
     "src/ext/goc_mpc/milp_waypoint_mpc.cpp"
     "src/ext/goc_mpc/graph_timing_mpc.cpp"
     "src/ext/goc_mpc/timing_gn_layout.cpp"

@@ -670,352 +670,6 @@ static void AddHoldRigidityAssignableGated(
 	}
 }
 
-// Compute the L1 distance between two symbolic configuration expressions,
-// summed over a spline's R blocks only (non-Euclidean blocks — Torus, SO3 —
-// are skipped; geodesic distance over those is not yet implemented). One
-// slack variable t_i per component (t_i >= |x1_i - x2_i|) is introduced and
-// the returned expression is sum(t) over all R blocks.
-Expression ComputeL1Distance(
-	MathematicalProgram& prog,
-	const CubicConfigurationSpline& spline,
-	const VecX<Expression>& x1,
-	const VecX<Expression>& x2,
-	const std::string& tag) {
-
-	const double kInf = std::numeric_limits<double>::infinity();
-	Expression dist(0.0);
-
-	for (const auto& off : spline.block_offsets_) {
-		if (off.type != CubicConfigurationSpline::Block::Type::R) continue;
-		const int a0 = off.ambient_offset;
-		const int aN = off.ambient_size;
-
-		auto t = prog.NewContinuousVariables(aN, "l1_t_" + tag);
-		prog.AddBoundingBoxConstraint(0.0, kInf, t);
-
-		for (int i = 0; i < aN; ++i) {
-			const Expression diff = x1(a0 + i) - x2(a0 + i);
-			prog.AddLinearConstraint( diff - Expression(t(i)), -kInf, 0.0);
-			prog.AddLinearConstraint(-diff - Expression(t(i)), -kInf, 0.0);
-			dist += Expression(t(i));
-		}
-	}
-
-	return dist;
-}
-
-// Compute the L2 (Euclidean) distance between two symbolic configuration
-// expressions, summed over a spline's R blocks only (same scope as
-// ComputeL1Distance). One nonnegative scalar d_blk per R block is introduced,
-// constrained via a Lorentz cone (d_blk >= ||x1_blk - x2_blk||_2), and the
-// returned expression is sum(d_blk) over all R blocks.
-Expression ComputeL2Distance(
-	MathematicalProgram& prog,
-	const CubicConfigurationSpline& spline,
-	const VecX<Expression>& x1,
-	const VecX<Expression>& x2,
-	const std::string& tag) {
-
-	const double kInf = std::numeric_limits<double>::infinity();
-	Expression dist(0.0);
-
-	for (const auto& off : spline.block_offsets_) {
-		if (off.type != CubicConfigurationSpline::Block::Type::R) continue;
-		const int a0 = off.ambient_offset;
-		const int aN = off.ambient_size;
-
-		auto d_blk = prog.NewContinuousVariables(1, "l2_d_" + tag)(0);
-		prog.AddBoundingBoxConstraint(0.0, kInf, d_blk);
-
-		VecX<Expression> z(aN + 1);
-		z(0) = Expression(d_blk);
-		for (int i = 0; i < aN; ++i)
-			z(i + 1) = x1(a0 + i) - x2(a0 + i);
-		prog.AddLorentzConeConstraint(z);
-
-		dist += Expression(d_blk);
-	}
-
-	return dist;
-}
-
-// Compile b_same: binary MILP variable = 1 iff variables r0 and r1 are
-// assigned to the same agent in the current (or previous) solve.
-drake::symbolic::Variable CompileVarEq(
-	MathematicalProgram& prog,
-	int r0, int r1,
-	const MatrixXDecisionVariable& Assignments,
-	const SubgraphOfConstraints& subgraph,
-	const Eigen::VectorXi& prev_var_assignments)
-{
-	const double kInf = std::numeric_limits<double>::infinity();
-	int r0_local = subgraph.subgraph_variable_id(r0);
-	int r1_local = subgraph.subgraph_variable_id(r1);
-	int r0_prev  = (r0 < prev_var_assignments.size()) ? prev_var_assignments(r0) : -1;
-	int r1_prev  = (r1 < prev_var_assignments.size()) ? prev_var_assignments(r1) : -1;
-
-	auto b_same = prog.NewBinaryVariables(1, "b_same")(0);
-
-	if (r0_prev >= 0 && r1_prev >= 0) {
-		double val = (r0_prev == r1_prev) ? 1.0 : 0.0;
-		prog.AddLinearConstraint(Expression(b_same), val, val);
-		return b_same;
-	}
-
-	int num_agents = Assignments.cols();
-	Expression sum_s;
-	for (int j = 0; j < num_agents; ++j) {
-		Expression a0 = (r0_prev >= 0) ? Expression(r0_prev == j ? 1.0 : 0.0)
-		                               : Expression(Assignments(r0_local, j));
-		Expression a1 = (r1_prev >= 0) ? Expression(r1_prev == j ? 1.0 : 0.0)
-		                               : Expression(Assignments(r1_local, j));
-		auto s_j = prog.NewBinaryVariables(1, "s_j")(0);
-		prog.AddLinearConstraint(Expression(s_j) - a0,       -kInf, 0.0);   // s_j ≤ a0
-		prog.AddLinearConstraint(Expression(s_j) - a1,       -kInf, 0.0);   // s_j ≤ a1
-		prog.AddLinearConstraint(Expression(s_j) - a0 - a1,  -1.0, kInf);   // s_j ≥ a0+a1-1
-		sum_s += Expression(s_j);
-	}
-	prog.AddLinearConstraint(Expression(b_same) - sum_s, 0.0, 0.0);
-	return b_same;
-}
-
-// Compile a conditional ordering formula to a binary MILP variable.
-// Returns a variable b such that b=1 iff the formula holds.
-// Recognised atoms: VarEq (r_sym_i == r_sym_j) and BinVarEq (bv_sym == 0/1).
-// Compound formulas use Drake FormulaKind::And / Or / Not.
-drake::symbolic::Variable CompileConditionToBinary(
-	MathematicalProgram& prog,
-	const drake::symbolic::Formula& f,
-	const MatrixXDecisionVariable& Assignments,
-	const SubgraphOfConstraints& subgraph,
-	const Eigen::VectorXi& prev_var_assignments,
-	const GraphOfConstraints* graph,
-	const std::vector<drake::symbolic::Variable>& cond_binary_vars)
-{
-	using drake::symbolic::FormulaKind;
-	using drake::symbolic::get_lhs_expression;
-	using drake::symbolic::get_rhs_expression;
-	using drake::symbolic::get_operands;
-	using drake::symbolic::get_operand;
-	using drake::symbolic::is_variable;
-	using drake::symbolic::get_variable;
-	const double kInf = std::numeric_limits<double>::infinity();
-
-	auto new_binary = [&](const std::string& name) {
-		return prog.NewBinaryVariables(1, name)(0);
-	};
-
-	switch (f.get_kind()) {
-
-	case FormulaKind::Eq: {
-		const Expression& lhs = get_lhs_expression(f);
-		const Expression& rhs = get_rhs_expression(f);
-
-		// VarEq: both sides are assignment symbolic vars
-		if (is_variable(lhs) && is_variable(rhs)) {
-			auto lv = get_variable(lhs);
-			auto rv = get_variable(rhs);
-			if (graph->_sym_id_to_variable_id.count(lv.get_id()) &&
-			    graph->_sym_id_to_variable_id.count(rv.get_id())) {
-				int r0 = graph->_sym_id_to_variable_id.at(lv.get_id());
-				int r1 = graph->_sym_id_to_variable_id.at(rv.get_id());
-				return CompileVarEq(prog, r0, r1, Assignments, subgraph, prev_var_assignments);
-			}
-		}
-
-		// BinVarEq: one side is a binary cond var, other is a 0/1 constant
-		auto try_binary_eq = [&](const Expression& var_expr, const Expression& val_expr)
-			-> std::optional<drake::symbolic::Variable>
-		{
-			if (!is_variable(var_expr)) return {};
-			auto sv = get_variable(var_expr);
-			if (!graph->_sym_id_to_binary_cond_id.count(sv.get_id())) return {};
-			int idx = graph->_sym_id_to_binary_cond_id.at(sv.get_id());
-			double val = val_expr.Evaluate();
-			const auto& gv = cond_binary_vars[idx];
-			auto b = new_binary("b_bveq");
-			if (val == 1.0) {
-				prog.AddLinearConstraint(Expression(b) - Expression(gv), 0.0, 0.0);
-			} else {
-				prog.AddLinearConstraint(Expression(b) + Expression(gv), 1.0, 1.0);
-			}
-			return b;
-		};
-		if (auto r = try_binary_eq(lhs, rhs)) return *r;
-		if (auto r = try_binary_eq(rhs, lhs)) return *r;
-
-		throw std::runtime_error("Unsupported Eq atom in conditional edge formula");
-	}
-
-	case FormulaKind::And: {
-		auto b = new_binary("b_and");
-		Expression sum;
-		int n = 0;
-		for (const auto& sub : get_operands(f)) {
-			auto b_sub = CompileConditionToBinary(prog, sub, Assignments, subgraph,
-			                                      prev_var_assignments, graph, cond_binary_vars);
-			prog.AddLinearConstraint(Expression(b) - Expression(b_sub), -kInf, 0.0);
-			sum += Expression(b_sub);
-			++n;
-		}
-		prog.AddLinearConstraint(Expression(b) - sum, -(n - 1.0), kInf);   // b ≥ sum-(n-1)
-		return b;
-	}
-
-	case FormulaKind::Or: {
-		auto b = new_binary("b_or");
-		Expression sum;
-		for (const auto& sub : get_operands(f)) {
-			auto b_sub = CompileConditionToBinary(prog, sub, Assignments, subgraph,
-			                                      prev_var_assignments, graph, cond_binary_vars);
-			prog.AddLinearConstraint(Expression(b) - Expression(b_sub), 0.0, kInf);
-			sum += Expression(b_sub);
-		}
-		prog.AddLinearConstraint(Expression(b) - sum, -kInf, 0.0);
-		return b;
-	}
-
-	case FormulaKind::Not: {
-		auto b_sub = CompileConditionToBinary(prog, get_operand(f), Assignments, subgraph,
-		                                      prev_var_assignments, graph, cond_binary_vars);
-		auto b = new_binary("b_not");
-		prog.AddLinearConstraint(Expression(b) + Expression(b_sub), 1.0, 1.0);
-		return b;
-	}
-
-	default:
-		throw std::runtime_error("Unsupported FormulaKind in conditional edge ordering");
-	}
-}
-
-// Returns (creating and caching if necessary) a binary MILP variable b such
-// that: t(t_idx_w) weakly between t(t_idx_u) and t(t_idx_v)  ⟹  b = 1.
-// This is one-directional by design: b is free to be 0 when the node isn't
-// between (so unrelated edge phis stay unconstrained), but can never be
-// forced to 0 when it genuinely is between (so the caller's gated constraint
-// can't be silently skipped). Built from two big-M half-plane implications
-// ANDed together, mirroring the And-combination in CompileConditionToBinary.
-drake::symbolic::Variable GetOrAddBetweennessIndicator(
-	MathematicalProgram& prog,
-	const VectorXDecisionVariable& t_var,
-	int t_idx_u, int t_idx_w, int t_idx_v,
-	double M_time,
-	std::map<std::tuple<int, int, int>, drake::symbolic::Variable>& cache)
-{
-	const auto key = std::make_tuple(t_idx_u, t_idx_w, t_idx_v);
-	auto it = cache.find(key);
-	if (it != cache.end()) return it->second;
-
-	const double kInf = std::numeric_limits<double>::infinity();
-	// Must clear the solver's default numerical tolerances (Gurobi's
-	// FeasibilityTol/IntFeasTol are ~1e-6/1e-5) with margin, or a
-	// same-time tie (t(u) == t(w) == t(v), e.g. nodes with no forced
-	// routing) can let b1/b2 slack to 0 well within tolerance, silently
-	// defeating the "forced to 1 when genuinely between" guarantee.
-	const double eps = 1e-3;
-
-	auto b1 = prog.NewBinaryVariables(1, "b_after_u")(0);   // t(w) >= t(u)  ⟹  b1 = 1
-	auto b2 = prog.NewBinaryVariables(1, "b_before_v")(0);  // t(w) <= t(v)  ⟹  b2 = 1
-
-	prog.AddLinearConstraint(
-		Expression(t_var(t_idx_u)) - Expression(t_var(t_idx_w)) + M_time * Expression(b1),
-		eps, kInf);
-	prog.AddLinearConstraint(
-		Expression(t_var(t_idx_w)) - Expression(t_var(t_idx_v)) + M_time * Expression(b2),
-		eps, kInf);
-
-	auto b = prog.NewBinaryVariables(1, "b_between")(0);
-	prog.AddLinearConstraint(Expression(b) - Expression(b1), -kInf, 0.0);
-	prog.AddLinearConstraint(Expression(b) - Expression(b2), -kInf, 0.0);
-	prog.AddLinearConstraint(Expression(b) - Expression(b1) - Expression(b2), -1.0, kInf);
-
-	cache[key] = b;
-	return b;
-}
-
-// Returns (creating and caching if necessary) a binary MILP variable b such
-// that: [t(t_idx_a1), t(t_idx_b1)] overlaps [t(t_idx_a2), t(t_idx_b2)]  <=>  b = 1
-// (intervals overlap iff t(a1) <= t(b2) AND t(a2) <= t(b1)). Fully
-// bidirectional: b is forced to 0 when the intervals genuinely do NOT
-// overlap (not just free to be 0), via a matched reverse-direction big-M
-// constraint per side, in addition to the existing "genuinely overlapping
-// ⟹ b=1" constraints. Needed because Constraint 14b (the only caller) uses
-// b=1 to RELAX a stationary-object constraint -- a false positive there
-// silently lets an unheld/not-yet-held object drift, which is exactly the
-// bug this fixes (see Constraint 14b's own comment). Only an unavoidable
-// +-eps dead zone remains, right at an exact interval-boundary tie.
-//
-// Kept as a separate function/cache from GetOrAddBetweennessIndicator
-// (which remains one-directional, deliberately not changed here): that one
-// gates Constraint 13/14a, where b=1 APPLIES an extra invariant rather than
-// relaxing one, so a false positive there is redundant rather than unsound,
-// and retightening it isn't needed to fix this bug.
-drake::symbolic::Variable GetOrAddIntervalOverlapIndicator(
-	MathematicalProgram& prog,
-	const VectorXDecisionVariable& t_var,
-	int t_idx_a1, int t_idx_b1, int t_idx_a2, int t_idx_b2,
-	double M_time,
-	std::map<std::tuple<int, int, int, int>, drake::symbolic::Variable>& cache)
-{
-	const auto key = std::make_tuple(t_idx_a1, t_idx_b1, t_idx_a2, t_idx_b2);
-	auto it = cache.find(key);
-	if (it != cache.end()) return it->second;
-
-	const double kInf = std::numeric_limits<double>::infinity();
-	const double eps = 1e-3;
-
-	auto c1 = prog.NewBinaryVariables(1, "c_a1_le_b2")(0);  // t(a1) <= t(b2)  <=>  c1 = 1
-	auto c2 = prog.NewBinaryVariables(1, "c_a2_le_b1")(0);  // t(a2) <= t(b1)  <=>  c2 = 1
-
-	// t_idx_a1 == t_idx_b2 (or t_idx_a2 == t_idx_b1) means the SAME t_var
-	// entry is being compared to itself -- e.g. an edge that ends exactly at
-	// a hold's own start node (the edge leading up to a pick-up). The two
-	// spans are then merely ADJACENT, not overlapping: the edge's own span
-	// is strictly before the hold even begins (the grasp happens AT the
-	// shared node, not during any part of the edge), so this must resolve
-	// to "no overlap" (0), not "trivially true, therefore overlapping" (1)
-	// -- pinning it to 1 was backwards, and is what was letting the held
-	// object drift free (via the wrongly-activated gated/relaxed branch)
-	// right up to and including the hold's own boundary node. It's also the
-	// case the bidirectional big-M pair below can't encode directly: at an
-	// exact tie the difference is identically zero, not just numerically
-	// close to zero, so demanding a +-eps margin on both sides of it
-	// simultaneously is unsatisfiable regardless of which value we want.
-	if (t_idx_a1 == t_idx_b2) {
-		prog.AddLinearEqualityConstraint(Expression(c1), 0.0);
-	} else {
-		// t(a1) <= t(b2)  ⟹  c1 = 1
-		prog.AddLinearConstraint(
-			Expression(t_var(t_idx_a1)) - Expression(t_var(t_idx_b2)) + M_time * Expression(c1),
-			eps, kInf);
-		// c1 = 1  ⟹  t(a1) <= t(b2) (with margin) -- the previously-missing direction.
-		prog.AddLinearConstraint(
-			Expression(t_var(t_idx_b2)) - Expression(t_var(t_idx_a1)) + M_time * (1.0 - Expression(c1)),
-			eps, kInf);
-	}
-
-	if (t_idx_a2 == t_idx_b1) {
-		prog.AddLinearEqualityConstraint(Expression(c2), 0.0);
-	} else {
-		// t(a2) <= t(b1)  ⟹  c2 = 1
-		prog.AddLinearConstraint(
-			Expression(t_var(t_idx_a2)) - Expression(t_var(t_idx_b1)) + M_time * Expression(c2),
-			eps, kInf);
-		// c2 = 1  ⟹  t(a2) <= t(b1) (with margin) -- the previously-missing direction.
-		prog.AddLinearConstraint(
-			Expression(t_var(t_idx_b1)) - Expression(t_var(t_idx_a2)) + M_time * (1.0 - Expression(c2)),
-			eps, kInf);
-	}
-
-	auto b = prog.NewBinaryVariables(1, "b_overlap")(0);
-	prog.AddLinearConstraint(Expression(b) - Expression(c1), -kInf, 0.0);
-	prog.AddLinearConstraint(Expression(b) - Expression(c2), -kInf, 0.0);
-	prog.AddLinearConstraint(Expression(b) - Expression(c1) - Expression(c2), -1.0, kInf);
-
-	cache[key] = b;
-	return b;
-}
-
 GraphWaypointProblem BuildGraphWaypointProblem(
 	GraphOfConstraints* graph,
 	std::shared_ptr<std::vector<CubicConfigurationSpline>> splines,
@@ -1028,7 +682,6 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	WaypointObjective objective) {
 
 	const int num_agents = graph->num_agents;
-	const int num_objects = graph->num_objects;
 
 	const SubgraphOfConstraints subgraph(graph, remaining_vertices);
 
@@ -1105,98 +758,13 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	VectorXDecisionVariable L_ms_var = prog.NewContinuousVariables(1, "L");
 	problem.L_ms = L_ms_var;
 
-	// One binary MILP variable per binary condition symbolic variable in the graph.
-	std::vector<drake::symbolic::Variable> cond_binary_vars;
-	for (int i = 0; i < static_cast<int>(graph->_binary_cond_sym_vars.size()); ++i) {
-		cond_binary_vars.push_back(prog.NewBinaryVariables(1, "bv_" + std::to_string(i))(0));
-	}
+	const std::vector<Variable> cond_binary_vars = AddConditionBinaryVars(prog, *graph);
 
-	// Which agents and roles each task node references (Constraint 8 below
-	// turns these into visits): a node references a role/agent through its
-	// own symbolic constraints, an edge constraint at either endpoint (u_/v_
-	// placeholders at their own endpoint, plain ones at both), or a hold's
-	// endpoints. required_at: agents that must visit the node.
-	std::vector<std::set<int>> roles_at(n_V), required_at(n_V);
-	auto add_refs = [&](int node, const drake::symbolic::Variables& free_vars,
-			    const PlaceholderVarFamily<int>& var_family,
-			    const PlaceholderVarFamily<int>& agent_family) {
-		const int sg = subgraph.subgraph_id(node);
-		if (sg < 0) return;
-		for (int var : var_family.KeysReferencedBy(free_vars)) roles_at[sg].insert(var);
-		for (int ag : agent_family.KeysReferencedBy(free_vars)) required_at[sg].insert(ag);
-	};
-
-	for (const auto& [phi_id, rec] : subgraph.get_subgraph_symbolic_ops()) {
-		if (graph->_phi_routing_exempt.count(phi_id)) continue;
-		const auto free_vars = rec.formula.GetFreeVariables();
-		add_refs(rec.node, free_vars, graph->_var_agent_q, graph->_agent_q);
-		const int sg = subgraph.subgraph_id(rec.node);
-		if (sg < 0) continue;
-		for (const auto& key : graph->_var_agent_link_pos.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
-		for (const auto& key : graph->_var_agent_link_rot.KeysReferencedBy(free_vars)) roles_at[sg].insert(key.first);
-		for (const auto& key : graph->_agent_link_pos.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
-		for (const auto& key : graph->_agent_link_rot.KeysReferencedBy(free_vars)) required_at[sg].insert(key.first);
-		if (graph->_phi_to_static_assignment_map.contains(phi_id))
-			required_at[sg].insert(graph->_phi_to_static_assignment_map.at(phi_id));
-	}
-	for (const auto& [edge_phi_id, rec] : subgraph.get_subgraph_symbolic_edge_ops()) {
-		const auto free_vars = rec.formula.GetFreeVariables();
-		for (int node : {rec.u_node, rec.v_node})
-			add_refs(node, free_vars, graph->_var_agent_q, graph->_agent_q);
-		add_refs(rec.u_node, free_vars, graph->_var_agent_q_u, graph->_agent_q_u);
-		add_refs(rec.v_node, free_vars, graph->_var_agent_q_v, graph->_agent_q_v);
-	}
-	for (const auto& [hold_id, hold] : subgraph.get_subgraph_hold_ops()) {
-		for (int node : {hold.u_node, hold.v_node}) {
-			const int sg = subgraph.subgraph_id(node);
-			if (sg < 0) continue;
-			if (hold.robot_ag.has_value()) required_at[sg].insert(*hold.robot_ag);
-			else roles_at[sg].insert(*hold.var_id);
-		}
-	}
-
-	// Arc pruning: arcs no optimal route needs, given the hard orderings
-	// (structure edges, Constraint 10). before[u][v]: u must come no later
-	// than v (transitive closure over the remaining task nodes). Agent j's
-	// arc a -> b is pruned if
-	//   - b must come before a, or
-	//   - some node c that j must visit has to come between them (a before
-	//     c before b; the depot comes before, and the sink after, everything).
-	// Sound: with the orderings non-strict (t(u) <= t(v)), a route can only
-	// take such an arc at equal times, over zero-length arcs (Constraint 9),
-	// i.e. between waypoints equal in every distance-measured block; visiting
-	// those in the ordered sequence instead costs the same. Pruned arcs keep
-	// Z = 0 and e = 0, and get no distance (Constraint 2) or time
-	// propagation (Constraint 9) rows. For a chain visited by one agent only
-	// the n+1 consecutive arcs remain, instead of ~n^2 binaries with big-M
-	// rows that the solver would branch over.
-	std::vector<std::vector<bool>> before(n_V, std::vector<bool>(n_V, false));
-	for (const auto& edge : subgraph.structure.edges()) {
-		const int sg_u = subgraph.subgraph_id(edge.u);
-		const int sg_v = subgraph.subgraph_id(edge.e->to);
-		if (sg_u >= 0 && sg_v >= 0 && sg_u != sg_v) before[sg_u][sg_v] = true;
-	}
-	for (int k = 0; k < n_V; ++k)
-		for (int u = 0; u < n_V; ++u)
-			if (before[u][k])
-				for (int v = 0; v < n_V; ++v)
-					if (before[k][v]) before[u][v] = true;
-	// Routing indices: depot before everything, sink after everything
-	auto precedes = [&](int a, int b) -> bool {
-		if (a == depot_idx || b == sink_idx) return a != b;
-		if (a == sink_idx || b == depot_idx) return false;
-		return before[a - 1][b - 1];
-	};
-	auto arc_allowed = [&](int j, int a, int b) -> bool {
-		if (a != depot_idx && a != sink_idx && b != depot_idx && b != sink_idx && precedes(b, a))
-			return false;
-		for (int sg_c = 0; sg_c < n_V; ++sg_c) {
-			const int c = ri(sg_c);
-			if (c != a && c != b && required_at[sg_c].contains(j) && precedes(a, c) && precedes(c, b))
-				return false;
-		}
-		return true;
-	};
+	// Visits and arc pruning (see RoutingPresolve).
+	const RoutingPresolve presolve = BuildRoutingPresolve(*graph, subgraph);
+	const auto& roles_at = presolve.roles_at;
+	const auto& required_at = presolve.required_at;
+	auto arc_allowed = [&](int j, int a, int b) { return presolve.arc_allowed(j, a, b); };
 
 	///////////////////////////////////////////////////////////////////////
         //                             Constraints                           //
@@ -1349,11 +917,7 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	//   otherwise: inflow(k,v) = Σ_{r at v} A(r,k) ≤ 1  (0 at a node with no roles)
 	// (roles_at / required_at: computed above, before the arc pruning.)
 	{
-		for (int var_k = 0; var_k < subgraph.num_variables(); ++var_k) {
-			Expression sum_A;
-			for (int k = 0; k < num_agents; ++k) sum_A += Expression(Assignments(var_k, k));
-			prog.AddLinearEqualityConstraint(sum_A, 1.0);
-		}
+		AddRoleExactlyOneAgent(prog, subgraph, Assignments, num_agents);
 
 		for (int sg_v2 = 0; sg_v2 < n_V; ++sg_v2) {
 			const int rv = ri(sg_v2);
@@ -1377,28 +941,8 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		}
 	}
 
-	// Constraint 8b: assignment commits (see add_variable_commit /
-	// GraphOfConstraints::committed_assignments) -- once a plan has pinned a
-	// variable to whichever agent it resolved to at some earlier commit
-	// node, force every remaining node/hold that still references it through
-	// that same agent. Pin the whole row (not just the committed cell) --
-	// the row's other cells aren't otherwise guaranteed to be forced to 0 by
-	// something else (that normally falls out of a var_id node constraint's
-	// own "exactly one agent" emission in CompileSymbolicNodeConstraint, but
-	// a committed variable referenced only via a hold at this point in the
-	// plan would have no such emission left in the subgraph) -- and the
-	// solution-extraction scan in Solve()/SolveCoordinated (`for k: if
-	// val>0.5: ... break`) takes the first 1-valued cell it finds, so a
-	// stray free cell at a lower agent index would silently report the
-	// wrong agent even though the intended one is also pinned to 1.
-	for (const auto& [var, committed_agent] : graph->committed_assignments) {
-		const int variable_k = subgraph.subgraph_variable_id(var);
-		if (variable_k < 0) continue;
-		for (int k = 0; k < num_agents; ++k) {
-			prog.AddLinearEqualityConstraint(
-				Expression(Assignments(variable_k, k)), k == committed_agent ? 1.0 : 0.0);
-		}
-	}
+	// Constraint 8b: assignment commits.
+	AddCommittedAssignments(prog, *graph, subgraph, Assignments);
 
 	// Constraint 9: time propagation — Z[j,a,b]=1 ⟹ t[b] ≥ t[a] + e[j,a,b]
 	// (into the sink e = 0 by Constraint 3, so t(sink) ≥ each agent's finish time)
@@ -1416,56 +960,13 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		}
 	}
 
-	// Constraint 10: DAG ordering — hard (structure edges) or conditional (_conditional_ordering_map)
-	auto add_ordering_constraint = [&](int u_node, int v_node,
-	                                   const drake::symbolic::Formula* cond) {
-		const int sg_u = subgraph.subgraph_id(u_node);
-		const int sg_v = subgraph.subgraph_id(v_node);
-		if (sg_u < 0 || sg_v < 0) return;
-		if (cond == nullptr) {
-			// Unconditional: hard ordering t(u) ≤ t(v)
-			prog.AddLinearConstraint(
-				Expression(t_var(ri(sg_u))) - Expression(t_var(ri(sg_v))),
-				-kInf, 0.0);
-		} else {
-			// Conditional: t(u) ≤ t(v) only when b_cond = 1
-			// Enforced as: t(u) - t(v) - M_time + M_time*b_cond ≤ 0
-			auto b_cond = CompileConditionToBinary(
-				prog, *cond, Assignments, subgraph,
-				previous_var_assignments, graph, cond_binary_vars);
-			prog.AddLinearConstraint(
-				Expression(t_var(ri(sg_u))) - Expression(t_var(ri(sg_v)))
-				- M_time + M_time * Expression(b_cond),
-				-kInf, 0.0);
-		}
-	};
-
-	for (const auto& edge : subgraph.structure.edges()) {
-		const int u_node = edge.u;
-		const int v_node = edge.e->to;
-		add_ordering_constraint(u_node, v_node, nullptr);
-	}
-	for (const auto& [uv, formula] : graph->_conditional_ordering_map) {
-		add_ordering_constraint(uv.first, uv.second, &formula);
-	}
+	// Constraint 10: DAG ordering -- hard (structure edges) or conditional (_conditional_ordering_map)
+	AddOrderingConstraints(prog, *graph, subgraph, t_var, M_time, Assignments,
+			       previous_var_assignments, cond_binary_vars);
 
 	// Constraint 11: assignment-variable constraints (add_variable_constraint /
-	// add_variable_ineq_constraint), for variables present in this subgraph.
-	for (const auto& [var, allowed] : graph->var_candidates) {
-		const int variable_k = subgraph.subgraph_variable_id(var);
-		if (variable_k < 0) continue;
-		for (int k = 0; k < num_agents; ++k)
-			if (!allowed.contains(k))
-				prog.AddLinearEqualityConstraint(Expression(Assignments(variable_k, k)), 0.0);
-	}
-	for (const auto& [var1, var2] : graph->var_ineq_pairs) {
-		const int variable1_k = subgraph.subgraph_variable_id(var1);
-		const int variable2_k = subgraph.subgraph_variable_id(var2);
-		if (variable1_k < 0 || variable2_k < 0) continue;
-		for (int k = 0; k < num_agents; ++k)
-			prog.AddLinearEqualityConstraint(
-				Expression(Assignments(variable1_k, k)) + Expression(Assignments(variable2_k, k)), 1.0);
-	}
+	// add_variable_ineq_constraint).
+	AddAssignmentVariableConstraints(prog, *graph, subgraph, Assignments);
 
 	// Constraint 12: node constraints from the unified symbolic API
 	// (add_constraint / add_assignable_constraint), compiled from the stored
@@ -1610,82 +1111,11 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		}
 	}
 
-	// 14b: stationary objects — an object not currently being held must not
-	// move between two graph nodes. Unlike 14a, this only ever compares
-	// plain position segments (W.row(...).segment(...)) with no rotation
-	// applied, so it's linear (or, when gated by an overlap indicator,
-	// mixed-integer-linear) regardless of robot kind -- there's no
-	// configuration space for which it becomes nonlinear the way 14a's
-	// rotated relative-offset check can. So it's always enforced,
-	// independent of enforce_rigidity.
-	{
-		std::map<std::tuple<int, int, int, int>, Variable> overlap_cache;
-
-		auto stationary_edge = [&](const Eigen::VectorX<Expression>& seg_a_full, int sg_b,
-					    int t_idx_a, int t_idx_b) {
-			for (int obj = 0; obj < num_objects; ++obj) {
-				const int start = graph->object_col_offset(obj);
-				const int width = graph->object_ambient_dim(obj);
-				Eigen::VectorX<Expression> seg_a = seg_a_full.segment(start, width);
-				Eigen::VectorX<Expression> seg_b = W.row(sg_b).segment(start, width)
-									.template cast<Expression>();
-
-				// Every hold (anywhere in the graph) that might move this object.
-				std::vector<int> relevant_holds;
-				for (const auto& [other_hold_id, other_hold] : graph->hold_ops) {
-					if (std::find(other_hold.held_point_ids.begin(), other_hold.held_point_ids.end(), obj) !=
-					    other_hold.held_point_ids.end()) {
-						relevant_holds.push_back(other_hold_id);
-					}
-				}
-
-				Expression gate_sum;
-				bool any_gate = false;
-				for (int other_hold_id : relevant_holds) {
-					const auto& other_hold = graph->hold_ops.at(other_hold_id);
-					const int sg_other_u = subgraph.subgraph_id(other_hold.u_node);
-					const int sg_other_v = subgraph.subgraph_id(other_hold.v_node);
-					if (sg_other_v < 0) continue;  // can't reason about it within this horizon
-					const int t_idx_other_u = (sg_other_u >= 0) ? ri(sg_other_u) : depot_idx;
-					const int t_idx_other_v = ri(sg_other_v);
-
-					const Variable& overlap = GetOrAddIntervalOverlapIndicator(
-						prog, t_var, t_idx_a, t_idx_b, t_idx_other_u, t_idx_other_v,
-						M_time, overlap_cache);
-					gate_sum += Expression(overlap);
-					any_gate = true;
-				}
-
-				if (!any_gate) {
-					prog.AddLinearEqualityConstraint(seg_a - seg_b, Eigen::VectorXd::Zero(width))
-						.evaluator()->set_description(fmt::format("stationary point {}", obj));
-					continue;
-				}
-
-				const double m_stat = (graph->_global_x_ub.segment(start, width) -
-							graph->_global_x_lb.segment(start, width))
-							.cwiseAbs().maxCoeff();
-				for (int i = 0; i < width; ++i) {
-					const Expression slack = m_stat * gate_sum;
-					prog.AddLinearConstraint(seg_a(i) - seg_b(i) - slack, -kInf, 0.0)
-						.evaluator()->set_description(fmt::format("gated stationary point {}", obj));
-					prog.AddLinearConstraint(-seg_a(i) + seg_b(i) - slack, -kInf, 0.0)
-						.evaluator()->set_description(fmt::format("gated stationary point {}", obj));
-				}
-			}
-		};
-
-		for (auto edge : subgraph.structure.edges()) {
-			const int sg_u14b = subgraph.subgraph_id(edge.u);
-			const int sg_v14b = subgraph.subgraph_id(edge.e->to);
-			stationary_edge(W.row(sg_u14b).template cast<Expression>(), sg_v14b,
-					 ri(sg_u14b), ri(sg_v14b));
-		}
-		for (int v14b : subgraph.structure.sources()) {
-			const int sg_v14b = subgraph.subgraph_id(v14b);
-			stationary_edge(x0.template cast<Expression>(), sg_v14b, depot_idx, ri(sg_v14b));
-		}
-	}
+	// 14b: stationary objects (see AddStationaryObjectConstraints). Always
+	// enforced, independent of enforce_rigidity: it only compares plain
+	// object position columns, so it's linear regardless of robot kind.
+	AddStationaryObjectConstraints(prog, *graph, subgraph, W.template cast<Expression>(),
+				       x0, t_var, M_time);
 
 
 	// TODO: Constraint 15: Manifold Constraints
@@ -1783,163 +1213,23 @@ MILPWaypointMPC::MILPWaypointMPC(GraphOfConstraints& graph,
 using drake::solvers::MathematicalProgram;
 using drake::solvers::MathematicalProgramResult;
 
-void PrintSolverReport(GraphWaypointProblem* problem,
-		       const MathematicalProgramResult& result,
-		       double tol = 1e-6) {
-	using std::cout;
-	using std::endl;
-
-	cout << "=== Drake Solve() Report ===\n";
-	cout << "Solver:           " << result.get_solver_id().name() << "\n";
-	// to_string(SolutionResult) is supported; if your Drake is older, cast to int.
-	cout << "SolutionResult:   " << to_string(result.get_solution_result()) << "\n";
-	cout << "Success?          " << (result.is_success() ? "yes" : "no") << "\n";
-
-	// Print optimal cost if available.
-	if (std::isfinite(result.get_optimal_cost())) {
-		cout << "Optimal cost:     " << result.get_optimal_cost() << "\n";
-	}
-
-	// Try to obtain a decision vector to evaluate constraints.
-	Eigen::VectorXd x;
-	bool have_x = false;
-	try {
-		x = result.GetSolution(problem->prog->decision_variables());
-		have_x = true;
-	} catch (const std::exception&) {
-		// Fall back to initial guess (may be zero) if solver did not return x.
-		if (problem->prog->decision_variables().size() > 0) {
-			x = problem->prog->initial_guess();
-			have_x = true;
-			cout << "(No returned solution vector; using initial guess for diagnostics.)\n";
-		}
-	}
-
-	// Constraint violation scan.
-	if (have_x) {
-		try {
-			auto print_binding_violation = [&](const auto& bindings, const char* kind) {
-				for (const auto& b : bindings) {
-					const auto& c = *b.evaluator();
-					const auto& vars = b.variables();
-					Eigen::VectorXd x_b = result.GetSolution(vars);
-
-					double tol = 0.05;
-					if (!c.CheckSatisfied(x_b, tol)) {
-						cout << "Violation [" << kind << "]: "
-						     << " (constraint: " << c.get_description() << ")\n";
-					} else {
-						cout << "Satisfied [" << kind << "]: "
-						     << " (constraint: " << c.get_description() << ")\n";
-					}
-				}
-			};
-
-			cout << "--- Constraint violations (inf-norm > " << tol << ") ---\n";
-			print_binding_violation(problem->prog->bounding_box_constraints(),   "BoundingBox");
-			print_binding_violation(problem->prog->linear_equality_constraints(),"LinEq");
-			print_binding_violation(problem->prog->linear_constraints(),         "LinIneq");
-			print_binding_violation(problem->prog->lorentz_cone_constraints(),   "Lorentz");
-			print_binding_violation(problem->prog->rotated_lorentz_cone_constraints(),"RotLorentz");
-			print_binding_violation(problem->prog->quadratic_constraints(),      "Quadratic");
-			print_binding_violation(problem->prog->exponential_cone_constraints(),"ExpCone");
-			print_binding_violation(problem->prog->generic_constraints(),        "Generic");
-		} catch (const std::exception& e) {
-			cout << "Exception in printing binding violations: " << e.what() << endl;
-		}
-	} else {
-		cout << "(No decision vector available to evaluate constraints.)\n";
-	}
-
-	// Try to print some solver-specific details (best-effort).
-	try {
-		const auto& sid = result.get_solver_id().name();
-		if (sid == "Ipopt") {
-			struct IpoptDetails {
-				int status; int iterations; double objective; double dual_inf;
-				double constr_viol; double comp_viol; double primal_step; double dual_step;
-			};
-
-			for (const std::string& s : result.GetInfeasibleConstraintNames(*problem->prog, tol)) {
-				cout << "infeasible constraint: " << s << std::endl;
-			}
-
-			// If your Drake provides IpoptSolver::Details, use that exact type.
-			// Example (adjust to your Drake version):
-			const auto& d = result.get_solver_details<drake::solvers::IpoptSolver>();
-			cout << "Ipopt status: " << d.ConvertStatusToString() << endl;
-		} else if (sid == "NLopt") {
-			const auto& d = result.get_solver_details<drake::solvers::NloptSolver>();
-			cout << "TODO: Print nlopt information" << endl;
-		} else if (sid == "OSQP") {
-			// Example (adjust to your Drake version):
-			// const auto& d = result.get_solver_details<OsqpSolver>();
-			// cout << "OSQP status: " << d.status_val << ", iters: " << d.iter
-			//      << ", obj: " << d.obj_val << "\n";
-		} else if (sid == "Gurobi") {
-			// const auto& d = result.get_solver_details<GurobiSolver>();
-			// cout << "Gurobi status: " << d.optimization_status << ", iters: "
-			//      << d.iteration_count << ", mip_gap: " << d.mip_relative_gap << "\n";
-		}
-	} catch (const std::exception& e) {
-		cout << "(Could not print solver-specific details: " << e.what() << ")\n";
-	}
-
-	cout << "=== End Report ===\n";
-}
-
 bool MILPWaypointMPC::Solve(
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
-	_timer.Start();
-
-	// Warm start configurations
-	if (_first_cycle) {
-		for (int v : remaining_vertices) {
-			_waypoints.row(v) = x0.transpose();
-		}
-		_first_cycle = false;
-	}
-
-	// Live-rebind: a node's row in `_waypoints`, once it's no longer in
-	// remaining_vertices, is otherwise whatever SolveWithGurobi/
-	// SolveWithMosek's write-back loop last planned for it while still
-	// active -- the nominal MILP-solved target, not the real state the
-	// graph actually reached. That's stale for a relational edge
-	// constraint anchored at that node (e.g. a rigid-transport edge):
-	// CompileSymbolicEdgeConstraint substitutes a passed endpoint's row as
-	// a constant read from `_waypoints` (passed through as `previous_X` --
-	// see symbolic_constraint_compiler.cpp), so it would otherwise
-	// propagate the *planned* transform forward even once the real one has
-	// diverged (e.g. a grasp whose real standoff doesn't match the planned
-	// one). So the first Solve() call that sees a node freshly missing
-	// from remaining_vertices (vs. the previous call) overwrites that
-	// node's row with the real x0 given on THIS call, once, before
-	// anything reads it as previous_X -- not every cycle after, since the
-	// contract is a frozen constant once a node has passed, not a
-	// continuously-tracked one. Mirrors EvolutionaryWaypointSolver's
-	// equivalent fix (evolutionary_waypoint_solver/mpc.py's solve()).
-	const std::set<int> remaining_set(remaining_vertices.begin(), remaining_vertices.end());
-	if (_has_prev_remaining_set) {
-		for (int v : _prev_remaining_set) {
-			if (remaining_set.contains(v)) continue;
-			_waypoints.row(v) = x0.transpose();
-		}
-	}
-	_prev_remaining_set = remaining_set;
-	_has_prev_remaining_set = true;
+	BeginSolve(remaining_vertices, x0);
 
 	switch (_solver) {
 	case WaypointSolver::kGurobi:
-		return SolveWithGurobi(remaining_vertices, x0);
+		return SolveWith(drake::solvers::GurobiSolver(), remaining_vertices, x0);
 	case WaypointSolver::kMosek:
-		return SolveWithMosek(remaining_vertices, x0);
+		return SolveWith(drake::solvers::MosekSolver(), remaining_vertices, x0);
 	}
 	return false;
 }
 
-bool MILPWaypointMPC::SolveWithMosek(
+bool MILPWaypointMPC::SolveWith(
+	const drake::solvers::SolverInterface& solver,
 	const std::vector<int>& remaining_vertices,
 	const Eigen::VectorXd& x0) {
 
@@ -1947,124 +1237,32 @@ bool MILPWaypointMPC::SolveWithMosek(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
 		_enforce_rigidity, _enforce_rigidity, _objective);
 
-	// Solve
-	drake::solvers::MosekSolver solver;
-	const auto result = solver.Solve(*problem.prog);
+	drake::solvers::MathematicalProgramResult result;
+	solver.Solve(*problem.prog, std::nullopt, std::nullopt, &result);
 
-	if (result.is_success()) {
-
-		_last_solve_time = _timer.Tick();
-
-		const int num_phis = _graph->num_phis;
-		const int num_agents = _graph->num_agents;
-
-		for (int i = 0; i < num_phis; ++i) {
-			if (_graph->phi_to_variable_map.contains(i)) {
-				const int variable_id = _graph->phi_to_variable_map.at(i);
-				const int variable_k = problem.subgraph->subgraph_variable_id(variable_id);
-				if (variable_k >= 0 && problem.Assignments.rows() > 0) {
-					for (int j = 0; j < num_agents; ++j) {
-						const double val = result.GetSolution(problem.Assignments(variable_k, j));
-						if (val > 0.5) {
-							_assignments(i) = j;
-							_var_assignments(variable_id) = j;
-							break;
-						}
-					}
-				} else {
-					_assignments(i) = -1;
-					_var_assignments(variable_id) = -1;
-				}
-			} else {
-				_assignments(i) = -1;
-			}
-		}
-
-		Eigen::MatrixXd W_flat = result.GetSolution(problem.W);
-		for (int v : remaining_vertices) {
-			const int i = problem.subgraph->subgraph_id(v);
-			_waypoints.row(v) = W_flat.row(i);
-		}
-		if (problem.n_N > 0) {
-			_t_routing = result.GetSolution(problem.t);
-			_Z_routing = result.GetSolution(problem.Z);
-			_t_by_node_id.setZero();
-			for (int v : remaining_vertices) {
-				const int sg_v = problem.subgraph->subgraph_id(v);
-				_t_by_node_id(v) = _t_routing(sg_v + 1);
-			}
-		}
-		return true;
-	}
-
-	return false;
-}
-
-bool MILPWaypointMPC::SolveWithGurobi(
-	const std::vector<int>& remaining_vertices,
-	const Eigen::VectorXd& x0) {
-
-	GraphWaypointProblem problem = BuildGraphWaypointProblem(
-		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		_enforce_rigidity, _enforce_rigidity, _objective);
-
-	// Solve
-	drake::solvers::GurobiSolver solver;
-	auto result = solver.Solve(*problem.prog);
-
-	if (result.is_success()) {
-
-		_last_solve_time = _timer.Tick();
-
-		const int num_phis = _graph->num_phis;
-		const int num_agents = _graph->num_agents;
-
-		for (int i = 0; i < num_phis; ++i) {
-			if (_graph->phi_to_variable_map.contains(i)) {
-				const int variable_id = _graph->phi_to_variable_map.at(i);
-				const int variable_k = problem.subgraph->subgraph_variable_id(variable_id);
-				if (variable_k >= 0 && problem.Assignments.rows() > 0) {
-					for (int j = 0; j < num_agents; ++j) {
-						const double val = result.GetSolution(problem.Assignments(variable_k, j));
-						if (val > 0.5) {
-							_assignments(i) = j;
-							_var_assignments(variable_id) = j;
-							break;
-						}
-					}
-				} else {
-					_assignments(i) = -1;
-					_var_assignments(variable_id) = -1;
-				}
-			} else {
-				_assignments(i) = -1;
-			}
-		}
-
-		Eigen::MatrixXd W_flat = result.GetSolution(problem.W);
-		for (int v : remaining_vertices) {
-			const int i = problem.subgraph->subgraph_id(v);
-			_waypoints.row(v) = W_flat.row(i);
-		}
-		if (problem.n_N > 0) {
-			_t_routing = result.GetSolution(problem.t);
-			_Z_routing = result.GetSolution(problem.Z);
-			_t_by_node_id.setZero();
-			for (int v : remaining_vertices) {
-				const int sg_v = problem.subgraph->subgraph_id(v);
-				_t_by_node_id(v) = _t_routing(sg_v + 1);
-			}
-		}
-		return true;
-	}
-
-	std::cerr << "No feasible solution across all assignments.\n";
-
-	if (result.is_success()) {
-	} else {
-		PrintSolverReport(&problem, result, 1e-6);
+	if (!result.is_success()) {
+		std::cerr << "No feasible solution across all assignments.\n";
+		PrintSolverReport(*problem.prog, result, 1e-6);
 		return false;
 	}
 
-	return false;
+	_last_solve_time = _timer.Tick();
+
+	StoreAssignments(*problem.subgraph, problem.Assignments, result);
+
+	Eigen::MatrixXd W_flat = result.GetSolution(problem.W);
+	for (int v : remaining_vertices) {
+		const int i = problem.subgraph->subgraph_id(v);
+		_waypoints.row(v) = W_flat.row(i);
+	}
+	if (problem.n_N > 0) {
+		_t_routing = result.GetSolution(problem.t);
+		_Z_routing = result.GetSolution(problem.Z);
+		_t_by_node_id.setZero();
+		for (int v : remaining_vertices) {
+			const int sg_v = problem.subgraph->subgraph_id(v);
+			_t_by_node_id(v) = _t_routing(sg_v + 1);
+		}
+	}
+	return true;
 }
