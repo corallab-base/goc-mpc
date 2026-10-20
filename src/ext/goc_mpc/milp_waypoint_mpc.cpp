@@ -691,7 +691,8 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 	Eigen::VectorXi previous_var_assignments,
 	bool enforce_rigidity,
 	bool relax_binary_vars,
-	WaypointObjective objective) {
+	WaypointObjective objective,
+	SubtourElimination subtour) {
 
 	const int num_agents = graph->num_agents;
 
@@ -972,6 +973,27 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		}
 	}
 
+	// Constraint 9b: subtour elimination (optional, see SubtourElimination).
+	if (subtour == SubtourElimination::kMCF) {
+		std::vector<int> vertex_node(n_V);
+		for (int sg = 0; sg < n_V; ++sg) vertex_node[sg] = sg;
+		for (int j = 0; j < num_agents; ++j) {
+			std::vector<std::pair<int, int>> arcs;
+			std::vector<Variable> z;
+			std::vector<Expression> visits(n_V);
+			for (int a = 0; a <= n_V; ++a) {
+				for (int b = 1; b <= sink_idx; ++b) {
+					if (a == b || !arc_allowed(j, a, b)) continue;
+					arcs.emplace_back(a == depot_idx ? -1 : a - 1, b == sink_idx ? -2 : b - 1);
+					z.push_back(Z_var(z_idx_fn(j, a, b)));
+					if (b != sink_idx) visits[b - 1] += Expression(z.back());
+				}
+			}
+			const VectorXDecisionVariable Z_j = Eigen::Map<const VectorXDecisionVariable>(z.data(), z.size());
+			AddMultiCommodityFlow(prog, arcs, Z_j, vertex_node, visits, std::to_string(j));
+		}
+	}
+
 	// Constraint 10: DAG ordering -- hard (structure edges) or conditional (_conditional_ordering_map)
 	AddOrderingConstraints(prog, *graph, subgraph, t_var, M_time, Assignments,
 			       previous_var_assignments, cond_binary_vars);
@@ -1213,10 +1235,12 @@ MILPWaypointMPC::MILPWaypointMPC(GraphOfConstraints& graph,
 				   std::vector<CubicConfigurationSpline> splines,
 				   WaypointSolver solver,
 				   bool enforce_rigidity,
-				   WaypointObjective objective)
+				   WaypointObjective objective,
+				   SubtourElimination subtour)
 	: GraphWaypointMPC(graph, std::move(splines), objective),
 	  _solver(solver),
-	  _enforce_rigidity(enforce_rigidity) {
+	  _enforce_rigidity(enforce_rigidity),
+	  _subtour(subtour) {
 	// Routing outputs are sized on first successful solve.
 	_t_routing = Eigen::VectorXd();
 	_Z_routing = Eigen::VectorXd();
@@ -1247,7 +1271,7 @@ bool MILPWaypointMPC::SolveWith(
 
 	GraphWaypointProblem problem = BuildGraphWaypointProblem(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		_enforce_rigidity, _enforce_rigidity, _objective);
+		_enforce_rigidity, _enforce_rigidity, _objective, _subtour);
 
 	drake::solvers::MathematicalProgramResult result;
 	solver.Solve(*problem.prog, std::nullopt, std::nullopt, &result);

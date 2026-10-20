@@ -464,13 +464,15 @@ void init_submodule_goc_mpc(py::module_& m) {
 			      std::vector<CubicConfigurationSpline>,
 			      WaypointSolver,
 			      bool,
-			      WaypointObjective>(),
+			      WaypointObjective,
+			      SubtourElimination>(),
 		     py::keep_alive<1, 2>(),
 		     py::arg("graph"),
 		     py::arg("splines"),
 		     py::arg("solver")            = WaypointSolver::kGurobi,
 		     py::arg("enforce_rigidity")  = false,
-		     py::arg("objective")         = WaypointObjective::kMinMaxL1)
+		     py::arg("objective")         = WaypointObjective::kMinMaxL1,
+		     py::arg("subtour")           = SubtourElimination::kNone)
 		.def("view_t", &MILPWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		.def("view_Z", &MILPWaypointMPC::view_Z, py::return_value_policy::reference_internal);
 
