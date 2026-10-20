@@ -148,6 +148,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// which objects" for non-MILP consumers (e.g. the JAX evolutionary
 		// solver).
 		.def_readonly("hold_ops", &GraphOfConstraints::hold_ops)
+		// add_variable_constraint / add_variable_ineq_constraint records:
+		// {var: allowed agents} (absent == every agent) and [(var1, var2)].
+		.def_readonly("var_candidates", &GraphOfConstraints::var_candidates)
+		.def_readonly("var_ineq_pairs", &GraphOfConstraints::var_ineq_pairs)
 		// Raw Formula records for the unified symbolic constraint API
 		// (add_constraint / add_assignable_constraint / add_edge_constraint),
 		// keyed by phi id — introspectable so non-MILP consumers (e.g. the
