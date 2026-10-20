@@ -549,8 +549,9 @@ void AddAssignmentVariableConstraints(MathematicalProgram& prog,
 		const int variable2_k = subgraph.subgraph_variable_id(var2);
 		if (variable1_k < 0 || variable2_k < 0) continue;
 		for (int k = 0; k < num_agents; ++k)
-			prog.AddLinearEqualityConstraint(
-				Expression(Assignments(variable1_k, k)) + Expression(Assignments(variable2_k, k)), 1.0);
+			prog.AddLinearConstraint(
+				Expression(Assignments(variable1_k, k)) + Expression(Assignments(variable2_k, k)),
+				-std::numeric_limits<double>::infinity(), 1.0);
 	}
 }
 
