@@ -177,8 +177,13 @@ drake::symbolic::Variable CompileVarEq(
 	const double kInf = std::numeric_limits<double>::infinity();
 	int r0_local = subgraph.subgraph_variable_id(r0);
 	int r1_local = subgraph.subgraph_variable_id(r1);
-	int r0_prev  = (r0 < prev_var_assignments.size()) ? prev_var_assignments(r0) : -1;
-	int r1_prev  = (r1 < prev_var_assignments.size()) ? prev_var_assignments(r1) : -1;
+	// A variable still in the subgraph is decided by this solve; only one
+	// whose nodes are all done reads its previous assignment as a constant.
+	auto prev = [&](int r, int r_local) {
+		return (r_local < 0 && r < prev_var_assignments.size()) ? prev_var_assignments(r) : -1;
+	};
+	int r0_prev  = prev(r0, r0_local);
+	int r1_prev  = prev(r1, r1_local);
 
 	auto b_same = prog.NewBinaryVariables(1, "b_same")(0);
 
