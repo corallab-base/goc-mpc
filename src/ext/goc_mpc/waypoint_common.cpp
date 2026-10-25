@@ -508,7 +508,32 @@ void AddOrderingConstraints(MathematicalProgram& prog,
 	                                   const drake::symbolic::Formula* cond) {
 		const int sg_u = subgraph.subgraph_id(u_node);
 		const int sg_v = subgraph.subgraph_id(v_node);
-		if (sg_u < 0 || sg_v < 0) return;
+		if (sg_u < 0 || sg_v < 0) {
+			// u still to do but v already done: t(u) ≤ t(v) can no longer
+			// hold, so the condition gating it must be false. Dropping the
+			// edge instead would free its binaries to pick this branch.
+			// That needs every assignable variable the condition mentions to
+			// be in the subgraph or previously assigned; one whose nodes are
+			// all done has neither, and then the edge is dropped as before.
+			auto resolvable = [&](const drake::symbolic::Formula& f) {
+				for (const auto& sym : f.GetFreeVariables()) {
+					auto it = graph._sym_id_to_variable_id.find(sym.get_id());
+					if (it == graph._sym_id_to_variable_id.end()) continue;
+					const int var = it->second;
+					const bool previous = var < previous_var_assignments.size()
+						&& previous_var_assignments(var) >= 0;
+					if (subgraph.subgraph_variable_id(var) < 0 && !previous) return false;
+				}
+				return true;
+			};
+			if (cond != nullptr && sg_u >= 0 && resolvable(*cond)) {
+				auto b_cond = CompileConditionToBinary(
+					prog, *cond, Assignments, subgraph,
+					previous_var_assignments, &graph, cond_binary_vars);
+				prog.AddLinearEqualityConstraint(Expression(b_cond), 0.0);
+			}
+			return;
+		}
 		if (cond == nullptr) {
 			// Unconditional: hard ordering t(u) ≤ t(v)
 			prog.AddLinearConstraint(
