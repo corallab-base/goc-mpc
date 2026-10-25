@@ -1361,9 +1361,14 @@ struct SubgraphOfConstraints {
 		// Hold registry entries (see HoldDeclaration) whose edge touches this
 		// subgraph -- unlike edge phis above, each hold already carries its own
 		// u_node/v_node directly, so no edge_to_phis_map indirection is needed.
+		// An assignable hold's variable is relevant while the hold is: once
+		// its u completes, no remaining node constraint may reference it.
 		for (const auto& [hold_id, hold] : graph->hold_ops) {
 			if (structure.contains_node(hold.u_node) || structure.contains_node(hold.v_node)) {
 				_subgraph_hold_ops[hold_id] = hold;
+				if (hold.var_id.has_value() && !_variable_to_subgraph_variable_id.contains(*hold.var_id)) {
+					_variable_to_subgraph_variable_id[*hold.var_id] = num_subgraph_variables++;
+				}
 			}
 		}
 	}

@@ -536,10 +536,12 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 					if (is_candidate(*hold.var_id, j)) holders.push_back(j);
 			}
 			for (int j : holders) {
-				if (graph->robot_rigidity_constraint_degree(j) != ConstraintDegree::kLinear)
+				// Translation-only: the rows below read only the holder's
+				// leading position columns, linear for any free body.
+				if (!graph->robot_is_free_body(j))
 					throw std::runtime_error(fmt::format(
-						"GCSWaypointMPC: {}: only holders whose rigidity relation is linear "
-						"(point masses) are supported", where));
+						"GCSWaypointMPC: {}: only free-body holders are supported "
+						"(articulated holders need FK)", where));
 			}
 
 			// Holder's end-effector position at an endpoint (exact), and at
