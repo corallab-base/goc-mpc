@@ -485,7 +485,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 			      bool,
 			      WaypointObjective,
 			      SubtourElimination,
-			      double>(),
+			      double,
+			      double,
+			      bool>(),
 		     py::keep_alive<1, 2>(),
 		     py::arg("graph"),
 		     py::arg("splines"),
@@ -493,7 +495,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("enforce_rigidity")  = false,
 		     py::arg("objective")         = WaypointObjective::kMinMaxL1,
 		     py::arg("subtour")           = SubtourElimination::kMCF,
-		     py::arg("length_weight")     = 0.0)
+		     py::arg("length_weight")     = 0.0,
+		     py::arg("mip_gap")           = 1e-4,
+		     py::arg("warm_start")        = true)
 		.def("view_t", &GCSWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		// Per agent: graph node ids visited, in order.
 		.def("view_routes", &GCSWaypointMPC::view_routes);

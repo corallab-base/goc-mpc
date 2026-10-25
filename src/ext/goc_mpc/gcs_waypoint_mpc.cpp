@@ -782,12 +782,16 @@ GCSWaypointMPC::GCSWaypointMPC(GraphOfConstraints& graph,
 			       bool enforce_rigidity,
 			       WaypointObjective objective,
 			       SubtourElimination subtour,
-			       double length_weight)
+			       double length_weight,
+			       double mip_gap,
+			       bool warm_start)
 	: GraphWaypointMPC(graph, std::move(splines), objective),
 	  _solver(solver),
 	  _enforce_rigidity(enforce_rigidity),
 	  _subtour(subtour),
-	  _length_weight(length_weight) {
+	  _length_weight(length_weight),
+	  _mip_gap(mip_gap),
+	  _warm_start(warm_start) {
 	CheckLengthWeight(objective, length_weight);
 }
 
@@ -814,8 +818,14 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
 		_enforce_rigidity, _objective, _subtour, _length_weight);
 
+	if (_warm_start) SetWarmStart(problem, remaining_vertices);
+
+	drake::solvers::SolverOptions options;
+	options.SetOption(drake::solvers::GurobiSolver::id(), "MIPGap", _mip_gap);
+	options.SetOption(drake::solvers::MosekSolver::id(), "MSK_DPAR_MIO_TOL_REL_GAP", _mip_gap);
+
 	MathematicalProgramResult result;
-	solver.Solve(*problem.prog, std::nullopt, std::nullopt, &result);
+	solver.Solve(*problem.prog, std::nullopt, options, &result);
 
 	if (!result.is_success()) {
 		std::cerr << "GCSWaypointMPC: no feasible solution.\n";
@@ -842,10 +852,14 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 			_waypoints.row(v).segment(_graph->object_col_offset(o), O.cols()) = O.row(subgraph.subgraph_id(v));
 	}
 
+	std::vector<int> row_var(subgraph.num_variables(), -1);
+	for (const auto& [var, row] : subgraph._variable_to_subgraph_variable_id) row_var[row] = var;
+
 	// Each agent's route; its visited rows from the vertex copies, the rest
 	// interpolated per block (linear spline: geodesic per block) in time
 	// between its neighbouring visits, holding after the last.
 	_routes.assign(_graph->num_agents, {});
+	_prev_route_modes.assign(_graph->num_agents, {});
 	for (int j = 0; j < _graph->num_agents; ++j) {
 		const GCSModeGraph& g = problem.graphs[j];
 		const int off = _graph->agent_col_offset(j);
@@ -865,6 +879,9 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 			const int node = node_of_sg[sg];
 			const Eigen::VectorXd q = result.GetSolution(problem.P[j][next]);
 			_routes[j].push_back(node);
+			const int mode = g.vertices[next].mode;
+			_prev_route_modes[j].push_back(
+				{node, mode == GCSModeGraph::kNoRole ? GCSModeGraph::kNoRole : row_var[mode]});
 			visited.insert(node);
 			_waypoints.row(node).segment(off, d) = q;
 			const double t_node = _t_routing(RoutingPresolve::ri(sg));
@@ -890,4 +907,49 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 			if (!visited.contains(v)) _waypoints.row(v).segment(off, d) = interp.eval(_t_by_node_id(v)).q_ambient;
 	}
 	return true;
+}
+
+void GCSWaypointMPC::SetWarmStart(const GCSWaypointProblem& problem,
+				  const std::vector<int>& remaining_vertices) const {
+	if (_prev_route_modes.empty()) return;
+	MathematicalProgram& prog = *problem.prog;
+	const SubgraphOfConstraints& subgraph = *problem.subgraph;
+	std::vector<int> node_of_sg(subgraph.num_nodes(), -1);
+	for (int v : remaining_vertices) node_of_sg[subgraph.subgraph_id(v)] = v;
+	std::vector<int> row_var(subgraph.num_variables(), -1);
+	for (const auto& [var, row] : subgraph._variable_to_subgraph_variable_id) row_var[row] = var;
+
+	for (const auto& [var, row] : subgraph._variable_to_subgraph_variable_id) {
+		if (var >= _var_assignments.size() || _var_assignments(var) < 0) continue;
+		for (int k = 0; k < _graph->num_agents; ++k)
+			prog.SetInitialGuess(problem.Assignments(row, k), k == _var_assignments(var) ? 1.0 : 0.0);
+	}
+
+	for (int j = 0; j < _graph->num_agents; ++j) {
+		const GCSModeGraph& g = problem.graphs[j];
+		std::map<std::pair<int, int>, int> vertex_of;
+		for (size_t v = 0; v < g.vertices.size(); ++v) {
+			const int mode = g.vertices[v].mode;
+			const int var = mode == GCSModeGraph::kNoRole ? GCSModeGraph::kNoRole : row_var[mode];
+			vertex_of[{node_of_sg[g.vertices[v].sg], var}] = v;
+		}
+
+		std::vector<int> chain = {GCSModeGraph::kDepot};
+		for (const auto& key : _prev_route_modes[j]) {
+			const auto it = vertex_of.find(key);
+			if (it != vertex_of.end()) chain.push_back(it->second);
+		}
+		chain.push_back(GCSModeGraph::kSink);
+
+		std::map<std::pair<int, int>, int> arc_of;
+		for (size_t a = 0; a < g.arcs.size(); ++a) arc_of[g.arcs[a]] = a;
+		Eigen::VectorXd z = Eigen::VectorXd::Zero(g.arcs.size());
+		bool complete = true;
+		for (size_t k = 0; k + 1 < chain.size(); ++k) {
+			const auto it = arc_of.find({chain[k], chain[k + 1]});
+			if (it == arc_of.end()) { complete = false; break; }
+			z(it->second) = 1.0;
+		}
+		if (complete) prog.SetInitialGuess(problem.Z[j], z);
+	}
 }

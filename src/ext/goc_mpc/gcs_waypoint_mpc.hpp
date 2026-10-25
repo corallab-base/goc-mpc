@@ -88,6 +88,13 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 	bool _enforce_rigidity;
 	SubtourElimination _subtour;
 	double _length_weight;
+	// Relative optimality gap at which the MIP solve stops.
+	double _mip_gap;
+	// Seed each solve with the previous solve's assignments and routes.
+	bool _warm_start;
+	// Per agent: (graph node id, global variable id or kNoRole) of each
+	// vertex on the previous solve's route, in order.
+	std::vector<std::vector<std::pair<int, int>>> _prev_route_modes;
 
 	GCSWaypointMPC(GraphOfConstraints& graph,
 		       std::vector<CubicConfigurationSpline> splines,
@@ -95,7 +102,9 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 		       bool enforce_rigidity = false,
 		       WaypointObjective objective = WaypointObjective::kMinMaxL1,
 		       SubtourElimination subtour = SubtourElimination::kMCF,
-		       double length_weight = 0.0);
+		       double length_weight = 0.0,
+		       double mip_gap = 1e-4,
+		       bool warm_start = true);
 
 	bool Solve(const std::vector<int>& remaining_vertices,
 		   const Eigen::VectorXd& x0) override;
@@ -107,4 +116,10 @@ private:
 	bool SolveWith(const drake::solvers::SolverInterface& solver,
 		       const std::vector<int>& remaining_vertices,
 		       const Eigen::VectorXd& x0);
+	// Sets a MIP start on problem.prog from the previous solve: assignment
+	// binaries, and per agent the arc binaries of its previous route
+	// restricted to the vertices still in the problem. Continuous variables
+	// are left for the solver to complete.
+	void SetWarmStart(const GCSWaypointProblem& problem,
+			  const std::vector<int>& remaining_vertices) const;
 };
