@@ -13,8 +13,9 @@
 // Solver-agnostic waypoint objective: MinMax variants minimize the makespan
 // (the time the last agent finishes, including any waiting forced by
 // orderings), Avg variants minimize the average route cost across agents.
-// L1/L2 select the per-edge distance metric.
-enum class WaypointObjective { kMinMaxL1, kAvgL1, kMinMaxL2, kAvgL2 };
+// L1/L2 select the per-edge distance metric; TravelTime uses per-agent
+// ArcTravelTimeModels instead (GCSWaypointMPC only).
+enum class WaypointObjective { kMinMaxL1, kAvgL1, kMinMaxL2, kAvgL2, kMinMaxTravelTime, kAvgTravelTime };
 
 // Abstract base for a waypoint-phase solver: given the remaining graph
 // vertices and the current state x0, produces per-node configurations

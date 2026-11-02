@@ -869,6 +869,9 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 				case WaypointObjective::kAvgL2:
 					dist = ComputeL2Distance(prog, splines->at(j), w_a, w_b, tag);
 					break;
+				case WaypointObjective::kMinMaxTravelTime:
+				case WaypointObjective::kAvgTravelTime:
+					throw std::runtime_error("MILPWaypointMPC: travel-time objectives are GCSWaypointMPC only");
 				}
 				const Variable e_jab = e_var(e_idx_fn(j, a, b));
 				const Variable z_jab = Z_var(z_idx_fn(j, a, b));
@@ -1217,6 +1220,9 @@ GraphWaypointProblem BuildGraphWaypointProblem(
 		prog.AddLinearCost(MinMaxObjectiveCost(L_ms_var(0), total_cost, length_weight));
 		break;
 	}
+	case WaypointObjective::kMinMaxTravelTime:
+	case WaypointObjective::kAvgTravelTime:
+		throw std::runtime_error("MILPWaypointMPC: travel-time objectives are GCSWaypointMPC only");
 	case WaypointObjective::kAvgL1:
 	case WaypointObjective::kAvgL2: {
 		if (num_agents == 0) throw std::runtime_error("kAvg* objectives require num_agents > 0");
@@ -1249,6 +1255,8 @@ MILPWaypointMPC::MILPWaypointMPC(GraphOfConstraints& graph,
 	  _subtour(subtour),
 	  _length_weight(length_weight) {
 	CheckLengthWeight(objective, length_weight);
+	if (objective == WaypointObjective::kMinMaxTravelTime || objective == WaypointObjective::kAvgTravelTime)
+		throw std::runtime_error("MILPWaypointMPC: travel-time objectives are GCSWaypointMPC only");
 	// Routing outputs are sized on first successful solve.
 	_t_routing = Eigen::VectorXd();
 	_Z_routing = Eigen::VectorXd();

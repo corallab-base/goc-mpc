@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -7,6 +8,7 @@
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/solver_interface.h>
 
+#include "arc_travel_time.hpp"
 #include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
 #include "waypoint_common.hpp"
@@ -62,7 +64,9 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	bool enforce_rigidity,
 	WaypointObjective objective,
 	SubtourElimination subtour,
-	double length_weight = 0.0);
+	double length_weight = 0.0,
+	const std::vector<std::shared_ptr<ArcTravelTimeModel>>& travel_time_models = {},
+	double max_tangent_halfwidth = std::numeric_limits<double>::infinity());
 
 // Waypoint solver for the same problem as MILPWaypointMPC, sharing everything
 // that doesn't depend on the encoding (waypoint_common.*), but encoding
@@ -79,6 +83,14 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 // is slightly larger in exactly those cases. view_waypoints() still reports
 // every agent at every node: an unvisited agent's row is interpolated per
 // block in time between its neighbouring visits (holding after its last).
+//
+// kMinMaxTravelTime/kAvgTravelTime replace each arc's L1/L2 distance with a
+// tangent plane of agent j's ArcTravelTimeModel, taken once per solve at the
+// Chebyshev centres of the arc's two vertex sets (x0 out of the depot), and
+// applied in perspective to the arc copies -- linear, so the problem stays a
+// MILP. Exact on pinned vertices; elsewhere it is the field's linearization
+// over the whole set, and a vertex set wider than max_tangent_halfwidth in
+// any of the model's columns raises.
 struct GCSWaypointMPC : public GraphWaypointMPC {
 	Eigen::VectorXd _t_routing;
 	// Per agent: graph node ids visited, in order.
@@ -92,6 +104,9 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 	double _mip_gap;
 	// Seed each solve with the previous solve's assignments and routes.
 	bool _warm_start;
+	// Per agent (travel-time objectives only).
+	std::vector<std::shared_ptr<ArcTravelTimeModel>> _travel_time_models;
+	double _max_tangent_halfwidth;
 	// Per agent: (graph node id, global variable id or kNoRole) of each
 	// vertex on the previous solve's route, in order.
 	std::vector<std::vector<std::pair<int, int>>> _prev_route_modes;
@@ -104,7 +119,9 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 		       SubtourElimination subtour = SubtourElimination::kMCF,
 		       double length_weight = 0.0,
 		       double mip_gap = 1e-4,
-		       bool warm_start = true);
+		       bool warm_start = true,
+		       std::vector<std::shared_ptr<ArcTravelTimeModel>> travel_time_models = {},
+		       double max_tangent_halfwidth = std::numeric_limits<double>::infinity());
 
 	bool Solve(const std::vector<int>& remaining_vertices,
 		   const Eigen::VectorXd& x0) override;

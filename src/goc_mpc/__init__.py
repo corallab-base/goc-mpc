@@ -12,6 +12,7 @@ from .goc_mpc import (
     GraphWaypointMPC,
     MILPWaypointMPC,
     GCSWaypointMPC,
+    ArcTravelTimeModel,
     SubtourElimination,
     GraphTimingMPC,
     GraphShortPathMPC,

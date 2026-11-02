@@ -822,7 +822,8 @@ Expression MinMaxObjectiveCost(const Variable& makespan, const Expression& total
 void CheckLengthWeight(WaypointObjective objective, double length_weight) {
 	if (!(length_weight >= 0.0))
 		throw std::runtime_error(fmt::format("length_weight must be >= 0, got {}", length_weight));
-	const bool minmax = objective == WaypointObjective::kMinMaxL1 || objective == WaypointObjective::kMinMaxL2;
+	const bool minmax = objective == WaypointObjective::kMinMaxL1 || objective == WaypointObjective::kMinMaxL2 ||
+			    objective == WaypointObjective::kMinMaxTravelTime;
 	if (length_weight != 0.0 && !minmax)
 		throw std::runtime_error("length_weight applies only to the kMinMax* objectives");
 }

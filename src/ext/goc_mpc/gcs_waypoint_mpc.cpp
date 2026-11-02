@@ -13,9 +13,12 @@
 
 #include <fmt/format.h>
 
+#include <Eigen/LU>
+
 #include <drake/common/symbolic/decompose.h>
 #include <drake/solvers/gurobi_solver.h>
 #include <drake/solvers/mosek_solver.h>
+#include <drake/solvers/solve.h>
 
 using drake::symbolic::Expression;
 using drake::symbolic::Formula;
@@ -159,6 +162,99 @@ void AddGatedAtoms(MathematicalProgram& prog, const Formula& f, const std::vecto
 	}
 }
 
+// A set {x : rows}'s Chebyshev centre (within the affine hull of its
+// equalities) and the bounding box of its leading `box_cols` columns.
+struct SetGeometry {
+	Eigen::VectorXd centre, lo, hi;
+	bool empty = false;
+};
+
+// One LP block for `rows`: the centre/radius problem and, per box column, a
+// min and a max copy. Blocks share no variables, so their costs add.
+struct SetGeometryBlock {
+	VectorXDecisionVariable centre;
+	std::vector<VectorXDecisionVariable> lo, hi;
+};
+
+SetGeometryBlock AddSetGeometryBlock(MathematicalProgram& prog, const AffineRows& rows, int box_cols, double r_max) {
+	const int d = rows.A_in.cols();
+	auto add_membership = [&](const VectorXDecisionVariable& x) {
+		if (rows.A_eq.rows() > 0) prog.AddLinearEqualityConstraint(rows.A_eq, -rows.b_eq, x);
+		if (rows.A_in.rows() > 0)
+			prog.AddLinearConstraint(rows.A_in, Eigen::VectorXd::Constant(rows.A_in.rows(), -kInf), -rows.b_in, x);
+	};
+
+	SetGeometryBlock block;
+	block.centre = prog.NewContinuousVariables(d, "centre");
+	const drake::symbolic::Variable r = prog.NewContinuousVariables(1, "radius")(0);
+	prog.AddBoundingBoxConstraint(0.0, r_max, r);
+	// Distances within the affine hull: a_i's component along its null space.
+	Eigen::MatrixXd N = Eigen::MatrixXd::Identity(d, d);
+	if (rows.A_eq.rows() > 0) {
+		const Eigen::FullPivLU<Eigen::MatrixXd> lu(rows.A_eq);
+		N = lu.rank() == d ? Eigen::MatrixXd(d, 0) : Eigen::MatrixXd(lu.kernel());
+	}
+	if (rows.A_eq.rows() > 0) prog.AddLinearEqualityConstraint(rows.A_eq, -rows.b_eq, block.centre);
+	if (rows.A_in.rows() > 0) {
+		Eigen::MatrixXd A(rows.A_in.rows(), d + 1);
+		A << rows.A_in, (rows.A_in * N).rowwise().norm();
+		VectorXDecisionVariable cr(d + 1);
+		cr << block.centre, r;
+		prog.AddLinearConstraint(A, Eigen::VectorXd::Constant(A.rows(), -kInf), -rows.b_in, cr);
+	}
+	prog.AddLinearCost(-Expression(r));
+
+	for (int c = 0; c < box_cols; ++c) {
+		block.lo.push_back(prog.NewContinuousVariables(d, "lo"));
+		block.hi.push_back(prog.NewContinuousVariables(d, "hi"));
+		add_membership(block.lo.back());
+		add_membership(block.hi.back());
+		prog.AddLinearCost(Expression(block.lo.back()(c)) - Expression(block.hi.back()(c)));
+	}
+	return block;
+}
+
+// Every set's geometry from one LP; if that is infeasible, each set alone,
+// marking the ones with no point as empty. `sets` pairs each set with its
+// number of box columns.
+std::vector<SetGeometry> AnalyzeSets(const std::vector<std::pair<const AffineRows*, int>>& sets, double r_max) {
+	auto read = [&](const MathematicalProgramResult& result, const SetGeometryBlock& block) {
+		const int box_cols = block.lo.size();
+		SetGeometry g;
+		g.centre = result.GetSolution(block.centre);
+		g.lo.resize(box_cols);
+		g.hi.resize(box_cols);
+		for (int c = 0; c < box_cols; ++c) {
+			g.lo(c) = result.GetSolution(block.lo[c](c));
+			g.hi(c) = result.GetSolution(block.hi[c](c));
+		}
+		return g;
+	};
+
+	std::vector<SetGeometry> out(sets.size());
+	{
+		MathematicalProgram prog;
+		std::vector<SetGeometryBlock> blocks;
+		for (const auto& [rows, box_cols] : sets) blocks.push_back(AddSetGeometryBlock(prog, *rows, box_cols, r_max));
+		const MathematicalProgramResult result = drake::solvers::Solve(prog);
+		if (result.is_success()) {
+			for (size_t i = 0; i < sets.size(); ++i) out[i] = read(result, blocks[i]);
+			return out;
+		}
+	}
+	for (size_t i = 0; i < sets.size(); ++i) {
+		MathematicalProgram prog;
+		const SetGeometryBlock block = AddSetGeometryBlock(prog, *sets[i].first, sets[i].second, r_max);
+		const MathematicalProgramResult result = drake::solvers::Solve(prog);
+		if (result.is_success()) {
+			out[i] = read(result, block);
+		} else {
+			out[i].empty = true;
+		}
+	}
+	return out;
+}
+
 }  // namespace
 
 GCSWaypointProblem BuildGCSWaypointProblem(
@@ -171,9 +267,17 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	bool enforce_rigidity,
 	WaypointObjective objective,
 	SubtourElimination subtour,
-	double length_weight) {
+	double length_weight,
+	const std::vector<std::shared_ptr<ArcTravelTimeModel>>& travel_time_models,
+	double max_tangent_halfwidth) {
 
 	const int num_agents = graph->num_agents;
+	const bool travel_time = objective == WaypointObjective::kMinMaxTravelTime ||
+				 objective == WaypointObjective::kAvgTravelTime;
+	if (travel_time && static_cast<int>(travel_time_models.size()) != num_agents)
+		throw std::runtime_error(fmt::format(
+			"GCSWaypointMPC: travel-time objectives need one ArcTravelTimeModel per agent ({}), got {}",
+			num_agents, travel_time_models.size()));
 	const int num_objects = graph->num_objects;
 
 	const SubgraphOfConstraints subgraph(graph, remaining_vertices);
@@ -192,10 +296,16 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 
 	// Same bounds as BuildGraphWaypointProblem: M_cost upper-bounds any arc's
 	// cost, M_time any routing time -- here the horizon of the time copies.
+	// Under travel-time objectives, the models' own bounds (each arc's
+	// tangent is checked against its model's below).
 	const double x_range = (graph->_global_x_ub - graph->_global_x_lb).maxCoeff();
 	int max_agent_width = 0;
 	for (int j = 0; j < num_agents; ++j) max_agent_width = std::max(max_agent_width, graph->robot_ambient_dim(j));
-	const double M_cost = max_agent_width * x_range;
+	double M_cost = max_agent_width * x_range;
+	if (travel_time) {
+		M_cost = 0.0;
+		for (const auto& model : travel_time_models) M_cost = std::max(M_cost, model->max_travel_time);
+	}
 	const double M_time = (n_N - 1) * M_cost + 1.0;
 	const double M_sym = ConservativeStateBigM(*graph);
 
@@ -610,6 +720,42 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 		for (size_t v = 0; v < problem.graphs[j].vertices.size(); ++v)
 			AddPerspectiveRows(prog, vertex_rows[j][v], problem.P[j][v].cast<Expression>(), weight(j, v));
 
+	// Travel-time objectives: each vertex set's centre (where arcs are
+	// linearized) and bounding box over its model's columns.
+	std::vector<std::vector<SetGeometry>> vertex_geom(num_agents);
+	if (travel_time) {
+		std::vector<int> node_of_sg(n_V, -1);
+		for (int v : remaining_vertices) node_of_sg[subgraph.subgraph_id(v)] = v;
+		std::vector<std::pair<const AffineRows*, int>> sets;
+		for (int j = 0; j < num_agents; ++j)
+			for (const AffineRows& rows : vertex_rows[j]) sets.push_back({&rows, travel_time_models[j]->dim()});
+		const std::vector<SetGeometry> geom = AnalyzeSets(sets, x_range);
+		size_t i = 0;
+		for (int j = 0; j < num_agents; ++j) {
+			const ArcTravelTimeModel& model = *travel_time_models[j];
+			const int m = model.dim();
+			for (size_t v = 0; v < problem.graphs[j].vertices.size(); ++v, ++i) {
+				vertex_geom[j].push_back(geom[i]);
+				const SetGeometry& g = geom[i];
+				if (g.empty) continue;
+				const auto& vx = problem.graphs[j].vertices[v];
+				const std::string who = fmt::format(
+					"agent {} at node {} ({})", j, node_of_sg[vx.sg],
+					vx.mode == GCSModeGraph::kNoRole ? std::string("no role")
+									 : fmt::format("variable {}", row_var[vx.mode]));
+				const double halfwidth = ((g.hi - g.lo) / 2.0).maxCoeff();
+				if (halfwidth > max_tangent_halfwidth)
+					throw std::runtime_error(fmt::format(
+						"GCSWaypointMPC: {}: vertex set half-width {} exceeds max_tangent_halfwidth {}",
+						who, halfwidth, max_tangent_halfwidth));
+				const Eigen::VectorXd c = g.centre.head(m);
+				if ((c.array() < model.lower.array() - 1e-9).any() || (c.array() > model.upper.array() + 1e-9).any())
+					throw std::runtime_error(fmt::format(
+						"GCSWaypointMPC: {}: vertex set centre lies outside the travel-time model's domain", who));
+			}
+		}
+	}
+
 	// An agent holds at most one role per node.
 	for (int j = 0; j < num_agents; ++j) {
 		for (int sg = 0; sg < n_V; ++sg) {
@@ -646,6 +792,67 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 			if (presolve.arc_allowed(j, vertex_ri(v), sink_idx)) g.arcs.push_back({v, GCSModeGraph::kSink});
 
 		const int L = g.arcs.size();
+
+		// Travel-time objectives: the model's value and gradient at every
+		// non-sink arc's (tail centre, head centre), in one call. An arc at
+		// an empty vertex set is unusable (its copies' perspective forces
+		// Z = 0) and isn't linearized.
+		Eigen::VectorXd arc_T;
+		Eigen::MatrixXd arc_gX, arc_gY, arc_X, arc_Y;
+		std::vector<int> arc_row(L, -1);
+		if (travel_time) {
+			const ArcTravelTimeModel& model = *travel_time_models[j];
+			const int m = model.dim();
+			if ((x0_j.head(m).array() < model.lower.array() - 1e-9).any() ||
+			    (x0_j.head(m).array() > model.upper.array() + 1e-9).any())
+				throw std::runtime_error(fmt::format(
+					"GCSWaypointMPC: agent {}'s x0 lies outside its travel-time model's domain", j));
+			int n = 0;
+			for (int a = 0; a < L; ++a) {
+				const auto [tail, head] = g.arcs[a];
+				if (head == GCSModeGraph::kSink) continue;
+				if ((tail != GCSModeGraph::kDepot && vertex_geom[j][tail].empty) || vertex_geom[j][head].empty) continue;
+				arc_row[a] = n++;
+			}
+			arc_X.resize(n, m);
+			arc_Y.resize(n, m);
+			Eigen::MatrixXd arc_X_lo(n, m), arc_X_hi(n, m), arc_Y_lo(n, m), arc_Y_hi(n, m);
+			for (int a = 0; a < L; ++a) {
+				if (arc_row[a] < 0) continue;
+				const auto [tail, head] = g.arcs[a];
+				const int r = arc_row[a];
+				if (tail == GCSModeGraph::kDepot) {
+					arc_X.row(r) = arc_X_lo.row(r) = arc_X_hi.row(r) = x0_j.head(m).transpose();
+				} else {
+					arc_X.row(r) = vertex_geom[j][tail].centre.head(m).transpose();
+					arc_X_lo.row(r) = vertex_geom[j][tail].lo.transpose();
+					arc_X_hi.row(r) = vertex_geom[j][tail].hi.transpose();
+				}
+				arc_Y.row(r) = vertex_geom[j][head].centre.head(m).transpose();
+				arc_Y_lo.row(r) = vertex_geom[j][head].lo.transpose();
+				arc_Y_hi.row(r) = vertex_geom[j][head].hi.transpose();
+			}
+			std::tie(arc_T, arc_gX, arc_gY) = model.Linearize(arc_X, arc_Y);
+			if (arc_T.size() != n || arc_gX.rows() != n || arc_gX.cols() != m ||
+			    arc_gY.rows() != n || arc_gY.cols() != m)
+				throw std::runtime_error(fmt::format(
+					"GCSWaypointMPC: agent {}'s travel-time model returned the wrong shapes for {} arcs", j, n));
+			if (!arc_T.allFinite() || !arc_gX.allFinite() || !arc_gY.allFinite())
+				throw std::runtime_error(fmt::format(
+					"GCSWaypointMPC: agent {}'s travel-time model returned non-finite values", j));
+			// The tangent's maximum over the arc's bounding boxes must fit the
+			// time big-M.
+			const Eigen::ArrayXXd dX = arc_gX.array() * (arc_X_hi - arc_X).array();
+			const Eigen::ArrayXXd dX2 = arc_gX.array() * (arc_X_lo - arc_X).array();
+			const Eigen::ArrayXXd dY = arc_gY.array() * (arc_Y_hi - arc_Y).array();
+			const Eigen::ArrayXXd dY2 = arc_gY.array() * (arc_Y_lo - arc_Y).array();
+			const Eigen::VectorXd peak = arc_T + (dX.max(dX2) + dY.max(dY2)).rowwise().sum().matrix();
+			if (n > 0 && peak.maxCoeff() > model.max_travel_time)
+				throw std::runtime_error(fmt::format(
+					"GCSWaypointMPC: agent {}: an arc's linearized travel time reaches {}, above its "
+					"model's max_travel_time {}", j, peak.maxCoeff(), model.max_travel_time));
+		}
+
 		const VectorXDecisionVariable Z = prog.NewBinaryVariables(L, fmt::format("Z_{}", j));
 		problem.Z[j] = Z;
 		const VectorXDecisionVariable sigma = prog.NewContinuousVariables(L, fmt::format("sigma_{}", j));
@@ -688,6 +895,17 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 				case WaypointObjective::kAvgL2:
 					dist = ComputeL2Distance(prog, splines->at(j), Y[a], X[a], tag);
 					break;
+				case WaypointObjective::kMinMaxTravelTime:
+				case WaypointObjective::kAvgTravelTime: {
+					// Perspective of T(x̄, ȳ) + gX·(x - x̄) + gY·(y - ȳ).
+					const int r = arc_row[a];
+					if (r < 0) break;
+					dist = Expression(Z(a)) * (arc_T(r) - arc_gX.row(r).dot(arc_X.row(r)) -
+								   arc_gY.row(r).dot(arc_Y.row(r)));
+					for (int c = 0; c < arc_X.cols(); ++c)
+						dist += arc_gX(r, c) * X[a](c) + arc_gY(r, c) * Y[a](c);
+					break;
+				}
 				}
 				prog.AddLinearConstraint(Expression(rho(a)) - Expression(sigma(a)) - dist, 0.0, kInf);
 				total_cost += dist;
@@ -759,10 +977,12 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	switch (objective) {
 	case WaypointObjective::kMinMaxL1:
 	case WaypointObjective::kMinMaxL2:
+	case WaypointObjective::kMinMaxTravelTime:
 		prog.AddLinearCost(MinMaxObjectiveCost(L_ms_var(0), total_cost, length_weight));
 		break;
 	case WaypointObjective::kAvgL1:
 	case WaypointObjective::kAvgL2:
+	case WaypointObjective::kAvgTravelTime:
 		if (num_agents == 0) throw std::runtime_error("kAvg* objectives require num_agents > 0");
 		prog.AddLinearCost(total_cost * (1.0 / num_agents));
 		break;
@@ -784,15 +1004,37 @@ GCSWaypointMPC::GCSWaypointMPC(GraphOfConstraints& graph,
 			       SubtourElimination subtour,
 			       double length_weight,
 			       double mip_gap,
-			       bool warm_start)
+			       bool warm_start,
+			       std::vector<std::shared_ptr<ArcTravelTimeModel>> travel_time_models,
+			       double max_tangent_halfwidth)
 	: GraphWaypointMPC(graph, std::move(splines), objective),
 	  _solver(solver),
 	  _enforce_rigidity(enforce_rigidity),
 	  _subtour(subtour),
 	  _length_weight(length_weight),
 	  _mip_gap(mip_gap),
-	  _warm_start(warm_start) {
+	  _warm_start(warm_start),
+	  _travel_time_models(std::move(travel_time_models)),
+	  _max_tangent_halfwidth(max_tangent_halfwidth) {
 	CheckLengthWeight(objective, length_weight);
+	const bool travel_time = objective == WaypointObjective::kMinMaxTravelTime ||
+				 objective == WaypointObjective::kAvgTravelTime;
+	if (!travel_time && !_travel_time_models.empty())
+		throw std::runtime_error("GCSWaypointMPC: travel_time_models given, but the objective isn't a travel-time one");
+	if (travel_time) {
+		if (static_cast<int>(_travel_time_models.size()) != graph.num_agents)
+			throw std::runtime_error(fmt::format(
+				"GCSWaypointMPC: travel-time objectives need one ArcTravelTimeModel per agent ({}), got {}",
+				graph.num_agents, _travel_time_models.size()));
+		for (int j = 0; j < graph.num_agents; ++j) {
+			if (!_travel_time_models[j])
+				throw std::runtime_error(fmt::format("GCSWaypointMPC: agent {}'s travel-time model is None", j));
+			if (_travel_time_models[j]->dim() > graph.robot_ambient_dim(j))
+				throw std::runtime_error(fmt::format(
+					"GCSWaypointMPC: agent {}'s travel-time model reads {} columns, but its row has {}",
+					j, _travel_time_models[j]->dim(), graph.robot_ambient_dim(j)));
+		}
+	}
 }
 
 bool GCSWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
@@ -816,7 +1058,7 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 
 	GCSWaypointProblem problem = BuildGCSWaypointProblem(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		_enforce_rigidity, _objective, _subtour, _length_weight);
+		_enforce_rigidity, _objective, _subtour, _length_weight, _travel_time_models, _max_tangent_halfwidth);
 
 	if (_warm_start) SetWarmStart(problem, remaining_vertices);
 

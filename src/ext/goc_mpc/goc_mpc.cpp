@@ -15,6 +15,16 @@
 using drake::symbolic::Expression;
 namespace py = pybind11;
 
+class PyArcTravelTimeModel : public ArcTravelTimeModel {
+public:
+	using ArcTravelTimeModel::ArcTravelTimeModel;
+	std::tuple<Eigen::VectorXd, Eigen::MatrixXd, Eigen::MatrixXd> Linearize(
+		const Eigen::MatrixXd& X, const Eigen::MatrixXd& Y) const override {
+		using Result = std::tuple<Eigen::VectorXd, Eigen::MatrixXd, Eigen::MatrixXd>;
+		PYBIND11_OVERRIDE_PURE_NAME(Result, ArcTravelTimeModel, "linearize", Linearize, X, Y);
+	}
+};
+
 /*
  * PYBIND11 MODULE
  */
@@ -445,6 +455,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.value("kAvgL1",         WaypointObjective::kAvgL1)
 		.value("kMinMaxL2",      WaypointObjective::kMinMaxL2)
 		.value("kAvgL2",         WaypointObjective::kAvgL2)
+		.value("kMinMaxTravelTime", WaypointObjective::kMinMaxTravelTime)
+		.value("kAvgTravelTime",    WaypointObjective::kAvgTravelTime)
 		.export_values();
 
 	py::class_<GraphWaypointMPC, std::shared_ptr<GraphWaypointMPC>>(goc_mpc, "GraphWaypointMPC")
@@ -478,6 +490,17 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_t", &MILPWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		.def("view_Z", &MILPWaypointMPC::view_Z, py::return_value_policy::reference_internal);
 
+	// Subclass in Python and override linearize(X, Y) -> (T, dT/dX, dT/dY).
+	py::class_<ArcTravelTimeModel, PyArcTravelTimeModel, std::shared_ptr<ArcTravelTimeModel>>(
+		goc_mpc, "ArcTravelTimeModel")
+		.def(py::init<Eigen::VectorXd, Eigen::VectorXd, double>(),
+		     py::arg("lower"), py::arg("upper"), py::arg("max_travel_time"))
+		.def_readonly("lower", &ArcTravelTimeModel::lower)
+		.def_readonly("upper", &ArcTravelTimeModel::upper)
+		.def_readonly("max_travel_time", &ArcTravelTimeModel::max_travel_time)
+		.def("dim", &ArcTravelTimeModel::dim)
+		.def("linearize", &ArcTravelTimeModel::Linearize, py::arg("X"), py::arg("Y"));
+
         py::class_<GCSWaypointMPC, GraphWaypointMPC, std::shared_ptr<GCSWaypointMPC>>(goc_mpc, "GCSWaypointMPC")
                 .def(py::init<GraphOfConstraints&,
 			      std::vector<CubicConfigurationSpline>,
@@ -487,8 +510,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 			      SubtourElimination,
 			      double,
 			      double,
-			      bool>(),
+			      bool,
+			      std::vector<std::shared_ptr<ArcTravelTimeModel>>,
+			      double>(),
 		     py::keep_alive<1, 2>(),
+		     // Keeps the list (and so any Python-subclassed models in it) alive.
+		     py::keep_alive<1, 11>(),
 		     py::arg("graph"),
 		     py::arg("splines"),
 		     py::arg("solver")            = WaypointSolver::kGurobi,
@@ -497,7 +524,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("subtour")           = SubtourElimination::kMCF,
 		     py::arg("length_weight")     = 0.0,
 		     py::arg("mip_gap")           = 1e-4,
-		     py::arg("warm_start")        = true)
+		     py::arg("warm_start")        = true,
+		     py::arg("travel_time_models") = std::vector<std::shared_ptr<ArcTravelTimeModel>>{},
+		     py::arg("max_tangent_halfwidth") = std::numeric_limits<double>::infinity())
 		.def("view_t", &GCSWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		// Per agent: graph node ids visited, in order.
 		.def("view_routes", &GCSWaypointMPC::view_routes);
