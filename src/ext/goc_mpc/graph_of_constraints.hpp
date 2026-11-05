@@ -449,6 +449,16 @@ struct GraphOfConstraints {
 	// (agent_id, link_name) -- see set_robot_fk/link_pose.
 	std::map<std::pair<int, std::string>, py::function> robot_fk_registry;
 
+	// The same forward kinematics as expressions, for solvers that need
+	// FK symbolically (SCIPWaypointMPC's spatial branch-and-bound): the
+	// position (workspace_dim) and row-major rotation (workspace_dim^2) of
+	// (agent_id, link_name), over agent_q(agent_id)'s placeholders. Set by
+	// set_robot_symbolic_fk (set_robot_fk's symbolic_fk_fn in Python).
+	struct SymbolicLinkFK {
+		drake::VectorX<drake::symbolic::Expression> position, rotation;
+	};
+	std::map<std::pair<int, std::string>, SymbolicLinkFK> robot_symbolic_fk;
+
 	// Per-agent non-trivial collision geometry (v2 plan Stage 3), keyed by
 	// agent_id. Plain data (agent_collision_model.hpp) -- GraphShortPathMPC's
 	// constructor turns each entry into an AgentCollisionModel (a Drake
@@ -827,6 +837,16 @@ struct GraphOfConstraints {
 	// an agent_link_pos constraint (2), since that path traces it under
 	// jax.jit with an abstract input.
 	void set_robot_fk(int agent_id, const std::string& link_name, py::function fk_fn);
+	void set_robot_symbolic_fk(int agent_id, const std::string& link_name,
+				   drake::VectorX<drake::symbolic::Expression> position,
+				   drake::VectorX<drake::symbolic::Expression> rotation);
+	// Takes every agent_link_pos/agent_link_rot placeholder in free_vars to
+	// its registered symbolic FK (over agent_q), and -- when holder >= 0 --
+	// every var_agent_link_pos/var_agent_link_rot placeholder of variable
+	// `var` to agent `holder`'s symbolic FK over var_agent_q(var). Throws on
+	// such a placeholder with no symbolic FK registered.
+	drake::symbolic::Substitution SymbolicFKSubstitution(const drake::symbolic::Variables& free_vars,
+							     int var = -1, int holder = -1) const;
 
 	// Forward kinematics for `link_name` on robot `agent_id`, from a full
 	// state row `x` (total_dim, same agents-then-objects layout as

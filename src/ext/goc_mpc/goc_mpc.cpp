@@ -9,6 +9,7 @@
 #include "graph_waypoint_mpc.hpp"
 #include "milp_waypoint_mpc.hpp"
 #include "gcs_waypoint_mpc.hpp"
+#include "scip_waypoint_mpc.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
 
@@ -212,8 +213,32 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("add_assignable_grasp_change", &GraphOfConstraints::add_assignable_grasp_change)
 		.def("get_grasp_changes", &GraphOfConstraints::get_grasp_changes)
 		.def("make_node_unpassable", &GraphOfConstraints::make_node_unpassable)
-		.def("set_robot_fk", &GraphOfConstraints::set_robot_fk,
-		     py::arg("agent_id"), py::arg("link_name"), py::arg("fk_fn"))
+		// symbolic_fk_fn: optionally the same FK written over symbolic
+		// inputs (e.g. numpy object arrays with pydrake.symbolic sin/cos),
+		// called once here with agent_q(agent_id) and returning
+		// (position, rotation) expressions -- what SCIPWaypointMPC compiles
+		// agent_link_pos/agent_link_rot constraints from.
+		.def("set_robot_fk",
+		     [](GraphOfConstraints& g, int agent_id, const std::string& link_name, py::function fk_fn,
+			py::object symbolic_fk_fn) {
+			     g.set_robot_fk(agent_id, link_name, std::move(fk_fn));
+			     if (symbolic_fk_fn.is_none()) return;
+			     const py::tuple result = symbolic_fk_fn(g.agent_q(agent_id));
+			     if (result.size() != 2)
+				     throw std::runtime_error("set_robot_fk: symbolic_fk_fn must return (position, rotation)");
+			     static const py::object asarray = py::module_::import("numpy").attr("asarray");
+			     auto flat = [](py::handle h) {
+				     const py::list items = asarray(h).attr("reshape")(-1).attr("tolist")();
+				     drake::VectorX<drake::symbolic::Expression> out(items.size());
+				     for (size_t k = 0; k < items.size(); ++k)
+					     out(k) = py::isinstance<py::float_>(items[k]) || py::isinstance<py::int_>(items[k])
+							      ? drake::symbolic::Expression(items[k].cast<double>())
+							      : items[k].cast<drake::symbolic::Expression>();
+				     return out;
+			     };
+			     g.set_robot_symbolic_fk(agent_id, link_name, flat(result[0]), flat(result[1]));
+		     },
+		     py::arg("agent_id"), py::arg("link_name"), py::arg("fk_fn"), py::arg("symbolic_fk_fn") = py::none())
 		// Register a configuration-dependent workspace-sphere collision
 		// body for an agent of GraphShortPathMPC (v2 plan Stage 3):
 		// `model_path` is a URDF/MJCF/SDF parsed once into a Drake
@@ -530,6 +555,73 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_t", &GCSWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		// Per agent: graph node ids visited, in order.
 		.def("view_routes", &GCSWaypointMPC::view_routes);
+
+        py::class_<LocalSolveRecord>(goc_mpc, "LocalSolveRecord")
+                .def_readonly("success", &LocalSolveRecord::success)
+                .def_readonly("vars", &LocalSolveRecord::vars)
+                .def_readonly("rows", &LocalSolveRecord::rows)
+                .def_readonly("outer", &LocalSolveRecord::outer)
+                .def_readonly("inner", &LocalSolveRecord::inner)
+                .def_readonly("trials", &LocalSolveRecord::trials)
+                .def_readonly("rho", &LocalSolveRecord::rho)
+                .def_readonly("build_time", &LocalSolveRecord::build_time)
+                .def_readonly("eval_time", &LocalSolveRecord::eval_time)
+                .def_readonly("factor_time", &LocalSolveRecord::factor_time)
+                .def_readonly("total_time", &LocalSolveRecord::total_time);
+
+        py::class_<SCIPSolveStats>(goc_mpc, "SCIPSolveStats")
+                .def_readonly("status", &SCIPSolveStats::status)
+                .def_readonly("nodes", &SCIPSolveStats::nodes)
+                .def_readonly("primal_bound", &SCIPSolveStats::primal_bound)
+                .def_readonly("dual_bound", &SCIPSolveStats::dual_bound)
+                .def_readonly("gap", &SCIPSolveStats::gap)
+                .def_readonly("solving_time", &SCIPSolveStats::solving_time)
+                .def_readonly("solution_times", &SCIPSolveStats::solution_times)
+                .def_readonly("solution_objectives", &SCIPSolveStats::solution_objectives)
+                .def_readonly("local_solves", &SCIPSolveStats::local_solves)
+                .def_readonly("local_failures", &SCIPSolveStats::local_failures)
+                .def_readonly("local_solve_time", &SCIPSolveStats::local_solve_time)
+                .def_readonly("last_local_failure", &SCIPSolveStats::last_local_failure)
+                .def_readonly("local_log", &SCIPSolveStats::local_log);
+
+        py::class_<SCIPWaypointMPC, GCSWaypointMPC, std::shared_ptr<SCIPWaypointMPC>>(goc_mpc, "SCIPWaypointMPC")
+                .def(py::init<GraphOfConstraints&,
+			      std::vector<CubicConfigurationSpline>,
+			      bool,
+			      WaypointObjective,
+			      SubtourElimination,
+			      double,
+			      double,
+			      bool,
+			      std::vector<std::shared_ptr<ArcTravelTimeModel>>,
+			      double,
+			      double,
+			      std::map<std::string, SCIPWaypointMPC::ParamValue>,
+			      double,
+			      bool,
+			      bool>(),
+		     py::keep_alive<1, 2>(),
+		     // Keeps the list (and so any Python-subclassed models in it) alive.
+		     py::keep_alive<1, 10>(),
+		     py::arg("graph"),
+		     py::arg("splines"),
+		     py::arg("enforce_rigidity")  = false,
+		     py::arg("objective")         = WaypointObjective::kMinMaxL1,
+		     py::arg("subtour")           = SubtourElimination::kMCF,
+		     py::arg("length_weight")     = 0.0,
+		     py::arg("mip_gap")           = 1e-4,
+		     py::arg("warm_start")        = true,
+		     py::arg("travel_time_models") = std::vector<std::shared_ptr<ArcTravelTimeModel>>{},
+		     py::arg("max_tangent_halfwidth") = std::numeric_limits<double>::infinity(),
+		     // Seconds per solve; infinity for none.
+		     py::arg("time_limit")        = std::numeric_limits<double>::infinity(),
+		     // SCIP parameter name -> value, converted to the parameter's own type.
+		     py::arg("params")            = std::map<std::string, SCIPWaypointMPC::ParamValue>{},
+		     py::arg("feasibility_tol")   = 1e-5,
+		     py::arg("verbose")           = false,
+		     // No solution: store the last failed local NLP iterate anyway (solve still returns False).
+		     py::arg("keep_failed_local") = false)
+		.def("view_stats", &SCIPWaypointMPC::view_stats, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")
                 .def(py::init([](const GraphOfConstraints& graph,

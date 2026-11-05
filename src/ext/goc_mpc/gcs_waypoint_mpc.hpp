@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Sparse>
 #include <drake/solvers/mathematical_program.h>
 #include <drake/solvers/solver_interface.h>
 
@@ -46,12 +47,50 @@ struct GCSWaypointProblem {
 	std::vector<std::vector<drake::solvers::VectorXDecisionVariable>> P;
 	// Per object o: (subgraph nodes x object width) positions.
 	std::vector<drake::solvers::MatrixXDecisionVariable> O;
+	// Starting points for moving onto the nonlinear constraints: each
+	// unscaled vertex copy's agent's, and each nonlinearly constrained
+	// object's, current position (x0).
+	std::vector<std::pair<drake::symbolic::Variable, double>> nonlinear_seed;
 
 	GCSWaypointProblem() = default;
 	GCSWaypointProblem(const GCSWaypointProblem&) = delete;
 	GCSWaypointProblem& operator=(const GCSWaypointProblem&) = delete;
 	GCSWaypointProblem(GCSWaypointProblem&&) = default;
 	GCSWaypointProblem& operator=(GCSWaypointProblem&&) = default;
+};
+
+// z = A x + b with z(0) >= |z(1:)|.
+struct ExternalLorentzCone {
+	Eigen::SparseMatrix<double, Eigen::RowMajor> A;
+	Eigen::VectorXd b;
+};
+
+// lb <= e <= ub, e an expression over ExternalMIP::vars.
+struct ExternalNonlinear {
+	drake::symbolic::Expression e;
+	double lb, ub;
+};
+
+// A GCSWaypointProblem's MathematicalProgram as plain mixed-integer
+// (MILP; MISOCP under the L2 objectives; MINLP with nonlinear node
+// constraints) data, indexed by prog.decision_variable_index():
+//   minimize c·x + c0  s.t.  row_lb <= A x <= row_ub,  var_lb <= x <= var_ub,
+//   every cone, every nonlinear row, x_i integer where is_integer(i).
+// vars(i) is x_i's Variable (what nonlinear expressions refer to);
+// initial_guess is the MIP start (NaN where unset); nonlinear_seed, a
+// starting point for the nonlinear rows' variables (NaN where unset).
+struct ExternalMIP {
+	drake::solvers::VectorXDecisionVariable vars;
+	Eigen::SparseMatrix<double, Eigen::RowMajor> A;
+	Eigen::VectorXd row_lb, row_ub;
+	Eigen::VectorXd var_lb, var_ub;
+	std::vector<ExternalLorentzCone> cones;
+	std::vector<ExternalNonlinear> nonlinear;
+	Eigen::VectorXd c;
+	double c0 = 0.0;
+	Eigen::Matrix<bool, Eigen::Dynamic, 1> is_integer;
+	Eigen::VectorXd initial_guess;
+	Eigen::VectorXd nonlinear_seed;
 };
 
 GCSWaypointProblem BuildGCSWaypointProblem(
@@ -129,10 +168,36 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 	const Eigen::VectorXd& view_t() const { return _t_routing; }
 	const std::vector<std::vector<int>>& view_routes() const { return _routes; }
 
+protected:
+	// Solve() split in two for a solver outside Drake: BeginExternalSolve
+	// builds the problem (with the MIP start, if warm_start) and returns it
+	// as an ExternalMIP, valid until FinishExternalSolve or the next
+	// BeginExternalSolve; FinishExternalSolve takes that solver's x, checks
+	// it against every row, bound and cone to within tol (throws otherwise),
+	// and stores it exactly as Solve() would.
+	const ExternalMIP& BeginExternalSolve(const std::vector<int>& remaining_vertices,
+					      const Eigen::VectorXd& x0);
+	void FinishExternalSolve(const Eigen::VectorXd& x, double tol);
+
 private:
+	struct PendingExternalSolve {
+		GCSWaypointProblem problem;
+		ExternalMIP mip;
+		std::vector<int> remaining_vertices;
+		Eigen::VectorXd x0;
+	};
+	std::unique_ptr<PendingExternalSolve> _pending_external;
+
+	GCSWaypointProblem BuildProblem(const std::vector<int>& remaining_vertices,
+					const Eigen::VectorXd& x0) const;
 	bool SolveWith(const drake::solvers::SolverInterface& solver,
 		       const std::vector<int>& remaining_vertices,
 		       const Eigen::VectorXd& x0);
+	// Writes a solved problem back: routes, assignments, waypoints, times.
+	void StoreSolution(const GCSWaypointProblem& problem,
+			   const drake::solvers::MathematicalProgramResult& result,
+			   const std::vector<int>& remaining_vertices,
+			   const Eigen::VectorXd& x0);
 	// Sets a MIP start on problem.prog from the previous solve: assignment
 	// binaries, and per agent the arc binaries of its previous route
 	// restricted to the vertices still in the problem. Continuous variables

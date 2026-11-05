@@ -16,6 +16,7 @@ from ._ext.goc_mpc import (
     GraphWaypointMPC,
     MILPWaypointMPC,
     GCSWaypointMPC,
+    SCIPWaypointMPC,
     ArcTravelTimeModel,
     SubtourElimination,
     GraphTimingMPC,

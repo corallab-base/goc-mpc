@@ -323,6 +323,62 @@ void GraphOfConstraints::set_robot_fk(int agent_id, const std::string& link_name
 	robot_fk_registry[{agent_id, link_name}] = std::move(fk_fn);
 }
 
+void GraphOfConstraints::set_robot_symbolic_fk(int agent_id, const std::string& link_name,
+					       drake::VectorX<drake::symbolic::Expression> position,
+					       drake::VectorX<drake::symbolic::Expression> rotation) {
+	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);
+	if (position.size() != workspace_dim || rotation.size() != workspace_dim * workspace_dim)
+		throw std::runtime_error(fmt::format(
+			"set_robot_symbolic_fk: agent {} link '{}': position has {} entries and rotation {}, "
+			"expected workspace_dim = {} and its square", agent_id, link_name, position.size(),
+			rotation.size(), workspace_dim));
+	const drake::symbolic::Variables allowed(_agent_q.Vars(agent_id));
+	for (const auto* fk : {&position, &rotation})
+		for (const auto& e : *fk)
+			for (const auto& v : e.GetVariables())
+				if (!allowed.include(v))
+					throw std::runtime_error(fmt::format(
+						"set_robot_symbolic_fk: agent {} link '{}': {} isn't one of agent_q({})",
+						agent_id, link_name, v.get_name(), agent_id));
+	robot_symbolic_fk[{agent_id, link_name}] = {std::move(position), std::move(rotation)};
+}
+
+drake::symbolic::Substitution GraphOfConstraints::SymbolicFKSubstitution(
+	const drake::symbolic::Variables& free_vars, int var, int holder) const {
+	using drake::symbolic::Expression;
+	drake::symbolic::Substitution sub;
+	auto lookup = [&](int agent, const std::string& link) -> const SymbolicLinkFK& {
+		const auto it = robot_symbolic_fk.find({agent, link});
+		if (it == robot_symbolic_fk.end())
+			throw std::runtime_error(fmt::format(
+				"no symbolic FK for agent {} link '{}' -- pass symbolic_fk_fn to set_robot_fk",
+				agent, link));
+		return it->second;
+	};
+	auto bind = [&](const drake::VectorX<drake::symbolic::Variable>& ph,
+			const drake::VectorX<Expression>& fk, const drake::symbolic::Substitution& rename) {
+		for (int c = 0; c < ph.size(); ++c) sub[ph(c)] = rename.empty() ? fk(c) : fk(c).Substitute(rename);
+	};
+	for (const auto& key : _agent_link_pos.KeysReferencedBy(free_vars))
+		bind(_agent_link_pos.Vars(key), lookup(key.first, key.second).position, {});
+	for (const auto& key : _agent_link_rot.KeysReferencedBy(free_vars))
+		bind(_agent_link_rot.Vars(key), lookup(key.first, key.second).rotation, {});
+	if (holder < 0) return sub;
+
+	const auto& q_holder = _agent_q.Vars(holder);
+	const auto& q_var = _var_agent_q.Vars(var);
+	if (q_holder.size() != q_var.size())
+		throw std::runtime_error(fmt::format(
+			"SymbolicFKSubstitution: agent {} is {} wide, variable {} {}", holder, q_holder.size(), var, q_var.size()));
+	drake::symbolic::Substitution rename;
+	for (int c = 0; c < q_var.size(); ++c) rename.emplace(q_holder(c), Expression(q_var(c)));
+	for (const auto& key : _var_agent_link_pos.KeysReferencedBy(free_vars))
+		if (key.first == var) bind(_var_agent_link_pos.Vars(key), lookup(holder, key.second).position, rename);
+	for (const auto& key : _var_agent_link_rot.KeysReferencedBy(free_vars))
+		if (key.first == var) bind(_var_agent_link_rot.Vars(key), lookup(holder, key.second).rotation, rename);
+	return sub;
+}
+
 std::pair<Eigen::VectorXd, Eigen::MatrixXd> GraphOfConstraints::link_pose(int agent_id, const Eigen::VectorXd& x,
 									  const std::string& link_name) const {
 	DRAKE_DEMAND(agent_id >= 0 && agent_id < num_agents);

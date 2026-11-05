@@ -48,6 +48,11 @@ find_package(qpOASES REQUIRED)
 # which its own package config pulls in.
 find_package(proxsuite REQUIRED)
 
+# SCIP (SCIP Optimization Suite built from source into
+# ~/phd/software/scip-install, on CMAKE_PREFIX_PATH via .envrc) --
+# SCIPWaypointMPC's (scip_waypoint_mpc.cpp) branch-and-bound solver.
+find_package(SCIP CONFIG REQUIRED)
+
 #
 # _ext module stuff
 #
@@ -67,6 +72,8 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/waypoint_common.cpp"
     "src/ext/goc_mpc/milp_waypoint_mpc.cpp"
     "src/ext/goc_mpc/gcs_waypoint_mpc.cpp"
+    "src/ext/goc_mpc/scip_waypoint_mpc.cpp"
+    "src/ext/goc_mpc/expression_tape.cpp"
     "src/ext/goc_mpc/graph_timing_mpc.cpp"
     "src/ext/goc_mpc/timing_gn_layout.cpp"
     "src/ext/goc_mpc/obstacle_set.cpp"
@@ -74,7 +81,11 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/sqp_short_path_layout.cpp"
     "src/ext/goc_mpc/graph_short_path_mpc.cpp"
 )
-target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann ${qpOASES_LIBRARY} proxsuite::proxsuite)
+target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann ${qpOASES_LIBRARY} proxsuite::proxsuite ${SCIP_LIBRARIES})
+target_include_directories(_ext PRIVATE ${SCIP_INCLUDE_DIRS})
+# Find libscip at runtime without LD_LIBRARY_PATH (e.g. from other venvs).
+get_filename_component(SCIP_LIBRARY_DIR "${SCIP_DIR}/../.." ABSOLUTE)
+set_target_properties(_ext PROPERTIES BUILD_RPATH "${SCIP_LIBRARY_DIR}" INSTALL_RPATH "${SCIP_LIBRARY_DIR}")
 target_include_directories(_ext PRIVATE ${qpOASES_INCLUDE_DIR})
 target_link_directories(_ext PRIVATE ${qpOASES_LIBRARY_DIR})
 target_compile_definitions(_ext PRIVATE

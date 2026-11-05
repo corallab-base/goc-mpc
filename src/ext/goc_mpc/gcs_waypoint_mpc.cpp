@@ -12,10 +12,13 @@
 #include <tuple>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <Eigen/LU>
 
+#include <drake/common/nice_type_name.h>
 #include <drake/common/symbolic/decompose.h>
+#include <drake/solvers/aggregate_costs_constraints.h>
 #include <drake/solvers/gurobi_solver.h>
 #include <drake/solvers/mosek_solver.h>
 #include <drake/solvers/solve.h>
@@ -87,8 +90,17 @@ void CollectAtoms(const Formula& f, std::vector<Expression>* in, std::vector<Exp
 	}
 }
 
-// Rows of f, a conjunction of affine relations over `vars` only.
-AffineRows RowsOver(const Formula& f, const drake::VectorX<Variable>& vars, const std::string& where) {
+// lb <= e <= ub, e over the placeholders `over`.
+struct NonlinearAtom {
+	Expression e;
+	double lb, ub;
+	drake::VectorX<Variable> over;
+};
+
+// Rows of f, a conjunction of relations over `vars` only. Non-affine atoms
+// go to `nonlinear` when given; without it they throw.
+AffineRows RowsOver(const Formula& f, const drake::VectorX<Variable>& vars, const std::string& where,
+		    std::vector<NonlinearAtom>* nonlinear = nullptr) {
 	const Variables allowed(vars);
 	for (const auto& v : f.GetFreeVariables()) {
 		if (!allowed.include(v))
@@ -97,6 +109,20 @@ AffineRows RowsOver(const Formula& f, const drake::VectorX<Variable>& vars, cons
 	}
 	std::vector<Expression> in, eq;
 	CollectAtoms(f, &in, &eq, where);
+	if (nonlinear) {
+		auto split = [&](std::vector<Expression>& es, double lb) {
+			std::vector<Expression> affine;
+			for (const auto& e : es) {
+				if (drake::symbolic::IsAffine(drake::Vector1<Expression>(e), allowed))
+					affine.push_back(e);
+				else
+					nonlinear->push_back({e, lb, 0.0, vars});
+			}
+			es = std::move(affine);
+		};
+		split(in, -kInf);
+		split(eq, 0.0);
+	}
 	AffineRows rows(vars.size());
 	auto decompose = [&](const std::vector<Expression>& es, Eigen::MatrixXd* A, Eigen::VectorXd* b) {
 		if (es.empty()) return;
@@ -108,7 +134,8 @@ AffineRows RowsOver(const Formula& f, const drake::VectorX<Variable>& vars, cons
 			drake::symbolic::DecomposeAffineExpressions(e, vars, A, b);
 		} catch (const std::exception& ex) {
 			throw std::runtime_error(fmt::format(
-				"GCSWaypointMPC: {}: only linear constraints are supported ({})", where, ex.what()));
+				"GCSWaypointMPC: {}: only linear constraints are supported here; nonlinear ones only "
+				"on a single agent's or role's position in a node constraint ({})", where, ex.what()));
 		}
 	};
 	decompose(in, &rows.A_in, &rows.b_in);
@@ -158,7 +185,8 @@ void AddGatedAtoms(MathematicalProgram& prog, const Formula& f, const std::vecto
 		}
 	} catch (const std::exception& ex) {
 		throw std::runtime_error(fmt::format(
-			"GCSWaypointMPC: {}: only linear constraints are supported ({})", where, ex.what()));
+			"GCSWaypointMPC: {}: only linear constraints are supported here; nonlinear ones only "
+			"on a single agent's or role's position in a node constraint ({})", where, ex.what()));
 	}
 }
 
@@ -381,6 +409,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	// agent or role alone at that node.
 	problem.P.resize(num_agents);
 	std::vector<std::vector<AffineRows>> vertex_rows(num_agents);
+	std::vector<std::vector<std::vector<NonlinearAtom>>> vertex_nonlinear(num_agents);
 	for (int j = 0; j < num_agents; ++j) {
 		const int d = graph->robot_ambient_dim(j);
 		const Eigen::VectorXd lb = graph->_global_x_lb.segment(graph->agent_col_offset(j), d);
@@ -393,6 +422,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 		for (const auto& vx : problem.graphs[j].vertices) {
 			problem.P[j].push_back(prog.NewContinuousVariables(d, fmt::format("P_{}_{}_{}", j, vx.sg, vx.mode)));
 			vertex_rows[j].push_back(box);
+			vertex_nonlinear[j].emplace_back();
 		}
 	}
 
@@ -450,12 +480,21 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	// output, are linear in the vertex copies. `gate` (an interior node of
 	// an along-edge constraint) makes the rows conditional instead -- on
 	// the gate, and on the agent in each slot actually being at sg.
-	auto compile_at_node = [&](const Formula& f, int sg, bool routes, const Expression* gate,
+	//
+	// FK placeholders (agent_link_pos/rot) become their agent's symbolic
+	// FK over agent_q first; a role's (var_agent_link_pos/rot), each
+	// candidate holder's FK over var_agent_q.
+	auto compile_at_node = [&](const Formula& f_raw, int sg, bool routes, const Expression* gate,
 				   const std::string& where) {
+		const Formula f = f_raw.Substitute(graph->SymbolicFKSubstitution(f_raw.GetFreeVariables()));
 		const Variables fv = f.GetFreeVariables();
 		const std::vector<int> agents = graph->_agent_q.KeysReferencedBy(fv);
-		const std::vector<int> vars = graph->_var_agent_q.KeysReferencedBy(fv);
 		const std::vector<int> objects = graph->_object_q.KeysReferencedBy(fv);
+		std::set<int> var_set;
+		for (int var : graph->_var_agent_q.KeysReferencedBy(fv)) var_set.insert(var);
+		for (const auto& key : graph->_var_agent_link_pos.KeysReferencedBy(fv)) var_set.insert(key.first);
+		for (const auto& key : graph->_var_agent_link_rot.KeysReferencedBy(fv)) var_set.insert(key.first);
+		const std::vector<int> vars(var_set.begin(), var_set.end());
 		for (int var : vars) {
 			if (!routes)
 				throw std::runtime_error(fmt::format(
@@ -471,10 +510,12 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 
 		if (agents.size() == 1 && vars.empty() && objects.empty()) {
 			const int j = agents[0];
-			const AffineRows rows = RowsOver(f_p, graph->_agent_q.Vars(j), where);
+			std::vector<NonlinearAtom> nonlinear;
+			const AffineRows rows = RowsOver(f_p, graph->_agent_q.Vars(j), where, gate ? nullptr : &nonlinear);
 			for (int v : vertices_at[j][sg]) {
 				if (gate == nullptr) {
 					vertex_rows[j][v].Append(rows);
+					vertex_nonlinear[j][v].insert(vertex_nonlinear[j][v].end(), nonlinear.begin(), nonlinear.end());
 				} else {
 					const Expression slack = M_sym * (1.0 - *gate);
 					AddPerspectiveRows(prog, rows, problem.P[j][v].cast<Expression>(), weight(j, v), &slack);
@@ -485,12 +526,16 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 		if (vars.size() == 1 && agents.empty() && objects.empty()) {
 			const int var = vars[0];
 			const int row = subgraph.subgraph_variable_id(var);
-			const AffineRows rows = RowsOver(f_p, graph->_var_agent_q.Vars(var), where);
 			for (int j = 0; j < num_agents; ++j) {
 				if (!is_candidate(var, j)) continue;
+				const Formula f_j = f_p.Substitute(graph->SymbolicFKSubstitution(f_p.GetFreeVariables(), var, j));
+				std::vector<NonlinearAtom> nonlinear;
+				const AffineRows rows = RowsOver(f_j, graph->_var_agent_q.Vars(var), where, gate ? nullptr : &nonlinear);
 				for (int v : vertices_at[j][sg]) {
 					if (gate == nullptr) {
-						if (problem.graphs[j].vertices[v].mode == row) vertex_rows[j][v].Append(rows);
+						if (problem.graphs[j].vertices[v].mode != row) continue;
+						vertex_rows[j][v].Append(rows);
+						vertex_nonlinear[j][v].insert(vertex_nonlinear[j][v].end(), nonlinear.begin(), nonlinear.end());
 					} else {
 						// The holder's position at sg, in whatever mode it's there.
 						const Expression slack = M_sym * ((1.0 - *gate) + (1.0 - Expression(Assignments(row, j))));
@@ -499,6 +544,51 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 				}
 			}
 			return;
+		}
+		// One agent and objects, with nonlinear atoms (e.g. fk(q) == object_q
+		// + offset): the objects become this node's object variables, the
+		// nonlinear atoms join the agent's one vertex's unscaled copy and the
+		// affine ones are plain rows -- exact only because the agent surely
+		// visits sg, in that one vertex.
+		if (agents.size() == 1 && vars.empty() && !objects.empty() && gate == nullptr) {
+			const int j = agents[0];
+			Substitution sub_o;
+			for (int o : objects) {
+				const auto& ph = graph->_object_q.Vars(o);
+				for (int c = 0; c < ph.size(); ++c) sub_o[ph[c]] = problem.O[o](sg, c);
+			}
+			auto seed_objects = [&] {
+				for (int o : objects)
+					for (int c = 0; c < graph->object_ambient_dim(o); ++c)
+						problem.nonlinear_seed.emplace_back(problem.O[o](sg, c), x0(graph->object_col_offset(o) + c));
+			};
+			std::vector<Expression> in, eq;
+			CollectAtoms(f_p.Substitute(sub_o), &in, &eq, where);
+			auto affine = [](const Expression& e) { return drake::symbolic::IsAffine(drake::Vector1<Expression>(e)); };
+			const bool any_nonlinear = std::any_of(in.begin(), in.end(), [&](const auto& e) { return !affine(e); }) ||
+						   std::any_of(eq.begin(), eq.end(), [&](const auto& e) { return !affine(e); });
+			if (any_nonlinear) {
+				if (!presolve.required_at[sg].contains(j) || vertices_at[j][sg].size() != 1)
+					throw std::runtime_error(fmt::format(
+						"GCSWaypointMPC: {}: a nonlinear constraint coupling agent {} with objects needs "
+						"the agent to surely visit the node, in one mode", where, j));
+				const int v = vertices_at[j][sg][0];
+				const auto& ph = graph->_agent_q.Vars(j);
+				Substitution sub_q;
+				const drake::VectorX<Expression> p = pos_agent(j, sg);
+				for (int c = 0; c < ph.size(); ++c) sub_q[ph[c]] = p(c);
+				auto add = [&](const Expression& e, double lb) {
+					if (affine(e))
+						prog.AddLinearConstraint(drake::Vector1<Expression>(e.Substitute(sub_q)),
+									 drake::Vector1d(lb), drake::Vector1d(0.0));
+					else
+						vertex_nonlinear[j][v].push_back({e, lb, 0.0, ph});
+				};
+				for (const auto& e : in) add(e, -kInf);
+				for (const auto& e : eq) add(e, 0.0);
+				seed_objects();
+				return;
+			}
 		}
 
 		std::vector<Expression> gates;
@@ -719,6 +809,51 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	for (int j = 0; j < num_agents; ++j)
 		for (size_t v = 0; v < problem.graphs[j].vertices.size(); ++v)
 			AddPerspectiveRows(prog, vertex_rows[j][v], problem.P[j][v].cast<Expression>(), weight(j, v));
+
+	// A vertex with nonlinear atoms gets an unscaled copy Q of its position:
+	// Q lies in the vertex's whole set (affine rows and nonlinear atoms,
+	// unconditionally, so that set must be nonempty even if the vertex goes
+	// unused) and equals P whenever the vertex is used (big-M on the global
+	// box). The nonlinear constraints thus involve no binaries.
+	for (int j = 0; j < num_agents; ++j) {
+		const int d = graph->robot_ambient_dim(j);
+		const Eigen::VectorXd lb = graph->_global_x_lb.segment(graph->agent_col_offset(j), d);
+		const Eigen::VectorXd ub = graph->_global_x_ub.segment(graph->agent_col_offset(j), d);
+		const Eigen::VectorXd M = lb.cwiseAbs().cwiseMax(ub.cwiseAbs());
+		for (size_t v = 0; v < problem.graphs[j].vertices.size(); ++v) {
+			const auto& atoms = vertex_nonlinear[j][v];
+			if (atoms.empty()) continue;
+			const auto& vx = problem.graphs[j].vertices[v];
+			if (!M.allFinite())
+				throw std::runtime_error(fmt::format(
+					"GCSWaypointMPC: agent {} has a nonlinear constraint at subgraph node {} but an "
+					"unbounded state box", j, vx.sg));
+			const VectorXDecisionVariable Q =
+				prog.NewContinuousVariables(d, fmt::format("Q_{}_{}_{}", j, vx.sg, vx.mode));
+			prog.AddBoundingBoxConstraint(lb, ub, Q);
+			for (int c = 0; c < d; ++c)
+				problem.nonlinear_seed.emplace_back(Q(c), x0(graph->agent_col_offset(j) + c));
+			AddPerspectiveRows(prog, vertex_rows[j][v], Q.cast<Expression>(), Expression(1.0));
+			const Expression unused = 1.0 - weight(j, v);
+			for (int c = 0; c < d; ++c) {
+				const Expression diff = problem.P[j][v](c) - Q(c);
+				prog.AddLinearConstraint(diff - M(c) * unused, -kInf, 0.0);
+				prog.AddLinearConstraint(-diff - M(c) * unused, -kInf, 0.0);
+			}
+			for (const auto& atom : atoms) {
+				if (atom.over.size() != d)
+					throw std::runtime_error(fmt::format(
+						"GCSWaypointMPC: a nonlinear constraint's placeholders are {} wide, agent {}'s position {}",
+						atom.over.size(), j, d));
+				Substitution sub;
+				for (int c = 0; c < d; ++c) sub[atom.over(c)] = Q(c);
+				const auto constraint = std::make_shared<drake::solvers::ExpressionConstraint>(
+					drake::Vector1<Expression>(atom.e.Substitute(sub)), drake::Vector1d(atom.lb),
+					drake::Vector1d(atom.ub));
+				prog.AddConstraint(constraint, constraint->vars());
+			}
+		}
+	}
 
 	// Travel-time objectives: each vertex set's centre (where arcs are
 	// linearized) and bounding box over its model's columns.
@@ -1052,15 +1187,185 @@ bool GCSWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 	throw std::runtime_error("GCSWaypointMPC: solver must be kGurobi or kMosek");
 }
 
+GCSWaypointProblem GCSWaypointMPC::BuildProblem(const std::vector<int>& remaining_vertices,
+						const Eigen::VectorXd& x0) const {
+	GCSWaypointProblem problem = BuildGCSWaypointProblem(
+		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
+		_enforce_rigidity, _objective, _subtour, _length_weight, _travel_time_models, _max_tangent_halfwidth);
+	if (_warm_start) SetWarmStart(problem, remaining_vertices);
+	return problem;
+}
+
+const ExternalMIP& GCSWaypointMPC::BeginExternalSolve(const std::vector<int>& remaining_vertices,
+						const Eigen::VectorXd& x0) {
+	BeginSolve(remaining_vertices, x0);
+	auto pending = std::make_unique<PendingExternalSolve>();
+	pending->problem = BuildProblem(remaining_vertices, x0);
+	pending->remaining_vertices = remaining_vertices;
+	pending->x0 = x0;
+	const MathematicalProgram& prog = *pending->problem.prog;
+
+	const auto linear = prog.GetAllLinearConstraints();
+	std::set<std::string> unsupported;
+	for (const auto& b : prog.GetAllConstraints()) {
+		const auto* e = b.evaluator().get();
+		if (!dynamic_cast<const drake::solvers::LinearConstraint*>(e) &&
+		    !dynamic_cast<const drake::solvers::LorentzConeConstraint*>(e) &&
+		    !dynamic_cast<const drake::solvers::ExpressionConstraint*>(e))
+			unsupported.insert(drake::NiceTypeName::Get(*e));
+	}
+	for (const auto& b : prog.GetAllCosts())
+		if (!dynamic_cast<const drake::solvers::LinearCost*>(b.evaluator().get()))
+			unsupported.insert(drake::NiceTypeName::Get(*b.evaluator()));
+	if (!unsupported.empty())
+		throw std::runtime_error(fmt::format(
+			"GCSWaypointMPC::BeginExternalSolve: only linear, Lorentz cone and expression constraints, "
+			"bounding boxes and linear costs export to ExternalMIP; program has {}", fmt::join(unsupported, ", ")));
+
+	ExternalMIP& mip = pending->mip;
+	const int n = prog.num_vars();
+	mip.vars = prog.decision_variables();
+
+	for (const auto& b : prog.generic_constraints()) {
+		const auto* ec = dynamic_cast<const drake::solvers::ExpressionConstraint*>(b.evaluator().get());
+		if (!ec) continue;
+		Substitution to_binding;
+		for (int k = 0; k < ec->vars().size(); ++k)
+			if (!ec->vars()(k).equal_to(b.variables()(k))) to_binding[ec->vars()(k)] = b.variables()(k);
+		for (int r = 0; r < ec->num_constraints(); ++r)
+			mip.nonlinear.push_back({ec->expressions()(r).Substitute(to_binding),
+						 ec->lower_bound()(r), ec->upper_bound()(r)});
+	}
+
+	for (const auto& b : prog.lorentz_cone_constraints()) {
+		const auto& A = b.evaluator()->A();
+		const std::vector<int> idx = prog.FindDecisionVariableIndices(b.variables());
+		std::vector<Eigen::Triplet<double>> cone_triplets;
+		for (int k = 0; k < A.outerSize(); ++k)
+			for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it)
+				cone_triplets.emplace_back(it.row(), idx[it.col()], it.value());
+		ExternalLorentzCone& cone = mip.cones.emplace_back();
+		cone.A.resize(A.rows(), n);
+		cone.A.setFromTriplets(cone_triplets.begin(), cone_triplets.end());
+		cone.b = b.evaluator()->b();
+	}
+
+	std::vector<Eigen::Triplet<double>> triplets;
+	std::vector<double> lb, ub;
+	for (const auto& b : linear) {
+		const auto& A = b.evaluator()->get_sparse_A();
+		const std::vector<int> idx = prog.FindDecisionVariableIndices(b.variables());
+		const int r0 = static_cast<int>(lb.size());
+		for (int k = 0; k < A.outerSize(); ++k)
+			for (Eigen::SparseMatrix<double>::InnerIterator it(A, k); it; ++it)
+				triplets.emplace_back(r0 + it.row(), idx[it.col()], it.value());
+		const auto& l = b.evaluator()->lower_bound();
+		const auto& u = b.evaluator()->upper_bound();
+		lb.insert(lb.end(), l.data(), l.data() + l.size());
+		ub.insert(ub.end(), u.data(), u.data() + u.size());
+	}
+	mip.A.resize(static_cast<int>(lb.size()), n);
+	mip.A.setFromTriplets(triplets.begin(), triplets.end());
+	mip.row_lb = Eigen::Map<const Eigen::VectorXd>(lb.data(), lb.size());
+	mip.row_ub = Eigen::Map<const Eigen::VectorXd>(ub.data(), ub.size());
+
+	drake::solvers::AggregateBoundingBoxConstraints(prog, &mip.var_lb, &mip.var_ub);
+
+	mip.c = Eigen::VectorXd::Zero(n);
+	for (const auto& b : prog.linear_costs()) {
+		const std::vector<int> idx = prog.FindDecisionVariableIndices(b.variables());
+		const Eigen::VectorXd& a = b.evaluator()->a();
+		for (int k = 0; k < a.size(); ++k) mip.c(idx[k]) += a(k);
+		mip.c0 += b.evaluator()->b();
+	}
+
+	mip.is_integer.resize(n);
+	for (int i = 0; i < n; ++i) {
+		const auto type = prog.decision_variable(i).get_type();
+		using VarType = drake::symbolic::Variable::Type;
+		if (type != VarType::CONTINUOUS && type != VarType::BINARY && type != VarType::INTEGER)
+			throw std::runtime_error(fmt::format(
+				"GCSWaypointMPC::BeginExternalSolve: unsupported type of variable {}",
+				prog.decision_variable(i).get_name()));
+		mip.is_integer(i) = type != VarType::CONTINUOUS;
+		if (type == VarType::BINARY) {
+			mip.var_lb(i) = std::max(mip.var_lb(i), 0.0);
+			mip.var_ub(i) = std::min(mip.var_ub(i), 1.0);
+		}
+	}
+	mip.initial_guess = prog.initial_guess();
+	mip.nonlinear_seed = Eigen::VectorXd::Constant(n, std::numeric_limits<double>::quiet_NaN());
+	for (const auto& [v, value] : pending->problem.nonlinear_seed)
+		mip.nonlinear_seed(prog.FindDecisionVariableIndex(v)) = value;
+
+	_pending_external = std::move(pending);
+	return _pending_external->mip;
+}
+
+void GCSWaypointMPC::FinishExternalSolve(const Eigen::VectorXd& x, double tol) {
+	if (!_pending_external)
+		throw std::runtime_error("GCSWaypointMPC::FinishExternalSolve: no BeginExternalSolve pending");
+	const std::unique_ptr<PendingExternalSolve> pending = std::move(_pending_external);
+	const ExternalMIP& mip = pending->mip;
+	const MathematicalProgram& prog = *pending->problem.prog;
+	if (x.size() != prog.num_vars())
+		throw std::runtime_error(fmt::format(
+			"GCSWaypointMPC::FinishExternalSolve: x has {} entries, program has {} variables",
+			x.size(), prog.num_vars()));
+
+	const Eigen::VectorXd Ax = mip.A * x;
+	const Eigen::VectorXd row_violation =
+		(mip.row_lb - Ax).cwiseMax(Ax - mip.row_ub).cwiseMax(0.0);
+	const Eigen::VectorXd var_violation =
+		(mip.var_lb - x).cwiseMax(x - mip.var_ub).cwiseMax(0.0);
+	Eigen::Index worst_row = 0, worst_var = 0;
+	const double max_row = row_violation.size() ? row_violation.maxCoeff(&worst_row) : 0.0;
+	const double max_var = var_violation.size() ? var_violation.maxCoeff(&worst_var) : 0.0;
+	double max_cone = 0.0;
+	size_t worst_cone = 0;
+	for (size_t k = 0; k < mip.cones.size(); ++k) {
+		const Eigen::VectorXd z = mip.cones[k].A * x + mip.cones[k].b;
+		const double violation = z.tail(z.size() - 1).norm() - z(0);
+		if (violation > max_cone) { max_cone = violation; worst_cone = k; }
+	}
+	double max_nonlinear = 0.0;
+	size_t worst_nonlinear = 0;
+	if (!mip.nonlinear.empty()) {
+		drake::symbolic::Environment env;
+		for (int i = 0; i < x.size(); ++i) env.insert(mip.vars(i), x(i));
+		for (size_t k = 0; k < mip.nonlinear.size(); ++k) {
+			const ExternalNonlinear& nl = mip.nonlinear[k];
+			const double val = nl.e.Evaluate(env);
+			const double violation = std::max({nl.lb - val, val - nl.ub, 0.0});
+			if (violation > max_nonlinear) { max_nonlinear = violation; worst_nonlinear = k; }
+		}
+	}
+	if (max_row > tol || max_var > tol || max_cone > tol || max_nonlinear > tol)
+		throw std::runtime_error(fmt::format(
+			"GCSWaypointMPC::FinishExternalSolve: x violates the problem beyond tol {}: "
+			"row {} by {}, bound on {} by {}, cone {} by {}, nonlinear row {} by {}",
+			tol, worst_row, max_row, prog.decision_variable(worst_var).get_name(), max_var,
+			worst_cone, max_cone, worst_nonlinear, max_nonlinear));
+
+	MathematicalProgramResult result;
+	result.set_decision_variable_index(prog.decision_variable_index());
+	result.set_x_val(x);
+	result.set_solution_result(drake::solvers::SolutionResult::kSolutionFound);
+	result.set_optimal_cost(mip.c.dot(x) + mip.c0);
+
+	_last_solve_time = _timer.Tick();
+	StoreSolution(pending->problem, result, pending->remaining_vertices, pending->x0);
+}
+
 bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 			       const std::vector<int>& remaining_vertices,
 			       const Eigen::VectorXd& x0) {
 
-	GCSWaypointProblem problem = BuildGCSWaypointProblem(
-		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		_enforce_rigidity, _objective, _subtour, _length_weight, _travel_time_models, _max_tangent_halfwidth);
-
-	if (_warm_start) SetWarmStart(problem, remaining_vertices);
+	GCSWaypointProblem problem = BuildProblem(remaining_vertices, x0);
+	if (!problem.prog->generic_constraints().empty())
+		throw std::runtime_error(
+			"GCSWaypointMPC: the graph has nonlinear node constraints, which Gurobi/Mosek can't "
+			"solve here -- use SCIPWaypointMPC");
 
 	drake::solvers::SolverOptions options;
 	options.SetOption(drake::solvers::GurobiSolver::id(), "MIPGap", _mip_gap);
@@ -1076,7 +1381,14 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 	}
 
 	_last_solve_time = _timer.Tick();
+	StoreSolution(problem, result, remaining_vertices, x0);
+	return true;
+}
 
+void GCSWaypointMPC::StoreSolution(const GCSWaypointProblem& problem,
+				   const MathematicalProgramResult& result,
+				   const std::vector<int>& remaining_vertices,
+				   const Eigen::VectorXd& x0) {
 	const SubgraphOfConstraints& subgraph = *problem.subgraph;
 	StoreAssignments(subgraph, problem.Assignments, result);
 
@@ -1148,7 +1460,6 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 		for (int v : remaining_vertices)
 			if (!visited.contains(v)) _waypoints.row(v).segment(off, d) = interp.eval(_t_by_node_id(v)).q_ambient;
 	}
-	return true;
 }
 
 void GCSWaypointMPC::SetWarmStart(const GCSWaypointProblem& problem,
