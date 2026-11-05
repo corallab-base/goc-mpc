@@ -717,8 +717,11 @@ class GraphOfConstraintsMPC():
             if success:
                 self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, v0_for_spline)
                 if self._collision_refiner is not None:
+                    refine_start = time.perf_counter()
                     self.last_cycle_collision_refinement = self._collision_refiner.refine(
                         self.timing_mpc, self.last_cycle_splines, x, v0_for_spline)
+                    # Also inside `timing`: this is a split of it, not an addition.
+                    self.last_cycle_solve_times["refine"] = time.perf_counter() - refine_start
                 self._prev_spline_time = self.last_cycle_time
                 self._has_prior_spline = True
                 return True

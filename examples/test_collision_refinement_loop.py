@@ -21,11 +21,14 @@ production wiring `_solve_for_timing` calls when configured with a
    have different REAL knot counts (padded to a fixed `max_nodes`) rather
    than retracing every cycle -- the fix for "we can't re-jit every
    cycle" (see CollisionRefiner's own doc comment).
+5. The safety net around write-back: knot-time projection, all-or-nothing
+   acceptance, the freeze_* config flags, and the end-time diagnostics.
 
 Run: python examples/test_collision_refinement_loop.py
 """
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from goc_mpc import GraphOfConstraints, GraphOfConstraintsMPC
@@ -417,6 +420,310 @@ def check_active_mask_dtype_consistency():
     return ok
 
 
+class _RecordingSpline:
+    """Forwards to a real spline, keeping what `CollisionRefiner` wrote --
+    the spline API has no knot accessors to read it back from afterward."""
+
+    def __init__(self, spline):
+        self._spline = spline
+        self.written = None
+
+    def block_active_mask(self):
+        return self._spline.block_active_mask()
+
+    def set_block_active_mask(self, mask):
+        self._spline.set_block_active_mask(mask)
+
+    def set(self, wps, vs, times):
+        self.written = SplineParams(times=times, wps=wps, vs=vs)
+        self._spline.set(wps, vs, times)
+
+
+def solved_two_agent_problem():
+    graph, specs, starts, goals = build_two_agent_graph()
+    splines = [CubicConfigurationSpline([s]) for s in specs]
+    timing_mpc = TracedTimingMPC(graph, splines, LinearTracer(n_interior=4), time_cost=1.0)
+
+    x = np.concatenate([starts[0], starts[1]])
+    x_dot = np.zeros(4)
+    waypoints = np.zeros((4, graph.agent_col_offsets[-1]))
+    waypoints[0, 0:2] = np.array([2.0, 0.0])
+    waypoints[1, 0:2] = goals[0]
+    waypoints[2, 2:4] = np.array([2.0, 0.0])
+    waypoints[3, 2:4] = goals[1]
+    ok_solve = timing_mpc.solve(x, x_dot, [0, 1, 2, 3], waypoints, np.array([], dtype=np.int32))
+    assert ok_solve, "TracedTimingMPC.solve failed"
+    timing_mpc.fill_cubic_splines(splines, x, x_dot)
+    return graph, [_RecordingSpline(s) for s in splines], timing_mpc, x, x_dot
+
+
+def refinement_config(**overrides):
+    kwargs = dict(
+        fk_fns=[two_sphere_ish_fk, two_sphere_ish_fk],
+        sphere_radii=[jnp.array([0.6]), jnp.array([0.6])],
+        speed_fn=lambda q: 1.0,
+        weights=CostWeights(inter_agent=8.0, environment=0.0, regularizer=0.0),
+        n_steps=25, step_size=3e-4, t_samples=60, max_nodes=16,
+    )
+    kwargs.update(overrides)
+    return CollisionRefinementConfig(**kwargs)
+
+
+def check_project_knot_times():
+    times = jnp.array(np.cumsum(np.random.default_rng(3).uniform(0.02, 2.0, 12)))
+    untouched = ccj._project_knot_times(times)
+    identical = bool(jnp.all(untouched == times))
+    print(f"[project] increasing times come back bit-identical: {'OK' if identical else 'FAIL'}")
+
+    # The final arrival (row 2) pushed past the first two frozen pad rows.
+    inverted = jnp.array([0.0, 1.0, 4.5, 3.0, 4.0, 5.0])
+    fixed = np.asarray(ccj._project_knot_times(inverted))
+    repaired = bool(np.all(np.diff(fixed) >= 0.01 - 1e-12))
+    kept = fixed[0] == 0.0 and fixed[1] == 1.0 and fixed[2] == 4.5 and fixed[5] == 5.0
+    print(f"[project] inverted times repaired ({fixed}): {'OK' if repaired and kept else 'FAIL'}")
+    return identical and repaired and kept
+
+
+def check_monotone_guard():
+    """A step big enough to invert knot times: without the projection the
+    acceptance gate must reject it, with the projection it must go through
+    and leave `set()` something it can take."""
+    aggressive = dict(n_steps=25, step_size=0.05)
+
+    real_project = ccj._project_knot_times
+    ccj._project_knot_times = lambda times: times
+    try:
+        graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+        diag = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, refinement_config(**aggressive))
+    finally:
+        ccj._project_knot_times = real_project
+    gate_ok = not diag["accepted"] and all(s.written is None for s in splines)
+    print(f"[guard] no projection: inverted times rejected, nothing written: {'OK' if gate_ok else 'FAIL'}")
+
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    diag = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, refinement_config(**aggressive))
+    guarded = diag["accepted"] and all(np.all(np.diff(s.written.times) >= 0.01 - 1e-9) for s in splines)
+    print(f"[guard] with projection: accepted, times strictly increasing: {'OK' if guarded else 'FAIL'}")
+    return gate_ok and guarded
+
+
+def check_nonfinite_rejected():
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    before = [np.asarray(s._spline.eval(1.0)[0]) for s in splines]
+    config = refinement_config(
+        speed_fn=lambda q: jnp.nan * q[0],
+        weights=CostWeights(inter_agent=8.0, environment=1.0, regularizer=0.0))
+    diag = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, config)
+    unchanged = all(np.array_equal(b, np.asarray(s._spline.eval(1.0)[0])) for b, s in zip(before, splines))
+    ok = not diag["accepted"] and unchanged and all(s.written is None for s in splines)
+    print(f"[nonfinite] NaN refinement rejected, splines untouched: {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def check_freeze_flags():
+    ok = True
+    for flag, group in [("freeze_times", "times"), ("freeze_positions", "wps"), ("freeze_velocities", "vs")]:
+        graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+        before = [ccj.extract_agent_refinement_data(timing_mpc, graph, s, i, x, x_dot, 16)
+                  for i, s in enumerate(splines)]
+        diag = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, refinement_config(**{flag: True}))
+
+        frozen, moved = diag["accepted"], True
+        for e, s in zip(before, splines):
+            n = e.n_real
+            frozen &= np.array_equal(np.asarray(getattr(e.params, group))[:n], getattr(s.written, group))
+            for other in {"times", "wps", "vs"} - {group}:
+                moved &= not np.array_equal(np.asarray(getattr(e.params, other))[:n], getattr(s.written, other))
+        print(f"[freeze] {flag}: {group} unchanged: {'OK' if frozen else 'FAIL'}; "
+              f"the other groups moved: {'OK' if moved else 'FAIL'}")
+        ok &= frozen and moved
+    return ok
+
+
+def check_obstacle_term():
+    q = jnp.array([[0.0], [0.3], [2.0]])
+    clearance = lambda q: 1.0 - q[0]
+    value = float(ccj.obstacle_cost(clearance, q, margin=0.5))
+    value_ok = abs(value - 1.5**2) < 1e-12
+    print(f"[obstacle] hinge value by hand: {'OK' if value_ok else 'FAIL'}")
+
+    def run(**overrides):
+        graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+        return ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, refinement_config(**overrides)), splines
+
+    keep_near_origin = lambda q: 1.0 - jnp.sum(q * q)
+    plain_diag, plain = run()
+    off_diag, off = run(clearance_fn=keep_near_origin)
+    same = all(np.array_equal(getattr(a.written, g), getattr(b.written, g))
+               for a, b in zip(plain, off) for g in ("times", "wps", "vs"))
+    print(f"[obstacle] weight 0 leaves the refiner unchanged: {'OK' if same else 'FAIL'}")
+
+    on_diag, _ = run(clearance_fn=keep_near_origin,
+                     weights=CostWeights(inter_agent=0.0, environment=0.0, regularizer=0.0, obstacle=1.0))
+    reduced = 0.0 < on_diag["final"]["obstacle"] < on_diag["initial"]["obstacle"]
+    print(f"[obstacle] descent reduces the hinge "
+          f"({on_diag['initial']['obstacle']:.3f} -> {on_diag['final']['obstacle']:.3f}): "
+          f"{'OK' if reduced else 'FAIL'}")
+    return value_ok and same and reduced
+
+
+def check_swept_cost():
+    """Two unit spheres cross head-on between samples: the point hinge misses
+    it and the swept hinge reads full overlap, with a usable gradient."""
+    a = jnp.array([[[-5.0, 0.0, 0.0]], [[5.0, 0.0, 0.0]]])
+    b = jnp.array([[[5.0, 0.0, 0.0]], [[-5.0, 0.3, 0.0]]])
+    r = jnp.array([1.0])
+    point = float(ccj.inter_agent_cost([a, b], [r, r]))
+    swept = float(ccj.inter_agent_cost([a, b], [r, r], swept=True))
+    tunnel_ok = point == 0.0 and swept > 1.0
+    print(f"[swept] crossing pair: point {point:.3f}, swept {swept:.3f}: {'OK' if tunnel_ok else 'FAIL'}")
+
+    grad = jax.grad(lambda c: ccj.inter_agent_cost([c, b], [r, r], swept=True))(a)
+    h = 1e-6
+    bumped = a.at[0, 0, 1].add(h)
+    fd = (ccj.inter_agent_cost([bumped, b], [r, r], swept=True)
+          - ccj.inter_agent_cost([a.at[0, 0, 1].add(-h), b], [r, r], swept=True)) / (2 * h)
+    grad_ok = bool(jnp.all(jnp.isfinite(grad))) and abs(float(grad[0, 0, 1]) - float(fd)) < 1e-4
+    print(f"[swept] gradient matches finite differences: {'OK' if grad_ok else 'FAIL'}")
+
+    still = jnp.array([[[0.0, 0.0, 0.0]]] * 3)
+    parked = float(ccj.inter_agent_cost([still, still + jnp.array([1.5, 0.0, 0.0])], [r, r], swept=True))
+    parked_ok = abs(parked - 2 * 0.5**2) < 1e-4
+    print(f"[swept] pair with no relative motion stays finite: {'OK' if parked_ok else 'FAIL'}")
+    return tunnel_ok and grad_ok and parked_ok
+
+
+def _line_search_problem():
+    """A badly scaled quadratic in the knot values."""
+    wps = jnp.array([[0.0, 0.0], [1.0, 2.0], [3.0, -1.0]])
+    params = [SplineParams(times=jnp.array([0.0, 1.0, 2.0]), wps=wps, vs=jnp.zeros((3, 2)))]
+    free = [(jnp.array([0.0, 1.0, 1.0]), jnp.array([0.0, 1.0, 0.0]), jnp.array([0.0, 1.0, 1.0]))]
+    target = jnp.array([[0.0, 0.0], [5.0, -3.0], [-2.0, 4.0]])
+
+    def cost(params_list, _q0, _masks):
+        p = params_list[0]
+        total = (1000.0 * jnp.sum((p.wps - target) ** 2) + jnp.sum((p.vs - 1.0) ** 2)
+                 + 10.0 * jnp.sum((p.times - jnp.array([0.0, 1.5, 4.0])) ** 2))
+        return total, {"total": total}
+    return cost, params, free, target
+
+
+def check_line_search():
+    cost, params, free, target = _line_search_problem()
+    run = lambda n: ccj._run_line_search(cost, params, [None], [None], free, n, 1e-3, 8, (1.0, 1.0, 1.0))
+
+    final, history, _ = run(200)
+    p = final[0]
+    converged = (float(jnp.max(jnp.abs(p.wps[1:] - target[1:]))) < 1e-6
+                 and abs(float(p.vs[1, 0]) - 1.0) < 1e-2 and abs(float(p.times[2]) - 4.0) < 1e-5)
+    print(f"[line search] reaches a badly scaled minimum: {'OK' if converged else 'FAIL'}")
+
+    history = np.asarray(history)
+    monotone = bool(np.all(np.diff(history) <= 1e-9))
+    print(f"[line search] cost never rises: {'OK' if monotone else 'FAIL'}")
+
+    pinned = (np.array_equal(p.wps[0], params[0].wps[0]) and np.array_equal(p.vs[0], params[0].vs[0])
+              and np.array_equal(p.vs[2], params[0].vs[2]) and float(p.times[0]) == 0.0)
+    print(f"[line search] pinned rows do not move: {'OK' if pinned else 'FAIL'}")
+
+    def poisoned(params_list, q0, masks):
+        total, bd = cost(params_list, q0, masks)
+        moved = jnp.sum((params_list[0].wps - params[0].wps) ** 2)
+        return jnp.where(moved > 0.0, jnp.nan, total), bd
+
+    stuck, _, _ = ccj._run_line_search(poisoned, params, [None], [None], free, 5, 1e-3, 4, (1.0, 1.0, 1.0))
+    held = np.array_equal(stuck[0].wps, params[0].wps) and np.array_equal(stuck[0].times, params[0].times)
+    print(f"[line search] NaN trials are rejected, params held: {'OK' if held else 'FAIL'}")
+    return converged and monotone and pinned and held
+
+
+def check_line_search_in_refiner():
+    ok = True
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    fixed = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, refinement_config())
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    searched = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, refinement_config(line_search=True))
+    better = searched["accepted"] and searched["final"]["inter_agent"] < fixed["final"]["inter_agent"]
+    print(f"[line search] beats fixed step at the same budget "
+          f"({fixed['final']['inter_agent']:.4f} -> {searched['final']['inter_agent']:.4f}): "
+          f"{'OK' if better else 'FAIL'}")
+    ok &= better
+
+    times = np.all([np.all(np.diff(s.written.times) > 0.0) for s in splines])
+    print(f"[line search] written times strictly increasing: {'OK' if times else 'FAIL'}")
+    return ok and bool(times)
+
+
+def check_dynamics_sees_squeezed_knots():
+    """A fast piece that fits between two grid samples still costs."""
+    graph, *_ = solved_two_agent_problem()
+    geom = AgentGeometry(spec=graph._robot_specs[0], fk_fn=two_sphere_ish_fk, sphere_radii=jnp.array([0.6]))
+    wps, vs = jnp.zeros((4, 2)), jnp.zeros((4, 2))
+    wps = wps.at[2:, 0].set(1.0)
+    params = SplineParams(times=jnp.array([0.0, 1.0, 1.01, 2.0]), wps=wps, vs=vs)
+    grid = jnp.array([0.0, 0.5, 1.5, 2.0])
+    fast = ccj.dynamics_cost(lambda q, v, a: jnp.sum(v * v), geom, params, grid,
+                             jnp.ones((4, len(graph._robot_specs[0])), dtype=jnp.int32))
+    ok = float(fast) > 100.0
+    print(f"[dynamics] piece between grid samples is seen ({float(fast):.1f}): {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def check_dynamics_term():
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    e = ccj.extract_agent_refinement_data(timing_mpc, graph, splines[0], 0, x, x_dot, 16)
+    geom = AgentGeometry(spec=graph._robot_specs[0], fk_fn=two_sphere_ish_fk, sphere_radii=jnp.array([0.6]))
+    late = jnp.linspace(0.0, float(e.params.times[-1]) + 10.0, 40)
+    count = ccj.dynamics_cost(lambda q, v, a: 1.0, geom, e.params, late, e.active_mask)
+    knots = e.params.times.shape[0]
+    grid_hits = int(jnp.sum(late <= e.params.times[-1]))
+    window_ok = int(count) == grid_hits + 2 * knots - 1 and grid_hits < 40
+    print(f"[dynamics] only samples up to the end time count: {'OK' if window_ok else 'FAIL'}")
+
+    capped = lambda q, v, a: jnp.maximum(jnp.sum(v * v) - 0.01, 0.0)
+    weights = CostWeights(inter_agent=0.0, environment=0.0, regularizer=0.0, dynamics=1.0)
+    diag = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot,
+                              refinement_config(dynamics_fn=capped, weights=weights, line_search=True))
+    reduced = 0.0 <= diag["final"]["dynamics"] < diag["initial"]["dynamics"]
+    print(f"[dynamics] descent lowers the speed hinge "
+          f"({diag['initial']['dynamics']:.3f} -> {diag['final']['dynamics']:.3f}): "
+          f"{'OK' if reduced else 'FAIL'}")
+    return window_ok and reduced
+
+
+def check_pair_margin():
+    a = jnp.array([[[0.0, 0.0, 0.0]]])
+    b = jnp.array([[[2.1, 0.0, 0.0]]])
+    r = jnp.array([1.0])
+    clear = float(ccj.inter_agent_cost([a, b], [r, r]))
+    wanted = float(ccj.inter_agent_cost([a, b], [r, r], margin=0.2))
+    ok = clear == 0.0 and abs(wanted - 0.1**2) < 1e-6
+    print(f"[margin] a clear pair inside the margin costs ({clear:.4f} -> {wanted:.4f}): {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def check_end_time_diagnostics():
+    # A single step: the scan records each step's cost before its update, so
+    # a `final` read off that history would still equal `initial` here.
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    diag = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot, refinement_config(n_steps=1))
+    current = diag["final"]["inter_agent"] != diag["initial"]["inter_agent"]
+    print(f"[diag] final cost is evaluated at the returned params: {'OK' if current else 'FAIL'}")
+
+    # End times don't drift late on this toy scene, so shorten the grid to
+    # put them past it instead.
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    short = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot,
+                               refinement_config(t_horizon_margin=-1.0))
+    graph, splines, timing_mpc, x, x_dot = solved_two_agent_problem()
+    wide = ccj.refine_splines(timing_mpc, graph, splines, x, x_dot,
+                              refinement_config(t_horizon_margin=100.0))
+    covered = short["end_time_overrun"] > 0.0 and wide["end_time_overrun"] == 0.0
+    print(f"[diag] end-time overrun {short['end_time_overrun']:.3f} s past a short grid, "
+          f"{wide['end_time_overrun']:.3f} s with a margin: {'OK' if covered else 'FAIL'}")
+    return current and covered
+
+
 def main():
     ok = True
     ok &= check_scan_mask_invariance()
@@ -424,6 +731,18 @@ def main():
     ok &= check_controller_wiring()
     ok &= check_no_retrace_across_cycles()
     ok &= check_active_mask_dtype_consistency()
+    ok &= check_project_knot_times()
+    ok &= check_monotone_guard()
+    ok &= check_nonfinite_rejected()
+    ok &= check_freeze_flags()
+    ok &= check_end_time_diagnostics()
+    ok &= check_obstacle_term()
+    ok &= check_swept_cost()
+    ok &= check_line_search()
+    ok &= check_line_search_in_refiner()
+    ok &= check_dynamics_term()
+    ok &= check_dynamics_sees_squeezed_knots()
+    ok &= check_pair_margin()
     print("\nALL OK" if ok else "\nFAILURES ABOVE")
     raise SystemExit(0 if ok else 1)
 
