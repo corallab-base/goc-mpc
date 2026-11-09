@@ -11,20 +11,7 @@
 #include <scip/type_var.h>
 
 #include "gcs_waypoint_mpc.hpp"
-
-// One local NLP relaxation solve: whether it reached SCIP's feasibility
-// tolerance, its problem size, its iteration counts (outer augmented-Lagrangian updates,
-// inner Levenberg-Marquardt steps, trial points evaluated), the final
-// penalty weight, and its wall time split into building the node's model,
-// evaluating rows and Jacobians, and forming/factorizing/solving the LM
-// systems (total includes the rest).
-struct LocalSolveRecord {
-	bool success = false;
-	int vars = 0, rows = 0;  // the node's problem size
-	int outer = 0, inner = 0, trials = 0;
-	double rho = 0.0;
-	double build_time = 0.0, eval_time = 0.0, factor_time = 0.0, total_time = 0.0;
-};
+#include "local_nlp_solver.hpp"
 
 // The last SCIPWaypointMPC solve, as SCIP reported it.
 struct SCIPSolveStats {
@@ -61,10 +48,11 @@ struct SCIPSolveStats {
 // NLP-based branch-and-bound on the integer variables alone: SCIP only
 // checks them, and each node's relaxation replaces SCIP's LP with its
 // presolved problem at the node -- integers relaxed, the nonlinear
-// constraints and cones kept -- solved by an augmented Lagrangian with
-// Levenberg-Marquardt inner solves from the agents' current configurations
-// and treated as globally optimal: its value prunes, its fractional
-// integers are branched on, and an integral one is a solution. Bounds and
+// constraints and cones kept -- solved locally (local_solver) from the
+// agents' current configurations and treated as globally optimal: its value prunes, its fractional
+// integers are branched on, and an integral one is a solution. A local
+// solve that misses feasibility cuts off only a node whose integers are all
+// fixed; otherwise SCIP branches without a bound from it. Bounds and
 // gap are then only as good as the local solves; SCIP's LP-based machinery
 // (cuts, strong branching, LP heuristics) is off.
 //
@@ -88,6 +76,8 @@ struct SCIPWaypointMPC : public GCSWaypointMPC {
 	// iterate (integers rounded) as the waypoints anyway, unchecked -- for
 	// inspecting where the local solve got stuck. Solve still returns false.
 	bool _keep_failed_local;
+	// The local NLP solver for the node relaxations.
+	LocalNLPSolver _local_solver;
 	SCIPSolveStats _stats;
 
 	SCIPWaypointMPC(GraphOfConstraints& graph,
@@ -104,7 +94,8 @@ struct SCIPWaypointMPC : public GCSWaypointMPC {
 			std::map<std::string, ParamValue> params = {},
 			double feasibility_tol = 1e-5,
 			bool verbose = false,
-			bool keep_failed_local = false);
+			bool keep_failed_local = false,
+			LocalNLPSolver local_solver = LocalNLPSolver::kPenalizedLM);
 
 	bool Solve(const std::vector<int>& remaining_vertices,
 		   const Eigen::VectorXd& x0) override;

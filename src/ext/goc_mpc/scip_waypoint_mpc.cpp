@@ -1,5 +1,6 @@
 #include "scip_waypoint_mpc.hpp"
 #include "expression_tape.hpp"
+#include "local_nlp_solver.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -10,7 +11,6 @@
 #include <unordered_map>
 
 #include <Eigen/Dense>
-#include <Eigen/SparseCholesky>
 #include <fmt/format.h>
 
 #include <objscip/objrelax.h>
@@ -248,17 +248,15 @@ void ToActive(SCIP* scip, std::vector<SCIP_VAR*> vars, std::vector<double> vals,
 // ones y (x = T y + t): SCIP's own copies of them, rewritten by presolve,
 // are only checked.
 //
-// The local solve: an augmented Lagrangian on all the constraints, each
-// inner problem by bounded Levenberg-Marquardt (Gauss-Newton on the penalty
-// terms), from one start: mip.nonlinear_seed (the agents' current
-// configurations), everything else 0 clipped into its bounds. Redundant
-// but consistent equalities, such as a full rotation-matrix pin, are fine.
+// The local solve is a LocalSolver (local_nlp_solver.hpp) from one start:
+// mip.nonlinear_seed (the agents' current configurations), everything else
+// 0.
 class LocalNLPRelax : public scip::ObjRelax {
 public:
-	LocalNLPRelax(SCIP* scip, const ExternalMIP& mip, std::vector<SCIP_VAR*> x, SCIPSolveStats* stats)
-		: ObjRelax(scip, "goc_localnlp", "local NLP relaxation (augmented Lagrangian, Levenberg-Marquardt)", 1, 1,
-			   TRUE),
-		  _mip(mip), _x(std::move(x)), _stats(stats) {
+	LocalNLPRelax(SCIP* scip, const ExternalMIP& mip, std::vector<SCIP_VAR*> x, SCIPSolveStats* stats,
+		      LocalNLPSolver solver)
+		: ObjRelax(scip, "goc_localnlp", "local NLP relaxation", 1, 1, TRUE),
+		  _mip(mip), _x(std::move(x)), _stats(stats), _solver(MakeLocalSolver(solver)) {
 		// The nonlinear rows, compiled per group of rows sharing variables
 		// (e.g. one agent's FK pins at one node).
 		std::unordered_map<drake::symbolic::Variable::Id, int> index;
@@ -330,36 +328,29 @@ private:
 		std::vector<int> x, rows;
 	};
 
-	// The constraints at a node, over the active variables y:
-	// l <= A y + a0 (linear),  the nonlinear rows on x = T y + t,  and cones
-	// on z = Z y + z0.
+	// The constraints at a node over the active variables y, beyond the
+	// linear rows: the nonlinear rows on x = T y + t, then the cones on
+	// z = Z y + z0.
 	struct Model {
-		int n = 0;
-		SparseRows A, T;
-		Eigen::VectorXd a0, t;
+		SparseRows T;
+		Eigen::VectorXd t;
 		std::vector<SparseRows> Tg;  // each group's x entries: Tg y + tg
 		std::vector<Eigen::VectorXd> tg;
 		std::vector<SparseRows> Z;   // each cone's z = Z y + z0
 		std::vector<Eigen::VectorXd> z0;
-		Eigen::VectorXd l, u;  // linear rows, then nonlinear rows, then one row per cone
-		// The Jacobian, its pattern fixed per node (values refreshed in place),
-		// and the pattern of J'J plus the diagonal, zero-valued.
-		SparseRows J;
-		Eigen::SparseMatrix<double> H0;
 		Eigen::VectorXd scratch;  // n zeros between uses
 	};
 
-	// Every row's value g at y, and the Jacobian into model.J.
-	void Evaluate(Model& model, const Eigen::VectorXd& y, Eigen::VectorXd* g) const {
-		const int m_lin = static_cast<int>(model.A.rows());
+	// The nonlinear rows' and cones' values g at y, their Jacobian's values
+	// into J.
+	void Evaluate(Model& model, const Eigen::VectorXd& y, Eigen::VectorXd* g, SparseRows* J) const {
 		const int m_nl = static_cast<int>(_mip.nonlinear.size());
 		const int m_cone = static_cast<int>(_mip.cones.size());
-		g->resize(m_lin + m_nl + m_cone);
-		g->head(m_lin) = model.A * y + model.a0;
+		g->resize(m_nl + m_cone);
 		// Copies the scratch row into J's row r, re-zeroing the scratch.
 		Eigen::VectorXd& row = model.scratch;
 		auto write = [&](int r) {
-			for (SparseRows::InnerIterator it(model.J, r); it; ++it) {
+			for (SparseRows::InnerIterator it(*J, r); it; ++it) {
 				it.valueRef() = row(it.col());
 				row(it.col()) = 0.0;
 			}
@@ -370,23 +361,23 @@ private:
 			const Group& group = _groups[k];
 			group.tape->Eval(model.Tg[k] * y + model.tg[k], &value, &jac);
 			for (size_t i = 0; i < group.rows.size(); ++i) {
-				(*g)(m_lin + group.rows[i]) = value(i);
+				(*g)(group.rows[i]) = value(i);
 				for (int j = 0; j < model.Tg[k].rows(); ++j)
 					for (SparseRows::InnerIterator it(model.Tg[k], j); it; ++it)
 						row(it.col()) += jac(i, j) * it.value();
-				write(m_lin + group.rows[i]);
+				write(group.rows[i]);
 			}
 		}
 		for (int k = 0; k < m_cone; ++k) {
 			// |z_1:| - z_0; at z_1: = 0 the subgradient 0 for the norm.
 			const Eigen::VectorXd z = model.Z[k] * y + model.z0[k];
 			const double norm = z.tail(z.size() - 1).norm();
-			(*g)(m_lin + m_nl + k) = norm - z(0);
+			(*g)(m_nl + k) = norm - z(0);
 			for (int i = 0; i < z.size(); ++i) {
 				const double w = i == 0 ? -1.0 : (norm > 0 ? z(i) / norm : 0.0);
 				for (SparseRows::InnerIterator it(model.Z[k], i); it; ++it) row(it.col()) += w * it.value();
 			}
-			write(m_lin + m_nl + k);
+			write(m_nl + k);
 		}
 	}
 
@@ -398,10 +389,16 @@ private:
 		SCIP_VAR** all = SCIPgetVars(scip);
 		const std::vector<SCIP_VAR*> vars(all, all + SCIPgetNVars(scip));
 		Model model;
-		model.n = static_cast<int>(vars.size());
-		const int n = model.n;
+		LocalNLP nlp;
+		const int n = static_cast<int>(vars.size());
 		std::unordered_map<SCIP_VAR*, int> col_of;
-		Eigen::VectorXd lb(n), ub(n), c(n), y = Eigen::VectorXd::Zero(n);
+		Eigen::VectorXd& lb = nlp.lb;
+		Eigen::VectorXd& ub = nlp.ub;
+		Eigen::VectorXd& c = nlp.c;
+		Eigen::VectorXd y = Eigen::VectorXd::Zero(n);
+		lb.resize(n);
+		ub.resize(n);
+		c.resize(n);
 		for (int k = 0; k < n; ++k) {
 			col_of.emplace(vars[k], k);
 			lb(k) = SCIPisInfinity(scip, -SCIPvarGetLbLocal(vars[k])) ? -kInf : SCIPvarGetLbLocal(vars[k]);
@@ -424,7 +421,6 @@ private:
 		}
 		model.T.resize(static_cast<int>(_x.size()), n);
 		model.T.setFromTriplets(tT.begin(), tT.end());
-		y = y.cwiseMax(lb).cwiseMin(ub);
 		for (const Group& group : _groups) {
 			std::vector<Eigen::Triplet<double>> tg_entries;
 			Eigen::VectorXd tg(group.x.size());
@@ -446,7 +442,7 @@ private:
 		// SCIP's linear constraints (its nonlinear ones, rewritten by
 		// presolve, are only checked: their exported forms are evaluated).
 		std::vector<Eigen::Triplet<double>> tA;
-		std::vector<double> a0, l, u;
+		std::vector<double> a0, l_lin, u_lin;
 		SCIP_CONS** conss = SCIPgetConss(scip);
 		for (int k = 0; k < SCIPgetNConss(scip); ++k) {
 			SCIP_CONS* cons = conss[k];
@@ -473,12 +469,17 @@ private:
 			const int r = static_cast<int>(a0.size());
 			for (const auto& [col, a] : terms) tA.emplace_back(r, col, a);
 			a0.push_back(constant);
-			l.push_back(SCIPisInfinity(scip, -lhs) ? -kInf : lhs);
-			u.push_back(SCIPisInfinity(scip, rhs) ? kInf : rhs);
+			l_lin.push_back(SCIPisInfinity(scip, -lhs) ? -kInf : lhs);
+			u_lin.push_back(SCIPisInfinity(scip, rhs) ? kInf : rhs);
 		}
-		model.A.resize(static_cast<int>(a0.size()), n);
-		model.A.setFromTriplets(tA.begin(), tA.end());
-		model.a0 = Eigen::Map<const Eigen::VectorXd>(a0.data(), a0.size());
+		const int m_lin = static_cast<int>(a0.size());
+		nlp.A.resize(m_lin, n);
+		nlp.A.setFromTriplets(tA.begin(), tA.end());
+		nlp.A.makeCompressed();
+		nlp.a0 = Eigen::Map<const Eigen::VectorXd>(a0.data(), m_lin);
+		nlp.l_lin = Eigen::Map<const Eigen::VectorXd>(l_lin.data(), m_lin);
+		nlp.u_lin = Eigen::Map<const Eigen::VectorXd>(u_lin.data(), m_lin);
+		std::vector<double> l, u;
 		for (size_t r = 0; r < _mip.nonlinear.size(); ++r) {
 			l.push_back(_mip.nonlinear[r].lb);
 			u.push_back(_mip.nonlinear[r].ub);
@@ -487,20 +488,15 @@ private:
 			l.push_back(-kInf);
 			u.push_back(0.0);
 		}
-		model.l = Eigen::Map<const Eigen::VectorXd>(l.data(), l.size());
-		model.u = Eigen::Map<const Eigen::VectorXd>(u.data(), u.size());
+		nlp.l = Eigen::Map<const Eigen::VectorXd>(l.data(), l.size());
+		nlp.u = Eigen::Map<const Eigen::VectorXd>(u.data(), u.size());
 		const int m = static_cast<int>(l.size());
 		record.vars = n;
-		record.rows = m;
+		record.rows = m_lin + m;
 
-		// J's pattern: A's rows, each nonlinear row on its group's columns,
+		// g's Jacobian pattern: each nonlinear row on its group's columns,
 		// each cone row on its Z's columns.
 		{
-			const int m_lin = static_cast<int>(model.A.rows());
-			const int m_nl = static_cast<int>(_mip.nonlinear.size());
-			std::vector<Eigen::Triplet<double>> tJ;
-			for (int r = 0; r < m_lin; ++r)
-				for (SparseRows::InnerIterator it(model.A, r); it; ++it) tJ.emplace_back(r, it.col(), it.value());
 			auto columns = [](const SparseRows& M) {
 				std::vector<int> cols;
 				for (int r = 0; r < M.rows(); ++r)
@@ -509,134 +505,56 @@ private:
 				cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
 				return cols;
 			};
+			const int m_nl = static_cast<int>(_mip.nonlinear.size());
+			std::vector<Eigen::Triplet<double>> tJ;
 			for (size_t k = 0; k < _groups.size(); ++k) {
 				const std::vector<int> cols = columns(model.Tg[k]);
 				for (int r : _groups[k].rows)
-					for (int col : cols) tJ.emplace_back(m_lin + r, col, 0.0);
+					for (int col : cols) tJ.emplace_back(r, col, 0.0);
 			}
 			for (size_t k = 0; k < _mip.cones.size(); ++k)
-				for (int col : columns(model.Z[k])) tJ.emplace_back(m_lin + m_nl + static_cast<int>(k), col, 0.0);
-			model.J.resize(m, n);
-			model.J.setFromTriplets(tJ.begin(), tJ.end());
-			model.J.makeCompressed();
-			SparseRows ones = model.J;
-			ones.coeffs().setOnes();
-			Eigen::SparseMatrix<double> identity(n, n);
-			identity.setIdentity();
-			model.H0 = Eigen::SparseMatrix<double>(ones.transpose() * ones) + identity;
-			model.H0.coeffs().setZero();
-			model.H0.makeCompressed();
-			model.scratch = Eigen::VectorXd::Zero(n);
+				for (int col : columns(model.Z[k])) tJ.emplace_back(m_nl + static_cast<int>(k), col, 0.0);
+			nlp.J.resize(m, n);
+			nlp.J.setFromTriplets(tJ.begin(), tJ.end());
+			nlp.J.makeCompressed();
 		}
+		model.scratch = Eigen::VectorXd::Zero(n);
+		nlp.evaluate = [&](const Eigen::VectorXd& yy, Eigen::VectorXd* g, SparseRows* J) {
+			Evaluate(model, yy, g, J);
+		};
 		record.build_time = since(tic);
 
-		Eigen::VectorXd g, lambda = Eigen::VectorXd::Zero(m);
-		Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
-		ldlt.analyzePattern(model.H0);
-		double rho = 10.0;
-		// The augmented Lagrangian at y (Rockafellar's form for l <= g <= u):
-		// c.y + 1/2 |res|^2, res = sqrt(rho) (s - clamp(s, l, u)), s = g + lambda/rho;
-		// +infinity where something isn't finite (a rejected step).
-		auto merit = [&](const Eigen::VectorXd& yy, Eigen::VectorXd* res) {
-			if (!yy.allFinite()) return kInf;
-			const auto t0 = Clock::now();
-			Evaluate(model, yy, &g);
-			record.eval_time += since(t0);
-			++record.trials;
-			if (!g.allFinite()) return kInf;
-			const Eigen::VectorXd shifted = g + lambda / rho;
-			*res = std::sqrt(rho) * (shifted - shifted.cwiseMax(model.l).cwiseMin(model.u));
-			return c.dot(yy) + 0.5 * res->squaredNorm();
-		};
-		auto violation = [&](const Eigen::VectorXd& gg) {
-			return (model.l - gg).cwiseMax(gg - model.u).cwiseMax(0.0).lpNorm<Eigen::Infinity>();
-		};
+		_solver->Solve(nlp, &y, &record);
 
-		double prev_viol = kInf;
-		int outer = 0;
-		for (; outer < kMaxOuter; ++outer) {
-			// Inner: bounded Levenberg-Marquardt on the augmented Lagrangian.
-			Eigen::VectorXd res;
-			double phi = merit(y, &res);
-			if (!std::isfinite(phi)) throw std::runtime_error("the local solve's iterate can't be evaluated");
-			double mu = 1e-3;
-			for (int it = 0; it < kMaxInner; ++it) {
-				// Gauss-Newton on the active penalty rows (res is 0 on the rest).
-				const Eigen::VectorXd grad = c + std::sqrt(rho) * (model.J.transpose() * res);
-				++record.inner;
-				// Variables held at a bound by the gradient leave the step: their
-				// rows and columns become the identity, their gradient 0.
-				std::vector<char> held(n, 0);
-				double pg = 0.0;
-				for (int k = 0; k < n; ++k) {
-					held[k] = (y(k) <= lb(k) && grad(k) > 0) || (y(k) >= ub(k) && grad(k) < 0);
-					if (!held[k]) pg = std::max(pg, std::abs(grad(k)));
-				}
-				if (pg < kInnerTol) break;
-				const Eigen::VectorXd active = (res.array() != 0.0).cast<double>();
-				const SparseRows Ja = active.asDiagonal() * model.J;
-				Eigen::SparseMatrix<double> H = rho * Eigen::SparseMatrix<double>(Ja.transpose() * Ja) + model.H0;
-				Eigen::VectorXd gf = grad;
-				for (int k = 0; k < H.outerSize(); ++k)
-					for (Eigen::SparseMatrix<double>::InnerIterator it(H, k); it; ++it)
-						if (held[it.row()] || held[it.col()]) it.valueRef() = it.row() == it.col() ? 1.0 : 0.0;
-				for (int k = 0; k < n; ++k)
-					if (held[k]) gf(k) = 0.0;
-				// Marquardt's scaling plus Levenberg's identity: bounded steps
-				// on variables the penalty doesn't curve.
-				Eigen::VectorXd diag = H.diagonal().array() + 1.0;
-				for (int k = 0; k < n; ++k)
-					if (held[k]) diag(k) = 0.0;
-				bool accepted = false;
-				while (mu < 1e12) {
-					const auto t0 = Clock::now();
-					Eigen::SparseMatrix<double> A = H;
-					for (int k = 0; k < n; ++k) A.coeffRef(k, k) += mu * diag(k);
-					ldlt.factorize(A);
-					Eigen::VectorXd y_new = y;
-					if (ldlt.info() == Eigen::Success) {
-						y_new += ldlt.solve(-gf);
-						y_new = y_new.cwiseMax(lb).cwiseMin(ub);
-					}
-					record.factor_time += since(t0);
-					Eigen::VectorXd res_new;
-					const double phi_new = ldlt.info() == Eigen::Success ? merit(y_new, &res_new) : kInf;
-					if (phi_new < phi) {
-						accepted = phi - phi_new > 1e-14 * std::max(1.0, std::abs(phi));
-						y = y_new;
-						res = res_new;
-						phi = phi_new;
-						mu = std::max(mu / 3.0, 1e-12);
-						break;
-					}
-					mu *= 4.0;
-				}
-				if (!accepted) break;
-			}
-			// Outer: multipliers, and a stiffer penalty when progress stalls.
-			merit(y, &res);
-			const double viol = violation(g);
-			const Eigen::VectorXd shifted = g + lambda / rho;
-			lambda = rho * (shifted - shifted.cwiseMax(model.l).cwiseMin(model.u));
-			if (viol < kFeasTol) break;
-			if (viol > 0.25 * prev_viol) rho = std::min(rho * 10.0, 1e10);
-			prev_viol = viol;
-		}
-
-		Evaluate(model, y, &g);
-		bool feasible = g.allFinite();
-		record.outer = outer + (outer < kMaxOuter ? 1 : 0);
-		record.rho = rho;
+		Eigen::VectorXd g;
+		SparseRows J = nlp.J;
+		Evaluate(model, y, &g, &J);
+		const Eigen::VectorXd ay = nlp.A * y + nlp.a0;
+		bool feasible = g.allFinite() && ay.allFinite();
 		for (int r = 0; feasible && r < m; ++r)
-			if (!SCIPisFeasGE(scip, g(r), model.l(r)) || !SCIPisFeasLE(scip, g(r), model.u(r))) feasible = false;
+			if (!SCIPisFeasGE(scip, g(r), nlp.l(r)) || !SCIPisFeasLE(scip, g(r), nlp.u(r))) feasible = false;
+		for (int r = 0; feasible && r < m_lin; ++r)
+			if (!SCIPisFeasGE(scip, ay(r), nlp.l_lin(r)) || !SCIPisFeasLE(scip, ay(r), nlp.u_lin(r)))
+				feasible = false;
 
 		++_stats->local_solves;
 		if (!feasible) {
 			++_stats->local_failures;
+			const double viol = (nlp.l - g).cwiseMax(g - nlp.u).cwiseMax(0.0).lpNorm<Eigen::Infinity>();
+			const double lin_viol =
+				(nlp.l_lin - ay).cwiseMax(ay - nlp.u_lin).cwiseMax(0.0).lpNorm<Eigen::Infinity>();
 			_stats->last_local_failure =
-				fmt::format("max constraint violation {} after {} outer iterations", violation(g), outer);
+				fmt::format("max violation {} on the nonlinear rows and cones, {} on the linear rows, after "
+					    "{} outer iterations", viol, lin_viol, record.outer);
 			failed = model.T * y + model.t;
+			// No proof of infeasibility: with integers still free, branch
+			// (no bound from this node); only a leaf is cut off.
 			*result = SCIP_CUTOFF;
+			for (int k = 0; k < n; ++k)
+				if (SCIPvarIsIntegral(vars[k]) && SCIPvarGetLbLocal(vars[k]) < SCIPvarGetUbLocal(vars[k]) - 0.5) {
+					*result = SCIP_DIDNOTRUN;
+					break;
+				}
 		} else {
 			*lowerbound = c.dot(y) + SCIPgetTransObjoffset(scip);
 			SCIP_CALL(SCIPsetRelaxSolVals(scip, relax, n, const_cast<SCIP_VAR**>(vars.data()), y.data(), TRUE));
@@ -651,12 +569,11 @@ private:
 	}
 
 	static constexpr double kInf = std::numeric_limits<double>::infinity();
-	static constexpr int kMaxOuter = 30, kMaxInner = 100;
-	static constexpr double kInnerTol = 1e-9, kFeasTol = 1e-9;
 
 	const ExternalMIP& _mip;
 	std::vector<SCIP_VAR*> _x, _tx;
 	SCIPSolveStats* _stats;
+	std::unique_ptr<LocalSolver> _solver;
 	std::vector<Group> _groups;
 };
 
@@ -676,14 +593,16 @@ SCIPWaypointMPC::SCIPWaypointMPC(GraphOfConstraints& graph,
 				 std::map<std::string, ParamValue> params,
 				 double feasibility_tol,
 				 bool verbose,
-				 bool keep_failed_local)
+				 bool keep_failed_local,
+				 LocalNLPSolver local_solver)
 	: GCSWaypointMPC(graph, std::move(splines), WaypointSolver::kGurobi, enforce_rigidity, objective, subtour,
 			 length_weight, mip_gap, warm_start, std::move(travel_time_models), max_tangent_halfwidth),
 	  _time_limit(time_limit),
 	  _params(std::move(params)),
 	  _feasibility_tol(feasibility_tol),
 	  _verbose(verbose),
-	  _keep_failed_local(keep_failed_local) {}
+	  _keep_failed_local(keep_failed_local),
+	  _local_solver(local_solver) {}
 
 bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 			    const Eigen::VectorXd& x0) {
@@ -769,7 +688,7 @@ bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 			SCIP_CHECK(SCIPaddCons(scip, cons));
 			SCIP_CHECK(SCIPreleaseCons(scip, &cons));
 		}
-		local_nlp = new LocalNLPRelax(scip, mip, x, &_stats);
+		local_nlp = new LocalNLPRelax(scip, mip, x, &_stats, _local_solver);
 		SCIP_CHECK(SCIPincludeObjRelax(scip, local_nlp, TRUE));
 		SCIP_CHECK(SCIPsetIntParam(scip, "lp/solvefreq", -1));
 	}

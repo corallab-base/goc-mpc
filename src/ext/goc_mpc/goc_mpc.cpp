@@ -556,6 +556,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		// Per agent: graph node ids visited, in order.
 		.def("view_routes", &GCSWaypointMPC::view_routes);
 
+        py::enum_<LocalNLPSolver>(goc_mpc, "LocalNLPSolver")
+                .value("kPenalizedLM", LocalNLPSolver::kPenalizedLM)
+                .value("kProxQPLM", LocalNLPSolver::kProxQPLM);
+
         py::class_<LocalSolveRecord>(goc_mpc, "LocalSolveRecord")
                 .def_readonly("success", &LocalSolveRecord::success)
                 .def_readonly("vars", &LocalSolveRecord::vars)
@@ -599,7 +603,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 			      std::map<std::string, SCIPWaypointMPC::ParamValue>,
 			      double,
 			      bool,
-			      bool>(),
+			      bool,
+			      LocalNLPSolver>(),
 		     py::keep_alive<1, 2>(),
 		     // Keeps the list (and so any Python-subclassed models in it) alive.
 		     py::keep_alive<1, 10>(),
@@ -620,7 +625,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("feasibility_tol")   = 1e-5,
 		     py::arg("verbose")           = false,
 		     // No solution: store the last failed local NLP iterate anyway (solve still returns False).
-		     py::arg("keep_failed_local") = false)
+		     py::arg("keep_failed_local") = false,
+		     py::arg("local_solver")      = LocalNLPSolver::kPenalizedLM)
 		.def("view_stats", &SCIPWaypointMPC::view_stats, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")

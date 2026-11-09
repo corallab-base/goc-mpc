@@ -12,21 +12,26 @@ PCOP plan translates to, rebuilt by hand with the same generators' formulas:
   Place(robot1)   blockA in the right-table band at place_z;
                   fk_1(q) == blockA + standoff, top-down
 
-chained Pick -> Handoff -> Place, with holds Pick -> Handoff (robot0) and
-Handoff -> Place (robot1), and every arm's joint box at every node
-(routes=False). The plan grounds each action's robot, so nothing is left to
-assign: the only discrete choices are the IK branches, and blockA's placement
-in its band is continuous. The objective is joint-space route length from
-the current configurations.
+chained Pick -> Handoff -> Place, with every arm's joint box at every node
+(routes=False). Unlike the PCOP plan, which grounds each action's robot, the
+giver and receiver are assignment variables (giver != receiver), with
+assignable holds Pick -> Handoff (giver) and Handoff -> Place (receiver): the
+one discrete decision is robot0 -> robot1 or robot1 -> robot0. blockA's
+placement in its band is continuous. The objective is joint-space route
+length from the current configurations.
 
 Scene constants come from data/ur5e_table_handover.npz, dumped from
 po-goc-mpc's DualUR5eTableJointEnv (the reset state is x0), each arm's FK
-checked here against its jax FK on 20 random configurations.
+checked here against its jax FK on 20 random configurations. The joint
+boxes are the model's own stops less the env's 0.05 margin (+-2pi on five
+joints, +-pi on the elbow), not the env's +-pi clamp, which exists only for
+its NTField's training box.
 
 SCIPWaypointMPC only locally optimizes the FK constraints, from the robots'
-current configurations, and this graph has no discrete decision, so the
-solve is one local NLP. Reported per objective, beside it: the same problem
-written directly as one NLP (Ipopt from x0) -- a reference local optimum.
+current configurations. Reported per objective: SCIP's assignment, total
+solve time, B&B nodes and time per node, and its local NLP solves; beside
+it, each assignment written directly as one NLP (Ipopt from x0) -- a
+reference local optimum.
 
 Usage:
   python test_scip_ur5e_handover.py [time_limit_seconds]
@@ -98,26 +103,28 @@ def build_graph(d):
     pick, handoff, place = graph.structure.add_nodes(3)
     graph.structure.add_edge(pick, handoff, True)
     graph.structure.add_edge(handoff, place, True)
-    graph.add_hold(pick, handoff, 0, [BLOCK_A])
-    graph.add_hold(handoff, place, 1, [BLOCK_A])
+    giver, receiver = graph.add_variable(), graph.add_variable()
+    graph.add_variable_ineq_constraint(giver, receiver)
+    graph.add_assignable_hold(pick, handoff, giver, [BLOCK_A])
+    graph.add_assignable_hold(handoff, place, receiver, [BLOCK_A])
 
-    def pin(node, arm, xyz, R):
-        graph.add_constraint(node, np.concatenate([eq(graph.agent_link_pos(arm, LINK), xyz),
-                                                   eq(graph.agent_link_rot(arm, LINK), R.flatten())]))
+    def pin(node, role, xyz, R):
+        graph.add_constraint(node, np.concatenate([eq(graph.var_agent_link_pos(role, LINK), xyz),
+                                                   eq(graph.var_agent_link_rot(role, LINK), R.flatten())]))
 
     block = graph.object_q(BLOCK_A)
     standoff = np.array([0.0, 0.0, float(d["grasp_standoff"])])
-    pin(pick, 0, block + standoff, d["R_top"])
+    pin(pick, giver, block + standoff, d["R_top"])
 
     hxyz = d["handoff_xyz"]
     graph.add_constraint(handoff, eq(block, hxyz))
-    pin(handoff, 0, hxyz, d["R_plus_x"])
-    pin(handoff, 1, hxyz + np.array([float(d["receiver_dx"]), 0.0, 0.0]), d["R_minus_x"])
+    pin(handoff, giver, hxyz, d["R_plus_x"])
+    pin(handoff, receiver, hxyz + np.array([float(d["receiver_dx"]), 0.0, 0.0]), d["R_minus_x"])
 
     xmin, ymin, xmax, ymax = (float(v) for v in d["right_table"])
     graph.add_constraint(place, logical_and(block[0] >= xmin, block[1] >= ymin, block[0] <= xmax, block[1] <= ymax))
     graph.add_constraint(place, block[2] == float(d["place_z"]))
-    pin(place, 1, block + standoff, d["R_top"])
+    pin(place, receiver, block + standoff, d["R_top"])
 
     for arm in (0, 1):
         q = graph.agent_q(arm)
@@ -132,19 +139,19 @@ def route_length(qs, ord_):
     return sum(float(np.linalg.norm(b - a, ord_)) for a, b in zip(qs, qs[1:]))
 
 
-def local_solve(d, starts, ord_):
-    """The same problem as one NLP, Ipopt from `starts` = (q0 pick, q0
-    handoff, q1 handoff, q1 place). Orientation as three equations + trace
+def local_solve(d, giver, receiver, ord_):
+    """The problem under one assignment as one NLP, Ipopt from x0. Orientation as three equations + trace
     >= 1 (Ipopt rejects the nine-equation pin: more equalities than joints
     at each pinned node). L2 route length smoothed as sqrt(|.|^2 + 1e-8)."""
     x0 = d["x0"]
+    arms = (giver, giver, receiver, receiver)
     prog = MathematicalProgram()
-    Q = [prog.NewContinuousVariables(6, n) for n in ("q0_pick", "q0_hand", "q1_hand", "q1_place")]
+    Q = [prog.NewContinuousVariables(6, n) for n in ("qg_pick", "qg_hand", "qr_hand", "qr_place")]
     xy = prog.NewContinuousVariables(2, "place_xy")
     for k, q in enumerate(Q):
-        lo, hi = d[f"joint_ranges{0 if k < 2 else 1}"].T
+        lo, hi = d[f"joint_ranges{arms[k]}"].T
         prog.AddBoundingBoxConstraint(lo, hi, q)
-        prog.SetInitialGuess(q, starts[k])
+        prog.SetInitialGuess(q, x0[6 * arms[k]:6 * arms[k] + 6])
     xmin, ymin, xmax, ymax = d["right_table"]
     prog.AddBoundingBoxConstraint([xmin, ymin], [xmax, ymax], xy)
     prog.SetInitialGuess(xy, [(xmin + xmax) / 2, (ymin + ymax) / 2])
@@ -152,17 +159,18 @@ def local_solve(d, starts, ord_):
     standoff = np.array([0.0, 0.0, float(d["grasp_standoff"])])
     hxyz = d["handoff_xyz"]
     place_xyz = np.array([xy[0], xy[1], float(d["place_z"])]) + standoff
-    targets = [(0, Q[0], x0[12:15] + standoff, d["R_top"]),
-               (0, Q[1], hxyz, d["R_plus_x"]),
-               (1, Q[2], hxyz + np.array([float(d["receiver_dx"]), 0, 0]), d["R_minus_x"]),
-               (1, Q[3], place_xyz, d["R_top"])]
+    targets = [(giver, Q[0], x0[12:15] + standoff, d["R_top"]),
+               (giver, Q[1], hxyz, d["R_plus_x"]),
+               (receiver, Q[2], hxyz + np.array([float(d["receiver_dx"]), 0, 0]), d["R_minus_x"]),
+               (receiver, Q[3], place_xyz, d["R_top"])]
     for arm, q, xyz, Rt in targets:
         p, R = fks[arm](q)
         M = Rt.T @ R
         for e in [*(p - xyz), M[2, 1] - M[1, 2], M[0, 2] - M[2, 0], M[1, 0] - M[0, 1]]:
             prog.AddConstraint(e, 0.0, 0.0)
         prog.AddConstraint(M[0, 0] + M[1, 1] + M[2, 2], 1.0, 3.0)
-    legs = [(x0[:6], Q[0]), (Q[0], Q[1]), (x0[6:12], Q[2]), (Q[2], Q[3])]
+    qg0, qr0 = x0[6 * giver:6 * giver + 6], x0[6 * receiver:6 * receiver + 6]
+    legs = [(qg0, Q[0]), (Q[0], Q[1]), (qr0, Q[2]), (Q[2], Q[3])]
     for a, b in legs:
         diff = b - a
         if ord_ == 2:
@@ -179,7 +187,7 @@ def local_solve(d, starts, ord_):
     if not result.is_success():
         return None, wall
     qs = [result.GetSolution(q) for q in Q]
-    value = route_length([x0[:6], qs[0], qs[1]], ord_) + route_length([x0[6:12], qs[2], qs[3]], ord_)
+    value = route_length([qg0, qs[0], qs[1]], ord_) + route_length([qr0, qs[2], qs[3]], ord_)
     return value, wall
 
 
@@ -193,9 +201,10 @@ def main():
 
     for objective, ord_ in ((WaypointObjective.kAvgL2, 2), (WaypointObjective.kAvgL1, 1)):
         print(f"\n{objective}")
-        local, wall = local_solve(d, [x0[:6], x0[:6], x0[6:12], x0[6:12]], ord_)
-        print(f"   local solve from x0: " + (f"{local:.4f}" if local is not None else "failed")
-              + f" in {wall * 1e3:.1f} ms")
+        for giver, receiver in ((0, 1), (1, 0)):
+            local, wall = local_solve(d, giver, receiver, ord_)
+            print(f"   local solve from x0, robot{giver} -> robot{receiver}: "
+                  + (f"{local:.4f}" if local is not None else "failed") + f" in {wall * 1e3:.1f} ms")
 
         graph = build_graph(d)
         scip = SCIPWaypointMPC(graph, [CubicConfigurationSpline([Block.R(6)]) for _ in range(2)],
@@ -204,27 +213,36 @@ def main():
         ok = scip.solve([0, 1, 2], x0)
         wall = time.perf_counter() - tic
         s = scip.view_stats()
-        times = np.asarray(s.solution_times)
+        local_times = np.array([r.total_time for r in s.local_log])
+        per_local = (f"mean {local_times.mean() * 1e3:.2f} ms, median {np.median(local_times) * 1e3:.2f} ms, "
+                     f"max {local_times.max() * 1e3:.2f} ms" if local_times.size else "none")
+        print(f"   SCIP: {s.status}, wall {wall:.3f}s (SCIP solving time {s.solving_time:.3f}s); "
+              f"{s.nodes} nodes, {s.solving_time / max(s.nodes, 1) * 1e3:.2f} ms per node")
+        print(f"         {s.local_solves} local solves ({s.local_failures} failed), {s.local_solve_time:.3f}s total; "
+              f"per solve {per_local}")
+        for k, r in enumerate(s.local_log):
+            print(f"           local solve {k}: {'ok    ' if r.success else 'failed'} {r.total_time * 1e3:7.2f} ms, "
+                  f"outer {r.outer}, inner {r.inner}, rho {r.rho:.0e}")
         if not ok:
-            print(f"   SCIP: no solution ({s.status}, {s.nodes} nodes, {wall:.2f}s; {s.local_solves} local solves, "
-                  f"{s.local_failures} failed, {s.local_solve_time:.3f}s)")
+            print(f"         no solution")
             continue
+        giver, receiver = (int(a) for a in np.asarray(scip.view_var_assignments()))
         W = np.asarray(scip.view_waypoints())
         routes = [list(r) for r in scip.view_routes()]
-        assert routes == [[0, 1], [1, 2]], routes
-        q0p, q0h, q1h, q1p = W[0, :6], W[1, :6], W[1, 6:12], W[2, 6:12]
+        assert routes[giver] == [0, 1] and routes[receiver] == [1, 2], routes
+        g, r = slice(6 * giver, 6 * giver + 6), slice(6 * receiver, 6 * receiver + 6)
+        qgp, qgh, qrh, qrp = W[0, g], W[1, g], W[1, r], W[2, r]
         block_place = W[2, 12 + 3 * BLOCK_A:15 + 3 * BLOCK_A]
         standoff = np.array([0.0, 0.0, float(d["grasp_standoff"])])
-        for arm, q, xyz, Rt in ((0, q0p, x0[12:15] + standoff, d["R_top"]), (0, q0h, d["handoff_xyz"], d["R_plus_x"]),
-                                (1, q1h, d["handoff_xyz"] + [float(d["receiver_dx"]), 0, 0], d["R_minus_x"]),
-                                (1, q1p, block_place + standoff, d["R_top"])):
+        for arm, q, xyz, Rt in ((giver, qgp, x0[12:15] + standoff, d["R_top"]),
+                                (giver, qgh, d["handoff_xyz"], d["R_plus_x"]),
+                                (receiver, qrh, d["handoff_xyz"] + [float(d["receiver_dx"]), 0, 0], d["R_minus_x"]),
+                                (receiver, qrp, block_place + standoff, d["R_top"])):
             p, R = fk_num[arm](q)
             assert np.linalg.norm(p - xyz) < 1e-5 and np.linalg.norm(R - Rt) < 1e-5, (arm, p, xyz)
-        got = route_length([x0[:6], q0p, q0h], ord_) + route_length([x0[6:12], q1h, q1p], ord_)
-        print(f"   SCIP: route length {got:.4f} ({s.status}, {s.nodes} nodes, {len(times)} solutions, first at "
-              f"{times[0]:.3f}s); {s.local_solves} local solves ({s.local_failures} failed) in "
-              f"{s.local_solve_time:.3f}s; solve {s.solving_time:.3f}s, wall {wall:.3f}s")
-        print(f"         blockA placed at {np.round(block_place, 3)}")
+        got = route_length([x0[g], qgp, qgh], ord_) + route_length([x0[r], qrh, qrp], ord_)
+        print(f"         robot{giver} -> robot{receiver}, route length {got:.4f}; blockA placed at "
+              f"{np.round(block_place, 3)}")
 
 
 if __name__ == "__main__":

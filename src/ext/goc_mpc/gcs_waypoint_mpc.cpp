@@ -3,6 +3,7 @@
 #include "../utils.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -37,6 +39,81 @@ using drake::solvers::VectorXDecisionVariable;
 namespace {
 
 constexpr double kInf = std::numeric_limits<double>::infinity();
+
+// An enclosure [lo, hi] of e over boxes on its variables (interval
+// arithmetic; sin/cos as [-1, 1]). Throws on an unsupported operation or a
+// variable with no box.
+struct Interval {
+	double lo, hi;
+};
+
+Interval Mul(Interval a, Interval b) {
+	const double p[] = {a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi};
+	return {*std::min_element(p, p + 4), *std::max_element(p, p + 4)};
+}
+
+Interval Bound(const Expression& e, const std::unordered_map<Variable::Id, Interval>& box) {
+	using namespace drake::symbolic;
+	if (is_constant(e)) {
+		const double c = get_constant_value(e);
+		return {c, c};
+	}
+	if (is_variable(e)) {
+		const auto it = box.find(get_variable(e).get_id());
+		if (it == box.end())
+			throw std::runtime_error("GCSWaypointMPC: no box for " + get_variable(e).get_name());
+		return it->second;
+	}
+	if (is_addition(e)) {
+		Interval r{get_constant_in_addition(e), get_constant_in_addition(e)};
+		for (const auto& [term, coef] : get_expr_to_coeff_map_in_addition(e)) {
+			const Interval t = Mul(Bound(term, box), {coef, coef});
+			r = {r.lo + t.lo, r.hi + t.hi};
+		}
+		return r;
+	}
+	if (is_multiplication(e)) {
+		Interval r{get_constant_in_multiplication(e), get_constant_in_multiplication(e)};
+		for (const auto& [base, exponent] : get_base_to_exponent_map_in_multiplication(e))
+			r = Mul(r, Bound(pow(base, exponent), box));
+		return r;
+	}
+	if (is_pow(e)) {
+		const Interval b = Bound(get_first_argument(e), box);
+		const Expression& ex = get_second_argument(e);
+		if (!is_constant(ex)) throw std::runtime_error("GCSWaypointMPC: non-constant power in " + e.to_string());
+		const double p = get_constant_value(ex);
+		if (p == std::round(p) && p >= 0) {
+			const double a = std::pow(b.lo, p), c = std::pow(b.hi, p);
+			if (static_cast<long>(p) % 2 == 1) return {a, c};
+			const double hi = std::max(a, c);
+			return {(b.lo <= 0.0 && b.hi >= 0.0) ? 0.0 : std::min(a, c), hi};
+		}
+		if (b.lo < 0.0) throw std::runtime_error("GCSWaypointMPC: fractional power of a possibly negative base");
+		const double a = std::pow(b.lo, p), c = std::pow(b.hi, p);
+		return {std::min(a, c), std::max(a, c)};
+	}
+	if (is_division(e)) {
+		const Interval d = Bound(get_second_argument(e), box);
+		if (d.lo <= 0.0 && d.hi >= 0.0) throw std::runtime_error("GCSWaypointMPC: division by a possibly zero " + e.to_string());
+		return Mul(Bound(get_first_argument(e), box), {1.0 / d.hi, 1.0 / d.lo});
+	}
+	if (is_sin(e) || is_cos(e)) return {-1.0, 1.0};
+	if (is_sqrt(e)) {
+		const Interval a = Bound(get_argument(e), box);
+		return {std::sqrt(std::max(a.lo, 0.0)), std::sqrt(std::max(a.hi, 0.0))};
+	}
+	if (is_abs(e)) {
+		const Interval a = Bound(get_argument(e), box);
+		const double hi = std::max(std::abs(a.lo), std::abs(a.hi));
+		return {(a.lo <= 0.0 && a.hi >= 0.0) ? 0.0 : std::min(std::abs(a.lo), std::abs(a.hi)), hi};
+	}
+	if (is_exp(e)) {
+		const Interval a = Bound(get_argument(e), box);
+		return {std::exp(a.lo), std::exp(a.hi)};
+	}
+	throw std::runtime_error("GCSWaypointMPC: no interval bound for " + e.to_string());
+}
 
 // Affine rows A x + b <= 0 (in) and A x + b == 0 (eq) over some vector x.
 struct AffineRows {
@@ -410,6 +487,9 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	problem.P.resize(num_agents);
 	std::vector<std::vector<AffineRows>> vertex_rows(num_agents);
 	std::vector<std::vector<std::vector<NonlinearAtom>>> vertex_nonlinear(num_agents);
+	// Boxes on the object variables and their per-vertex copies, for
+	// bounding atoms over them.
+	std::unordered_map<Variable::Id, Interval> copy_box;
 	for (int j = 0; j < num_agents; ++j) {
 		const int d = graph->robot_ambient_dim(j);
 		const Eigen::VectorXd lb = graph->_global_x_lb.segment(graph->agent_col_offset(j), d);
@@ -455,8 +535,10 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 		problem.O[o] = prog.NewContinuousVariables(n_V, w, fmt::format("O_{}", o));
 		const Eigen::VectorXd lb = graph->_global_x_lb.segment(graph->object_col_offset(o), w);
 		const Eigen::VectorXd ub = graph->_global_x_ub.segment(graph->object_col_offset(o), w);
-		for (int sg = 0; sg < n_V; ++sg)
+		for (int sg = 0; sg < n_V; ++sg) {
 			prog.AddBoundingBoxConstraint(lb, ub, problem.O[o].row(sg).transpose());
+			for (int c = 0; c < w; ++c) copy_box[problem.O[o](sg, c).get_id()] = {lb(c), ub(c)};
+		}
 	}
 	auto obj_pos = [&](int o, int sg) -> drake::VectorX<Expression> {
 		return problem.O[o].row(sg).transpose().cast<Expression>();
@@ -587,6 +669,66 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 				for (const auto& e : in) add(e, -kInf);
 				for (const auto& e : eq) add(e, 0.0);
 				seed_objects();
+				return;
+			}
+		}
+		// One role and objects, with nonlinear atoms: per candidate holder,
+		// every atom joins its role vertex's unscaled copy, over that
+		// vertex's own copy of the objects (equal to O whenever the vertex
+		// is used, big-M on the global box), so no atom involves binaries.
+		if (vars.size() == 1 && agents.empty() && !objects.empty() && gate == nullptr) {
+			const int var = vars[0];
+			const int row = subgraph.subgraph_variable_id(var);
+			auto atoms_for = [&](int j, std::vector<Expression>* in, std::vector<Expression>* eq) {
+				const Formula f_j = f_p.Substitute(graph->SymbolicFKSubstitution(f_p.GetFreeVariables(), var, j));
+				CollectAtoms(f_j, in, eq, where);
+			};
+			auto affine = [](const Expression& e) { return drake::symbolic::IsAffine(drake::Vector1<Expression>(e)); };
+			bool any_nonlinear = false;
+			for (int j = 0; j < num_agents && !any_nonlinear; ++j) {
+				if (!is_candidate(var, j)) continue;
+				std::vector<Expression> in, eq;
+				atoms_for(j, &in, &eq);
+				any_nonlinear = std::any_of(in.begin(), in.end(), [&](const auto& e) { return !affine(e); }) ||
+						std::any_of(eq.begin(), eq.end(), [&](const auto& e) { return !affine(e); });
+			}
+			if (any_nonlinear) {
+				const auto& ph = graph->_var_agent_q.Vars(var);
+				for (int j = 0; j < num_agents; ++j) {
+					if (!is_candidate(var, j)) continue;
+					std::vector<Expression> in, eq;
+					atoms_for(j, &in, &eq);
+					for (int v : vertices_at[j][sg]) {
+						if (problem.graphs[j].vertices[v].mode != row) continue;
+						const Expression unused = 1.0 - weight(j, v);
+						Substitution sub_o;
+						for (int o : objects) {
+							const int w = graph->object_ambient_dim(o);
+							const Eigen::VectorXd lb = graph->_global_x_lb.segment(graph->object_col_offset(o), w);
+							const Eigen::VectorXd ub = graph->_global_x_ub.segment(graph->object_col_offset(o), w);
+							const Eigen::VectorXd M = 2.0 * lb.cwiseAbs().cwiseMax(ub.cwiseAbs());
+							if (!M.allFinite())
+								throw std::runtime_error(fmt::format(
+									"GCSWaypointMPC: {}: object {} has an unbounded state box", where, o));
+							const VectorXDecisionVariable Oc = prog.NewContinuousVariables(
+								w, fmt::format("O_{}_{}_{}_{}", o, j, sg, row));
+							prog.AddBoundingBoxConstraint(lb, ub, Oc);
+							const auto& ph_o = graph->_object_q.Vars(o);
+							for (int c = 0; c < w; ++c) {
+								copy_box[Oc(c).get_id()] = {lb(c), ub(c)};
+								sub_o[ph_o[c]] = Oc(c);
+								const Expression diff = problem.O[o](sg, c) - Oc(c);
+								prog.AddLinearConstraint(diff - M(c) * unused, -kInf, 0.0);
+								prog.AddLinearConstraint(-diff - M(c) * unused, -kInf, 0.0);
+								const double x0_c = x0(graph->object_col_offset(o) + c);
+								problem.nonlinear_seed.emplace_back(Oc(c), x0_c);
+								problem.nonlinear_seed.emplace_back(problem.O[o](sg, c), x0_c);
+							}
+						}
+						for (const auto& e : in) vertex_nonlinear[j][v].push_back({e.Substitute(sub_o), -kInf, 0.0, ph});
+						for (const auto& e : eq) vertex_nonlinear[j][v].push_back({e.Substitute(sub_o), 0.0, 0.0, ph});
+					}
+				}
 				return;
 			}
 		}
@@ -811,10 +953,9 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 			AddPerspectiveRows(prog, vertex_rows[j][v], problem.P[j][v].cast<Expression>(), weight(j, v));
 
 	// A vertex with nonlinear atoms gets an unscaled copy Q of its position:
-	// Q lies in the vertex's whole set (affine rows and nonlinear atoms,
-	// unconditionally, so that set must be nonempty even if the vertex goes
-	// unused) and equals P whenever the vertex is used (big-M on the global
-	// box). The nonlinear constraints thus involve no binaries.
+	// Q lies in the vertex's affine set unconditionally, satisfies its
+	// nonlinear atoms whenever the vertex is used (each scaled by the
+	// vertex's weight), and equals P then (big-M on the global box).
 	for (int j = 0; j < num_agents; ++j) {
 		const int d = graph->robot_ambient_dim(j);
 		const Eigen::VectorXd lb = graph->_global_x_lb.segment(graph->agent_col_offset(j), d);
@@ -840,15 +981,37 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 				prog.AddLinearConstraint(diff - M(c) * unused, -kInf, 0.0);
 				prog.AddLinearConstraint(-diff - M(c) * unused, -kInf, 0.0);
 			}
+			// An atom binds only when the vertex is used: lb <= e - s <= 0, with
+			// a slack s that is 0 when used and anywhere in e's enclosure over
+			// the boxes otherwise (linear big-M rows, so the nonlinear rows
+			// still involve no binaries).
+			const Expression w = weight(j, v);
+			const bool always_used = is_constant(w) && get_constant_value(w) == 1.0;
+			std::unordered_map<Variable::Id, Interval> box = copy_box;
+			for (int c = 0; c < d; ++c) box[Q(c).get_id()] = {lb(c), ub(c)};
 			for (const auto& atom : atoms) {
 				if (atom.over.size() != d)
 					throw std::runtime_error(fmt::format(
 						"GCSWaypointMPC: a nonlinear constraint's placeholders are {} wide, agent {}'s position {}",
 						atom.over.size(), j, d));
+				if (atom.ub != 0.0 || (atom.lb != 0.0 && atom.lb != -kInf))
+					throw std::runtime_error("GCSWaypointMPC: a nonlinear atom's bounds must be [0 or -inf, 0]");
 				Substitution sub;
 				for (int c = 0; c < d; ++c) sub[atom.over(c)] = Q(c);
+				Expression e = atom.e.Substitute(sub);
+				if (!always_used) {
+					const Interval range = Bound(e, box);
+					const double s_hi = std::max(range.hi, 0.0);
+					const double s_lo = atom.lb == 0.0 ? std::min(range.lo, 0.0) : 0.0;
+					const Variable s_var = prog.NewContinuousVariables(1, fmt::format("S_{}_{}", j, v))(0);
+					prog.AddBoundingBoxConstraint(s_lo, s_hi, s_var);
+					const Expression unused = 1.0 - w;
+					prog.AddLinearConstraint(s_var - s_hi * unused, -kInf, 0.0);
+					prog.AddLinearConstraint(s_lo * unused - s_var, -kInf, 0.0);
+					e -= s_var;
+				}
 				const auto constraint = std::make_shared<drake::solvers::ExpressionConstraint>(
-					drake::Vector1<Expression>(atom.e.Substitute(sub)), drake::Vector1d(atom.lb),
+					drake::Vector1<Expression>(e), drake::Vector1d(atom.lb),
 					drake::Vector1d(atom.ub));
 				prog.AddConstraint(constraint, constraint->vars());
 			}

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 
 #include <fmt/format.h>
 
@@ -604,7 +606,29 @@ void AddStationaryObjectConstraints(MathematicalProgram& prog,
 	const int depot_idx = RoutingPresolve::depot;
 	std::map<std::tuple<int, int, int, int>, Variable> overlap_cache;
 
-	auto stationary_edge = [&](const Eigen::VectorX<Expression>& seg_a_full, int sg_b,
+	// precedes(a, b): node b is a or a descendant of it in the subgraph's
+	// structure, whose edges all order t(a) <= t(b).
+	std::map<int, std::vector<int>> children;
+	for (auto edge : subgraph.structure.edges()) children[edge.u].push_back(edge.e->to);
+	std::map<int, std::set<int>> reach_cache;
+	auto precedes = [&](int a, int b) {
+		auto it = reach_cache.find(a);
+		if (it == reach_cache.end()) {
+			std::set<int> seen{a};
+			std::vector<int> stack{a};
+			while (!stack.empty()) {
+				const int n = stack.back();
+				stack.pop_back();
+				for (int c : children[n])
+					if (seen.insert(c).second) stack.push_back(c);
+			}
+			it = reach_cache.emplace(a, std::move(seen)).first;
+		}
+		return it->second.contains(b);
+	};
+
+	// The span from node_a (-1: x0) to node_b.
+	auto stationary_edge = [&](const Eigen::VectorX<Expression>& seg_a_full, int node_a, int sg_b, int node_b,
 				    int t_idx_a, int t_idx_b) {
 		for (int obj = 0; obj < num_objects; ++obj) {
 			const int start = graph.object_col_offset(obj);
@@ -628,6 +652,10 @@ void AddStationaryObjectConstraints(MathematicalProgram& prog,
 				const int sg_other_u = subgraph.subgraph_id(other_hold.u_node);
 				const int sg_other_v = subgraph.subgraph_id(other_hold.v_node);
 				if (sg_other_v < 0) continue;  // can't reason about it within this horizon
+				// Ordered apart by the structure: the hold starts once the span
+				// has ended, or ends before it begins.
+				if (sg_other_u >= 0 && precedes(node_b, other_hold.u_node)) continue;
+				if (node_a >= 0 && precedes(other_hold.v_node, node_a)) continue;
 				const int t_idx_other_u = (sg_other_u >= 0) ? ri(sg_other_u) : depot_idx;
 				const int t_idx_other_v = ri(sg_other_v);
 
@@ -660,12 +688,12 @@ void AddStationaryObjectConstraints(MathematicalProgram& prog,
 	for (auto edge : subgraph.structure.edges()) {
 		const int sg_u14b = subgraph.subgraph_id(edge.u);
 		const int sg_v14b = subgraph.subgraph_id(edge.e->to);
-		stationary_edge(state.row(sg_u14b).transpose(), sg_v14b,
+		stationary_edge(state.row(sg_u14b).transpose(), edge.u, sg_v14b, edge.e->to,
 				 ri(sg_u14b), ri(sg_v14b));
 	}
 	for (int v14b : subgraph.structure.sources()) {
 		const int sg_v14b = subgraph.subgraph_id(v14b);
-		stationary_edge(x0.template cast<Expression>(), sg_v14b, depot_idx, ri(sg_v14b));
+		stationary_edge(x0.template cast<Expression>(), -1, sg_v14b, v14b, depot_idx, ri(sg_v14b));
 	}
 }
 

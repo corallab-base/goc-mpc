@@ -74,6 +74,7 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/gcs_waypoint_mpc.cpp"
     "src/ext/goc_mpc/scip_waypoint_mpc.cpp"
     "src/ext/goc_mpc/expression_tape.cpp"
+    "src/ext/goc_mpc/local_nlp_solver.cpp"
     "src/ext/goc_mpc/graph_timing_mpc.cpp"
     "src/ext/goc_mpc/timing_gn_layout.cpp"
     "src/ext/goc_mpc/obstacle_set.cpp"
