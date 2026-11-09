@@ -20,6 +20,10 @@ dependencies = [
     "ortools>=9.10",
 ]
 
+[project.optional-dependencies]
+# TracedTimingMPC(fields=...): segments planned through ntfields Fields.
+ntfields = ["ntfields"]
+
 [build-system]
 requires = ["py-build-cmake~=0.4.3"]
 build-backend = "py_build_cmake.build"

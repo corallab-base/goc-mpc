@@ -125,8 +125,8 @@ def build_two_agent_graph():
     return graph, [spec, spec], starts, goals
 
 
-class LinearTracer:
-    """Minimal field.trace_path stand-in: a ZIGZAG path -- each interior
+class ZigzagTimingMPC(TracedTimingMPC):
+    """TracedTimingMPC whose segments are a ZIGZAG path -- each interior
     sample alternates a perpendicular offset sign, so consecutive points
     are never colinear and TracedTimingMPC's default RDP simplification
     keeps (approximately) all `n_interior` of them, scaling the real
@@ -136,11 +136,12 @@ class LinearTracer:
     each half down to just its shared endpoint, giving the SAME real knot
     count regardless of `n_interior`)."""
 
-    def __init__(self, n_interior=4, bow=0.5):
+    def __init__(self, graph, splines, n_interior=4, bow=0.5, **kwargs):
+        super().__init__(graph, splines, [None] * graph.num_agents, **kwargs)
         self.n_interior = n_interior
         self.bow = bow
 
-    def trace_path(self, agent, start, goal):
+    def plan_segment(self, agent, start, goal):
         del agent
         start, goal = np.asarray(start, dtype=float), np.asarray(goal, dtype=float)
         chord = goal - start
@@ -163,14 +164,11 @@ def two_sphere_ish_fk(q):
 def check_end_to_end():
     """Drives TracedTimingMPC directly (goc_mpc.collision_cost_jax.
     refine_splines only needs a timing_mpc/graph/splines triple, not a
-    full GraphOfConstraintsMPC) -- mirrors
-    traced_timing_obstacle_avoidance.py's own compare_chord_vs_traced()
-    pattern, extended to 2 agents, so this test doesn't depend on a
+    full GraphOfConstraintsMPC), with 2 agents, so this test doesn't depend on a
     waypoint-MPC backend (Gurobi/IPOPT) being available/licensed at all."""
     graph, specs, starts, goals = build_two_agent_graph()
-    field = LinearTracer(n_interior=4)
     splines = [CubicConfigurationSpline([s]) for s in specs]
-    timing_mpc = TracedTimingMPC(graph, splines, field, time_cost=1.0)
+    timing_mpc = ZigzagTimingMPC(graph, splines, n_interior=4, time_cost=1.0)
 
     x = np.concatenate([starts[0], starts[1]])
     x_dot = np.zeros(4)
@@ -255,9 +253,8 @@ def check_controller_wiring():
     refinement inside _solve_for_timing and records last_cycle_collision_
     refinement -- the real production call path this session wired up."""
     graph, specs, starts, goals = build_two_agent_graph()
-    field = LinearTracer(n_interior=4)
-    timing_mpc = TracedTimingMPC(graph, [CubicConfigurationSpline([s]) for s in specs],
-                                  field, time_cost=1.0)
+    timing_mpc = ZigzagTimingMPC(graph, [CubicConfigurationSpline([s]) for s in specs],
+                                 n_interior=4, time_cost=1.0)
 
     x = np.concatenate([starts[0], starts[1]])
     x_dot = np.zeros(4)
@@ -307,7 +304,7 @@ def check_no_retrace_across_cycles():
     counting how many times `_run_scan`'s BODY actually executes (that
     only happens at jax.jit trace time, once per distinct compiled
     cache entry) across two `.refine()` calls built from deliberately
-    different `LinearTracer` densities."""
+    different `ZigzagTimingMPC` densities."""
     trace_count = [0]
     real_run_scan = ccj._run_scan
 
@@ -340,8 +337,7 @@ def check_no_retrace_across_cycles():
 
         results = []
         for n_interior in (2, 6):  # different densities -> different real knot counts
-            field = LinearTracer(n_interior=n_interior)
-            timing_mpc = TracedTimingMPC(graph, splines, field, time_cost=1.0)
+            timing_mpc = ZigzagTimingMPC(graph, splines, n_interior=n_interior, time_cost=1.0)
             ok_solve = timing_mpc.solve(x, x_dot, [0, 1, 2, 3], waypoints, var_assignments)
             assert ok_solve, "TracedTimingMPC.solve failed"
             timing_mpc.fill_cubic_splines(splines, x, x_dot)
@@ -384,9 +380,8 @@ def check_active_mask_dtype_consistency():
     jax.config.update("jax_enable_x64", True)
 
     graph, specs, starts, goals = build_two_agent_graph()
-    field = LinearTracer(n_interior=4)
     splines = [CubicConfigurationSpline([s]) for s in specs]
-    timing_mpc = TracedTimingMPC(graph, splines, field, time_cost=1.0)
+    timing_mpc = ZigzagTimingMPC(graph, splines, n_interior=4, time_cost=1.0)
 
     x = np.concatenate([starts[0], starts[1]])
     x_dot = np.zeros(4)
@@ -407,8 +402,8 @@ def check_active_mask_dtype_consistency():
     # A brand-new, never-solved TracedTimingMPC: get_agent_spline_length
     # returns 0 (graph_timing_mpc.cpp) -- exactly the n<=1 parked/dummy
     # branch, exercised WITHOUT going through a real solve.
-    fresh_timing_mpc = TracedTimingMPC(graph, [CubicConfigurationSpline([s]) for s in specs],
-                                        field, time_cost=1.0)
+    fresh_timing_mpc = ZigzagTimingMPC(graph, [CubicConfigurationSpline([s]) for s in specs],
+                                       n_interior=4, time_cost=1.0)
     fresh_spline = CubicConfigurationSpline([specs[0]])
     parked_data = ccj.extract_agent_refinement_data(fresh_timing_mpc, graph, fresh_spline, 0,
                                                       x, x_dot, 16)

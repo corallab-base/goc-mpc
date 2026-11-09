@@ -20,15 +20,23 @@ coarse `GraphTimingMPC.solve()` first, means there's exactly one place
 whether that sequence is the graph's real nodes (`solve()`) or a denser one
 with traced interior waypoints spliced in between them (`solve_dense()`).
 Each consecutive pair of positions on the resolved per-agent path (x0 ->
-first node -> second node -> ...) is traced through a `TimeToGoField`
--protocol `field` (see time_to_go_field.py) into a dense obstacle-avoiding
-polyline; `GraphOfConstraints.reindex_agent_interactions` then remaps the
+first node -> second node -> ...) is planned through the agent's `ntfields`
+`Field` (see `AgentField`) into a dense obstacle-avoiding polyline, or kept as
+a straight segment for an agent without one;
+`GraphOfConstraints.reindex_agent_interactions` then remaps the
 cross-agent interactions' depths (originally indices into the real-node-only
 list `get_agent_paths` returns) onto that denser sequence, so
 `solve_dense()`'s cross-agent LESS_THAN/EQUAL constraints are exact --
 unlike the old coarse/traced split, which only enforced them approximately
 (against the coarse per-edge time budget, not the refined per-segment one).
+
+`ntfields` is an optional dependency (the `ntfields` extra), imported only
+when some agent has a field.
 """
+
+import dataclasses
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -36,24 +44,16 @@ from .goc_mpc import GraphOfConstraints, GraphTimingMPC
 
 
 def _trim_trailing_duplicates(path, eps=1e-9):
-    """Drops trailing near-duplicate points from a traced (K, dim)
+    """Drops trailing near-duplicate points from a planned (K, dim)
     polyline, keeping everything up to (and one past) the last point where
     consecutive positions actually differ, plus forcing the true final
     point back on unconditionally.
 
-    `EdgeCostTimeToGoField` (time_to_go_field.py) traces via a *fixed*
-    number of jax.lax.scan steps -- once the descent converges within
-    goal_tol it freezes, so the raw path is padded with the converged
-    position repeated out to max_steps regardless of how close start
-    already was to goal. Left untrimmed, `_resample_by_arclength` below
-    would always see a long path and always spend most of its output
-    budget on synthetic interior points, even for an already-converged
-    (near-zero-length) segment -- inflating the QP's size (every extra
-    dense point is another free velocity/time-delta pair, see
-    add_agent_timing_segments) for no benefit. Trimming restores what a
-    variable-length trace (e.g. the old finite-difference tracer, or
-    NTFieldSolver's own early-exit loop) gives for free: an already-short
-    /degenerate raw path once start is close to goal.
+    A planner that converges early can repeat its final position; left
+    untrimmed, `_resample_by_arclength` below would spend its output budget
+    on those points -- inflating the QP's size (every extra dense point is
+    another free velocity/time-delta pair, see add_agent_timing_segments)
+    for no benefit.
     """
     path = np.asarray(path)
     if len(path) <= 2:
@@ -134,7 +134,7 @@ def _resample_by_arclength(path, n_points):
     which is far denser than the timing QP needs -- every extra point is
     another free velocity/time-delta pair (see add_agent_timing_segments)
     -- so this keeps the QP a fixed, small size per segment regardless of
-    trace resolution. Mirrors goc_ntfields's NTFieldSolver.trace_and_sample.
+    trace resolution.
     """
     path = np.asarray(path)
     if len(path) <= n_points:
@@ -155,13 +155,41 @@ def _resample_by_arclength(path, n_points):
     ], axis=1)
 
 
+def _interpolate_trailing(lead, start, goal):
+    """`lead` (K, dim), a path over the leading `dim` columns from `start[:dim]`
+    to `goal[:dim]`, with the trailing columns of `start`/`goal` interpolated
+    linearly in `lead`'s arc length."""
+    dim = lead.shape[1]
+    if start.shape[0] == dim:
+        return lead
+    cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(lead, axis=0), axis=1))])
+    alpha = cum / cum[-1] if cum[-1] > 0.0 else np.linspace(0.0, 1.0, len(lead))
+    trailing = start[dim:] + alpha[:, None] * (goal[dim:] - start[dim:])
+    return np.concatenate([lead, trailing], axis=1)
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentField:
+    """An `ntfields` `Field` (e.g. a `TrainedField`) for one agent, and the map
+    from the agent's row into the field's coordinates:
+    `field_q = (q[:dim] - offset) / scale`, with `dim = len(offset)`. The
+    agent's trailing columns are interpolated along the planned path."""
+
+    field: Any
+    offset: Sequence[float]
+    scale: float = 1.0
+
+
 class TracedTimingMPC:
 
     def __init__(
             self,
             graph,
             splines,
-            field,
+            # Per-agent `AgentField`, or None for a straight segment: each
+            # segment is planned by an `ntfields` planner
+            # (`ntfields.plan.PLANNERS`).
+            fields: Sequence[AgentField | None],
             time_cost: float = 1.0,
             time_cost2: float = 0.0,
             # Default ON (1.0) -- see GraphOfConstraintsMPC's matching
@@ -207,9 +235,20 @@ class TracedTimingMPC:
             # RDP's output as-is). Also doubles as the flat point count
             # `_resample_by_arclength` uses when rdp_tolerance is None.
             max_points_per_segment: int | None = 8,
+            *,
+            # `None` uses each field's method's own default planner.
+            planner: str | None = None,
+            planner_kwargs: Mapping | None = None,
     ):
+        if len(fields) != graph.num_agents:
+            raise ValueError(f"fields has {len(fields)} entries for {graph.num_agents} agents")
         self.graph = graph
-        self.field = field
+        self.fields = list(fields)
+        self.planner = planner
+        self.planner_kwargs = dict(planner_kwargs or {})
+        #: Segments in the last `solve` whose planner did not reach its goal;
+        #: their paths end with a jump to the goal.
+        self.last_failed_segments = 0
         self.rdp_tolerance = rdp_tolerance
         self.max_points_per_segment = max_points_per_segment
 
@@ -223,80 +262,36 @@ class TracedTimingMPC:
         # fill_cubic_splines(splines, x0, v0), delegated straight to
         # self._timing below.
         self._timing = GraphTimingMPC(graph, list(splines), *cost_args)
-        # Largest number of segments (`len(starts)`) `_trace_segments` has
-        # ever batched for a given agent -- see its own doc comment for why
-        # this matters and how it's used.
-        self._max_segments_seen: dict = {}
 
-    def _trace_segments(self, agent, starts, goals):
-        """Traces every (start, goal) pair in `starts`/`goals` (same-length
-        sequences of this agent's own ambient-dim positions) for `agent`.
+    def plan_segment(self, agent, start, goal):
+        """`start` -> `goal` (this agent's full rows) through its `AgentField`:
+        the leading columns planned in field coordinates by the `ntfields`
+        planner, mapped back, endpoints exact, trailing columns interpolated.
+        An agent whose entry is None gets the straight segment."""
+        start = np.asarray(start, dtype=float)
+        goal = np.asarray(goal, dtype=float)
+        spec = self.fields[agent]
+        if spec is None:
+            return np.stack([start, goal])
 
-        One batched `field.trace_paths(agent, starts, goals)` call when
-        `self.field` supports it (duck-typed -- see `EdgeCostTimeToGoField.
-        trace_paths`'s own doc comment: a `jax.vmap` of the same per-segment
-        gradient descent, agent held fixed/broadcast) instead of a Python
-        loop issuing one `field.trace_path` call -- and one device dispatch
-        -- per segment; falls back to that sequential loop for any
-        `TimeToGoField`-protocol adapter that doesn't implement `trace_paths`
-        (e.g. `NTFieldTimeToGo`, `PerAgentTimeToGoField`,
-        `_InterpolateExtraDimsField`) -- correctness is identical either
-        way, batching only removes the K-1 extra round trips.
+        import torch
+        from ntfields.plan import PLANNERS
 
-        The batch size K (= this agent's current remaining-segment count)
-        is PADDED, here, up to the largest K ever seen for this `agent`,
-        BEFORE calling `field.trace_paths` -- a jax backend's batch size is
-        part of its compiled program's shape signature, so a genuinely new
-        K recompiles (confirmed directly: ~65-70ms on a toy case, vs <1ms
-        for a repeated K) every time an agent's remaining real-node count
-        changes, i.e. every time a node gets consumed over the mission.
-        Padding is done in PLAIN NUMPY, entirely before any jax array
-        exists, deliberately NOT via `jnp.concatenate`/`jnp.broadcast_to`
-        on an already-jax-side array (an earlier version of this fix did
-        exactly that, inside `EdgeCostTimeToGoField.trace_paths` itself) --
-        measured directly that those ops are THEMSELVES separate per-shape
-        JAX dispatches with their own non-trivial one-time cost (tens of
-        ms on a toy case): XLA's per-op compile overhead is dominated by
-        fixed cost, not the op's own trivial complexity, so a "cheap"
-        concatenate is not actually cheap the first time a given shape
-        crosses into jax. Building the final fixed-shape array in numpy
-        first and handing jax exactly one already-final-shaped array
-        avoids paying that at all. Padding uses `goals[-1]` repeated
-        (start == goal exactly, so the descent is already converged at
-        step 0 -- cheap and side-effect-free); the extra rows are sliced
-        back off, also in plain numpy, before returning. Safe because an
-        agent's own remaining-segment count only ever SHRINKS across one
-        `TracedTimingMPC`'s lifetime (nodes get consumed, never re-added),
-        so whichever K is seen FIRST for a given agent is the max forever
-        after in practice -- but stays correct even if some caller's K did
-        grow later (just re-establishes a new, larger max), only forgoing
-        the "one recompile ever" property in that (currently nonexistent)
-        case.
-        """
-        if hasattr(self.field, "trace_paths"):
-            starts_arr = np.stack([np.asarray(s) for s in starts])
-            goals_arr = np.stack([np.asarray(g) for g in goals])
-            k = starts_arr.shape[0]
-            max_k = max(k, self._max_segments_seen.get(agent, 0))
-            self._max_segments_seen[agent] = max_k
-            if k < max_k:
-                pad = max_k - k
-                pad_point = goals_arr[-1]
-                pad_block = np.tile(pad_point, (pad, 1))
-                starts_arr = np.concatenate([starts_arr, pad_block], axis=0)
-                goals_arr = np.concatenate([goals_arr, pad_block], axis=0)
-            batched = self.field.trace_paths(agent, starts_arr, goals_arr)
-            # Indexed, NOT wrapped in np.asarray(batched): a plain
-            # EdgeCostTimeToGoField's own trace_paths returns one uniform
-            # (max_k, max_steps+2, dim) array (every segment the same fixed
-            # length -- see its own doc comment), but a wrapper like
-            # b1_multiroom's _FallbackField can substitute a variable-length
-            # grid-route path for whichever segments its own descent didn't
-            # converge on, returning a RAGGED Python list instead -- forcing
-            # that into one array here would raise (or silently object-dtype)
-            # on exactly the fallback case this exists to handle correctly.
-            return [np.asarray(batched[i]) for i in range(k)]  # drop the padding rows
-        return [np.asarray(self.field.trace_path(agent, s, g)) for s, g in zip(starts, goals)]
+        offset = np.asarray(spec.offset, dtype=float)
+        dim, scale = offset.shape[0], float(spec.scale)
+        device = spec.field.device
+        to_field = lambda q: torch.as_tensor((q[:dim] - offset) / scale, dtype=torch.float32, device=device)
+        planner = self.planner or getattr(getattr(spec.field, "method", None), "default_planner", "mppi")
+        result = PLANNERS[planner](spec.field, to_field(start), to_field(goal), **self.planner_kwargs)
+
+        lead = result.path.detach().cpu().numpy().astype(float) * scale + offset
+        lead[0] = start[:dim]
+        if result.success:
+            lead[-1] = goal[:dim]
+        else:
+            self.last_failed_segments += 1
+            lead = np.concatenate([lead, goal[None, :dim]], axis=0)
+        return _interpolate_trailing(lead, start, goal)
 
     def _agent_dense_wps_and_ids(self, agent, x0_i, coarse_node_ids, coarse_wps_i):
         """Traces every consecutive (position, position) pair on this
@@ -318,7 +313,7 @@ class TracedTimingMPC:
 
         starts = [positions[k] for k in range(len(positions) - 1)]
         goals = [positions[k + 1] for k in range(len(positions) - 1)]
-        traced_segments = self._trace_segments(agent, starts, goals)
+        traced_segments = [self.plan_segment(agent, s, g) for s, g in zip(starts, goals)]
 
         dense_positions = []
         dense_ids = []
@@ -340,7 +335,7 @@ class TracedTimingMPC:
             # already appended as the previous segment's goal); keep
             # everything after it. A zero-length segment (start == goal,
             # e.g. the agent is already sitting exactly at this node's
-            # target) collapses trace_path to a single point == goal --
+            # target) collapses the plan to a single point == goal --
             # keep that one point rather than dropping it, since there's
             # nothing to drop it as a duplicate "start" of.
             interior = traced[1:] if len(traced) > 1 else traced
@@ -355,6 +350,7 @@ class TracedTimingMPC:
     def solve(self, x0, v0, remaining_vertices, waypoints, var_assignments, t_by_node=None):
         if t_by_node is None:
             t_by_node = np.array([])
+        self.last_failed_segments = 0
 
         # Resolves ordering + cross-agent LESS_THAN/EQUAL interactions --
         # the same call GraphTimingMPC.solve makes internally -- directly,
