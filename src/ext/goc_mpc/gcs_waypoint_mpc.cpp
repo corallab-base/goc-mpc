@@ -566,9 +566,17 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	// FK placeholders (agent_link_pos/rot) become their agent's symbolic
 	// FK over agent_q first; a role's (var_agent_link_pos/rot), each
 	// candidate holder's FK over var_agent_q.
+	//
+	// Parameters (and, below, object variables) are substituted into the raw
+	// formula before its FK placeholders are expanded: Formula::Substitute
+	// rebuilds every conjunction, ordering its atoms by structural
+	// comparison, which is costly once the atoms hold FK expressions.
 	auto compile_at_node = [&](const Formula& f_raw, int sg, bool routes, const Expression* gate,
 				   const std::string& where) {
-		const Formula f = f_raw.Substitute(graph->SymbolicFKSubstitution(f_raw.GetFreeVariables()));
+		Substitution sub_p;
+		add_params(&sub_p);
+		const Formula f_raw_p = f_raw.Substitute(sub_p);
+		const Formula f = f_raw_p.Substitute(graph->SymbolicFKSubstitution(f_raw_p.GetFreeVariables()));
 		const Variables fv = f.GetFreeVariables();
 		const std::vector<int> agents = graph->_agent_q.KeysReferencedBy(fv);
 		const std::vector<int> objects = graph->_object_q.KeysReferencedBy(fv);
@@ -586,9 +594,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 			// row in this horizon contributes nothing.
 			if (subgraph.subgraph_variable_id(var) < 0) return;
 		}
-		Substitution sub_p;
-		add_params(&sub_p);
-		const Formula f_p = f.Substitute(sub_p);
+		const Formula& f_p = f;
 
 		if (agents.size() == 1 && vars.empty() && objects.empty()) {
 			const int j = agents[0];
@@ -644,8 +650,12 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 					for (int c = 0; c < graph->object_ambient_dim(o); ++c)
 						problem.nonlinear_seed.emplace_back(problem.O[o](sg, c), x0(graph->object_col_offset(o) + c));
 			};
+			// One pass over the raw formula: FK placeholders expanded and the
+			// objects replaced (the FK expressions hold no object placeholders).
+			Substitution sub_fk_o = graph->SymbolicFKSubstitution(f_raw_p.GetFreeVariables());
+			sub_fk_o.insert(sub_o.begin(), sub_o.end());
 			std::vector<Expression> in, eq;
-			CollectAtoms(f_p.Substitute(sub_o), &in, &eq, where);
+			CollectAtoms(f_raw_p.Substitute(sub_fk_o), &in, &eq, where);
 			auto affine = [](const Expression& e) { return drake::symbolic::IsAffine(drake::Vector1<Expression>(e)); };
 			const bool any_nonlinear = std::any_of(in.begin(), in.end(), [&](const auto& e) { return !affine(e); }) ||
 						   std::any_of(eq.begin(), eq.end(), [&](const auto& e) { return !affine(e); });
@@ -842,6 +852,14 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	// x0 when the hold began before this horizon) and at v -- exact at the
 	// endpoints, which the holder visits, and betweenness-gated at every
 	// other node, conditional on the holder actually being there.
+	//
+	// The holder's end effector is its symbolic FK for link "ee" when it has
+	// one (as the evolutionary solver's holds use its registered "ee" FK),
+	// and otherwise a free body's leading position columns. An FK holder's
+	// end effector at a vertex is a variable e, tied to the vertex's
+	// unscaled copy by the nonlinear atom e == fk_ee(Q), and enters the
+	// rows through its perspective copy E (E = e when the vertex is used,
+	// 0 otherwise, as P is), so the rows themselves stay linear.
 	if (enforce_rigidity) {
 		const int wd = graph->workspace_dim;
 		// The leading min(width, workspace_dim) position columns, zero-padded
@@ -851,6 +869,61 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 			const int n = std::min(width, wd);
 			p.head(n) = q.head(n);
 			return p;
+		};
+		auto ee_fk = [&](int j) -> const GraphOfConstraints::SymbolicLinkFK* {
+			const auto it = graph->robot_symbolic_fk.find({j, "ee"});
+			return it == graph->robot_symbolic_fk.end() ? nullptr : &it->second;
+		};
+		// fk_ee at agent j's current position, x0.
+		auto ee_at_x0 = [&](int j) {
+			const auto& ph = graph->_agent_q.Vars(j);
+			drake::symbolic::Environment env;
+			for (int c = 0; c < ph.size(); ++c) env.insert(ph(c), x0(graph->agent_col_offset(j) + c));
+			Eigen::VectorXd p = Eigen::VectorXd::Zero(wd);
+			const auto& pos = ee_fk(j)->position;
+			for (int c = 0; c < std::min<int>(pos.size(), wd); ++c) p(c) = pos(c).Evaluate(env);
+			return p;
+		};
+		// Agent j's end effector at its vertex v, scaled by the vertex's
+		// weight (0 when unused), as P[j][v] is.
+		std::map<std::pair<int, int>, VectorXDecisionVariable> ee_copies;
+		auto ee_vertex = [&](int j, int v) -> drake::VectorX<Expression> {
+			const auto* fk = ee_fk(j);
+			if (fk == nullptr) return padded(problem.P[j][v].cast<Expression>(), EEPositionWidth(graph, j));
+			const auto found = ee_copies.find({j, v});
+			if (found != ee_copies.end()) return found->second.cast<Expression>();
+			const auto& vx = problem.graphs[j].vertices[v];
+			const auto& ph = graph->_agent_q.Vars(j);
+			const int d = ph.size();
+			const Eigen::VectorXd q_lb = graph->_global_x_lb.segment(graph->agent_col_offset(j), d);
+			const Eigen::VectorXd q_ub = graph->_global_x_ub.segment(graph->agent_col_offset(j), d);
+			std::unordered_map<Variable::Id, Interval> q_box;
+			for (int c = 0; c < d; ++c) q_box[ph(c).get_id()] = {q_lb(c), q_ub(c)};
+			const VectorXDecisionVariable e =
+				prog.NewContinuousVariables(wd, fmt::format("EE_{}_{}_{}", j, vx.sg, vx.mode));
+			const VectorXDecisionVariable E =
+				prog.NewContinuousVariables(wd, fmt::format("EEw_{}_{}_{}", j, vx.sg, vx.mode));
+			const Eigen::VectorXd e_x0 = ee_at_x0(j);
+			const Expression w = weight(j, v);
+			for (int c = 0; c < wd; ++c) {
+				const Expression fk_c = c < fk->position.size() ? fk->position(c) : Expression::Zero();
+				const Interval range = Bound(fk_c, q_box);
+				if (!std::isfinite(range.lo) || !std::isfinite(range.hi))
+					throw std::runtime_error(fmt::format(
+						"GCSWaypointMPC: agent {}'s \"ee\" FK is unbounded over its state box", j));
+				prog.AddBoundingBoxConstraint(range.lo, range.hi, e(c));
+				copy_box[e(c).get_id()] = range;
+				problem.nonlinear_seed.emplace_back(e(c), e_x0(c));
+				vertex_nonlinear[j][v].push_back({Expression(e(c)) - fk_c, 0.0, 0.0, ph});
+				const double M = std::max(std::abs(range.lo), std::abs(range.hi));
+				prog.AddLinearConstraint(Expression(E(c)) - M * w, -kInf, 0.0);
+				prog.AddLinearConstraint(-Expression(E(c)) - M * w, -kInf, 0.0);
+				const Expression diff = Expression(E(c)) - e(c);
+				prog.AddLinearConstraint(diff - 2.0 * M * (1.0 - w), -kInf, 0.0);
+				prog.AddLinearConstraint(-diff - 2.0 * M * (1.0 - w), -kInf, 0.0);
+			}
+			ee_copies.emplace(std::make_pair(j, v), E);
+			return E.cast<Expression>();
 		};
 		const double M_rigid = 2.0 * M_sym;
 		for (const auto& [hold_id, hold] : subgraph.get_subgraph_hold_ops()) {
@@ -878,12 +951,10 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 					if (is_candidate(*hold.var_id, j)) holders.push_back(j);
 			}
 			for (int j : holders) {
-				// Translation-only: the rows below read only the holder's
-				// leading position columns, linear for any free body.
-				if (!graph->robot_is_free_body(j))
+				if (ee_fk(j) == nullptr && !graph->robot_is_free_body(j))
 					throw std::runtime_error(fmt::format(
-						"GCSWaypointMPC: {}: only free-body holders are supported "
-						"(articulated holders need FK)", where));
+						"GCSWaypointMPC: {}: articulated holder {} has no symbolic FK for link \"ee\" "
+						"(pass symbolic_fk_fn to set_robot_fk)", where, j));
 			}
 
 			// Holder's end-effector position at an endpoint (exact), and at
@@ -893,7 +964,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 				for (int j : holders) {
 					for (int v : vertices_at[j][sg]) {
 						if (row >= 0 && problem.graphs[j].vertices[v].mode != row) continue;
-						e += padded(problem.P[j][v].cast<Expression>(), EEPositionWidth(graph, j));
+						e += ee_vertex(j, v);
 					}
 				}
 				return e;
@@ -903,10 +974,14 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 				ee_ref = ee_at_endpoint(sg_u);
 			} else {
 				for (int j : holders) {
-					const drake::VectorX<Expression> x0_j = x0.segment(
-						graph->agent_col_offset(j), graph->robot_ambient_dim(j)).cast<Expression>();
 					const Expression held = row >= 0 ? Expression(Assignments(row, j)) : Expression(1.0);
-					ee_ref += held * padded(x0_j, EEPositionWidth(graph, j));
+					if (ee_fk(j) != nullptr) {
+						ee_ref += held * ee_at_x0(j).cast<Expression>();
+					} else {
+						const drake::VectorX<Expression> x0_j = x0.segment(
+							graph->agent_col_offset(j), graph->robot_ambient_dim(j)).cast<Expression>();
+						ee_ref += held * padded(x0_j, EEPositionWidth(graph, j));
+					}
 				}
 			}
 			const drake::VectorX<Expression> ee_v = ee_at_endpoint(sg_v);
@@ -932,8 +1007,9 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 					const Variable& b_between = GetOrAddBetweennessIndicator(
 						prog, t_var, t_idx_ref, ri(sg_w), ri(sg_v), M_time, betweenness_cache);
 					for (int j : holders) {
-						const drake::VectorX<Expression> rel_w =
-							padded(obj_pos(o, sg_w), w_o) - padded(pos_agent(j, sg_w), EEPositionWidth(graph, j));
+						drake::VectorX<Expression> ee_w = drake::VectorX<Expression>::Zero(wd);
+						for (int v : vertices_at[j][sg_w]) ee_w += ee_vertex(j, v);
+						const drake::VectorX<Expression> rel_w = padded(obj_pos(o, sg_w), w_o) - ee_w;
 						Expression slack = M_rigid * ((1.0 - Expression(b_between)) + (1.0 - visit(j, sg_w)));
 						if (row >= 0) slack += M_rigid * (1.0 - Expression(Assignments(row, j)));
 						const drake::VectorX<Expression> res_w = rel_ref - rel_w;
