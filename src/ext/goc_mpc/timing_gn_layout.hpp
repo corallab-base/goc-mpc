@@ -4,7 +4,7 @@
 // layout (per-agent tau/v ranges, per-segment constant PositionDelta data,
 // linear interaction rows) and the objective assembly (value/gradient/
 // Gauss-Newton-Hessian-triplets) GraphTimingMPC (graph_timing_mpc.cpp,
-// solved via a trust-region Gauss-Newton loop with qpOASES QP subproblems)
+// solved via a trust-region Gauss-Newton loop with sparse ProxQP subproblems)
 // builds on. See graph_timing_mpc.hpp's own doc comment for the math
 // itself (D/V residuals, why disp needs no autodiff, etc.).
 
@@ -21,8 +21,8 @@ namespace gn_timing {
 
 constexpr double kTauMin = 0.01;
 constexpr double kTauMax = 100.0;
-// A generic "no bound" convention (used as qpOASES' box bound for an
-// "unbounded" variable).
+// A generic "no bound" convention (the box bound for an "unbounded"
+// variable).
 constexpr double kInf = 1e19;
 
 // One agent's tau/v decision-variable ranges within the flat global vector.

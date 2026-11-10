@@ -26,24 +26,11 @@ find_package(drake CONFIG REQUIRED)
 # installed (libnanoflann-dev), not vendored.
 find_package(nanoflann REQUIRED)
 
-# qpOASES (robotpkg install, already on this machine's CMAKE_PREFIX_PATH via
-# .envrc's PATH/openrobots setup) -- GraphTimingMPC's (graph_timing_mpc.cpp)
-# QP subproblem solver in its trust-region Gauss-Newton outer loop: every QP
-# subproblem there (PSD Gauss-Newton Hessian + exactly-linear constraints,
-# see gn_timing::AssembleObjective/BuildProblemLayout) is solvable by
-# construction, so a stalled/failed step degrades to a smaller trust region
-# rather than a hard infeasibility/restoration-failure stop -- see
-# graph_timing_mpc.hpp's own doc comment. No exported CMake target ships
-# with this package, only plain qpOASES_INCLUDE_DIR/qpOASES_LIBRARY
-# variables.
-find_package(qpOASES REQUIRED)
-
 # ProxQP (proxsuite, robotpkg/openrobots install, on CMAKE_PREFIX_PATH via
-# .envrc) -- GraphShortPathMPC's (graph_short_path_mpc.cpp) sparse QP
-# subproblem solver in its trust-region SQP outer loop. Replaces the dense
-# qpOASES::SQProblem path there: H is block-diagonal per agent (zero
-# cross-agent coupling) and every constraint row is sparse, so a sparse
-# solver is the scaling lever for many-agent scenes -- see the v2 plan.
+# .envrc) -- the sparse QP subproblem solver in GraphShortPathMPC's
+# (graph_short_path_mpc.cpp) and GraphTimingMPC's (graph_timing_mpc.cpp)
+# trust-region SQP outer loops. H is block-diagonal per agent and every
+# constraint row is sparse, so a sparse solver scales with agent count.
 # Header-only (proxsuite::proxsuite is an INTERFACE target); needs simde,
 # which its own package config pulls in.
 find_package(proxsuite REQUIRED)
@@ -82,13 +69,11 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/sqp_short_path_layout.cpp"
     "src/ext/goc_mpc/graph_short_path_mpc.cpp"
 )
-target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann ${qpOASES_LIBRARY} proxsuite::proxsuite ${SCIP_LIBRARIES})
+target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann proxsuite::proxsuite ${SCIP_LIBRARIES})
 target_include_directories(_ext PRIVATE ${SCIP_INCLUDE_DIRS})
 # Find libscip at runtime without LD_LIBRARY_PATH (e.g. from other venvs).
 get_filename_component(SCIP_LIBRARY_DIR "${SCIP_DIR}/../.." ABSOLUTE)
 set_target_properties(_ext PROPERTIES BUILD_RPATH "${SCIP_LIBRARY_DIR}" INSTALL_RPATH "${SCIP_LIBRARY_DIR}")
-target_include_directories(_ext PRIVATE ${qpOASES_INCLUDE_DIR})
-target_link_directories(_ext PRIVATE ${qpOASES_LIBRARY_DIR})
 target_compile_definitions(_ext PRIVATE
     MODULE_NAME=_ext
     VERSION_INFO="${PY_FULL_VERSION}"

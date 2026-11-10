@@ -24,7 +24,7 @@ namespace py = pybind11;
 // (acceleration_cost * psi, "psi" = compute_ctrl_cost's coast-corrected
 // residual), and the cross-agent LESS_THAN/EQUAL timing constraints
 // (GraphOfConstraints::get_agent_paths), solved as a sequence of small QPs
-// (qpOASES::SQProblem, hot-started both across outer iterations and across
+// (sparse ProxQP, hot-started both across outer iterations and across
 // MPC cycles) inside a trust-region loop -- gn_timing::AssembleObjective/
 // BuildProblemLayout (timing_gn_layout.hpp) do the actual residual/
 // Jacobian/Gauss-Newton-Hessian math.
@@ -59,7 +59,7 @@ namespace py = pybind11;
 // for any node two agents both touch, e.g. a handoff) can have a CURRENT
 // violation larger than any combination of moves within
 // `[-trust_radius, trust_radius]` on the involved tau's can close, making
-// that iteration's box-intersect-hyperplane genuinely empty -- qpOASES
+// that iteration's box-intersect-hyperplane genuinely empty -- the QP solver
 // then correctly (not spuriously) reports infeasibility. Worse, for an
 // EQUALITY row this trust-region shrink-and-retry loop's usual remedy
 // backfires: a smaller box is a STRICTER subset, never easier to satisfy,
@@ -199,12 +199,9 @@ struct GraphTimingMPC {
 	double _min_trust_radius;
 	double _grad_tol;
 
-	// Reused across solve()/solve_dense() calls -- qpOASES::SQProblem's
-	// hot-start only pays off if the SAME instance persists cycle-to-cycle.
-	// Held as a raw pointer with manual lifetime management (constructed
-	// lazily on first solve, re-constructed whenever `n`/`m` change) since
-	// qpOASES::SQProblem isn't move-constructible in a way that plays
-	// nicely with resizing.
+	// Reused across solve()/solve_dense() calls so the QP's warm start and
+	// symbolic factorization persist cycle-to-cycle. Constructed lazily on
+	// the first solve and re-constructed whenever the QP's size changes.
 	struct QpState;
 	std::unique_ptr<QpState> _qp_state;
 

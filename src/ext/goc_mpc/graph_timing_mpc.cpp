@@ -4,7 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 
-#include <qpOASES.hpp>
+#include <proxsuite/proxqp/sparse/sparse.hpp>
 
 #include "timing_gn_layout.hpp"
 
@@ -21,17 +21,41 @@ using gn_timing::ProblemLayout;
 using gn_timing::VelocityConstraintRow;
 
 namespace {
-using RealMat = Eigen::Matrix<qpOASES::real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-using RealVec = Eigen::Matrix<qpOASES::real_t, Eigen::Dynamic, 1>;
+namespace psp = proxsuite::proxqp;
+using SpMat = Eigen::SparseMatrix<double, Eigen::ColMajor, long long>;
+using Trip = Eigen::Triplet<double, long long>;
+// proxqp treats any bound whose magnitude reaches helpers::infinite_bound
+// (sqrt(DBL_MAX)) as +/-infinity.
+const double kProxInf = proxsuite::helpers::infinite_bound<double>::value();
+double ProxBound(double v) { return std::clamp(v, -kProxInf, kProxInf); }
+
+// Compressed sparsity-pattern signature (outer + inner index arrays) for the
+// update()-vs-init() decision in RunTrustRegionSqp.
+std::vector<long long> PatternKey(const SpMat& m) {
+	std::vector<long long> key(m.outerIndexPtr(), m.outerIndexPtr() + m.outerSize() + 1);
+	key.insert(key.end(), m.innerIndexPtr(), m.innerIndexPtr() + m.nonZeros());
+	return key;
+}
 }  // namespace
 
+// Sparse ProxQP subproblem solver, hot-started across outer iterations and
+// across solve() calls: update() (values only, keeps the symbolic
+// factorization) + WARM_START_WITH_PREVIOUS_RESULT while the H/C sparsity
+// pattern is unchanged, a full init() otherwise. The variable box is passed
+// as identity inequality rows after the interaction/velocity rows (the
+// sparse backend has no separate box argument).
 struct GraphTimingMPC::QpState {
-	qpOASES::SQProblem qp;
-	int n = 0, m_eff = 0;  // m_eff: max(real interaction-row count, 1) -- see solve()'s own comment
+	psp::sparse::QP<double, long long> qp;
+	int n = 0, n_in = 0;
 	bool initialized = false;
+	std::vector<long long> h_pattern;
+	std::vector<long long> c_pattern;
 
-	QpState(int n_, int m_eff_) : qp(n_, m_eff_), n(n_), m_eff(m_eff_) {
-		qp.setPrintLevel(qpOASES::PL_NONE);
+	QpState(int n_, int n_in_) : qp(n_, 0, n_in_), n(n_), n_in(n_in_) {
+		qp.settings.verbose = false;
+		qp.settings.compute_timings = false;
+		qp.settings.eps_abs = 1.0e-7;
+		qp.settings.eps_rel = 0.0;
 	}
 };
 
@@ -203,9 +227,6 @@ SqpResult RunTrustRegionSqp(
 	// slack-relaxed -- see below).
 	const int m_interactions = static_cast<int>(layout.interactions.size());
 	const int m = m_interactions + static_cast<int>(layout.velocity_rows.size());
-	// qpOASES::SQProblem always gets at least one (possibly trivially-
-	// inactive, all-zero-row) constraint row rather than special-casing nC=0.
-	const int m_eff = std::max(m, 1);
 
 	// Slack-column layout for the interaction rows' Sl1QP relaxation (see
 	// this file's own header comment's CORRECTION paragraph): a LESS_THAN
@@ -225,18 +246,18 @@ SqpResult RunTrustRegionSqp(
 	}
 	const int n_smooth = layout.n;
 	const int n = n_smooth + n_slack;
+	const int n_in = m + n;  // constraint rows, then one identity row per variable (the box)
 
-	// (Re)build the persistent QpState on the first call or whenever (n, m)
-	// changed since last time (a node completing, or a dense re-trace
-	// changing point count, resizes the problem) -- qpOASES::SQProblem is
-	// fixed-size once constructed. Every other cycle at a stable size
-	// reuses the same instance, which is what lets hotstart() actually
-	// warm-start cycle-to-cycle, not just iteration-to-iteration within one
-	// call.
-	if (!*qp_state || (*qp_state)->n != n || (*qp_state)->m_eff != m_eff) {
-		*qp_state = std::make_unique<GraphTimingMPC::QpState>(n, m_eff);
+	// (Re)build the persistent QpState on the first call or whenever (n,
+	// n_in) changed since last time (a node completing, or a dense re-trace
+	// changing point count, resizes the problem); the QP is fixed-size once
+	// constructed. Every other cycle at a stable size reuses the same
+	// instance, so update() warm-starts cycle-to-cycle, not just
+	// iteration-to-iteration within one call.
+	if (!*qp_state || (*qp_state)->n != n || (*qp_state)->n_in != n_in) {
+		*qp_state = std::make_unique<GraphTimingMPC::QpState>(n, n_in);
 	}
-	qpOASES::SQProblem& qp = (*qp_state)->qp;
+	GraphTimingMPC::QpState& st = **qp_state;
 
 	// Per-variable box bounds (tau in [kTauMin, kTauMax]; v unbounded but
 	// for the single-variable velocity constraints, layout.velocity_bounds)
@@ -277,30 +298,35 @@ SqpResult RunTrustRegionSqp(
 		return SqpResult{x, 0, initial_trust_radius};
 	}
 
-	// Constraint matrix A -- fixed for the whole call (every interaction
+	// Constraint matrix C -- fixed for the whole call (every interaction
 	// row is exactly linear, same +/-1 pattern every outer iteration, incl.
 	// the slack columns' own fixed +/-1 coefficients; only its RHS bounds
-	// shift with the current iterate x).
-	RealMat A = RealMat::Zero(m_eff, n);
+	// shift with the current iterate x). Rows m..m+n-1 are the box.
+	std::vector<Trip> c_trips;
 	for (int r = 0; r < m; ++r) {
 		const int scol = n_smooth + slack_offset[r];
 		if (r >= m_interactions) {  // a velocity constraint row, elastic both ways
 			const auto& vr = layout.velocity_rows[r - m_interactions];
-			for (std::size_t c = 0; c < vr.cols.size(); ++c) A(r, vr.cols[c]) += vr.coeffs[c];
-			A(r, scol) = 1.0;       // s_plus
-			A(r, scol + 1) = -1.0;  // s_minus
+			for (std::size_t c = 0; c < vr.cols.size(); ++c) c_trips.emplace_back(r, vr.cols[c], vr.coeffs[c]);
+			c_trips.emplace_back(r, scol, 1.0);       // s_plus
+			c_trips.emplace_back(r, scol + 1, -1.0);  // s_minus
 			continue;
 		}
 		const auto& ir = layout.interactions[r];
-		for (int k = 0; k < ir.count_i; ++k) A(r, ir.tau_offset_i + k) += 1.0;
-		for (int k = 0; k < ir.count_j; ++k) A(r, ir.tau_offset_j + k) -= 1.0;
+		for (int k = 0; k < ir.count_i; ++k) c_trips.emplace_back(r, ir.tau_offset_i + k, 1.0);
+		for (int k = 0; k < ir.count_j; ++k) c_trips.emplace_back(r, ir.tau_offset_j + k, -1.0);
 		if (ir.type == AgentInteraction::Type::LESS_THAN) {
-			A(r, scol) = -1.0;
+			c_trips.emplace_back(r, scol, -1.0);
 		} else {
-			A(r, scol) = 1.0;      // s_plus
-			A(r, scol + 1) = -1.0;  // s_minus
+			c_trips.emplace_back(r, scol, 1.0);       // s_plus
+			c_trips.emplace_back(r, scol + 1, -1.0);  // s_minus
 		}
 	}
+	for (int c = 0; c < n; ++c) c_trips.emplace_back(m + c, c, 1.0);
+	SpMat C_sp(n_in, n);
+	C_sp.setFromTriplets(c_trips.begin(), c_trips.end());  // sums duplicate (r, col) entries
+	C_sp.makeCompressed();
+	std::vector<long long> c_key = PatternKey(C_sp);
 
 
 	double trust_radius = initial_trust_radius;
@@ -320,89 +346,76 @@ SqpResult RunTrustRegionSqp(
 		// making rho itself meaningless at that scale.
 		if (iter > 0 && trust_radius <= min_trust_radius) break;
 
-		// Dense symmetric Gauss-Newton Hessian, mirrored from the
-		// lower-triangle-only triplets AssembleObjective returns -- placed
-		// in the smooth (tau/v) top-left corner only; the slack block gets
-		// just the Tikhonov floor below (slack appears LINEARLY only in
-		// the true cost, `interaction_penalty_weight * slack`).
-		RealMat H_qp = RealMat::Zero(n, n);
-		for (const auto& t : hess_triplets) {
-			H_qp(t.row(), t.col()) += static_cast<qpOASES::real_t>(t.value());
-			if (t.row() != t.col()) {
-				H_qp(t.col(), t.row()) += static_cast<qpOASES::real_t>(t.value());
-			}
-		}
-		// Tiny Tikhonov floor: a numerical-conditioning safety net for
-		// qpOASES' internal Cholesky factorization on a PSD-but-not-
-		// necessarily-PD Hessian -- doesn't change which point is a
-		// stationary point of the true objective (H_GN is PSD by
-		// construction regardless -- see this file's own header comment),
-		// only the QP subproblem's conditioning.
-		for (int i = 0; i < n; ++i) H_qp(i, i) += qpOASES::real_t(1e-10);
+		// Gauss-Newton Hessian, upper triangle (what proxqp reads) from the
+		// lower-triangle triplets AssembleObjective returns, in the smooth
+		// (tau/v) block; the slack block gets just the Tikhonov floor (slack
+		// appears LINEARLY in the true cost, `interaction_penalty_weight *
+		// slack`). The floor is a conditioning safety net on a PSD-but-not-
+		// necessarily-PD Hessian; it doesn't move the true objective's
+		// stationary points.
+		std::vector<Trip> h_trips;
+		h_trips.reserve(hess_triplets.size() + n);
+		for (const auto& t : hess_triplets)
+			h_trips.emplace_back(std::min(t.row(), t.col()), std::max(t.row(), t.col()), t.value());
+		for (int i = 0; i < n; ++i) h_trips.emplace_back(i, i, 1e-10);
+		SpMat H_sp(n, n);
+		H_sp.setFromTriplets(h_trips.begin(), h_trips.end());
+		H_sp.makeCompressed();
 
-		const Eigen::VectorXd dx_lb_smooth = (var_lb - x).cwiseMax(-trust_radius);
-		const Eigen::VectorXd dx_ub_smooth = (var_ub - x).cwiseMin(trust_radius);
-		RealVec dx_lb(n), dx_ub(n);
-		dx_lb.head(n_smooth) = dx_lb_smooth.cast<qpOASES::real_t>();
-		dx_ub.head(n_smooth) = dx_ub_smooth.cast<qpOASES::real_t>();
-		for (int c = 0; c < n_slack; ++c) {
-			dx_lb(n_smooth + c) = qpOASES::real_t(0.0);
-			dx_ub(n_smooth + c) = qpOASES::real_t(kInf);
-		}
-
-		RealVec lbA = RealVec::Constant(m_eff, qpOASES::real_t(-kInf));
-		RealVec ubA = RealVec::Constant(m_eff, qpOASES::real_t(kInf));
+		Eigen::VectorXd cl = Eigen::VectorXd::Constant(n_in, -kProxInf);
+		Eigen::VectorXd cu = Eigen::VectorXd::Constant(n_in, kProxInf);
 		for (int r = 0; r < m; ++r) {
 			if (r >= m_interactions) {
 				const auto& vr = layout.velocity_rows[r - m_interactions];
 				const double value = VelocityRowValue(x, vr);
-				lbA(r) = static_cast<qpOASES::real_t>(vr.lb <= -kInf ? -kInf : vr.lb - value);
-				ubA(r) = static_cast<qpOASES::real_t>(vr.ub >= kInf ? kInf : vr.ub - value);
+				cl(r) = vr.lb <= -kInf ? -kProxInf : ProxBound(vr.lb - value);
+				cu(r) = vr.ub >= kInf ? kProxInf : ProxBound(vr.ub - value);
 				continue;
 			}
 			const auto& ir = layout.interactions[r];
 			const auto [gi, gj] = InteractionGiGj(x, ir);
 			const double g_val = gi - gj;
 			if (ir.type == AgentInteraction::Type::LESS_THAN) {
-				lbA(r) = qpOASES::real_t(-kInf);
-				ubA(r) = static_cast<qpOASES::real_t>(-ir.min_tau - g_val);
+				cu(r) = ProxBound(-ir.min_tau - g_val);
 			} else {
-				lbA(r) = ubA(r) = static_cast<qpOASES::real_t>(-g_val);
+				cl(r) = cu(r) = ProxBound(-g_val);
 			}
 		}
-
-		RealVec g_qp(n);
-		g_qp.head(n_smooth) = grad.cast<qpOASES::real_t>();
-		for (int c = 0; c < n_slack; ++c) g_qp(n_smooth + c) = qpOASES::real_t(interaction_penalty_weight);
-
-		qpOASES::int_t nWSR = 200;
-		qpOASES::returnValue status;
-		if (!(*qp_state)->initialized) {
-			status = qp.init(H_qp.data(), g_qp.data(), A.data(),
-					  dx_lb.data(), dx_ub.data(), lbA.data(), ubA.data(), nWSR);
-			(*qp_state)->initialized = (status == qpOASES::SUCCESSFUL_RETURN);
-		} else {
-			status = qp.hotstart(H_qp.data(), g_qp.data(), A.data(),
-					      dx_lb.data(), dx_ub.data(), lbA.data(), ubA.data(), nWSR);
+		for (int c = 0; c < n_smooth; ++c) {
+			cl(m + c) = ProxBound(std::max(var_lb(c) - x(c), -trust_radius));
+			cu(m + c) = ProxBound(std::min(var_ub(c) - x(c), trust_radius));
 		}
+		for (int c = 0; c < n_slack; ++c) cl(m + n_smooth + c) = 0.0;
 
-		if (status != qpOASES::SUCCESSFUL_RETURN) {
-			// Every QP subproblem is feasible by construction now (dx=0,
-			// slack=|current violation| always satisfies every row,
-			// independent of trust_radius -- see this file's header
-			// comment's CORRECTION paragraph), so a non-success status
-			// here really can only be a numerical/active-set-homotopy
-			// hiccup. Retry with a full re-init (discard the possibly-
-			// confused warm start) at a smaller trust region rather than
-			// trusting a possibly-garbage primal solution.
+		Eigen::VectorXd g_qp(n);
+		g_qp.head(n_smooth) = grad;
+		for (int c = 0; c < n_slack; ++c) g_qp(n_smooth + c) = interaction_penalty_weight;
+
+		std::vector<long long> h_key = PatternKey(H_sp);
+		if (st.initialized && h_key == st.h_pattern && c_key == st.c_pattern) {
+			st.qp.settings.initial_guess = psp::InitialGuessStatus::WARM_START_WITH_PREVIOUS_RESULT;
+			st.qp.update(H_sp, g_qp, proxsuite::nullopt, proxsuite::nullopt, C_sp, cl, cu,
+				     /*update_preconditioner=*/false);
+		} else {
+			st.qp.settings.initial_guess = psp::InitialGuessStatus::NO_INITIAL_GUESS;
+			st.qp.init(H_sp, g_qp, proxsuite::nullopt, proxsuite::nullopt, C_sp, cl, cu);
+			st.h_pattern = std::move(h_key);
+			st.c_pattern = c_key;
+		}
+		st.initialized = true;
+		st.qp.solve();
+
+		if (st.qp.results.info.status != psp::QPSolverOutput::PROXQP_SOLVED) {
+			// Every QP subproblem is feasible by construction (dx=0,
+			// slack=|current violation| satisfies every row, independent of
+			// trust_radius), so a non-solved status is a numerical hiccup.
+			// Retry from a cold init at a smaller trust region.
 			trust_radius *= 0.25;
-			(*qp_state)->initialized = false;
+			st.initialized = false;
 			continue;
 		}
 
-		RealVec z_q(n);
-		qp.getPrimalSolution(z_q.data());
-		const Eigen::VectorXd z = z_q.cast<double>();
+		const Eigen::VectorXd& z = st.qp.results.x;
 		const Eigen::VectorXd dx = z.head(n_smooth);
 		const double predicted_slack_sum = n_slack > 0 ? z.tail(n_slack).sum() : 0.0;
 
@@ -422,8 +435,10 @@ SqpResult RunTrustRegionSqp(
 		const double violation_new = TotalInteractionViolation(x + dx, layout);
 		const double phi_new = f_new + interaction_penalty_weight * violation_new;
 
-		const Eigen::MatrixXd H_d = H_qp.topLeftCorner(n_smooth, n_smooth).cast<double>();
-		const double predicted_smooth_reduction = -(grad.dot(dx) + 0.5 * dx.dot(H_d * dx));
+		double dx_H_dx = 0.0;
+		for (const auto& t : hess_triplets)
+			dx_H_dx += (t.row() == t.col() ? 1.0 : 2.0) * t.value() * dx(t.row()) * dx(t.col());
+		const double predicted_smooth_reduction = -(grad.dot(dx) + 0.5 * dx_H_dx);
 		// The QP's own slack values ARE exactly the post-step violation at
 		// the QP optimum (interaction_penalty_weight > 0 drives every
 		// slack to its tight lower bound given the row's RHS), so this is
