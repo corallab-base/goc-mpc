@@ -22,13 +22,17 @@ or environment field is plugged in.
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
 from . import spline_jax
+from .repulsive_energy_jax import RepulsiveKernel, repulsive_energy
+from .constrained_step_jax import WallConstraint, check_constraint as _check_wall, _run_constrained
+from .sobolev_metric_jax import SobolevMetric, check_metric as _check_sobolev
+from .spacetime_repulsion_jax import SpaceTimeKernel, check_kernel as _check_spacetime, spacetime_energy
 
 
 class AgentGeometry(NamedTuple):
@@ -168,17 +172,42 @@ def obstacle_cost(clearance_fn: Callable[[jnp.ndarray], jnp.ndarray],
     return jnp.sum(violation * violation)
 
 
+# Where sampling="segment" scores each knot interval, as fractions of its duration. The end fractions stay off the
+# knots themselves, where a cubic Hermite spline's acceleration jumps.
+SEGMENT_FRACTIONS = (1e-3, 0.25, 0.5, 0.75, 1.0 - 1e-3)
+DYNAMICS_SAMPLINGS = ("grid", "segment")
+
+
+def segment_times(times: jnp.ndarray, fractions) -> jnp.ndarray:
+    """Times at `fractions` of every knot interval, interval by interval."""
+    fractions = jnp.asarray(fractions)
+    tau = times[1:] - times[:-1]
+    return (times[:-1, None] + fractions[None, :] * tau[:, None]).reshape(-1)
+
+
 def dynamics_cost(dynamics_fn: Callable[[jnp.ndarray, jnp.ndarray, jnp.ndarray], jnp.ndarray],
                   geom: AgentGeometry, params: SplineParams, t_grid: jnp.ndarray,
-                  active_mask: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+                  active_mask: Optional[jnp.ndarray] = None, sampling: str = "grid") -> jnp.ndarray:
     """sum dynamics_fn(q, v, a) over one agent's samples up to its end time.
     Past the end spline_jax.eval clamps, which would repeat the last knot's
     acceleration. `dynamics_fn` returns a scalar penalty for one sample.
 
-    Every knot and knot-interval midpoint is scored too, since those samples
-    move with the knots: a Hermite piece squeezed between two grid samples
-    would otherwise spike its speed unseen."""
+    sampling="grid": the shared time grid, plus every knot and knot-interval
+    midpoint, since those samples move with the knots: a Hermite piece
+    squeezed between two grid samples would otherwise spike its speed unseen.
+    The acceleration of a cubic Hermite spline jumps at knots, so this cost is
+    discontinuous in the knots: when a knot crosses a grid sample, or sits on
+    its own knot sample, the smallest step moves that sample to the other
+    piece and the cost jumps. A line search then rejects every step.
+
+    sampling="segment": SEGMENT_FRACTIONS of every knot interval instead.
+    Each sample stays inside its own piece as knots move, so the cost is
+    smooth in the knots, and the grid is not used."""
     mask = geom.active_mask if active_mask is None else active_mask
+    if sampling == "segment":
+        t = segment_times(params.times, SEGMENT_FRACTIONS)
+        q, v, a = spline_jax.eval(geom.spec, params.times, params.wps, params.vs, t, active_mask=mask)
+        return jnp.sum(jax.vmap(dynamics_fn)(q, v, a))
     t = jnp.concatenate([t_grid, params.times, 0.5 * (params.times[:-1] + params.times[1:])])
     q, v, a = spline_jax.eval(geom.spec, params.times, params.wps, params.vs, t,
                               active_mask=mask)
@@ -199,6 +228,7 @@ class CostWeights(NamedTuple):
     regularizer: float = 1.0
     obstacle: float = 0.0
     dynamics: float = 0.0
+    repulsive: float = 0.0
 
 
 def build_cost_fn(geometries: Sequence[AgentGeometry],
@@ -210,7 +240,9 @@ def build_cost_fn(geometries: Sequence[AgentGeometry],
                    clearance_margin: float = 0.0,
                    swept: bool = False,
                    dynamics_fn: Optional[Callable[..., jnp.ndarray]] = None,
-                   pair_margin: float = 0.0):
+                   pair_margin: float = 0.0,
+                   repulsive_kernel: Optional[Union[RepulsiveKernel, SpaceTimeKernel]] = None,
+                   dynamics_sampling: str = "grid"):
     """Returns `cost_fn(params_list, q0_samples_list) -> (total, breakdown)`,
     the single forward pass Step 2 calls for `jax.value_and_grad` (`jit` is
     the caller's responsibility, per this module's own doc comment --
@@ -258,11 +290,18 @@ def build_cost_fn(geometries: Sequence[AgentGeometry],
             total = total + weights.obstacle * obstacle
         dynamics = jnp.zeros_like(total)
         if dynamics_fn is not None and weights.dynamics != 0.0:
-            dynamics = sum(dynamics_cost(dynamics_fn, g, p, t_grid, am)
+            dynamics = sum(dynamics_cost(dynamics_fn, g, p, t_grid, am, sampling=dynamics_sampling)
                            for g, p, am in zip(geometries, params_list, active_masks_list))
             total = total + weights.dynamics * dynamics
+        repulsive = jnp.zeros_like(total)
+        if repulsive_kernel is not None and weights.repulsive != 0.0:
+            if isinstance(repulsive_kernel, SpaceTimeKernel):
+                repulsive = spacetime_energy(centers_list, radii_list, t_grid, repulsive_kernel)
+            else:
+                repulsive = repulsive_energy(centers_list, radii_list, t_grid, repulsive_kernel)
+            total = total + weights.repulsive * repulsive
         return total, {"inter_agent": inter, "environment": env, "regularizer": reg,
-                       "obstacle": obstacle, "dynamics": dynamics}
+                       "obstacle": obstacle, "dynamics": dynamics, "repulsive": repulsive}
 
     return cost_fn
 
@@ -336,11 +375,22 @@ class CollisionRefinementConfig(NamedTuple):
     larger gradient at the same `step_size`.
 
     `dynamics_fn(q, v, a)` is a per-sample penalty, active with a nonzero
-    `weights.dynamics`. `line_search=True` replaces the fixed `step_size`
+    `weights.dynamics`, scored where `dynamics_sampling` says, see
+    dynamics_cost. "segment" keeps that cost smooth in the knots; "grid", the
+    default, can stall a line search. `line_search=True` replaces the fixed `step_size`
     with Armijo backtracking from `initial_step`, see _run_line_search;
     `metric_scale` weighs the (position, velocity, time) search directions
-    and is only used there. `pair_margin` is the gap the inter-agent hinge
-    aims for, in metres."""
+    and `max_step`, see _run_line_search, are only used there. `pair_margin`
+    is the gap the inter-agent hinge
+    aims for, in metres. `repulsive_kernel` is the barrier that a nonzero
+    `weights.repulsive` adds on top of, or with `weights.inter_agent` at 0
+    instead of, the hinge: a `RepulsiveKernel` for the same-time barrier, or
+    a `SpaceTimeKernel` for the space-time tangent-point energy.
+
+    `wall_constraint` makes `clearance_fn` a hard constraint instead of (or on top of) the
+    `weights.obstacle` hinge: projected descent with back-projection, see constrained_step_jax. It needs
+    `line_search=True`, a `clearance_fn` and a finite `max_step`. `sobolev_metric` then replaces that
+    step's diagonal metric by the Sobolev-Slobodeckij one, see sobolev_metric_jax."""
     fk_fns: Sequence[Callable[[jnp.ndarray], jnp.ndarray]]
     sphere_radii: Sequence[jnp.ndarray]
     speed_fn: Callable[[jnp.ndarray], jnp.ndarray]
@@ -370,6 +420,11 @@ class CollisionRefinementConfig(NamedTuple):
     max_backtracks: int = 8
     metric_scale: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     pair_margin: float = 0.0
+    repulsive_kernel: Optional[Union[RepulsiveKernel, SpaceTimeKernel]] = None
+    max_step: float = float("inf")
+    wall_constraint: Optional[WallConstraint] = None
+    sobolev_metric: Optional[SobolevMetric] = None
+    dynamics_sampling: str = "grid"
 
 
 def _cumsum_with_zero(deltas: np.ndarray, n: int) -> np.ndarray:
@@ -677,7 +732,8 @@ def _run_line_search(cost_fn, params_list: Sequence[SplineParams],
                      active_masks_list: Sequence[jnp.ndarray],
                      free_masks: Sequence[jnp.ndarray],
                      n_steps: int, initial_step: float, max_backtracks: int,
-                     metric_scale: Sequence[float], armijo: float = 1e-4):
+                     metric_scale: Sequence[float], armijo: float = 1e-4,
+                     max_step: float = float("inf")):
     """Masked descent with Armijo backtracking, a drop-in for `_run_scan`.
 
     Each of the `n_steps` iterations takes the masked gradient scaled by
@@ -685,7 +741,12 @@ def _run_line_search(cost_fn, params_list: Sequence[SplineParams],
     success doubles it for the next iteration. If `max_backtracks` halvings
     all fail, or the cost is NaN, the iteration leaves the params alone, so
     the total cost can only fall. Knot times go through `_project_knot_times`
-    before each trial, so what gets scored is what would be kept."""
+    before each trial, so what gets scored is what would be kept.
+
+    `max_step` bounds the largest single parameter change of a trial, before
+    backtracking. Armijo alone would accept any step that lowers the cost, and
+    a barrier's force in deep overlap is large enough to throw a knot metres
+    away in one step."""
     def value(p):
         return cost_fn(p, q0_samples_list, active_masks_list)[0]
 
@@ -709,6 +770,9 @@ def _run_line_search(cost_fn, params_list: Sequence[SplineParams],
         slope = sum(jnp.sum(g.times * d.times) + jnp.sum(g.wps * d.wps) + jnp.sum(g.vs * d.vs)
                     for g, d in zip(grads, direction))
 
+        largest = jnp.max(jnp.stack([jnp.max(jnp.abs(leaf)) for d in direction for leaf in d]))
+        first_alpha = jnp.minimum(alpha, max_step / jnp.maximum(largest, 1e-300))
+
         def enough(trial_alpha, trial_cost):
             return trial_cost <= total + armijo * trial_alpha * slope
 
@@ -722,12 +786,16 @@ def _run_line_search(cost_fn, params_list: Sequence[SplineParams],
             return trial_alpha, value(trial(params, direction, trial_alpha)), tries + 1
 
         final_alpha, final_cost, _ = jax.lax.while_loop(
-            keep_looking, backtrack, (alpha, value(trial(params, direction, alpha)), 0))
+            keep_looking, backtrack, (first_alpha, value(trial(params, direction, first_alpha)), 0))
         accepted = enough(final_alpha, final_cost)
         stepped = trial(params, direction, final_alpha)
         new_params = jax.tree_util.tree_map(lambda new, old: jnp.where(accepted, new, old),
                                             stepped, list(params))
-        return (new_params, jnp.where(accepted, 2.0 * final_alpha, final_alpha)), (total, bd)
+        # A step shortened only by the cap says nothing about the right step
+        # size, and carrying it over would collapse alpha for many iterations.
+        capped_only = accepted & (first_alpha < alpha) & (final_alpha == first_alpha)
+        next_alpha = jnp.where(capped_only, alpha, jnp.where(accepted, 2.0 * final_alpha, final_alpha))
+        return (new_params, next_alpha), (total, bd)
 
     (final_params, _alpha), (cost_history, bd_history) = jax.lax.scan(
         step, (list(params_list), jnp.asarray(initial_step, dtype=params_list[0].times.dtype)),
@@ -748,7 +816,12 @@ def _make_compiled_refiner(geometries: Sequence[AgentGeometry],
                             initial_step: float = 1e-3,
                             max_backtracks: int = 8,
                             metric_scale: Sequence[float] = (1.0, 1.0, 1.0),
-                            pair_margin: float = 0.0):
+                            pair_margin: float = 0.0,
+                            repulsive_kernel: Optional[Union[RepulsiveKernel, SpaceTimeKernel]] = None,
+                            max_step: float = float("inf"),
+                            wall_constraint: Optional[WallConstraint] = None,
+                            sobolev_metric: Optional[SobolevMetric] = None,
+                            dynamics_sampling: str = "grid"):
     """Builds and jits the WHOLE per-cycle refinement step exactly once:
     `run(params_list, active_masks_list, free_masks, t_max) -> (final_params,
     initial_bd, final_bd)`. `geometries`/`speed_fn`/`weights`/`n_steps`/
@@ -772,14 +845,22 @@ def _make_compiled_refiner(geometries: Sequence[AgentGeometry],
             t_grid = t_max * (t_grid / t_max) ** t_grid_power
         cost_fn = build_cost_fn(geometries, t_grid, speed_fn, weights,
                                 clearance_fn=clearance_fn, clearance_margin=clearance_margin,
-                                swept=swept, dynamics_fn=dynamics_fn, pair_margin=pair_margin)
+                                swept=swept, dynamics_fn=dynamics_fn, pair_margin=pair_margin,
+                                repulsive_kernel=repulsive_kernel, dynamics_sampling=dynamics_sampling)
         q0_samples_list = [sample_configs(g, p, t_grid, am)
                            for g, p, am in zip(geometries, params_list, active_masks_list)]
         _, initial_bd = cost_fn(params_list, q0_samples_list, active_masks_list)
-        if line_search:
+        if wall_constraint is not None:
+            final_params, _cost_history, _bd_history = _run_constrained(
+                cost_fn, geometries, clearance_fn, t_grid, params_list, q0_samples_list,
+                active_masks_list, free_masks, n_steps, initial_step, max_backtracks, metric_scale,
+                wall_constraint, max_step=max_step, project_times=_project_knot_times,
+                sobolev=sobolev_metric)
+        elif line_search:
             final_params, _cost_history, _bd_history = _run_line_search(
                 cost_fn, params_list, q0_samples_list, active_masks_list,
-                free_masks, n_steps, initial_step, max_backtracks, metric_scale)
+                free_masks, n_steps, initial_step, max_backtracks, metric_scale,
+                max_step=max_step)
         else:
             final_params, _cost_history, _bd_history = _run_scan(
                 cost_fn, params_list, q0_samples_list, active_masks_list,
@@ -822,6 +903,24 @@ class CollisionRefiner:
     `CollisionRefiner` instance's lifetime)."""
 
     def __init__(self, graph, config: CollisionRefinementConfig):
+        if config.weights.repulsive != 0.0:
+            if config.repulsive_kernel is None:
+                raise ValueError("weights.repulsive is set but repulsive_kernel is None")
+            if not config.line_search or not np.isfinite(config.max_step):
+                raise ValueError("the repulsive term needs line_search=True and a finite max_step: "
+                                 "its force in overlap can throw knots metres away in one step")
+            if isinstance(config.repulsive_kernel, SpaceTimeKernel):
+                _check_spacetime(config.repulsive_kernel)
+        if config.wall_constraint is not None:
+            if config.clearance_fn is None or not config.line_search or not np.isfinite(config.max_step):
+                raise ValueError("wall_constraint needs a clearance_fn, line_search=True and a finite max_step")
+            _check_wall(config.wall_constraint)
+        if config.dynamics_sampling not in DYNAMICS_SAMPLINGS:
+            raise ValueError(f"dynamics_sampling must be one of {DYNAMICS_SAMPLINGS}, got {config.dynamics_sampling!r}")
+        if config.sobolev_metric is not None:
+            if config.wall_constraint is None:
+                raise ValueError("sobolev_metric is used by the constrained step: set wall_constraint too")
+            _check_sobolev(config.sobolev_metric)
         self.graph = graph
         self.config = config
         self.geometries = [
@@ -834,7 +933,8 @@ class CollisionRefiner:
             config.n_steps, config.step_size, config.t_samples,
             config.clearance_fn, config.clearance_margin, config.swept, config.t_grid_power,
             config.dynamics_fn, config.line_search, config.initial_step, config.max_backtracks,
-            config.metric_scale, config.pair_margin)
+            config.metric_scale, config.pair_margin, config.repulsive_kernel, config.max_step,
+            config.wall_constraint, config.sobolev_metric, config.dynamics_sampling)
 
     def refine(self, timing_mpc, splines, x: np.ndarray, x_dot: np.ndarray) -> Optional[dict]:
         """Extracts every agent's current-cycle spline data (padded to
@@ -855,9 +955,10 @@ class CollisionRefiner:
 
         Returns a diagnostics dict for logging (`initial`/`final` cost
         breakdowns, each `{"inter_agent", "environment", "regularizer",
-        "obstacle", "dynamics"}`,
-        plus `accepted` and `end_time_overrun`, how far the latest end time
-        ran past the sampled grid), or None if the graph has fewer than 2
+        "obstacle", "dynamics", "repulsive"}`,
+        plus `accepted`, `moved`, whether any written agent changed at all,
+        and `end_time_overrun`, how far the latest end time ran past the
+        sampled grid), or None if the graph has fewer than 2
         agents total (nothing meaningful for inter-agent avoidance to ever
         do here)."""
         if self.graph.num_agents < 2:
@@ -889,9 +990,12 @@ class CollisionRefiner:
                 splines[e.agent_id].set(np.asarray(p.wps[:n]), np.asarray(p.vs[:n]), np.asarray(p.times[:n]))
 
         end_times = [float(p.times[e.n_real - 1]) for e, p in written]
+        moved = accepted and any(not np.array_equal(np.asarray(a), np.asarray(b))
+                                 for e, p in written for a, b in zip(e.params, p))
         return {"initial": {k: float(v) for k, v in initial_bd.items()},
                 "final": {k: float(v) for k, v in final_bd.items()},
                 "accepted": accepted,
+                "moved": moved,
                 "end_time_overrun": max(0.0, max(end_times, default=0.0) - t_max)}
 
 
