@@ -30,10 +30,19 @@ list `get_agent_paths` returns) onto that denser sequence, so
 unlike the old coarse/traced split, which only enforced them approximately
 (against the coarse per-edge time budget, not the refined per-segment one).
 
-`ntfields` is an optional dependency (the `ntfields` extra), imported only
-when some agent has a field.
+Every segment of a solve is known once the waypoints are, so all of them are
+planned before any is timed, each field's segments in one batch. The `mppi`
+planner runs on `fast_ntfields`' CUDA planner (`fast_ntfields.plan.mppi_batch`)
+when it is installed and supports the field (one loaded from a TD-NTFields
+checkpoint), and otherwise, with a warning, on `ntfields.plan.mppi` one
+segment at a time.
+
+`ntfields` and `fast_ntfields` are optional dependencies (the `ntfields` and
+`fast-ntfields` extras), imported only when some agent has a field.
 """
 
+import functools
+import warnings
 from collections.abc import Mapping, Sequence
 
 import numpy as np
@@ -167,6 +176,33 @@ def _interpolate_trailing(lead, start, goal):
     return np.concatenate([lead, trailing], axis=1)
 
 
+@functools.cache
+def _fast_ntfields_plan():
+    """`fast_ntfields.plan`, or None (with a warning) if fast_ntfields is not
+    installed."""
+    try:
+        from fast_ntfields import plan
+    except ImportError as e:
+        warnings.warn(f"fast_ntfields is not available ({e}); planning mppi segments with "
+                      "ntfields.plan.mppi, one at a time", stacklevel=3)
+        return None
+    return plan
+
+
+def _fast_mppi_batch(field):
+    """`fast_ntfields.plan.mppi_batch` if it can plan on `field`, else None
+    (with a warning)."""
+    plan = _fast_ntfields_plan()
+    if plan is None:
+        return None
+    if not plan.supports(field):
+        warnings.warn(f"fast_ntfields cannot plan on this {type(field).__name__} (not loaded from a TD-NTFields "
+                      "checkpoint); planning its mppi segments with ntfields.plan.mppi, one at a time",
+                      stacklevel=3)
+        return None
+    return plan.mppi_batch
+
+
 class TracedTimingMPC:
 
     def __init__(
@@ -175,7 +211,8 @@ class TracedTimingMPC:
             splines,
             # Per-agent `AgentField`, or None for a straight segment: each
             # segment is planned by an `ntfields` planner
-            # (`ntfields.plan.PLANNERS`).
+            # (`ntfields.plan.PLANNERS`; `mppi` on fast_ntfields when it is
+            # installed, see the module docstring).
             fields: Sequence[AgentField | None],
             time_cost: float = 1.0,
             time_cost2: float = 0.0,
@@ -251,27 +288,59 @@ class TracedTimingMPC:
         self._timing = GraphTimingMPC(graph, list(splines), *cost_args)
 
     def plan_segment(self, agent, start, goal):
-        """`start` -> `goal` (this agent's full rows) through its `AgentField`:
-        the leading columns planned in field coordinates by the `ntfields`
-        planner, mapped back, endpoints exact, trailing columns interpolated.
-        An agent whose entry is None gets the straight segment."""
-        start = np.asarray(start, dtype=float)
-        goal = np.asarray(goal, dtype=float)
-        spec = self.fields[agent]
-        if spec is None:
-            return np.stack([start, goal])
+        """`start` -> `goal` (this agent's full rows) through its `AgentField`
+        (see `plan_segments`)."""
+        return self.plan_segments([(agent, start, goal)])[0]
+
+    def plan_segments(self, segments):
+        """Each `(agent, start, goal)` of `segments` (the agent's full rows)
+        planned through that agent's `AgentField`: the leading columns in
+        field coordinates by the `ntfields` planner, mapped back, endpoints
+        exact, trailing columns interpolated. Segments on the same field are
+        planned together. An agent whose entry is None gets the straight
+        segment."""
+        segments = [(agent, np.asarray(start, dtype=float), np.asarray(goal, dtype=float))
+                    for agent, start, goal in segments]
+        traced = [None] * len(segments)
+        groups = {}
+        for k, (agent, start, goal) in enumerate(segments):
+            spec = self.fields[agent]
+            if spec is None:
+                traced[k] = np.stack([start, goal])
+                continue
+            planner = self.planner or getattr(getattr(spec.field, "method", None), "default_planner", "mppi")
+            groups.setdefault((id(spec.field), planner), []).append(k)
+        if not groups:
+            return traced
 
         import torch
         from ntfields.plan import PLANNERS
 
-        offset = np.asarray(spec.offset, dtype=float)
-        dim, scale = offset.shape[0], float(spec.scale)
-        device = spec.field.device
-        to_field = lambda q: torch.as_tensor((q[:dim] - offset) / scale, dtype=torch.float32, device=device)
-        planner = self.planner or getattr(getattr(spec.field, "method", None), "default_planner", "mppi")
-        result = PLANNERS[planner](spec.field, to_field(start), to_field(goal), **self.planner_kwargs)
+        for (_, planner), ks in groups.items():
+            specs = [self.fields[segments[k][0]] for k in ks]
+            field = specs[0].field
 
-        lead = result.path.detach().cpu().numpy().astype(float) * scale + offset
+            def to_field(spec, q):
+                offset = np.asarray(spec.offset, dtype=float)
+                return (q[:offset.shape[0]] - offset) / float(spec.scale)
+
+            starts = torch.as_tensor(np.stack([to_field(sp, segments[k][1]) for sp, k in zip(specs, ks)]),
+                                     dtype=torch.float32, device=field.device)
+            goals = torch.as_tensor(np.stack([to_field(sp, segments[k][2]) for sp, k in zip(specs, ks)]),
+                                    dtype=torch.float32, device=field.device)
+            fast = _fast_mppi_batch(field) if planner == "mppi" else None
+            if fast is not None:
+                results = fast(field, starts, goals, **self.planner_kwargs)
+            else:
+                results = [PLANNERS[planner](field, s, g, **self.planner_kwargs) for s, g in zip(starts, goals)]
+            for k, spec, result in zip(ks, specs, results):
+                traced[k] = self._map_back(spec, segments[k][1], segments[k][2], result)
+        return traced
+
+    def _map_back(self, spec, start, goal, result):
+        offset = np.asarray(spec.offset, dtype=float)
+        dim = offset.shape[0]
+        lead = result.path.detach().cpu().numpy().astype(float) * float(spec.scale) + offset
         lead[0] = start[:dim]
         if result.success:
             lead[-1] = goal[:dim]
@@ -280,37 +349,36 @@ class TracedTimingMPC:
             lead = np.concatenate([lead, goal[None, :dim]], axis=0)
         return _interpolate_trailing(lead, start, goal)
 
-    def _agent_dense_wps_and_ids(self, agent, x0_i, coarse_node_ids, coarse_wps_i):
-        """Traces every consecutive (position, position) pair on this
-        agent's coarse path -- starting at its current position `x0_i`,
-        through each real graph-node waypoint in order (resolved by
-        `graph.get_agent_paths`, positions looked up from `waypoints` --
-        see `solve` below) -- and concatenates the results into one dense
-        (K, dim) waypoint matrix plus a parallel length-K list of real
-        graph-node ids (-1 for a synthetic traced interior point). `x0_i`
-        itself is never included in the returned arrays, matching
-        build_dense_graph_timing_problem's wps_i convention (x0/v0 are
-        solve_dense()'s own separate boundary-condition arguments).
+    @staticmethod
+    def _agent_segments(x0_i, coarse_wps_i):
+        """The (start, goal) pairs along an agent's coarse path: its current
+        position `x0_i`, then each real graph-node waypoint in order."""
+        positions = [x0_i] + list(coarse_wps_i)
+        return [(positions[k], positions[k + 1]) for k in range(len(positions) - 1)]
+
+    def _agent_dense_wps_and_ids(self, agent, coarse_node_ids, segments, traced_segments):
+        """Concatenates an agent's traced segments (`segments`' (start, goal)
+        pairs, see `_agent_segments`, as planned by `plan_segments`) into one
+        dense (K, dim) waypoint matrix plus a parallel length-K list of real
+        graph-node ids (-1 for a synthetic traced interior point). The
+        agent's current position itself is never included in the returned
+        arrays, matching build_dense_graph_timing_problem's wps_i convention
+        (x0/v0 are solve_dense()'s own separate boundary-condition
+        arguments).
         """
         if len(coarse_node_ids) == 0:
             return np.zeros((0, self.graph.robot_ambient_dim(agent))), []
 
-        positions = [x0_i] + [coarse_wps_i[j] for j in range(len(coarse_node_ids))]
         node_ids = [None] + list(coarse_node_ids)
-
-        starts = [positions[k] for k in range(len(positions) - 1)]
-        goals = [positions[k + 1] for k in range(len(positions) - 1)]
-        traced_segments = [self.plan_segment(agent, s, g) for s, g in zip(starts, goals)]
-
         dense_positions = []
         dense_ids = []
-        for k in range(len(positions) - 1):
+        for k, (start, goal) in enumerate(segments):
             goal_node_id = node_ids[k + 1]
 
             traced = np.asarray(traced_segments[k])
             traced = _trim_trailing_duplicates(traced)
             if self.rdp_tolerance is not None:
-                chord = np.linalg.norm(np.asarray(goals[k]) - np.asarray(starts[k]))
+                chord = np.linalg.norm(np.asarray(goal) - np.asarray(start))
                 traced = _rdp(traced, self.rdp_tolerance * chord)
                 if (self.max_points_per_segment is not None
                         and len(traced) > self.max_points_per_segment):
@@ -346,8 +414,7 @@ class TracedTimingMPC:
         _parents, agent_nodes, agent_interactions = self.graph.get_agent_paths(
             remaining_vertices, var_assignments, t_by_node)
 
-        agent_dense_wps = []
-        agent_dense_node_ids = []
+        agent_segments = []
         agent_offsets = self.graph.agent_col_offsets
         for i in range(self.graph.num_agents):
             lo, hi = agent_offsets[i], agent_offsets[i + 1]
@@ -363,7 +430,16 @@ class TracedTimingMPC:
                     waypoints[node, lo:hi]
                     for node in node_ids_i
                 ])
-            dense_wps, dense_ids = self._agent_dense_wps_and_ids(i, x0_i, node_ids_i, wps_i)
+            agent_segments.append(self._agent_segments(x0_i, wps_i) if len(node_ids_i) else [])
+
+        traced = self.plan_segments([(i, start, goal)
+                                     for i, segments in enumerate(agent_segments)
+                                     for start, goal in segments])
+        agent_dense_wps = []
+        agent_dense_node_ids = []
+        for i, segments in enumerate(agent_segments):
+            traced_i, traced = traced[:len(segments)], traced[len(segments):]
+            dense_wps, dense_ids = self._agent_dense_wps_and_ids(i, agent_nodes[i], segments, traced_i)
             agent_dense_wps.append(dense_wps)
             agent_dense_node_ids.append(dense_ids)
 

@@ -141,8 +141,10 @@ class ZigzagTimingMPC(TracedTimingMPC):
         self.n_interior = n_interior
         self.bow = bow
 
-    def plan_segment(self, agent, start, goal):
-        del agent
+    def plan_segments(self, segments):
+        return [self._zigzag(start, goal) for _, start, goal in segments]
+
+    def _zigzag(self, start, goal):
         start, goal = np.asarray(start, dtype=float), np.asarray(goal, dtype=float)
         chord = goal - start
         length = np.linalg.norm(chord)

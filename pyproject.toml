@@ -23,6 +23,8 @@ dependencies = [
 [project.optional-dependencies]
 # TracedTimingMPC(fields=...): segments planned through ntfields Fields.
 ntfields = ["ntfields"]
+# The mppi planner on fast_ntfields' CUDA planner (TracedTimingMPC).
+fast-ntfields = ["fast-ntfields"]
 
 [build-system]
 requires = ["py-build-cmake~=0.4.3"]
