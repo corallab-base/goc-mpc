@@ -22,6 +22,7 @@ from .goc_mpc import (
     agent_link_names,
     agent_workspace_tracks,
 )
+from .fields import AgentField
 try:
     from .evolutionary_waypoint_solver import EvolutionaryWaypointSolver, build_graph_ordering_problem
 except ModuleNotFoundError:

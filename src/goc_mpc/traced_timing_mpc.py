@@ -34,12 +34,11 @@ unlike the old coarse/traced split, which only enforced them approximately
 when some agent has a field.
 """
 
-import dataclasses
 from collections.abc import Mapping, Sequence
-from typing import Any
 
 import numpy as np
 
+from .fields import AgentField
 from .goc_mpc import GraphOfConstraints, GraphTimingMPC
 
 
@@ -166,18 +165,6 @@ def _interpolate_trailing(lead, start, goal):
     alpha = cum / cum[-1] if cum[-1] > 0.0 else np.linspace(0.0, 1.0, len(lead))
     trailing = start[dim:] + alpha[:, None] * (goal[dim:] - start[dim:])
     return np.concatenate([lead, trailing], axis=1)
-
-
-@dataclasses.dataclass(frozen=True)
-class AgentField:
-    """An `ntfields` `Field` (e.g. a `TrainedField`) for one agent, and the map
-    from the agent's row into the field's coordinates:
-    `field_q = (q[:dim] - offset) / scale`, with `dim = len(offset)`. The
-    agent's trailing columns are interpolated along the planned path."""
-
-    field: Any
-    offset: Sequence[float]
-    scale: float = 1.0
 
 
 class TracedTimingMPC:

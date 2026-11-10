@@ -110,6 +110,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def_readonly("workspace_dim", &GraphOfConstraints::workspace_dim)
 		.def_readonly("_robot_specs", &GraphOfConstraints::_robot_specs)
 		.def_readonly("_object_specs", &GraphOfConstraints::_object_specs)
+		// The global state box every waypoint row lies in (total_dim each).
+		.def_readonly("_global_x_lb", &GraphOfConstraints::_global_x_lb)
+		.def_readonly("_global_x_ub", &GraphOfConstraints::_global_x_ub)
 		.def_readonly("structure", &GraphOfConstraints::structure)
 		.def_readonly("num_agents", &GraphOfConstraints::num_agents)
 		.def_readonly("num_objects", &GraphOfConstraints::num_objects)

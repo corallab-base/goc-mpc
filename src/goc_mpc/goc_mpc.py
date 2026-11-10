@@ -15,8 +15,8 @@ from ._ext.goc_mpc import (
     WaypointObjective,
     GraphWaypointMPC,
     MILPWaypointMPC,
-    GCSWaypointMPC,
-    SCIPWaypointMPC,
+    GCSWaypointMPC as _GCSWaypointMPC,
+    SCIPWaypointMPC as _SCIPWaypointMPC,
     LocalNLPSolver,
     ArcTravelTimeModel,
     SubtourElimination,
@@ -24,6 +24,38 @@ from ._ext.goc_mpc import (
     GraphShortPathMPC,
     ObstacleSet,
 )
+
+from .fields import field_solver_kwargs
+
+
+class GCSWaypointMPC(_GCSWaypointMPC):
+    """The C++ `GCSWaypointMPC`, also taking `fields=`: one `fields.AgentField`
+    (or None, for the L2 distance) per agent, whose travel times price each
+    agent's arcs under a travel-time objective (`kMinMaxTravelTime`, the
+    default with `fields=`, or `kAvgTravelTime`). Pass the other constructor
+    arguments by keyword when using `fields=`."""
+
+    def __init__(self, graph, splines, *args, fields=None, **kwargs):
+        if fields is not None:
+            if args:
+                raise TypeError("pass GCSWaypointMPC's other arguments by keyword with fields=")
+            kwargs = field_solver_kwargs(graph, fields, kwargs)
+        super().__init__(graph, splines, *args, **kwargs)
+        # The C++ solver holds the models; this keeps their Python halves alive.
+        self.travel_time_models = kwargs.get("travel_time_models")
+
+
+class SCIPWaypointMPC(_SCIPWaypointMPC):
+    """The C++ `SCIPWaypointMPC`, also taking `fields=` -- see
+    `GCSWaypointMPC`."""
+
+    def __init__(self, graph, splines, *args, fields=None, **kwargs):
+        if fields is not None:
+            if args:
+                raise TypeError("pass SCIPWaypointMPC's other arguments by keyword with fields=")
+            kwargs = field_solver_kwargs(graph, fields, kwargs)
+        super().__init__(graph, splines, *args, **kwargs)
+        self.travel_time_models = kwargs.get("travel_time_models")
 
 
 def _quat_block_slice(spec):
