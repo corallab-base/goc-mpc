@@ -29,6 +29,15 @@ namespace py = pybind11;
 // BuildProblemLayout (timing_gn_layout.hpp) do the actual residual/
 // Jacobian/Gauss-Newton-Hessian math.
 //
+// The warm start's taus are first projected onto the interaction rows. When
+// that succeeds and the graph has no velocity constraints at this cycle's
+// knots, the knot velocities are eliminated instead: for fixed taus the
+// objective is a strictly convex quadratic in them, so the solve minimizes
+// F(tau) = min_v f(tau, v) (same minimizers) by trust-region Newton over the
+// taus alone, on F's exact Hessian, with the interaction rows held exactly
+// (graph_timing_mpc.cpp's RunReducedNewton). The SQP described below runs
+// otherwise.
+//
 // This replaces an earlier Drake-MathematicalProgram/IPOPT(L-BFGS-only)
 // implementation under this same name, and a convex "stability_cost" proxy
 // cost that implementation leaned on to avoid IPOPT's non-convexity-

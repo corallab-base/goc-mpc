@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 
+#include <proxsuite/proxqp/dense/dense.hpp>
 #include <proxsuite/proxqp/sparse/sparse.hpp>
 
 #include "timing_gn_layout.hpp"
@@ -28,6 +30,16 @@ using Trip = Eigen::Triplet<double, long long>;
 // (sqrt(DBL_MAX)) as +/-infinity.
 const double kProxInf = proxsuite::helpers::infinite_bound<double>::value();
 double ProxBound(double v) { return std::clamp(v, -kProxInf, kProxInf); }
+
+// RunReducedNewton's per-tau relative trust region (|dtau_j| <= radius *
+// tau_j) and convergence test (every |dtau_j| / tau_j below
+// kRelativeStepTol), and the interaction violation up to which a start
+// counts as feasible for it.
+constexpr double kInitialRelativeRadius = 0.5;
+constexpr double kMaxRelativeRadius = 10.0;
+constexpr double kMinRelativeRadius = 1e-8;
+constexpr double kRelativeStepTol = 1e-7;
+constexpr double kFeasibilityTol = 1e-6;
 
 // Compressed sparsity-pattern signature (outer + inner index arrays) for the
 // update()-vs-init() decision in RunTrustRegionSqp.
@@ -188,6 +200,161 @@ double TotalInteractionViolation(const Eigen::VectorXd& x, const ProblemLayout& 
 	return violation;
 }
 
+// The interaction rows over the taus alone, in local tau indices: EQUAL rows
+// A tau = 0, LESS_THAN rows C tau <= u.
+struct TauConstraints {
+	std::vector<int> cols;   // local index -> global tau column
+	std::vector<int> local;  // global column -> local index (-1: not a tau)
+	Eigen::MatrixXd A, C;
+	Eigen::VectorXd u;
+};
+
+TauConstraints BuildTauConstraints(const ProblemLayout& layout) {
+	TauConstraints tc;
+	tc.local.assign(layout.n, -1);
+	for (const auto& al : layout.agents)
+		for (int j = 0; j < al.K; ++j) {
+			tc.local[al.tau_offset + j] = static_cast<int>(tc.cols.size());
+			tc.cols.push_back(al.tau_offset + j);
+		}
+	const int nt = static_cast<int>(tc.cols.size());
+	int n_eq = 0, n_lt = 0;
+	for (const auto& ir : layout.interactions)
+		(ir.type == AgentInteraction::Type::EQUAL ? n_eq : n_lt)++;
+	tc.A = Eigen::MatrixXd::Zero(n_eq, nt);
+	tc.C = Eigen::MatrixXd::Zero(n_lt, nt);
+	tc.u = Eigen::VectorXd::Zero(n_lt);
+	int r_eq = 0, r_lt = 0;
+	for (const auto& ir : layout.interactions) {
+		const bool eq = ir.type == AgentInteraction::Type::EQUAL;
+		auto row = eq ? tc.A.row(r_eq) : tc.C.row(r_lt);
+		for (int k = 0; k < ir.count_i; ++k) row(tc.local[ir.tau_offset_i + k]) += 1.0;
+		for (int k = 0; k < ir.count_j; ++k) row(tc.local[ir.tau_offset_j + k]) -= 1.0;
+		if (eq) {
+			++r_eq;
+		} else {
+			tc.u(r_lt++) = -ir.min_tau;
+		}
+	}
+	return tc;
+}
+
+// min 1/2 z'Hz + g'z  s.t.  A z = b_eq, C z <= u_lt, lo <= z <= hi, over the
+// taus (dense ProxQP); nullopt if it doesn't solve.
+std::optional<Eigen::VectorXd> SolveTauQp(const Eigen::MatrixXd& H, const Eigen::VectorXd& g,
+					  const TauConstraints& tc, const Eigen::VectorXd& b_eq,
+					  const Eigen::VectorXd& u_lt, const Eigen::VectorXd& lo,
+					  const Eigen::VectorXd& hi) {
+	const int nt = static_cast<int>(H.rows()), n_eq = static_cast<int>(tc.A.rows()),
+		  n_lt = static_cast<int>(tc.C.rows());
+	Eigen::MatrixXd C(n_lt + nt, nt);
+	C << tc.C, Eigen::MatrixXd::Identity(nt, nt);
+	Eigen::VectorXd l(n_lt + nt), u(n_lt + nt);
+	l << Eigen::VectorXd::Constant(n_lt, -kProxInf), lo;
+	u << u_lt, hi;
+	psp::dense::QP<double> qp(nt, n_eq, n_lt + nt);
+	qp.settings.eps_abs = 1e-10;
+	if (n_eq > 0) {
+		qp.init(H, g, tc.A, b_eq, C, l, u);
+	} else {
+		qp.init(H, g, proxsuite::nullopt, proxsuite::nullopt, C, l, u);
+	}
+	qp.solve();
+	if (qp.results.info.status != psp::QPSolverOutput::PROXQP_SOLVED) return std::nullopt;
+	return qp.results.x;
+}
+
+// Moves the taus of `x` to the nearest point (in relative change,
+// sum ((tau - tau0) / tau0)^2) satisfying every interaction row exactly and
+// the tau box, so the solve starts feasible. Leaves `x` unchanged if the rows
+// can't all hold.
+void ProjectTausOntoInteractions(const ProblemLayout& layout, Eigen::VectorXd* x) {
+	if (layout.interactions.empty()) return;
+	const TauConstraints tc = BuildTauConstraints(layout);
+	const int nt = static_cast<int>(tc.cols.size());
+	const Eigen::VectorXd tau0 = (*x)(tc.cols);
+	const Eigen::VectorXd w = tau0.cwiseInverse();
+	const std::optional<Eigen::VectorXd> tau = SolveTauQp(
+		w.cwiseProduct(w).asDiagonal(), -w, tc, Eigen::VectorXd::Zero(tc.A.rows()), tc.u,
+		Eigen::VectorXd::Constant(nt, kTauMin), Eigen::VectorXd::Constant(nt, kTauMax));
+	if (!tau) return;
+	Eigen::VectorXd projected = *x;
+	projected(tc.cols) = tau->cwiseMax(kTauMin).cwiseMin(kTauMax);
+	if (TotalInteractionViolation(projected, layout) < TotalInteractionViolation(*x, layout)) *x = projected;
+}
+
+// The objective (time_cost + time_cost2 + acceleration_cost * psi, as
+// AssembleObjective) with its exact gradient and dense Hessian. Per merged
+// block segment, with T the sum of its taus, s = v0 + v1, d = v1 - v0 and
+// D = disp - T s / 2, psi's term is 12 / T^3 |D|^2 + 1 / T |d|^2.
+void EvaluateExact(const ProblemLayout& layout, double acceleration_cost, double time_cost,
+		   double time_cost2, const Eigen::VectorXd& x, double* f, Eigen::VectorXd* grad,
+		   Eigen::MatrixXd* hess) {
+	*f = 0.0;
+	grad->setZero(layout.n);
+	hess->setZero(layout.n, layout.n);
+	for (const auto& al : layout.agents)
+		for (int j = 0; j < al.K; ++j) {
+			const int idx = al.tau_offset + j;
+			const double tau = x(idx);
+			*f += time_cost * tau + time_cost2 * tau * tau;
+			(*grad)(idx) += time_cost + 2.0 * time_cost2 * tau;
+			(*hess)(idx, idx) += 2.0 * time_cost2;
+		}
+	if (acceleration_cost <= 0.0) return;
+	const double w = acceleration_cost;
+	for (const auto& bs : layout.block_segments) {
+		const auto& off = bs.spline->block_offsets_[bs.block_idx];
+		if (off.type == CubicConfigurationSpline::Block::Type::SO3Mat)
+			throw std::runtime_error("GraphTimingMPC: SO3Mat blocks are not supported");
+		const int tN = off.tangent_size;
+		double T = 0.0;
+		for (int t : bs.tau_indices) T += x(t);
+		const Eigen::VectorXd v0 = bs.v0_idx >= 0 ? Eigen::VectorXd(x.segment(bs.v0_idx, tN)) : bs.v0_const;
+		const Eigen::VectorXd v1 = bs.v1_idx >= 0 ? Eigen::VectorXd(x.segment(bs.v1_idx, tN)) : bs.v1_const;
+		const Eigen::VectorXd s = v0 + v1, d = v1 - v0, D = bs.disp - 0.5 * T * s;
+		const double T2 = T * T, T3 = T2 * T, T4 = T3 * T, T5 = T4 * T;
+		const double DD = D.squaredNorm(), Ds = D.dot(s), ss = s.squaredNorm(), dd = d.squaredNorm();
+
+		*f += w * (12.0 / T3 * DD + dd / T);
+		const double c_T = w * (-36.0 / T4 * DD - 12.0 / T3 * Ds - dd / T2);
+		const double c_TT = w * (144.0 / T5 * DD + 72.0 / T4 * Ds + 6.0 / T3 * ss + 2.0 / T3 * dd);
+		const Eigen::VectorXd c_v0 = w * (-12.0 / T2 * D - 2.0 / T * d);
+		const Eigen::VectorXd c_v1 = w * (-12.0 / T2 * D + 2.0 / T * d);
+		const Eigen::VectorXd c_Tv0 = w * (24.0 / T3 * D + 6.0 / T2 * s + 2.0 / T2 * d);
+		const Eigen::VectorXd c_Tv1 = w * (24.0 / T3 * D + 6.0 / T2 * s - 2.0 / T2 * d);
+
+		for (int a : bs.tau_indices) {
+			(*grad)(a) += c_T;
+			for (int b : bs.tau_indices) (*hess)(a, b) += c_TT;
+		}
+		for (int k = 0; k < tN; ++k) {
+			const int i0 = bs.v0_idx >= 0 ? bs.v0_idx + k : -1;
+			const int i1 = bs.v1_idx >= 0 ? bs.v1_idx + k : -1;
+			if (i0 >= 0) {
+				(*grad)(i0) += c_v0(k);
+				(*hess)(i0, i0) += w * 8.0 / T;
+				for (int a : bs.tau_indices) {
+					(*hess)(a, i0) += c_Tv0(k);
+					(*hess)(i0, a) += c_Tv0(k);
+				}
+			}
+			if (i1 >= 0) {
+				(*grad)(i1) += c_v1(k);
+				(*hess)(i1, i1) += w * 8.0 / T;
+				for (int a : bs.tau_indices) {
+					(*hess)(a, i1) += c_Tv1(k);
+					(*hess)(i1, a) += c_Tv1(k);
+				}
+			}
+			if (i0 >= 0 && i1 >= 0) {
+				(*hess)(i0, i1) += w * 4.0 / T;
+				(*hess)(i1, i0) += w * 4.0 / T;
+			}
+		}
+	}
+}
+
 // Shared trust-region Gauss-Newton SQP loop, given an already-built
 // ProblemLayout -- solve()/solve_dense() differ only in how they build
 // `layout` (see BuildProblemLayout vs. BuildDenseProblemLayout) and what
@@ -203,6 +370,92 @@ struct SqpResult {
 	int iterations = 0;
 	double trust_radius = 0.0;
 };
+
+// Reduced (velocity-eliminated) solve, for a layout with no velocity
+// constraints whose start `x` satisfies every interaction row. For fixed taus
+// the objective is a strictly convex quadratic in the knot velocities, so
+// v*(tau) is one linear solve, and the solve minimizes
+// F(tau) = f(tau, v*(tau)) over the taus alone, subject to the interaction
+// rows (held exactly) and the tau box: trust-region Newton on F's exact
+// Hessian (the Schur complement f_tt - f_tv f_vv^-1 f_vt, shifted to be
+// positive definite where it isn't), each step bounded per tau relative to
+// that tau, |dtau_j| <= radius * tau_j. F's minimizers are exactly f's.
+SqpResult RunReducedNewton(const ProblemLayout& layout, double acceleration_cost, double time_cost,
+			   double time_cost2, int max_iterations, Eigen::VectorXd x) {
+	const TauConstraints tc = BuildTauConstraints(layout);
+	const int nt = static_cast<int>(tc.cols.size());
+	std::vector<int> v_cols;
+	for (int c = 0; c < layout.n; ++c)
+		if (tc.local[c] < 0) v_cols.push_back(c);
+
+	struct Reduced {
+		double F;
+		Eigen::VectorXd g;
+		Eigen::MatrixXd H;
+	};
+	// Sets x's velocities to v*(tau) and returns F, its gradient and Hessian.
+	auto reduce = [&](Eigen::VectorXd& xr) -> Reduced {
+		double f;
+		Eigen::VectorXd grad;
+		Eigen::MatrixXd hess;
+		EvaluateExact(layout, acceleration_cost, time_cost, time_cost2, xr, &f, &grad, &hess);
+		if (v_cols.empty()) return {f, grad(tc.cols), hess(tc.cols, tc.cols)};
+		const Eigen::LLT<Eigen::MatrixXd> llt(hess(v_cols, v_cols));
+		xr(v_cols) -= llt.solve(Eigen::VectorXd(grad(v_cols)));
+		EvaluateExact(layout, acceleration_cost, time_cost, time_cost2, xr, &f, &grad, &hess);
+		const Eigen::MatrixXd H_vt = hess(v_cols, tc.cols);
+		return {f, grad(tc.cols), hess(tc.cols, tc.cols) - H_vt.transpose() * llt.solve(H_vt)};
+	};
+
+	Reduced cur = reduce(x);
+	double radius = kInitialRelativeRadius;
+	int iter = 0;
+	for (; iter < max_iterations && nt > 0; ++iter) {
+		const Eigen::VectorXd tau = x(tc.cols);
+		Eigen::MatrixXd H = cur.H;
+		const Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(H, Eigen::EigenvaluesOnly);
+		const double floor = 1e-8 * std::max(1.0, eig.eigenvalues().cwiseAbs().maxCoeff());
+		if (eig.eigenvalues().minCoeff() < floor)
+			H.diagonal().array() += floor - eig.eigenvalues().minCoeff();
+
+		const Eigen::VectorXd lo = (Eigen::VectorXd::Constant(nt, kTauMin) - tau).cwiseMax(-radius * tau);
+		const Eigen::VectorXd hi = (Eigen::VectorXd::Constant(nt, kTauMax) - tau).cwiseMin(radius * tau);
+		const std::optional<Eigen::VectorXd> step =
+			SolveTauQp(H, cur.g, tc, -tc.A * tau, tc.u - tc.C * tau, lo, hi);
+		if (!step) {
+			radius *= 0.25;
+			if (radius < kMinRelativeRadius) break;
+			continue;
+		}
+		const Eigen::VectorXd& d = *step;
+		const double predicted = -(cur.g.dot(d) + 0.5 * d.dot(H * d));
+		if (d.cwiseQuotient(tau).cwiseAbs().maxCoeff() < kRelativeStepTol ||
+		    predicted <= 1e-12 * std::max(1.0, std::abs(cur.F))) {
+			++iter;
+			break;
+		}
+
+		Eigen::VectorXd trial = x;
+		trial(tc.cols) += d;
+		Reduced next = reduce(trial);
+		const double rho = (cur.F - next.F) / predicted;
+		const bool binding = (d.array().abs() > 0.9 * radius * tau.array()).any();
+		if (rho < 0.25) {
+			radius *= 0.25;
+		} else if (rho > 0.75 && binding) {
+			radius = std::min(2.0 * radius, kMaxRelativeRadius);
+		}
+		if (rho > 1e-8) {
+			x = std::move(trial);
+			cur = std::move(next);
+		}
+		if (radius < kMinRelativeRadius) {
+			++iter;
+			break;
+		}
+	}
+	return SqpResult{x, iter, radius};
+}
 
 SqpResult RunTrustRegionSqp(
 		const ProblemLayout& layout,
@@ -286,6 +539,10 @@ SqpResult RunTrustRegionSqp(
 	// The start inside the bounds (x_init already is, unless two velocity
 	// bounds on one column conflict)
 	Eigen::VectorXd x = layout.x_init.cwiseMax(var_lb).cwiseMin(var_ub);
+	ProjectTausOntoInteractions(layout, &x);
+	if (layout.velocity_bounds.empty() && layout.velocity_rows.empty() &&
+	    TotalInteractionViolation(x, layout) <= kFeasibilityTol)
+		return RunReducedNewton(layout, acceleration_cost, time_cost, time_cost2, max_iterations, x);
 	double f_current;
 	Eigen::VectorXd grad;
 	std::vector<Eigen::Triplet<double>> hess_triplets;
