@@ -42,9 +42,15 @@ class FieldTravelTimeModel(ArcTravelTimeModel):
     the agent's units (the field's time times `scale`), so the gradients with
     respect to the agent's coordinates are the field's own. `max_travel_time`
     is `headroom` times the largest time over `n_samples` random pairs in the
-    domain."""
+    domain.
 
-    def __init__(self, agent_field: AgentField, *, n_samples: int = 4096, headroom: float = 2.0, seed: int = 0):
+    Arcs reach the field in batches of exactly `batch_size` pairs (padded,
+    or split), so a field compiled per batch size (`ntfields`' "compile"
+    backend) compiles once, here at construction, not once per arc count
+    the solves happen to produce."""
+
+    def __init__(self, agent_field: AgentField, *, n_samples: int = 4096, headroom: float = 2.0, seed: int = 0,
+                 batch_size: int = 64):
         import torch
 
         field = agent_field.field
@@ -58,18 +64,30 @@ class FieldTravelTimeModel(ArcTravelTimeModel):
         t_max = float(field.travel_time(pairs[:, 0], pairs[:, 1]).max()) * scale
         super().__init__(bounds[:, 0].numpy() * scale + offset, bounds[:, 1].numpy() * scale + offset,
                          headroom * t_max)
-        self._field, self._offset, self._scale = field, offset, scale
+        self._field, self._offset, self._scale, self._batch_size = field, offset, scale, batch_size
+        mid = (self.lower + self.upper) / 2.0
+        self.linearize(mid[None], mid[None])
 
     def linearize(self, X, Y):
         import torch
 
+        X, Y = np.asarray(X, dtype=float), np.asarray(Y, dtype=float)
+        n, b = X.shape[0], self._batch_size
+        if n == 0:
+            return np.zeros(0), np.zeros((0, self.dim())), np.zeros((0, self.dim()))
+        n_pad = -(-n // b) * b
+        rows = np.minimum(np.arange(n_pad), n - 1)  # padding repeats the last pair
         device = self._field.device
-        to_field = lambda q: torch.as_tensor((np.asarray(q, dtype=float) - self._offset) / self._scale,
+        to_field = lambda q: torch.as_tensor((q[rows] - self._offset) / self._scale,
                                              dtype=torch.float32, device=device)
         q_s, q_g = to_field(X), to_field(Y)
-        t = self._field.travel_time(q_s, q_g)
-        g_s, g_g = self._field.gradient(q_s, q_g)
-        as_np = lambda a: a.detach().cpu().double().numpy()
+        t, g_s, g_g = [], [], []
+        for k in range(0, n_pad, b):
+            t.append(self._field.travel_time(q_s[k:k + b], q_g[k:k + b]))
+            gs, gg = self._field.gradient(q_s[k:k + b], q_g[k:k + b])
+            g_s.append(gs)
+            g_g.append(gg)
+        as_np = lambda parts: torch.cat(parts)[:n].detach().cpu().double().numpy()
         return as_np(t) * self._scale, as_np(g_s), as_np(g_g)
 
 
