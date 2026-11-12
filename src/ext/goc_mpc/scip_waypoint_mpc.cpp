@@ -249,8 +249,8 @@ void ToActive(SCIP* scip, std::vector<SCIP_VAR*> vars, std::vector<double> vals,
 // are only checked.
 //
 // The local solve is a LocalSolver (local_nlp_solver.hpp) from one start:
-// mip.nonlinear_seed (the agents' current configurations), everything else
-// 0.
+// mip.nonlinear_seed (the initialization oracle's guess, or the agents'
+// current configurations), everything else 0.
 class LocalNLPRelax : public scip::ObjRelax {
 public:
 	LocalNLPRelax(SCIP* scip, const ExternalMIP& mip, std::vector<SCIP_VAR*> x, SCIPSolveStats* stats,
@@ -594,7 +594,8 @@ SCIPWaypointMPC::SCIPWaypointMPC(GraphOfConstraints& graph,
 				 double feasibility_tol,
 				 bool verbose,
 				 bool keep_failed_local,
-				 LocalNLPSolver local_solver)
+				 LocalNLPSolver local_solver,
+				 std::shared_ptr<InitializationOracle> initialization_oracle)
 	: GCSWaypointMPC(graph, std::move(splines), WaypointSolver::kGurobi, enforce_rigidity, objective, subtour,
 			 length_weight, mip_gap, warm_start, std::move(travel_time_models), max_tangent_halfwidth),
 	  _time_limit(time_limit),
@@ -602,7 +603,9 @@ SCIPWaypointMPC::SCIPWaypointMPC(GraphOfConstraints& graph,
 	  _feasibility_tol(feasibility_tol),
 	  _verbose(verbose),
 	  _keep_failed_local(keep_failed_local),
-	  _local_solver(local_solver) {}
+	  _local_solver(local_solver) {
+	_initialization_oracle = std::move(initialization_oracle);
+}
 
 bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 			    const Eigen::VectorXd& x0) {

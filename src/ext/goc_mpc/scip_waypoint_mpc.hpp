@@ -49,7 +49,8 @@ struct SCIPSolveStats {
 // checks them, and each node's relaxation replaces SCIP's LP with its
 // presolved problem at the node -- integers relaxed, the nonlinear
 // constraints and cones kept -- solved locally (local_solver) from the
-// agents' current configurations and treated as globally optimal: its value prunes, its fractional
+// initialization_oracle's guess (without one, the agents' current
+// configurations) and treated as globally optimal: its value prunes, its fractional
 // integers are branched on, and an integral one is a solution. A local
 // solve that misses feasibility cuts off only a node whose integers are all
 // fixed; otherwise SCIP branches without a bound from it. Bounds and
@@ -95,7 +96,8 @@ struct SCIPWaypointMPC : public GCSWaypointMPC {
 			double feasibility_tol = 1e-5,
 			bool verbose = false,
 			bool keep_failed_local = false,
-			LocalNLPSolver local_solver = LocalNLPSolver::kPenalizedLM);
+			LocalNLPSolver local_solver = LocalNLPSolver::kPenalizedLM,
+			std::shared_ptr<InitializationOracle> initialization_oracle = nullptr);
 
 	bool Solve(const std::vector<int>& remaining_vertices,
 		   const Eigen::VectorXd& x0) override;

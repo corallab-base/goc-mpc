@@ -40,6 +40,27 @@ find_package(proxsuite REQUIRED)
 # SCIPWaypointMPC's (scip_waypoint_mpc.cpp) branch-and-bound solver.
 find_package(SCIP CONFIG REQUIRED)
 
+# VAMP (kavrakilab, header-only; ~/phd/software/vamp, the sibling checkout by
+# default, or $VAMP_ROOT) -- the initialization oracle's collision checks
+# (oracles/vamp_environment.cpp). Its own CMake fetches pdqsort, cddlib, nigh
+# and SIMDxorshift through CPM, cached in $CPM_SOURCE_CACHE (default
+# ~/.cache/CPM) so rebuilds don't refetch.
+if(DEFINED ENV{VAMP_ROOT})
+    set(VAMP_ROOT_DEFAULT "$ENV{VAMP_ROOT}")
+else()
+    set(VAMP_ROOT_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../vamp")
+endif()
+set(VAMP_ROOT "${VAMP_ROOT_DEFAULT}" CACHE PATH "VAMP source checkout")
+if(NOT EXISTS "${VAMP_ROOT}/CMakeLists.txt")
+    message(FATAL_ERROR "VAMP not found at ${VAMP_ROOT}; set VAMP_ROOT")
+endif()
+if(NOT DEFINED CPM_SOURCE_CACHE AND NOT DEFINED ENV{CPM_SOURCE_CACHE})
+    set(CPM_SOURCE_CACHE "$ENV{HOME}/.cache/CPM" CACHE PATH "CPM download cache")
+endif()
+set(VAMP_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
+set(VAMP_INSTALL_CPP_LIBRARY OFF CACHE BOOL "" FORCE)
+add_subdirectory("${VAMP_ROOT}" vamp EXCLUDE_FROM_ALL)
+
 #
 # _ext module stuff
 #
@@ -60,6 +81,10 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/milp_waypoint_mpc.cpp"
     "src/ext/goc_mpc/gcs_waypoint_mpc.cpp"
     "src/ext/goc_mpc/scip_waypoint_mpc.cpp"
+    "src/ext/goc_mpc/oracles/collision_checker.cpp"
+    "src/ext/goc_mpc/oracles/propagation_oracle.cpp"
+    "src/ext/goc_mpc/oracles/ur_analytic_ik.cpp"
+    "src/ext/goc_mpc/oracles/vamp_environment.cpp"
     "src/ext/goc_mpc/expression_tape.cpp"
     "src/ext/goc_mpc/local_nlp_solver.cpp"
     "src/ext/goc_mpc/graph_timing_mpc.cpp"
@@ -71,6 +96,13 @@ pybind11_add_module(_ext MODULE
 )
 target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann proxsuite::proxsuite ${SCIP_LIBRARIES})
 target_include_directories(_ext PRIVATE ${SCIP_INCLUDE_DIRS})
+# VAMP's headers, and its SIMD flags on the one file that includes them. The
+# rest of the module keeps the default ISA (matching the prebuilt Drake); 16-
+# byte Eigen alignment there keeps fixed-size Eigen types' layout the same.
+target_link_libraries(_ext PRIVATE vamp::vamp)
+set_source_files_properties("src/ext/goc_mpc/oracles/vamp_environment.cpp" PROPERTIES
+    COMPILE_OPTIONS "-march=native;-mavx2;-Wno-ignored-attributes"
+    COMPILE_DEFINITIONS "EIGEN_MAX_ALIGN_BYTES=16")
 # Find libscip at runtime without LD_LIBRARY_PATH (e.g. from other venvs).
 get_filename_component(SCIP_LIBRARY_DIR "${SCIP_DIR}/../.." ABSOLUTE)
 set_target_properties(_ext PROPERTIES BUILD_RPATH "${SCIP_LIBRARY_DIR}" INSTALL_RPATH "${SCIP_LIBRARY_DIR}")

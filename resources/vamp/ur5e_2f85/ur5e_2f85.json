@@ -1,0 +1,15 @@
+{
+    "name": "UR5e2F85",
+    "urdf": "ur5e_2f85_spherized.urdf",
+    "srdf": "ur5e_2f85.srdf",
+    "end_effector": "tcp",
+    "resolution": 32,
+    "template": "/home/tassos/phd/software/cricket/resources/templates/fk_template.hh",
+    "subtemplates": [
+        {
+            "name": "ccfk",
+            "template": "/home/tassos/phd/software/cricket/resources/templates/ccfk_template.hh"
+        }
+    ],
+    "output": "ur5e_2f85.hh"
+}

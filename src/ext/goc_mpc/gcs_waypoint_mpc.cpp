@@ -3,10 +3,12 @@
 #include "../utils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -374,8 +376,14 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	SubtourElimination subtour,
 	double length_weight,
 	const std::vector<std::shared_ptr<ArcTravelTimeModel>>& travel_time_models,
-	double max_tangent_halfwidth) {
+	double max_tangent_halfwidth,
+	const InitializationOracle* initialization_oracle,
+	const InitialGuess* previous_guess) {
 
+	const auto build_start = std::chrono::steady_clock::now();
+	auto seconds_since = [](std::chrono::steady_clock::time_point t0) {
+		return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+	};
 	const int num_agents = graph->num_agents;
 	const bool travel_time = objective == WaypointObjective::kMinMaxTravelTime ||
 				 objective == WaypointObjective::kAvgTravelTime;
@@ -487,6 +495,61 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	problem.P.resize(num_agents);
 	std::vector<std::vector<AffineRows>> vertex_rows(num_agents);
 	std::vector<std::vector<std::vector<NonlinearAtom>>> vertex_nonlinear(num_agents);
+	// The initialization oracle's guess: the starting point of every vertex
+	// copy, object position, assignment and route.
+	std::optional<InitialGuess> guess;
+	if (initialization_oracle != nullptr) {
+		InitializationRequest request;
+		request.graph = graph;
+		request.nodes = remaining_vertices;
+		request.x0 = x0;
+		request.previous_assignments = previous_var_assignments;
+		request.previous = previous_guess;
+		const auto call_start = std::chrono::steady_clock::now();
+		guess = initialization_oracle->Initialize(request);
+		problem.oracle_time = seconds_since(call_start);
+		if (guess->X.rows() != static_cast<int>(guess->nodes.size()) || guess->X.cols() != graph->total_dim)
+			throw std::runtime_error(fmt::format(
+				"GCSWaypointMPC: the initialization oracle's X is {}x{}, not (its nodes, {})", guess->X.rows(),
+				guess->X.cols(), graph->total_dim));
+	}
+	std::vector<int> guess_row(n_V, -1);
+	if (guess)
+		for (size_t r = 0; r < guess->nodes.size(); ++r)
+			if (subgraph.structure.contains_node(guess->nodes[r])) guess_row[subgraph.subgraph_id(guess->nodes[r])] = r;
+	// Whether the guess routes agent j through its vertex v.
+	auto guess_uses = [&](int j, int v) {
+		const auto holds = [&](int mode) {
+			const auto it = guess->assignments.find(row_var[mode]);
+			return it != guess->assignments.end() && it->second == j;
+		};
+		const int mode = problem.graphs[j].vertices[v].mode;
+		if (mode != GCSModeGraph::kNoRole) return holds(mode);
+		for (int u : vertices_at[j][problem.graphs[j].vertices[v].sg]) {
+			const int other = problem.graphs[j].vertices[u].mode;
+			if (other != GCSModeGraph::kNoRole && holds(other)) return false;
+		}
+		return true;
+	};
+	// Agent j's configuration seed at its vertex v: the guess's there, else x0.
+	auto vertex_seed = [&](int j, int v) {
+		const int d = graph->robot_ambient_dim(j), col = graph->agent_col_offset(j);
+		const int sg = problem.graphs[j].vertices[v].sg;
+		Eigen::VectorXd seed = x0.segment(col, d);
+		if (guess && guess_row[sg] >= 0) {
+			const Eigen::VectorXd q = guess->X.row(guess_row[sg]).segment(col, d).transpose();
+			if (q.allFinite()) seed = q;
+		}
+		return Eigen::VectorXd(seed.cwiseMax(graph->_global_x_lb.segment(col, d))
+					       .cwiseMin(graph->_global_x_ub.segment(col, d)));
+	};
+	// Object o's component c at sg: the guess's, else x0.
+	auto object_seed = [&](int o, int sg, int c) {
+		const int col = graph->object_col_offset(o) + c;
+		if (guess && guess_row[sg] >= 0 && std::isfinite(guess->X(guess_row[sg], col)))
+			return guess->X(guess_row[sg], col);
+		return x0(col);
+	};
 	// Boxes on the object variables and their per-vertex copies, for
 	// bounding atoms over them.
 	std::unordered_map<Variable::Id, Interval> copy_box;
@@ -648,7 +711,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 			auto seed_objects = [&] {
 				for (int o : objects)
 					for (int c = 0; c < graph->object_ambient_dim(o); ++c)
-						problem.nonlinear_seed.emplace_back(problem.O[o](sg, c), x0(graph->object_col_offset(o) + c));
+						problem.nonlinear_seed.emplace_back(problem.O[o](sg, c), object_seed(o, sg, c));
 			};
 			// One pass over the raw formula: FK placeholders expanded and the
 			// objects replaced (the FK expressions hold no object placeholders).
@@ -730,7 +793,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 								const Expression diff = problem.O[o](sg, c) - Oc(c);
 								prog.AddLinearConstraint(diff - M(c) * unused, -kInf, 0.0);
 								prog.AddLinearConstraint(-diff - M(c) * unused, -kInf, 0.0);
-								const double x0_c = x0(graph->object_col_offset(o) + c);
+								const double x0_c = object_seed(o, sg, c);
 								problem.nonlinear_seed.emplace_back(Oc(c), x0_c);
 								problem.nonlinear_seed.emplace_back(problem.O[o](sg, c), x0_c);
 							}
@@ -874,15 +937,18 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 			const auto it = graph->robot_symbolic_fk.find({j, "ee"});
 			return it == graph->robot_symbolic_fk.end() ? nullptr : &it->second;
 		};
-		// fk_ee at agent j's current position, x0.
-		auto ee_at_x0 = [&](int j) {
+		// fk_ee at agent j's configuration q.
+		auto ee_at = [&](int j, const Eigen::VectorXd& q) {
 			const auto& ph = graph->_agent_q.Vars(j);
 			drake::symbolic::Environment env;
-			for (int c = 0; c < ph.size(); ++c) env.insert(ph(c), x0(graph->agent_col_offset(j) + c));
+			for (int c = 0; c < ph.size(); ++c) env.insert(ph(c), q(c));
 			Eigen::VectorXd p = Eigen::VectorXd::Zero(wd);
 			const auto& pos = ee_fk(j)->position;
 			for (int c = 0; c < std::min<int>(pos.size(), wd); ++c) p(c) = pos(c).Evaluate(env);
 			return p;
+		};
+		auto ee_at_x0 = [&](int j) {
+			return ee_at(j, x0.segment(graph->agent_col_offset(j), graph->robot_ambient_dim(j)));
 		};
 		// Agent j's end effector at its vertex v, scaled by the vertex's
 		// weight (0 when unused), as P[j][v] is.
@@ -903,7 +969,8 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 				prog.NewContinuousVariables(wd, fmt::format("EE_{}_{}_{}", j, vx.sg, vx.mode));
 			const VectorXDecisionVariable E =
 				prog.NewContinuousVariables(wd, fmt::format("EEw_{}_{}_{}", j, vx.sg, vx.mode));
-			const Eigen::VectorXd e_x0 = ee_at_x0(j);
+			const Eigen::VectorXd e_seed = ee_at(j, vertex_seed(j, v));
+			const bool e_used = !guess || guess_uses(j, v);
 			const Expression w = weight(j, v);
 			for (int c = 0; c < wd; ++c) {
 				const Expression fk_c = c < fk->position.size() ? fk->position(c) : Expression::Zero();
@@ -913,7 +980,8 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 						"GCSWaypointMPC: agent {}'s \"ee\" FK is unbounded over its state box", j));
 				prog.AddBoundingBoxConstraint(range.lo, range.hi, e(c));
 				copy_box[e(c).get_id()] = range;
-				problem.nonlinear_seed.emplace_back(e(c), e_x0(c));
+				problem.nonlinear_seed.emplace_back(e(c), e_seed(c));
+				if (guess) problem.nonlinear_seed.emplace_back(E(c), e_used ? e_seed(c) : 0.0);
 				vertex_nonlinear[j][v].push_back({Expression(e(c)) - fk_c, 0.0, 0.0, ph});
 				const double M = std::max(std::abs(range.lo), std::abs(range.hi));
 				prog.AddLinearConstraint(Expression(E(c)) - M * w, -kInf, 0.0);
@@ -1048,8 +1116,8 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 			const VectorXDecisionVariable Q =
 				prog.NewContinuousVariables(d, fmt::format("Q_{}_{}_{}", j, vx.sg, vx.mode));
 			prog.AddBoundingBoxConstraint(lb, ub, Q);
-			for (int c = 0; c < d; ++c)
-				problem.nonlinear_seed.emplace_back(Q(c), x0(graph->agent_col_offset(j) + c));
+			const Eigen::VectorXd seed = vertex_seed(j, v);
+			for (int c = 0; c < d; ++c) problem.nonlinear_seed.emplace_back(Q(c), seed(c));
 			AddPerspectiveRows(prog, vertex_rows[j][v], Q.cast<Expression>(), Expression(1.0));
 			const Expression unused = 1.0 - weight(j, v);
 			for (int c = 0; c < d; ++c) {
@@ -1344,6 +1412,66 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 		AddStationaryObjectConstraints(prog, *graph, subgraph, obj_state, x0, t_var, M_time);
 	}
 
+	// The guess as the local solves' start (and, when it holds, the MIP
+	// start), and its infeasible assignment sets as cuts: at most |S| - 1 of
+	// each set S's pairs.
+	if (guess) {
+		problem.initial_guess = guess;
+		auto start = [&](const Variable& var, double value) {
+			problem.nonlinear_seed.emplace_back(var, value);
+			if (guess->success) prog.SetInitialGuess(var, value);
+		};
+		for (int row = 0; row < subgraph.num_variables(); ++row) {
+			const auto it = guess->assignments.find(row_var[row]);
+			if (it == guess->assignments.end()) continue;
+			for (int k = 0; k < num_agents; ++k) start(Assignments(row, k), k == it->second ? 1.0 : 0.0);
+		}
+		for (int o = 0; o < num_objects; ++o)
+			for (int sg = 0; sg < n_V; ++sg)
+				for (int c = 0; c < graph->object_ambient_dim(o); ++c)
+					problem.nonlinear_seed.emplace_back(problem.O[o](sg, c), object_seed(o, sg, c));
+		for (int j = 0; j < num_agents; ++j) {
+			const GCSModeGraph& g = problem.graphs[j];
+			std::vector<int> chain = {GCSModeGraph::kDepot};
+			for (size_t v = 0; v < g.vertices.size(); ++v) {
+				const bool used = guess_uses(j, v);
+				const Eigen::VectorXd seed = vertex_seed(j, v);
+				for (int c = 0; c < seed.size(); ++c) problem.nonlinear_seed.emplace_back(problem.P[j][v](c), used ? seed(c) : 0.0);
+			}
+			if (j < static_cast<int>(guess->routes.size())) {
+				for (int u : guess->routes[j]) {
+					if (!subgraph.structure.contains_node(u)) continue;
+					const int sg = subgraph.subgraph_id(u);
+					for (int v : vertices_at[j][sg])
+						if (guess_uses(j, v)) { chain.push_back(v); break; }
+				}
+			}
+			chain.push_back(GCSModeGraph::kSink);
+			std::map<std::pair<int, int>, int> arc_of;
+			for (size_t a = 0; a < g.arcs.size(); ++a) arc_of[g.arcs[a]] = a;
+			Eigen::VectorXd z = Eigen::VectorXd::Zero(g.arcs.size());
+			bool complete = true;
+			for (size_t k = 0; k + 1 < chain.size() && complete; ++k) {
+				const auto it = arc_of.find({chain[k], chain[k + 1]});
+				if (it == arc_of.end()) complete = false;
+				else z(it->second) = 1.0;
+			}
+			if (complete)
+				for (int a = 0; a < z.size(); ++a) start(problem.Z[j](a), z(a));
+		}
+		for (const auto& pairs : guess->infeasible_assignments) {
+			Expression sum = Expression::Zero();
+			bool in_horizon = true;
+			for (const auto& [var, agent] : pairs) {
+				const int row = subgraph.subgraph_variable_id(var);
+				if (row < 0) { in_horizon = false; break; }
+				sum += Expression(Assignments(row, agent));
+			}
+			if (in_horizon && !pairs.empty())
+				prog.AddLinearConstraint(sum, -kInf, static_cast<double>(pairs.size()) - 1.0);
+		}
+	}
+
 	///////////////////////////////////////////////////////////////////////
 	//                              Objective                            //
 	///////////////////////////////////////////////////////////////////////
@@ -1363,6 +1491,7 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	}
 
 	problem.prog = std::move(prog_ptr);
+	problem.build_time = seconds_since(build_start);
 	return problem;
 }
 
@@ -1430,7 +1559,8 @@ GCSWaypointProblem GCSWaypointMPC::BuildProblem(const std::vector<int>& remainin
 						const Eigen::VectorXd& x0) const {
 	GCSWaypointProblem problem = BuildGCSWaypointProblem(
 		_graph, _splines, remaining_vertices, x0, _waypoints, _var_assignments,
-		_enforce_rigidity, _objective, _subtour, _length_weight, _travel_time_models, _max_tangent_halfwidth);
+		_enforce_rigidity, _objective, _subtour, _length_weight, _travel_time_models, _max_tangent_halfwidth,
+		_initialization_oracle.get(), _initial_guess ? &*_initial_guess : nullptr);
 	if (_warm_start) SetWarmStart(problem, remaining_vertices);
 	return problem;
 }
@@ -1440,6 +1570,9 @@ const ExternalMIP& GCSWaypointMPC::BeginExternalSolve(const std::vector<int>& re
 	BeginSolve(remaining_vertices, x0);
 	auto pending = std::make_unique<PendingExternalSolve>();
 	pending->problem = BuildProblem(remaining_vertices, x0);
+	if (pending->problem.initial_guess) _initial_guess = pending->problem.initial_guess;
+	_build_time = pending->problem.build_time;
+	_oracle_time = pending->problem.oracle_time;
 	pending->remaining_vertices = remaining_vertices;
 	pending->x0 = x0;
 	const MathematicalProgram& prog = *pending->problem.prog;
@@ -1601,6 +1734,9 @@ bool GCSWaypointMPC::SolveWith(const drake::solvers::SolverInterface& solver,
 			       const Eigen::VectorXd& x0) {
 
 	GCSWaypointProblem problem = BuildProblem(remaining_vertices, x0);
+	if (problem.initial_guess) _initial_guess = problem.initial_guess;
+	_build_time = problem.build_time;
+	_oracle_time = problem.oracle_time;
 	if (!problem.prog->generic_constraints().empty())
 		throw std::runtime_error(
 			"GCSWaypointMPC: the graph has nonlinear node constraints, which Gurobi/Mosek can't "

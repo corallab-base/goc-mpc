@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -12,6 +13,7 @@
 #include "arc_travel_time.hpp"
 #include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
+#include "oracles/initialization_oracle.hpp"
 #include "waypoint_common.hpp"
 #include "../configuration_spline.hpp"
 
@@ -33,6 +35,7 @@ struct GCSModeGraph {
 	std::vector<std::pair<int, int>> arcs;
 };
 
+
 struct GCSWaypointProblem {
 	std::unique_ptr<drake::solvers::MathematicalProgram> prog;
 	std::unique_ptr<SubgraphOfConstraints> subgraph;
@@ -47,10 +50,15 @@ struct GCSWaypointProblem {
 	std::vector<std::vector<drake::solvers::VectorXDecisionVariable>> P;
 	// Per object o: (subgraph nodes x object width) positions.
 	std::vector<drake::solvers::MatrixXDecisionVariable> O;
-	// Starting points for moving onto the nonlinear constraints: each
-	// unscaled vertex copy's agent's, and each nonlinearly constrained
-	// object's, current position (x0).
+	// Starting points for the local solves: with an initialization oracle,
+	// its guess for every assignment, arc, vertex copy and object position;
+	// otherwise each unscaled vertex copy's agent's current position (x0)
+	// and each nonlinearly constrained object's. Later entries win.
 	std::vector<std::pair<drake::symbolic::Variable, double>> nonlinear_seed;
+	// The initialization oracle's guess, when there is an oracle.
+	std::optional<InitialGuess> initial_guess;
+	// Seconds spent building the problem, and inside the oracle.
+	double build_time = 0.0, oracle_time = 0.0;
 
 	GCSWaypointProblem() = default;
 	GCSWaypointProblem(const GCSWaypointProblem&) = delete;
@@ -105,7 +113,9 @@ GCSWaypointProblem BuildGCSWaypointProblem(
 	SubtourElimination subtour,
 	double length_weight = 0.0,
 	const std::vector<std::shared_ptr<ArcTravelTimeModel>>& travel_time_models = {},
-	double max_tangent_halfwidth = std::numeric_limits<double>::infinity());
+	double max_tangent_halfwidth = std::numeric_limits<double>::infinity(),
+	const InitializationOracle* initialization_oracle = nullptr,
+	const InitialGuess* previous_guess = nullptr);
 
 // Waypoint solver for the same problem as MILPWaypointMPC, sharing everything
 // that doesn't depend on the encoding (waypoint_common.*), but encoding
@@ -146,6 +156,12 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 	// Per agent (travel-time objectives only).
 	std::vector<std::shared_ptr<ArcTravelTimeModel>> _travel_time_models;
 	double _max_tangent_halfwidth;
+	// Called once per problem build (null: none) with the previous build's
+	// guess as its warm start. Its guess seeds every local solve, is the MIP
+	// start when it holds, and its infeasible assignment sets become cuts.
+	std::shared_ptr<InitializationOracle> _initialization_oracle;
+	std::optional<InitialGuess> _initial_guess;
+	double _build_time = 0.0, _oracle_time = 0.0;
 	// Per agent: (graph node id, global variable id or kNoRole) of each
 	// vertex on the previous solve's route, in order.
 	std::vector<std::vector<std::pair<int, int>>> _prev_route_modes;
@@ -167,6 +183,11 @@ struct GCSWaypointMPC : public GraphWaypointMPC {
 
 	const Eigen::VectorXd& view_t() const { return _t_routing; }
 	const std::vector<std::vector<int>>& view_routes() const { return _routes; }
+	// The last initialization oracle guess (null before any), and the last
+	// problem build's build / oracle seconds.
+	const InitialGuess* view_initial_guess() const { return _initial_guess ? &*_initial_guess : nullptr; }
+	double view_build_time() const { return _build_time; }
+	double view_oracle_time() const { return _oracle_time; }
 
 protected:
 	// Solve() split in two for a solver outside Drake: BeginExternalSolve

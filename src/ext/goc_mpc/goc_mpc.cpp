@@ -4,12 +4,17 @@
 #include <pybind11/stl.h>
 
 #include <drake/bindings/pydrake/symbolic_types_pybind.h>
+#include <fmt/format.h>
 
 #include "graph_of_constraints.hpp"
 #include "graph_waypoint_mpc.hpp"
 #include "milp_waypoint_mpc.hpp"
 #include "gcs_waypoint_mpc.hpp"
 #include "scip_waypoint_mpc.hpp"
+#include "oracles/initialization_oracle.hpp"
+#include "oracles/propagation_oracle.hpp"
+#include "oracles/ur_analytic_ik.hpp"
+#include "oracles/vamp_environment.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
 
@@ -25,6 +30,41 @@ public:
 		PYBIND11_OVERRIDE_PURE_NAME(Result, ArcTravelTimeModel, "linearize", Linearize, X, Y);
 	}
 };
+
+class PyIkSolver : public IkSolver {
+public:
+	using IkSolver::IkSolver;
+	std::vector<Eigen::VectorXd> Solve(const IkRequest& request) const override {
+		PYBIND11_OVERRIDE_PURE_NAME(std::vector<Eigen::VectorXd>, IkSolver, "solve", Solve, request);
+	}
+	bool complete() const override { PYBIND11_OVERRIDE(bool, IkSolver, complete); }
+};
+
+class PyCollisionChecker : public CollisionChecker {
+public:
+	using CollisionChecker::CollisionChecker;
+	std::vector<CollisionResult> CheckBatch(const GraphOfConstraints& graph, int agent,
+						const std::vector<Eigen::VectorXd>& configurations,
+						const CollisionScene& scene) const override {
+		PYBIND11_OVERRIDE_PURE_NAME(std::vector<CollisionResult>, CollisionChecker, "check_batch", CheckBatch,
+					    graph, agent, configurations, scene);
+	}
+};
+
+class PyInitializationOracle : public InitializationOracle {
+public:
+	using InitializationOracle::InitializationOracle;
+	InitialGuess Initialize(const InitializationRequest& request) const override {
+		PYBIND11_OVERRIDE_PURE_NAME(InitialGuess, InitializationOracle, "initialize", Initialize, request);
+	}
+};
+
+Eigen::Isometry3d IsometryFrom(const Eigen::Matrix4d& T) {
+	Eigen::Isometry3d out = Eigen::Isometry3d::Identity();
+	out.linear() = T.topLeftCorner<3, 3>();
+	out.translation() = T.topRightCorner<3, 1>();
+	return out;
+}
 
 /*
  * PYBIND11 MODULE
@@ -529,6 +569,163 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("dim", &ArcTravelTimeModel::dim)
 		.def("linearize", &ArcTravelTimeModel::Linearize, py::arg("X"), py::arg("Y"));
 
+        // Initialization oracles (oracles/): a starting point for a whole
+        // waypoint solve, and the IK solvers they use.
+        py::class_<IkRequest>(goc_mpc, "IkRequest")
+                .def(py::init<>())
+                .def_readwrite("agent", &IkRequest::agent)
+                .def_readwrite("link", &IkRequest::link)
+                // As a 4x4 homogeneous matrix.
+                .def_property("world_T_link",
+                              [](const IkRequest& r) { return Eigen::Matrix4d(r.world_T_link.matrix()); },
+                              [](IkRequest& r, const Eigen::Matrix4d& T) { r.world_T_link = IsometryFrom(T); })
+                .def_readwrite("reference", &IkRequest::reference)
+                .def_readwrite("lower", &IkRequest::lower)
+                .def_readwrite("upper", &IkRequest::upper);
+        py::class_<IkSolver, PyIkSolver, std::shared_ptr<IkSolver>>(goc_mpc, "IkSolver")
+                .def(py::init<>())
+                .def("solve", &IkSolver::Solve, py::arg("request"))
+                .def("complete", &IkSolver::complete);
+        py::class_<CandidateSet>(goc_mpc, "CandidateSet")
+                .def(py::init<>())
+                .def_readwrite("node", &CandidateSet::node)
+                .def_readwrite("agent", &CandidateSet::agent)
+                .def_readwrite("link", &CandidateSet::link)
+                .def_property("world_T_link",
+                              [](const CandidateSet& c) { return Eigen::Matrix4d(c.world_T_link.matrix()); },
+                              [](CandidateSet& c, const Eigen::Matrix4d& T) { c.world_T_link = IsometryFrom(T); })
+                .def_readwrite("assignments", &CandidateSet::assignments)
+                .def_readwrite("ik_solutions", &CandidateSet::ik_solutions)
+                .def_readwrite("configurations", &CandidateSet::configurations)
+                .def_readwrite("rejected", &CandidateSet::rejected)
+                .def_readwrite("chosen", &CandidateSet::chosen)
+                .def("__repr__", [](const CandidateSet& c) {
+                        return fmt::format("<CandidateSet node {} agent {} {}: {} of {} IK solutions collision-free, chosen {}>",
+                                           c.node, c.agent, c.link, c.configurations.size(), c.ik_solutions, c.chosen);
+                });
+        py::class_<AssignmentGuess>(goc_mpc, "AssignmentGuess")
+                .def(py::init<>())
+                .def_readwrite("assignments", &AssignmentGuess::assignments)
+                .def_readwrite("X", &AssignmentGuess::X)
+                .def_readwrite("routes", &AssignmentGuess::routes);
+        py::class_<InitialGuess>(goc_mpc, "InitialGuess")
+                .def(py::init<>())
+                .def_readwrite("success", &InitialGuess::success)
+                .def_readwrite("nodes", &InitialGuess::nodes)
+                .def_readwrite("X", &InitialGuess::X)
+                .def_readwrite("assignments", &InitialGuess::assignments)
+                .def_readwrite("routes", &InitialGuess::routes)
+                .def_readwrite("infeasible_assignments", &InitialGuess::infeasible_assignments)
+                .def_readwrite("candidates", &InitialGuess::candidates)
+                .def_readwrite("feasible", &InitialGuess::feasible)
+                .def_readwrite("log", &InitialGuess::log)
+                .def_readwrite("violations", &InitialGuess::violations)
+                .def_readwrite("unresolved", &InitialGuess::unresolved)
+                .def_readwrite("assignments_tried", &InitialGuess::assignments_tried)
+                .def_readwrite("time", &InitialGuess::time);
+        py::class_<InitializationRequest>(goc_mpc, "InitializationRequest")
+                .def_property_readonly("graph", [](const InitializationRequest& r) { return r.graph; },
+                                       py::return_value_policy::reference)
+                .def_readonly("nodes", &InitializationRequest::nodes)
+                .def_readonly("x0", &InitializationRequest::x0)
+                .def_readonly("previous_assignments", &InitializationRequest::previous_assignments)
+                .def_property_readonly("previous", [](const InitializationRequest& r) { return r.previous; },
+                                       py::return_value_policy::reference);
+        py::class_<InitializationOracle, PyInitializationOracle, std::shared_ptr<InitializationOracle>>(
+                goc_mpc, "InitializationOracle")
+                .def(py::init<>())
+                .def("initialize", &InitializationOracle::Initialize, py::arg("request"))
+                // One guess outside a solve: `previous_assignments` per global
+                // assignable variable id (-1: none), `previous` a warm start.
+                .def("initialize_graph",
+                     [](const InitializationOracle& self, const GraphOfConstraints& graph, std::vector<int> nodes,
+                        Eigen::VectorXd x0, Eigen::VectorXi previous_assignments, const InitialGuess* previous) {
+                             InitializationRequest request;
+                             request.graph = &graph;
+                             request.nodes = std::move(nodes);
+                             request.x0 = std::move(x0);
+                             request.previous_assignments = std::move(previous_assignments);
+                             request.previous = previous;
+                             return self.Initialize(request);
+                     },
+                     py::arg("graph"), py::arg("nodes"), py::arg("x0"),
+                     py::arg("previous_assignments") = Eigen::VectorXi(), py::arg("previous") = nullptr);
+        py::class_<CollisionScene>(goc_mpc, "CollisionScene")
+                .def(py::init<>())
+                .def_readwrite("node", &CollisionScene::node)
+                .def_readwrite("others", &CollisionScene::others);
+        py::class_<CollisionResult>(goc_mpc, "CollisionResult")
+                .def(py::init<>())
+                .def(py::init([](bool free, std::string hit) { return CollisionResult{free, std::move(hit)}; }),
+                     py::arg("free"), py::arg("hit") = "")
+                .def_readwrite("free", &CollisionResult::free)
+                .def_readwrite("hit", &CollisionResult::hit);
+        py::class_<CollisionChecker, PyCollisionChecker, std::shared_ptr<CollisionChecker>>(goc_mpc, "CollisionChecker")
+                .def(py::init<>())
+                .def("check_batch", &CollisionChecker::CheckBatch, py::arg("graph"), py::arg("agent"),
+                     py::arg("configurations"), py::arg("scene"));
+        py::class_<VampCollisionChecker, CollisionChecker, std::shared_ptr<VampCollisionChecker>>(
+                goc_mpc, "VampCollisionChecker")
+                // robots: agent -> compiled VAMP robot (robot_names()).
+                .def(py::init<const ObstacleSet&, double, std::map<int, std::string>>(), py::arg("obstacles"),
+                     py::arg("inflation") = 0.0, py::arg("robots") = std::map<int, std::string>{})
+                .def_property_readonly("inflation", &VampCollisionChecker::inflation)
+                .def_property_readonly("robots", &VampCollisionChecker::robots)
+                .def_static("robot_names", &VampRobot::Names);
+        py::class_<PropagationOracle, InitializationOracle, std::shared_ptr<PropagationOracle>>(
+                goc_mpc, "PropagationOracle")
+                // ik_solvers per agent id; threads > 1 needs C++ IK solvers and checker.
+                .def(py::init<std::map<int, std::shared_ptr<IkSolver>>, std::shared_ptr<CollisionChecker>, int, int,
+                              int, int, double>(),
+                     py::arg("ik_solvers"), py::arg("collision_checker") = nullptr, py::arg("max_assignments") = 64,
+                     py::arg("samples") = 64, py::arg("propagations") = 1024, py::arg("threads") = 1,
+                     py::arg("tolerance") = 1e-6, py::keep_alive<1, 2>(), py::keep_alive<1, 3>())
+                .def_property_readonly("ik_solvers", &PropagationOracle::ik_solvers)
+                .def_property_readonly("collision_checker", &PropagationOracle::collision_checker)
+                .def_property_readonly("max_assignments", &PropagationOracle::max_assignments)
+                .def_property_readonly("samples", &PropagationOracle::samples)
+                .def_property_readonly("propagations", &PropagationOracle::propagations)
+                .def_property_readonly("threads", &PropagationOracle::threads);
+        py::class_<UrDhParameters>(goc_mpc, "UrDhParameters")
+                .def(py::init([](double d1, double a2, double a3, double d4, double d5, double d6) {
+                        return UrDhParameters{d1, a2, a3, d4, d5, d6};
+                     }),
+                     py::arg("d1"), py::arg("a2"), py::arg("a3"), py::arg("d4"), py::arg("d5"), py::arg("d6"))
+                .def_readwrite("d1", &UrDhParameters::d1)
+                .def_readwrite("a2", &UrDhParameters::a2)
+                .def_readwrite("a3", &UrDhParameters::a3)
+                .def_readwrite("d4", &UrDhParameters::d4)
+                .def_readwrite("d5", &UrDhParameters::d5)
+                .def_readwrite("d6", &UrDhParameters::d6);
+        py::class_<UrArm>(goc_mpc, "UrArm")
+                // world_T_base / flange_T_link as 4x4 homogeneous matrices.
+                .def(py::init([](const UrDhParameters& dh, const Eigen::Matrix4d& world_T_base,
+                                 const Eigen::Matrix4d& flange_T_link, const std::string& link,
+                                 const Eigen::VectorXd& lower, const Eigen::VectorXd& upper) {
+                        return UrArm{dh, IsometryFrom(world_T_base), IsometryFrom(flange_T_link), link, lower, upper};
+                     }),
+                     py::arg("dh"), py::arg("world_T_base"), py::arg("flange_T_link"), py::arg("link"),
+                     py::arg("lower"), py::arg("upper"))
+                .def_readonly("dh", &UrArm::dh)
+                .def_readonly("link", &UrArm::link)
+                .def_readonly("lower", &UrArm::lower)
+                .def_readonly("upper", &UrArm::upper);
+        py::class_<UrAnalyticIK, IkSolver, std::shared_ptr<UrAnalyticIK>>(goc_mpc, "UrAnalyticIK")
+                // Per agent id.
+                .def(py::init<std::map<int, UrArm>>(), py::arg("arms"))
+                .def("solve",
+                     [](const UrAnalyticIK& self, int agent, const Eigen::Matrix4d& world_T_link,
+                        const Eigen::VectorXd& reference) {
+                             return self.Solve(agent, IsometryFrom(world_T_link), reference);
+                     },
+                     py::arg("agent"), py::arg("world_T_link"), py::arg("reference"))
+                .def("solve", py::overload_cast<const IkRequest&>(&UrAnalyticIK::Solve, py::const_), py::arg("request"))
+                .def("forward_kinematics",
+                     [](const UrAnalyticIK& self, int agent, const Eigen::VectorXd& q) {
+                             return Eigen::Matrix4d(self.ForwardKinematics(agent, q).matrix());
+                     },
+                     py::arg("agent"), py::arg("q"));
+
         py::class_<GCSWaypointMPC, GraphWaypointMPC, std::shared_ptr<GCSWaypointMPC>>(goc_mpc, "GCSWaypointMPC")
                 .def(py::init<GraphOfConstraints&,
 			      std::vector<CubicConfigurationSpline>,
@@ -557,7 +754,14 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("max_tangent_halfwidth") = std::numeric_limits<double>::infinity())
 		.def("view_t", &GCSWaypointMPC::view_t, py::return_value_policy::reference_internal)
 		// Per agent: graph node ids visited, in order.
-		.def("view_routes", &GCSWaypointMPC::view_routes);
+		.def("view_routes", &GCSWaypointMPC::view_routes)
+		// Seeds the local solves' vertex copies that carry FK pins (None: x0).
+		.def_readwrite("initialization_oracle", &GCSWaypointMPC::_initialization_oracle)
+		// The last initialization oracle guess (None before any), and the
+		// last problem build's build / oracle seconds.
+		.def("view_initial_guess", &GCSWaypointMPC::view_initial_guess, py::return_value_policy::reference_internal)
+		.def("view_build_time", &GCSWaypointMPC::view_build_time)
+		.def("view_oracle_time", &GCSWaypointMPC::view_oracle_time);
 
         py::enum_<LocalNLPSolver>(goc_mpc, "LocalNLPSolver")
                 .value("kPenalizedLM", LocalNLPSolver::kPenalizedLM)
@@ -607,7 +811,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 			      double,
 			      bool,
 			      bool,
-			      LocalNLPSolver>(),
+			      LocalNLPSolver,
+			      std::shared_ptr<InitializationOracle>>(),
 		     py::keep_alive<1, 2>(),
 		     // Keeps the list (and so any Python-subclassed models in it) alive.
 		     py::keep_alive<1, 10>(),
@@ -629,7 +834,9 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("verbose")           = false,
 		     // No solution: store the last failed local NLP iterate anyway (solve still returns False).
 		     py::arg("keep_failed_local") = false,
-		     py::arg("local_solver")      = LocalNLPSolver::kPenalizedLM)
+		     py::arg("local_solver")      = LocalNLPSolver::kPenalizedLM,
+		     // Seeds each vertex copy carrying FK pins (None: the agents' x0).
+		     py::arg("initialization_oracle") = std::shared_ptr<InitializationOracle>{})
 		.def("view_stats", &SCIPWaypointMPC::view_stats, py::return_value_policy::reference_internal);
 
         py::class_<GraphTimingMPC>(goc_mpc, "GraphTimingMPC")

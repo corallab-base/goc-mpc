@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -304,6 +305,14 @@ public:
 			}
 		}
 		return out;
+	}
+
+	// (key, component) of `v` if it is one of this family's placeholders.
+	std::optional<std::pair<Key, int>> Find(const drake::symbolic::Variable& v) const {
+		for (const auto& [key, vars] : vars_)
+			for (int j = 0; j < vars.size(); ++j)
+				if (vars[j].equal_to(v)) return std::make_pair(key, j);
+		return std::nullopt;
 	}
 
 	// Populates sub[Vars(i)[j]] = row_value(i, j) for i in [0, n), j in

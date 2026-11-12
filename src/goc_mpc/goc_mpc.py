@@ -18,6 +18,21 @@ from ._ext.goc_mpc import (
     GCSWaypointMPC as _GCSWaypointMPC,
     SCIPWaypointMPC as _SCIPWaypointMPC,
     LocalNLPSolver,
+    InitializationOracle,
+    InitializationRequest,
+    AssignmentGuess,
+    CandidateSet,
+    InitialGuess,
+    PropagationOracle,
+    CollisionChecker,
+    CollisionScene,
+    CollisionResult,
+    VampCollisionChecker,
+    IkRequest,
+    IkSolver,
+    UrDhParameters,
+    UrArm,
+    UrAnalyticIK,
     ArcTravelTimeModel,
     SubtourElimination,
     GraphTimingMPC,
@@ -56,6 +71,8 @@ class SCIPWaypointMPC(_SCIPWaypointMPC):
             kwargs = field_solver_kwargs(graph, fields, kwargs)
         super().__init__(graph, splines, *args, **kwargs)
         self.travel_time_models = kwargs.get("travel_time_models")
+        # Likewise for a Python-subclassed InitializationOracle.
+        self._initialization_oracle_ref = kwargs.get("initialization_oracle")
 
 
 def _quat_block_slice(spec):
