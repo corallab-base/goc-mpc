@@ -41,7 +41,7 @@ include = ["CMakeLists.txt", "cmake", "src/ext"]
 minimum_version = "3.17"
 build_type = "RelWithDebInfo"
 source_path = "."
-build_args = ["-j"]
+build_args = ["-j8"]
 install_components = ["python_modules"]
 options = { CMAKE_CXX_COMPILER = "g++-11", CMAKE_C_COMPILER = "gcc-11" }
 
