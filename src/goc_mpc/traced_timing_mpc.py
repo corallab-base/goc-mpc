@@ -286,6 +286,36 @@ class TracedTimingMPC:
         # fill_cubic_splines(splines, x0, v0), delegated straight to
         # self._timing below.
         self._timing = GraphTimingMPC(graph, list(splines), *cost_args)
+        self._build_fast_planners()
+
+    def _build_fast_planners(self):
+        """Builds, before any solve, every fast_ntfields MPPI planner a solve
+        can use: fast_ntfields keeps one per power-of-two batch size, so one
+        per power of two up to every segment the field's agents can have (one
+        per graph node each), each built by planning that many segments from
+        the field's center to itself."""
+        import torch
+
+        agents_per_field = {}
+        for spec in self.fields:
+            if spec is None:
+                continue
+            planner = self.planner or getattr(getattr(spec.field, "method", None), "default_planner", "mppi")
+            if planner == "mppi":
+                agents_per_field.setdefault(id(spec.field), [spec.field, 0])[1] += 1
+        for field, n_agents in agents_per_field.values():
+            fast = _fast_mppi_batch(field)
+            if fast is None:
+                continue
+            bounds = field.problem.env.bounds.detach().to(device=field.device, dtype=torch.float32)
+            center = bounds.mean(dim=1)
+            n_max = max(1, n_agents * self.graph.structure.num_nodes)
+            n = 1
+            while True:
+                fast(field, center.expand(n, -1), center.expand(n, -1), **self.planner_kwargs)
+                if n >= n_max:
+                    break
+                n *= 2
 
     def plan_segment(self, agent, start, goal):
         """`start` -> `goal` (this agent's full rows) through its `AgentField`
