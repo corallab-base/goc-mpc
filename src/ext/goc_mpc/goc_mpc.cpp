@@ -765,10 +765,12 @@ void init_submodule_goc_mpc(py::module_& m) {
 
         py::enum_<LocalNLPSolver>(goc_mpc, "LocalNLPSolver")
                 .value("kPenalizedLM", LocalNLPSolver::kPenalizedLM)
-                .value("kProxQPLM", LocalNLPSolver::kProxQPLM);
+                .value("kProxQPLM", LocalNLPSolver::kProxQPLM)
+                .value("kSl1LP", LocalNLPSolver::kSl1LP);
 
         py::class_<LocalSolveRecord>(goc_mpc, "LocalSolveRecord")
                 .def_readonly("success", &LocalSolveRecord::success)
+                .def_readonly("stalled", &LocalSolveRecord::stalled)
                 .def_readonly("vars", &LocalSolveRecord::vars)
                 .def_readonly("rows", &LocalSolveRecord::rows)
                 .def_readonly("outer", &LocalSolveRecord::outer)
@@ -793,7 +795,25 @@ void init_submodule_goc_mpc(py::module_& m) {
                 .def_readonly("local_failures", &SCIPSolveStats::local_failures)
                 .def_readonly("local_solve_time", &SCIPSolveStats::local_solve_time)
                 .def_readonly("last_local_failure", &SCIPSolveStats::last_local_failure)
-                .def_readonly("local_log", &SCIPSolveStats::local_log);
+                .def_readonly("fallback", &SCIPSolveStats::fallback)
+                .def_readonly("fallback_violation", &SCIPSolveStats::fallback_violation)
+                .def_readonly("local_log", &SCIPSolveStats::local_log)
+                .def_readonly("node_log", &SCIPSolveStats::node_log)
+                .def_readonly("feasible_leaves", &SCIPSolveStats::feasible_leaves)
+                .def_readonly("infeasible_leaves", &SCIPSolveStats::infeasible_leaves)
+                .def_readonly("objlim_leaves", &SCIPSolveStats::objlim_leaves);
+
+        py::class_<SCIPNodeRecord>(goc_mpc, "SCIPNodeRecord")
+                .def_readonly("number", &SCIPNodeRecord::number)
+                .def_readonly("parent", &SCIPNodeRecord::parent)
+                .def_readonly("depth", &SCIPNodeRecord::depth)
+                .def_readonly("focus_time", &SCIPNodeRecord::focus_time)
+                .def_readonly("branchings", &SCIPNodeRecord::branchings)
+                .def_readonly("assignments", &SCIPNodeRecord::assignments)
+                .def_readonly("local_solves", &SCIPNodeRecord::local_solves)
+                .def_readonly("relaxation", &SCIPNodeRecord::relaxation)
+                .def_readonly("lower_bound", &SCIPNodeRecord::lower_bound)
+                .def_readonly("events", &SCIPNodeRecord::events);
 
         py::class_<SCIPWaypointMPC, GCSWaypointMPC, std::shared_ptr<SCIPWaypointMPC>>(goc_mpc, "SCIPWaypointMPC")
                 .def(py::init<GraphOfConstraints&,
@@ -832,8 +852,8 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("params")            = std::map<std::string, SCIPWaypointMPC::ParamValue>{},
 		     py::arg("feasibility_tol")   = 1e-5,
 		     py::arg("verbose")           = false,
-		     // No solution: store the last failed local NLP iterate anyway (solve still returns False).
-		     py::arg("keep_failed_local") = false,
+		     // No feasible solution: return the least-violated failed leaf local solve (see stats().fallback).
+		     py::arg("fallback_to_least_violated") = true,
 		     py::arg("local_solver")      = LocalNLPSolver::kPenalizedLM,
 		     // Seeds each vertex copy carrying FK pins (None: the agents' x0).
 		     py::arg("initialization_oracle") = std::shared_ptr<InitializationOracle>{})

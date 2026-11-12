@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -13,6 +14,7 @@
 #include <Eigen/Dense>
 #include <fmt/format.h>
 
+#include <objscip/objeventhdlr.h>
 #include <objscip/objrelax.h>
 #include <scip/cons_linear.h>
 #include <scip/cons_nonlinear.h>
@@ -234,6 +236,81 @@ void ToActive(SCIP* scip, std::vector<SCIP_VAR*> vars, std::vector<double> vals,
 	for (int k = 0; k < nvars; ++k) terms->emplace_back(col_of.at(vars[k]), vals[k]);
 }
 
+// A transformed variable's name in the exported program (SCIP's original
+// variables are x<i>, mip.vars(i)).
+std::string ExportedName(const ExternalMIP& mip, SCIP_VAR* var) {
+	std::string name = SCIPvarGetName(var);
+	if (name.rfind("t_", 0) == 0) name = name.substr(2);
+	if (name.size() > 1 && name[0] == 'x') {
+		try {
+			const int i = std::stoi(name.substr(1));
+			if (i >= 0 && i < mip.vars.size()) return mip.vars(i).get_name();
+		} catch (const std::exception&) {
+		}
+	}
+	return name;
+}
+
+// Records every branch-and-bound node from SCIP's node events.
+class NodeTrace : public scip::ObjEventhdlr {
+public:
+	static constexpr SCIP_EVENTTYPE kEvents = SCIP_EVENTTYPE_NODEEVENT | SCIP_EVENTTYPE_NODEDELETE;
+
+	NodeTrace(SCIP* scip, std::function<std::string(SCIP_VAR*)> name)
+		: ObjEventhdlr(scip, "goc_nodetrace", "records branch-and-bound nodes"), _name(std::move(name)) {}
+
+	SCIP_DECL_EVENTINIT(scip_init) override {
+		return SCIPcatchEvent(scip, kEvents, eventhdlr, nullptr, nullptr);
+	}
+	SCIP_DECL_EVENTEXIT(scip_exit) override {
+		return SCIPdropEvent(scip, kEvents, eventhdlr, nullptr, -1);
+	}
+	SCIP_DECL_EVENTEXEC(scip_exec) override {
+		SCIP_NODE* node = SCIPeventGetNode(event);
+		if (node == nullptr) return SCIP_OKAY;
+		SCIPNodeRecord& rec = Record(node);
+		const SCIP_EVENTTYPE type = SCIPeventGetType(event);
+		if (type & SCIP_EVENTTYPE_NODEFOCUSED) {
+			rec.events.push_back("focused");
+			rec.focus_time = SCIPgetSolvingTime(scip);
+		}
+		if (type & SCIP_EVENTTYPE_NODEFEASIBLE) rec.events.push_back("feasible");
+		if (type & SCIP_EVENTTYPE_NODEINFEASIBLE) rec.events.push_back("infeasible");
+		if (type & SCIP_EVENTTYPE_NODEBRANCHED) rec.events.push_back("branched");
+		if (type & SCIP_EVENTTYPE_NODEDELETE) rec.events.push_back("deleted");
+		return SCIP_OKAY;
+	}
+
+	SCIPNodeRecord& Record(SCIP_NODE* node) {
+		const long long number = SCIPnodeGetNumber(node);
+		auto [it, added] = nodes.try_emplace(number);
+		if (added) {
+			order.push_back(number);
+			it->second.number = number;
+			SCIP_NODE* parent = SCIPnodeGetParent(node);
+			it->second.parent = parent ? SCIPnodeGetNumber(parent) : -1;
+			it->second.depth = SCIPnodeGetDepth(node);
+			int count = 0;
+			SCIPnodeGetParentBranchings(node, nullptr, nullptr, nullptr, &count, 0);
+			std::vector<SCIP_VAR*> vars(count);
+			std::vector<double> bounds(count);
+			std::vector<SCIP_BOUNDTYPE> types(count);
+			if (count > 0)
+				SCIPnodeGetParentBranchings(node, vars.data(), bounds.data(), types.data(), &count, count);
+			for (int k = 0; k < count; ++k)
+				it->second.branchings.push_back(fmt::format(
+					"{} {} {}", _name(vars[k]), types[k] == SCIP_BOUNDTYPE_LOWER ? ">=" : "<=", bounds[k]));
+		}
+		return it->second;
+	}
+
+	std::map<long long, SCIPNodeRecord> nodes;
+	std::vector<long long> order;
+
+private:
+	std::function<std::string(SCIP_VAR*)> _name;
+};
+
 // Each node's relaxation, in place of SCIP's LP (lp/solvefreq = -1): SCIP's
 // presolved problem at the node -- its active variables within the node's
 // bounds and its linear constraints -- plus the nonlinear rows and cones,
@@ -300,8 +377,12 @@ public:
 
 	// The first exception a callback raised (SCIP's C callbacks can't carry it).
 	std::string error;
-	// The last failed solve's final point over x; empty before one.
-	Eigen::VectorXd failed;
+	// The least-violated failed leaf solve: its final point over x (empty
+	// before one), its violation (the nonlinear rows' and cones' max) and
+	// objective. Candidates are leaves whose linear rows hold, compared by
+	// violation, then objective.
+	Eigen::VectorXd fallback;
+	double fallback_violation = kInf, fallback_objective = kInf;
 
 	SCIP_DECL_RELAXINITSOL(scip_initsol) override {
 		_tx.resize(_x.size());
@@ -530,12 +611,13 @@ private:
 		SparseRows J = nlp.J;
 		Evaluate(model, y, &g, &J);
 		const Eigen::VectorXd ay = nlp.A * y + nlp.a0;
-		bool feasible = g.allFinite() && ay.allFinite();
+		bool linear_ok = g.allFinite() && ay.allFinite();
+		for (int r = 0; linear_ok && r < m_lin; ++r)
+			if (!SCIPisFeasGE(scip, ay(r), nlp.l_lin(r)) || !SCIPisFeasLE(scip, ay(r), nlp.u_lin(r)))
+				linear_ok = false;
+		bool feasible = linear_ok;
 		for (int r = 0; feasible && r < m; ++r)
 			if (!SCIPisFeasGE(scip, g(r), nlp.l(r)) || !SCIPisFeasLE(scip, g(r), nlp.u(r))) feasible = false;
-		for (int r = 0; feasible && r < m_lin; ++r)
-			if (!SCIPisFeasGE(scip, ay(r), nlp.l_lin(r)) || !SCIPisFeasLE(scip, ay(r), nlp.u_lin(r)))
-				feasible = false;
 
 		++_stats->local_solves;
 		if (!feasible) {
@@ -543,10 +625,6 @@ private:
 			const double viol = (nlp.l - g).cwiseMax(g - nlp.u).cwiseMax(0.0).lpNorm<Eigen::Infinity>();
 			const double lin_viol =
 				(nlp.l_lin - ay).cwiseMax(ay - nlp.u_lin).cwiseMax(0.0).lpNorm<Eigen::Infinity>();
-			_stats->last_local_failure =
-				fmt::format("max violation {} on the nonlinear rows and cones, {} on the linear rows, after "
-					    "{} outer iterations", viol, lin_viol, record.outer);
-			failed = model.T * y + model.t;
 			// No proof of infeasibility: with integers still free, branch
 			// (no bound from this node); only a leaf is cut off.
 			*result = SCIP_CUTOFF;
@@ -555,6 +633,18 @@ private:
 					*result = SCIP_DIDNOTRUN;
 					break;
 				}
+			// A leaf still cut off for SCIP, kept outside it as a fallback.
+			const double objective = c.dot(y);
+			if (*result == SCIP_CUTOFF && linear_ok && std::isfinite(viol) &&
+			    (viol < fallback_violation || (viol == fallback_violation && objective < fallback_objective))) {
+				fallback = model.T * y + model.t;
+				fallback_violation = viol;
+				fallback_objective = objective;
+			}
+			_stats->last_local_failure =
+				fmt::format("max violation {} on the nonlinear rows and cones, {} on the linear rows, after "
+					    "{} outer iterations{}", viol, lin_viol, record.outer,
+					    *result == SCIP_CUTOFF ? " (leaf)" : " (integers free)");
 		} else {
 			*lowerbound = c.dot(y) + SCIPgetTransObjoffset(scip);
 			SCIP_CALL(SCIPsetRelaxSolVals(scip, relax, n, const_cast<SCIP_VAR**>(vars.data()), y.data(), TRUE));
@@ -565,11 +655,31 @@ private:
 		record.total_time = since(tic);
 		_stats->local_solve_time += record.total_time;
 		_stats->local_log.push_back(record);
+		if (trace != nullptr) {
+			SCIPNodeRecord& node = trace->Record(SCIPgetCurrentNode(scip));
+			node.local_solves.push_back(static_cast<int>(_stats->local_log.size()) - 1);
+			node.relaxation = feasible ? "feasible"
+					  : *result == SCIP_CUTOFF ? "infeasible: cut off (leaf)"
+								    : "infeasible: branched (integers free)";
+			if (feasible) node.lower_bound = *lowerbound;
+			node.assignments.clear();
+			const Eigen::VectorXd x_final = model.T * y + model.t;
+			for (int i = 0; i < _mip.vars.size(); ++i) {
+				const std::string name = _mip.vars(i).get_name();
+				if (name.rfind("Assignments", 0) == 0)
+					node.assignments.push_back(fmt::format("{} = {:.3f}", name, x_final(i)));
+			}
+		}
 		return SCIP_OKAY;
 	}
 
 	static constexpr double kInf = std::numeric_limits<double>::infinity();
 
+public:
+	// Where each local solve is filed under its node (null: not traced).
+	NodeTrace* trace = nullptr;
+
+private:
 	const ExternalMIP& _mip;
 	std::vector<SCIP_VAR*> _x, _tx;
 	SCIPSolveStats* _stats;
@@ -593,7 +703,7 @@ SCIPWaypointMPC::SCIPWaypointMPC(GraphOfConstraints& graph,
 				 std::map<std::string, ParamValue> params,
 				 double feasibility_tol,
 				 bool verbose,
-				 bool keep_failed_local,
+				 bool fallback_to_least_violated,
 				 LocalNLPSolver local_solver,
 				 std::shared_ptr<InitializationOracle> initialization_oracle)
 	: GCSWaypointMPC(graph, std::move(splines), WaypointSolver::kGurobi, enforce_rigidity, objective, subtour,
@@ -602,7 +712,7 @@ SCIPWaypointMPC::SCIPWaypointMPC(GraphOfConstraints& graph,
 	  _params(std::move(params)),
 	  _feasibility_tol(feasibility_tol),
 	  _verbose(verbose),
-	  _keep_failed_local(keep_failed_local),
+	  _fallback_to_least_violated(fallback_to_least_violated),
 	  _local_solver(local_solver) {
 	_initialization_oracle = std::move(initialization_oracle);
 }
@@ -660,20 +770,19 @@ bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 		SCIP_CHECK(SCIPcreateConsBasicSOCNonlinear(scip, &soc, fmt::format("cone{}", k).c_str(),
 							   static_cast<int>(z.size()) - 1, z.data() + 1, nullptr, nullptr,
 							   0.0, z[0], 1.0, 0.0));
-		if (!mip.nonlinear.empty()) {
-			// The local NLP relaxation holds the cones; SCIP only checks them.
-			SCIP_CHECK(SCIPsetConsSeparated(scip, soc, FALSE));
-			SCIP_CHECK(SCIPsetConsEnforced(scip, soc, FALSE));
-			SCIP_CHECK(SCIPsetConsPropagated(scip, soc, FALSE));
-		}
+		// The local NLP relaxation holds the cones; SCIP only checks them.
+		SCIP_CHECK(SCIPsetConsSeparated(scip, soc, FALSE));
+		SCIP_CHECK(SCIPsetConsEnforced(scip, soc, FALSE));
+		SCIP_CHECK(SCIPsetConsPropagated(scip, soc, FALSE));
 		SCIP_CHECK(SCIPaddCons(scip, soc));
 		SCIP_CHECK(SCIPreleaseCons(scip, &soc));
 		for (SCIP_VAR*& v : z) SCIP_CHECK(SCIPreleaseVar(scip, &v));
 	}
 
 	_stats = SCIPSolveStats{};
-	LocalNLPRelax* local_nlp = nullptr;
-	if (!mip.nonlinear.empty()) {
+	auto* trace = new NodeTrace(scip, [&mip](SCIP_VAR* v) { return ExportedName(mip, v); });
+	SCIP_CHECK(SCIPincludeObjEventhdlr(scip, trace, TRUE));
+	{
 		// SCIP only checks the nonlinear rows (presolve carries them through
 		// its reductions, and they lock their variables) and never branches,
 		// separates or propagates on them: the relaxation holds them. (SCIP
@@ -691,10 +800,12 @@ bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 			SCIP_CHECK(SCIPaddCons(scip, cons));
 			SCIP_CHECK(SCIPreleaseCons(scip, &cons));
 		}
-		local_nlp = new LocalNLPRelax(scip, mip, x, &_stats, _local_solver);
-		SCIP_CHECK(SCIPincludeObjRelax(scip, local_nlp, TRUE));
-		SCIP_CHECK(SCIPsetIntParam(scip, "lp/solvefreq", -1));
 	}
+	// Every node's relaxation, in place of SCIP's LP.
+	auto* local_nlp = new LocalNLPRelax(scip, mip, x, &_stats, _local_solver);
+	local_nlp->trace = trace;
+	SCIP_CHECK(SCIPincludeObjRelax(scip, local_nlp, TRUE));
+	SCIP_CHECK(SCIPsetIntParam(scip, "lp/solvefreq", -1));
 
 	if (mip.initial_guess.array().isFinite().any()) {
 		SCIP_SOL* start;
@@ -717,7 +828,7 @@ bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 	Configure(scip, x, mip);
 
 	const SCIP_RETCODE solved = SCIPsolve(scip);
-	if (local_nlp && !local_nlp->error.empty())
+	if (!local_nlp->error.empty())
 		throw std::runtime_error("SCIPWaypointMPC: local NLP: " + local_nlp->error);
 	SCIP_CHECK(solved);
 	if (_verbose) SCIP_CHECK(SCIPprintStatistics(scip, nullptr));
@@ -728,6 +839,10 @@ bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 	_stats.dual_bound = SCIPgetDualbound(scip);
 	_stats.gap = SCIPgetGap(scip);
 	_stats.solving_time = SCIPgetSolvingTime(scip);
+	_stats.feasible_leaves = SCIPgetNFeasibleLeaves(scip);
+	_stats.infeasible_leaves = SCIPgetNInfeasibleLeaves(scip);
+	_stats.objlim_leaves = SCIPgetNObjlimLeaves(scip);
+	for (long long number : trace->order) _stats.node_log.push_back(trace->nodes.at(number));
 	std::vector<std::pair<double, double>> history;
 	SCIP_SOL** sols = SCIPgetSols(scip);
 	for (int k = 0; k < SCIPgetNSols(scip); ++k)
@@ -741,14 +856,22 @@ bool SCIPWaypointMPC::Solve(const std::vector<int>& remaining_vertices,
 	}
 
 	if (SCIPgetNSols(scip) == 0) {
-		std::cerr << "SCIPWaypointMPC: no feasible solution (" << _stats.status << ").\n";
-		if (_keep_failed_local && local_nlp && local_nlp->failed.size()) {
-			Eigen::VectorXd failed = local_nlp->failed;
+		if (_fallback_to_least_violated && local_nlp->fallback.size()) {
+			Eigen::VectorXd fallback = local_nlp->fallback;
 			for (int i = 0; i < n; ++i)
-				if (mip.is_integer(i)) failed(i) = std::round(failed(i));
-			std::cerr << "SCIPWaypointMPC: storing the last failed local NLP iterate (unchecked).\n";
-			FinishExternalSolve(failed, std::numeric_limits<double>::infinity());
+				if (mip.is_integer(i)) fallback(i) = std::round(fallback(i));
+			_stats.fallback = true;
+			_stats.fallback_violation = local_nlp->fallback_violation;
+			if (_verbose)
+				std::cerr << "SCIPWaypointMPC: no feasible solution (" << _stats.status
+					  << "); returning the least-violated leaf (violation "
+					  << local_nlp->fallback_violation << ").\n";
+			// Its nonlinear rows and cones miss by fallback_violation; the
+			// linear rows held at its node.
+			FinishExternalSolve(fallback, std::numeric_limits<double>::infinity());
+			return true;
 		}
+		std::cerr << "SCIPWaypointMPC: no feasible solution (" << _stats.status << ").\n";
 		return false;
 	}
 	SCIP_SOL* best = SCIPgetBestSol(scip);

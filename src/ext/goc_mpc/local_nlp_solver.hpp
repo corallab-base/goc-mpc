@@ -12,9 +12,11 @@
 // evaluated), the final penalty weight, and its wall time split into
 // building the problem, evaluating rows and Jacobians, and the step
 // systems (factorizing/solving the LM systems, or the step QPs); total
-// includes the rest.
+// includes the rest. `stalled`: it stopped because, with the linear rows
+// met, the violation stopped shrinking at the capped penalty weight, not at
+// an iteration limit.
 struct LocalSolveRecord {
-	bool success = false;
+	bool success = false, stalled = false;
 	int vars = 0, rows = 0;
 	int outer = 0, inner = 0, trials = 0;
 	double rho = 0.0;
@@ -44,6 +46,11 @@ enum class LocalNLPSolver {
 	// Augmented Lagrangian on g only; each Levenberg-Marquardt step a sparse
 	// QP (ProxQP) holding the linear rows and bounds exactly.
 	kProxQPLM,
+	// Sequential l1 LP (SCIP's LP interface): each step an LP holding the
+	// linear rows and bounds exactly, g linearized with elastic slacks in a
+	// trust region; an unreachable g ends at a local minimizer of its
+	// violation.
+	kSl1LP,
 };
 
 // Solves a LocalNLP locally from *y and leaves its last iterate in *y,

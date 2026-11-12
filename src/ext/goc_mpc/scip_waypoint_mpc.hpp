@@ -14,6 +14,30 @@
 #include "local_nlp_solver.hpp"
 
 // The last SCIPWaypointMPC solve, as SCIP reported it.
+// One branch-and-bound node, as SCIP's node events and the local NLP
+// relaxation saw it.
+struct SCIPNodeRecord {
+	long long number = -1, parent = -1;
+	int depth = 0;
+	// Seconds into the solve when SCIP focused the node (NaN: never focused,
+	// e.g. deleted after a better bound pruned it).
+	double focus_time = std::numeric_limits<double>::quiet_NaN();
+	// The branching bound changes from its parent ("name <= v" / "name >=
+	// v"), by the exported program's variable names.
+	std::vector<std::string> branchings;
+	// Assignments(role, agent) at its last local solve's final point.
+	std::vector<std::string> assignments;
+	// Its local NLP solves (indices into local_log) and how the last ended:
+	// "feasible", "infeasible: cut off (leaf)" or "infeasible: branched
+	// (integers free)".
+	std::vector<int> local_solves;
+	std::string relaxation;
+	double lower_bound = std::numeric_limits<double>::quiet_NaN();
+	// SCIP's events on the node, in order: focused, feasible, infeasible,
+	// branched, deleted.
+	std::vector<std::string> events;
+};
+
 struct SCIPSolveStats {
 	std::string status;
 	long long nodes = 0;
@@ -24,15 +48,23 @@ struct SCIPSolveStats {
 	// The solutions SCIP kept, by the time (seconds into the solve) each
 	// was found: that time and its objective.
 	std::vector<double> solution_times, solution_objectives;
-	// Local NLP relaxations, one per node (nonlinear constraints only): how
+	// Local NLP relaxations, one per node: how
 	// many, how many missed SCIP's feasibility tolerance, and their total
 	// wall time.
 	int local_solves = 0, local_failures = 0;
 	double local_solve_time = 0.0;
 	// How the last failed one ended.
 	std::string last_local_failure;
+	// The solution is the least-violated failed leaf solve (no feasible one
+	// was found), missing the nonlinear rows and cones by fallback_violation.
+	bool fallback = false;
+	double fallback_violation = 0.0;
 	// Every local solve, in order.
 	std::vector<LocalSolveRecord> local_log;
+	// Every node SCIP created, in order of first event; and its leaf counts
+	// (feasible, infeasible, pruned by the objective limit / bound).
+	std::vector<SCIPNodeRecord> node_log;
+	long long feasible_leaves = 0, infeasible_leaves = 0, objlim_leaves = 0;
 };
 
 // GCSWaypointMPC's problem (a MILP, or a MISOCP under the L2 objectives)
@@ -44,16 +76,20 @@ struct SCIPSolveStats {
 // Each cone z = A x + b, z(0) >= |z(1:)|, becomes auxiliary variables tied to
 // A x + b by linear rows plus one SOC nonlinear constraint over them.
 //
-// Nonlinear node constraints (e.g. FK pins) are only locally optimized, as
-// NLP-based branch-and-bound on the integer variables alone: SCIP only
-// checks them, and each node's relaxation replaces SCIP's LP with its
-// presolved problem at the node -- integers relaxed, the nonlinear
+// The solve is NLP-based branch-and-bound on the integer variables alone,
+// whatever the problem holds: SCIP only checks the cones and nonlinear node
+// constraints (e.g. FK pins), and each node's relaxation replaces SCIP's LP
+// with its presolved problem at the node -- integers relaxed, the nonlinear
 // constraints and cones kept -- solved locally (local_solver) from the
 // initialization_oracle's guess (without one, the agents' current
-// configurations) and treated as globally optimal: its value prunes, its fractional
-// integers are branched on, and an integral one is a solution. A local
+// configurations), and treated as globally optimal: its value
+// prunes, its fractional integers are branched on, and an integral one is a
+// solution. A local
 // solve that misses feasibility cuts off only a node whose integers are all
-// fixed; otherwise SCIP branches without a bound from it. Bounds and
+// fixed; otherwise SCIP branches without a bound from it. A cut-off leaf
+// whose linear rows hold is kept outside SCIP as a candidate, and when SCIP
+// finds no solution the least-violated one is returned
+// (fallback_to_least_violated). Bounds and
 // gap are then only as good as the local solves; SCIP's LP-based machinery
 // (cuts, strong branching, LP heuristics) is off.
 //
@@ -73,10 +109,10 @@ struct SCIPWaypointMPC : public GCSWaypointMPC {
 	// FinishExternalSolve's tolerance on SCIP's solution.
 	double _feasibility_tol;
 	bool _verbose;
-	// When the solve finds no solution, store the last failed local NLP
-	// iterate (integers rounded) as the waypoints anyway, unchecked -- for
-	// inspecting where the local solve got stuck. Solve still returns false.
-	bool _keep_failed_local;
+	// When SCIP finds no solution, store the least-violated failed leaf
+	// local solve (integers rounded; linear rows held, nonlinear rows and
+	// cones missed by _stats.fallback_violation) and return true.
+	bool _fallback_to_least_violated;
 	// The local NLP solver for the node relaxations.
 	LocalNLPSolver _local_solver;
 	SCIPSolveStats _stats;
@@ -95,7 +131,7 @@ struct SCIPWaypointMPC : public GCSWaypointMPC {
 			std::map<std::string, ParamValue> params = {},
 			double feasibility_tol = 1e-5,
 			bool verbose = false,
-			bool keep_failed_local = false,
+			bool fallback_to_least_violated = true,
 			LocalNLPSolver local_solver = LocalNLPSolver::kPenalizedLM,
 			std::shared_ptr<InitializationOracle> initialization_oracle = nullptr);
 
