@@ -11,8 +11,10 @@
 #include "milp_waypoint_mpc.hpp"
 #include "gcs_waypoint_mpc.hpp"
 #include "scip_waypoint_mpc.hpp"
+#include "vrp_waypoint_mpc.hpp"
 #include "oracles/initialization_oracle.hpp"
 #include "oracles/propagation_oracle.hpp"
+#include "oracles/route_solver.hpp"
 #include "oracles/ur_analytic_ik.hpp"
 #include "oracles/vamp_environment.hpp"
 #include "graph_timing_mpc.hpp"
@@ -608,6 +610,31 @@ void init_submodule_goc_mpc(py::module_& m) {
                 .def_readwrite("assignments", &AssignmentGuess::assignments)
                 .def_readwrite("X", &AssignmentGuess::X)
                 .def_readwrite("routes", &AssignmentGuess::routes);
+        py::class_<RouteSolution>(goc_mpc, "RouteSolution")
+                .def(py::init<>())
+                .def_readonly("success", &RouteSolution::success)
+                .def_readonly("solver", &RouteSolution::solver)
+                .def_readonly("assignments", &RouteSolution::assignments)
+                .def_readonly("order", &RouteSolution::order)
+                .def_readonly("routes", &RouteSolution::routes)
+                .def_readonly("nodes", &RouteSolution::nodes)
+                .def_readonly("X", &RouteSolution::X)
+                .def_readonly("cost", &RouteSolution::cost)
+                .def_readonly("objective", &RouteSolution::objective)
+                .def_readonly("times", &RouteSolution::times)
+                .def_readonly("agent_costs", &RouteSolution::agent_costs)
+                .def_readonly("arcs", &RouteSolution::arcs)
+                .def_readonly("time", &RouteSolution::time)
+                .def_readonly("log", &RouteSolution::log);
+        // The routing MILP over guess.feasible (see route_solver.hpp); x0 the current state.
+        goc_mpc.def(
+                "solve_routes",
+                [](const GraphOfConstraints& graph, const InitialGuess& guess, const Eigen::VectorXd& x0, bool l1,
+                   bool min_max, double length_weight, double mip_gap) {
+                        return SolveRoutes(graph, guess, x0, DistanceArcCost(l1), min_max, length_weight, mip_gap);
+                },
+                py::arg("graph"), py::arg("guess"), py::arg("x0"), py::arg("l1") = false, py::arg("min_max") = false,
+                py::arg("length_weight") = 0.0, py::arg("mip_gap") = 1e-4);
         py::class_<InitialGuess>(goc_mpc, "InitialGuess")
                 .def(py::init<>())
                 .def_readwrite("success", &InitialGuess::success)
@@ -762,6 +789,24 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_initial_guess", &GCSWaypointMPC::view_initial_guess, py::return_value_policy::reference_internal)
 		.def("view_build_time", &GCSWaypointMPC::view_build_time)
 		.def("view_oracle_time", &GCSWaypointMPC::view_oracle_time);
+
+        py::class_<VRPWaypointMPC, GraphWaypointMPC, std::shared_ptr<VRPWaypointMPC>>(goc_mpc, "VRPWaypointMPC")
+                .def(py::init<GraphOfConstraints&, std::vector<CubicConfigurationSpline>,
+                              std::shared_ptr<InitializationOracle>, WaypointObjective,
+                              std::vector<std::shared_ptr<ArcTravelTimeModel>>, double, double>(),
+                     py::keep_alive<1, 2>(),
+                     // Keeps a Python-subclassed oracle and the models' list alive.
+                     py::keep_alive<1, 4>(), py::keep_alive<1, 6>(), py::arg("graph"), py::arg("splines"),
+                     py::arg("initialization_oracle"), py::arg("objective") = WaypointObjective::kAvgL2,
+                     py::arg("travel_time_models") = std::vector<std::shared_ptr<ArcTravelTimeModel>>{},
+                     py::arg("length_weight") = 0.0, py::arg("mip_gap") = 1e-4)
+                // Per agent: graph node ids visited, in order.
+                .def("view_routes", &VRPWaypointMPC::view_routes)
+                // The last solve's oracle guess and routing solution (None before any).
+                .def("view_initial_guess", &VRPWaypointMPC::view_initial_guess,
+                     py::return_value_policy::reference_internal)
+                .def("view_route_solution", &VRPWaypointMPC::view_route_solution,
+                     py::return_value_policy::reference_internal);
 
         py::enum_<LocalNLPSolver>(goc_mpc, "LocalNLPSolver")
                 .value("kPenalizedLM", LocalNLPSolver::kPenalizedLM)

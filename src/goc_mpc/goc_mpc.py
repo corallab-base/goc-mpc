@@ -17,11 +17,14 @@ from ._ext.goc_mpc import (
     MILPWaypointMPC,
     GCSWaypointMPC as _GCSWaypointMPC,
     SCIPWaypointMPC as _SCIPWaypointMPC,
+    VRPWaypointMPC as _VRPWaypointMPC,
     LocalNLPSolver,
     InitializationOracle,
     InitializationRequest,
     AssignmentGuess,
     CandidateSet,
+    RouteSolution,
+    solve_routes,
     InitialGuess,
     PropagationOracle,
     CollisionChecker,
@@ -72,6 +75,20 @@ class SCIPWaypointMPC(_SCIPWaypointMPC):
         super().__init__(graph, splines, *args, **kwargs)
         self.travel_time_models = kwargs.get("travel_time_models")
         # Likewise for a Python-subclassed InitializationOracle.
+        self._initialization_oracle_ref = kwargs.get("initialization_oracle")
+
+
+class VRPWaypointMPC(_VRPWaypointMPC):
+    """The C++ `VRPWaypointMPC`, also taking `fields=` -- see
+    `GCSWaypointMPC`."""
+
+    def __init__(self, graph, splines, *args, fields=None, **kwargs):
+        if fields is not None:
+            if args:
+                raise TypeError("pass VRPWaypointMPC's other arguments by keyword with fields=")
+            kwargs = field_solver_kwargs(graph, fields, kwargs)
+        super().__init__(graph, splines, *args, **kwargs)
+        self.travel_time_models = kwargs.get("travel_time_models")
         self._initialization_oracle_ref = kwargs.get("initialization_oracle")
 
 

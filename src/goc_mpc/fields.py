@@ -111,7 +111,7 @@ def travel_time_models(graph, fields: Sequence[AgentField | None]) -> list:
 
 
 def field_solver_kwargs(graph, fields, kwargs: dict) -> dict:
-    """`kwargs` for a `GCSWaypointMPC`/`SCIPWaypointMPC` constructor with
+    """`kwargs` for a `GCSWaypointMPC`/`SCIPWaypointMPC`/`VRPWaypointMPC` constructor with
     `fields` turned into `travel_time_models`. The objective must be a
     travel-time one; it defaults to `kMinMaxTravelTime`."""
     if "travel_time_models" in kwargs:
