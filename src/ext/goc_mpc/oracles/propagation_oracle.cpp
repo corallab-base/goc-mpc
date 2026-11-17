@@ -16,6 +16,7 @@
 #include <fmt/ranges.h>
 #include <drake/common/symbolic/decompose.h>
 
+#include "../expression_tape.hpp"
 #include "../graph_of_constraints.hpp"
 #include "../waypoint_common.hpp"
 #include "../../utils.hpp"
@@ -154,6 +155,8 @@ public:
 		const CollisionChecker* checker;
 		int samples;
 		double tol;
+		const std::set<int>& local_agents;
+		LocalNLPSolver local_solver;
 	};
 
 	Model(const Context& context, const std::map<int, int>& assignment)
@@ -530,7 +533,8 @@ private:
 // One propagation of a Model for one setting of its choices.
 class Runner {
 public:
-	Runner(const Model& model, const std::vector<int>& idx) : m(model), idx(idx), values(model.cells.size()) {}
+	Runner(const Model& model, const std::vector<int>& idx)
+		: m(model), idx(idx), values(model.cells.size()), promoted_check(model.checks.size(), 0) {}
 
 	Outcome Run() {
 		Propagate();
@@ -574,6 +578,11 @@ private:
 			inexact = inexact || v.inexact;
 		}
 	};
+
+	// Checks promoted to relations (step 1), with what their substituted
+	// cells came from; per check, whether it was.
+	std::vector<std::pair<Relation, Source>> promoted;
+	std::vector<char> promoted_check;
 
 	void Set(int id, double v, const Source& source) {
 		values[id] = {v, true, source.inexact, source.deps, source.choices};
@@ -705,23 +714,80 @@ private:
 		bool any = false;
 		for (bool changed = true; changed;) {
 			changed = false;
-			for (const Relation& rel : m.relations) {
-				if (!rel.equality) continue;
-				int cell = -1;
-				if (Unknowns(rel, &cell) != 1) continue;
-				double rest = rel.constant, a = 0.0;
-				Source source;
-				source.deps = rel.deps;
-				source.inexact = !rel.exact;
-				for (const auto& [id, coeff] : rel.terms) {
-					if (id == cell) { a += coeff; continue; }
-					rest += coeff * values[id].v;
-					source.Add(values[id]);
+			for (const Relation& rel : m.relations) changed = SolveEquality(rel, nullptr) || changed;
+			for (const auto& [rel, from] : promoted) changed = SolveEquality(rel, &from) || changed;
+			any = any || changed;
+		}
+		return any;
+	}
+
+	// Sets rel's one unknown, if it's an equality with one left; `from`: what
+	// a promoted relation's substituted cells came from.
+	bool SolveEquality(const Relation& rel, const Source* from) {
+		if (!rel.equality) return false;
+		int cell = -1;
+		if (Unknowns(rel, &cell) != 1) return false;
+		double rest = rel.constant, a = 0.0;
+		Source source;
+		if (from) source = *from;
+		Merge(&source.deps, rel.deps);
+		source.inexact = source.inexact || !rel.exact;
+		for (const auto& [id, coeff] : rel.terms) {
+			if (id == cell) { a += coeff; continue; }
+			rest += coeff * values[id].v;
+			source.Add(values[id]);
+		}
+		Set(cell, -rest / a, source);
+		out.log.push_back(fmt::format("{} = {:.6g} ({})", m.Name(cell), -rest / a, rel.where));
+		return true;
+	}
+
+	// Step 1, second part: every check that is now affine in its unknown
+	// cells, with its known ones substituted, becomes a relation. Whether
+	// any did.
+	bool PromoteChecks() {
+		bool any = false;
+		for (size_t i = 0; i < m.checks.size(); ++i) {
+			if (promoted_check[i]) continue;
+			const Check& check = m.checks[i];
+			Substitution known;
+			Source from;
+			std::vector<std::pair<Variable, int>> unknown;
+			for (const auto& [v, id] : check.bind) {
+				if (values[id].known) {
+					known[v] = values[id].v;
+					from.Add(values[id]);
+				} else {
+					unknown.emplace_back(v, id);
 				}
-				Set(cell, -rest / a, source);
-				out.log.push_back(fmt::format("{} = {:.6g} ({})", m.Name(cell), -rest / a, rel.where));
-				changed = any = true;
 			}
+			if (unknown.empty() || known.empty()) continue;
+			drake::VectorX<Variable> vars(unknown.size());
+			for (size_t k = 0; k < unknown.size(); ++k) vars(k) = unknown[k].first;
+			Expression e;
+			try {
+				e = check.e.Substitute(known);
+				if (!drake::symbolic::IsAffine(drake::Vector1<Expression>(e), Variables(vars))) continue;
+			} catch (const std::exception&) {
+				continue;
+			}
+			Eigen::MatrixXd A(1, vars.size());
+			Eigen::VectorXd b(1);
+			drake::symbolic::DecomposeAffineExpressions(drake::Vector1<Expression>(e), vars, &A, &b);
+			std::map<int, double> terms;
+			for (size_t k = 0; k < unknown.size(); ++k)
+				if (A(0, k) != 0.0) terms[unknown[k].second] += A(0, k);
+			Relation rel;
+			for (const auto& [cell, a] : terms)
+				if (a != 0.0) rel.terms.emplace_back(cell, a);
+			if (rel.terms.empty()) continue;
+			rel.constant = b(0);
+			rel.equality = check.equality;
+			rel.tolerance = m.c.tol;
+			rel.where = check.where + " (promoted)";
+			promoted_check[i] = 1;
+			promoted.emplace_back(std::move(rel), std::move(from));
+			any = true;
 		}
 		return any;
 	}
@@ -846,6 +912,341 @@ private:
 		return 1;
 	}
 
+	// Step 2b: one local NLP solve. 1: set, 0: none ready, -1: failed.
+	int SolveOneLocal() {
+		if (m.c.local_agents.empty()) return 0;
+		for (size_t pos = 0; pos < m.order.size(); ++pos) {
+			const int sg = m.order[pos];
+			for (int j : m.visits[sg]) {
+				if (!m.c.local_agents.contains(j)) continue;
+				const int r = SolveLocal(sg, j, pos);
+				if (r != 0) return r;
+			}
+		}
+		return 0;
+	}
+
+	// A constraint as step 2b reads it: a relation (with what a promoted one's
+	// substituted cells came from) or a check.
+	struct Row {
+		const Relation* rel = nullptr;
+		const Source* from = nullptr;
+		const Check* check = nullptr;
+	};
+
+	int SolveLocal(int sg, int j, size_t pos) {
+		const auto& g = m.g;
+		const int d = g.robot_ambient_dim(j), node = m.c.node_of[sg];
+		for (int k = 0; k < d; ++k)
+			if (values[m.Find(Cell::kConfig, sg, j, k)].known) return 0;
+
+		// The agent's cells here, as expressions of its configuration q: q
+		// itself, and each link's pose by its symbolic FK. A link's cells
+		// count as unknown even when propagation set them: those values are
+		// targets for q.
+		const drake::VectorX<Variable>& q = m.agent_ph[j];
+		std::map<int, Expression> block;
+		for (int k = 0; k < d; ++k) block[m.Find(Cell::kConfig, sg, j, k)] = q(k);
+		std::vector<std::string> link_names;
+		if (const auto lit = m.links.find({sg, j}); lit != m.links.end()) {
+			for (const std::string& link : lit->second) {
+				const auto fk = g.robot_symbolic_fk.find({j, link});
+				if (fk == g.robot_symbolic_fk.end()) continue;
+				link_names.push_back(link);
+				for (int k = 0; k < m.LinkWidth(); ++k) {
+					const int id = m.Find(Cell::kLink, sg, j, k, link);
+					if (id < 0) continue;
+					const auto& part = k < m.wd ? fk->second.position : fk->second.rotation;
+					const int kk = k < m.wd ? k : k - m.wd;
+					if (kk < part.size()) block[id] = part(kk);
+				}
+			}
+		}
+
+		std::vector<Row> all;
+		for (const Relation& rel : m.relations) all.push_back({&rel, nullptr, nullptr});
+		for (const auto& [rel, from] : promoted) all.push_back({&rel, &from, nullptr});
+		for (size_t i = 0; i < m.checks.size(); ++i)
+			if (!promoted_check[i]) all.push_back({nullptr, nullptr, &m.checks[i]});
+		auto unknowns = [&](const Row& row) {
+			std::vector<int> u;
+			auto add = [&](int id) {
+				if (!values[id].known || block.contains(id)) u.push_back(id);
+			};
+			if (row.rel) {
+				for (const auto& [id, a] : row.rel->terms) add(id);
+			} else {
+				for (const auto& [v, id] : row.check->bind) add(id);
+			}
+			std::sort(u.begin(), u.end());
+			u.erase(std::unique(u.begin(), u.end()), u.end());
+			return u;
+		};
+		auto touches_block = [&](const std::vector<int>& u) {
+			return std::any_of(u.begin(), u.end(), [&](int id) { return block.contains(id); });
+		};
+
+		// The node's unknown object components the agent's constraints read.
+		std::set<int> extra;
+		std::vector<std::vector<int>> u_of(all.size());
+		for (size_t r = 0; r < all.size(); ++r) {
+			u_of[r] = unknowns(all[r]);
+			if (!touches_block(u_of[r])) continue;
+			for (int id : u_of[r])
+				if (!block.contains(id) && m.cells[id].kind == Cell::kObject && m.cells[id].sg == sg) extra.insert(id);
+		}
+		// Every constraint on only those unknowns.
+		std::vector<size_t> rows;
+		bool constrained = false;
+		for (size_t r = 0; r < all.size(); ++r) {
+			const auto& u = u_of[r];
+			if (u.empty()) continue;
+			if (!std::all_of(u.begin(), u.end(), [&](int id) { return block.contains(id) || extra.contains(id); }))
+				continue;
+			rows.push_back(r);
+			constrained = constrained || touches_block(u);
+		}
+		if (!constrained) return 0;
+
+		// Unknowns y = (q, extra); everything else known is a constant.
+		const std::vector<int> extra_ids(extra.begin(), extra.end());
+		const int n = d + static_cast<int>(extra_ids.size());
+		drake::VectorX<Variable> y(n);
+		std::map<int, Expression> local = block;
+		for (int k = 0; k < d; ++k) y(k) = q(k);
+		for (size_t i = 0; i < extra_ids.size(); ++i) {
+			y(d + i) = Variable(fmt::format("cell_{}", extra_ids[i]));
+			local[extra_ids[i]] = y(d + i);
+		}
+		Source source;
+		auto cell_expr = [&](int id) -> Expression {
+			if (const auto it = local.find(id); it != local.end()) return it->second;
+			source.Add(values[id]);
+			return values[id].v;
+		};
+		std::vector<Expression> exprs;
+		std::vector<bool> equality;
+		for (size_t r : rows) {
+			const Row& row = all[r];
+			Expression e;
+			if (row.rel) {
+				e = row.rel->constant;
+				for (const auto& [id, a] : row.rel->terms) e += a * cell_expr(id);
+				Merge(&source.deps, row.rel->deps);
+				source.inexact = source.inexact || !row.rel->exact;
+				if (row.from) {
+					Merge(&source.deps, row.from->deps);
+					Merge(&source.choices, row.from->choices);
+					source.inexact = source.inexact || row.from->inexact;
+				}
+				equality.push_back(row.rel->equality);
+			} else {
+				Substitution s;
+				for (const auto& [v, id] : row.check->bind) s.emplace(v, cell_expr(id));
+				e = row.check->e.Substitute(s);
+				equality.push_back(row.check->equality);
+			}
+			exprs.push_back(e);
+		}
+		// The seed's derivation counts too: the result depends on it.
+		std::vector<Eigen::VectorXd> seeds;
+		auto add_seed = [&](const Eigen::VectorXd& qs) {
+			for (const auto& s : seeds)
+				if ((s.head(d) - qs).norm() < 1e-9) return;
+			Eigen::VectorXd s(n);
+			s.head(d) = qs;
+			for (size_t i = 0; i < extra_ids.size(); ++i) s(d + i) = ObjectReference(extra_ids[i]);
+			seeds.push_back(std::move(s));
+		};
+		for (size_t p = pos; p-- > 0;) {
+			const int prev = m.order[p];
+			if (!m.visits[prev].contains(j) || !BlockKnown(prev, j)) continue;
+			for (int k = 0; k < d; ++k) source.Add(values[m.Find(Cell::kConfig, prev, j, k)]);
+			add_seed(Block(prev, j));
+			break;
+		}
+		add_seed(Reference(sg, j));
+		add_seed(X0Reference(sg, j));
+
+		// The LocalNLP: affine rows exactly, the rest through a tape.
+		const Variables yset(y);
+		LocalNLP nlp;
+		nlp.c = Eigen::VectorXd::Zero(n);
+		nlp.lb.resize(n);
+		nlp.ub.resize(n);
+		for (int k = 0; k < d; ++k) {
+			const Cell& cell = m.cells[m.Find(Cell::kConfig, sg, j, k)];
+			nlp.lb(k) = cell.lb;
+			nlp.ub(k) = cell.ub;
+		}
+		for (size_t i = 0; i < extra_ids.size(); ++i) {
+			nlp.lb(d + i) = m.cells[extra_ids[i]].lb;
+			nlp.ub(d + i) = m.cells[extra_ids[i]].ub;
+		}
+		std::vector<Eigen::Triplet<double>> lin_t;
+		std::vector<double> a0, l_lin, u_lin, l_nl, u_nl;
+		std::vector<Expression> nl;
+		for (size_t r = 0; r < exprs.size(); ++r) {
+			const double lo = equality[r] ? 0.0 : -kInf;
+			if (drake::symbolic::IsAffine(drake::Vector1<Expression>(exprs[r]), yset)) {
+				Eigen::MatrixXd A(1, n);
+				Eigen::VectorXd b(1);
+				drake::symbolic::DecomposeAffineExpressions(drake::Vector1<Expression>(exprs[r]), y, &A, &b);
+				const int row = static_cast<int>(a0.size());
+				for (int k = 0; k < n; ++k)
+					if (A(0, k) != 0.0) lin_t.emplace_back(row, k, A(0, k));
+				a0.push_back(b(0));
+				l_lin.push_back(lo);
+				u_lin.push_back(0.0);
+			} else {
+				nl.push_back(exprs[r]);
+				l_nl.push_back(lo);
+				u_nl.push_back(0.0);
+			}
+		}
+		const int m_lin = static_cast<int>(a0.size()), m_nl = static_cast<int>(nl.size());
+		nlp.A.resize(m_lin, n);
+		nlp.A.setFromTriplets(lin_t.begin(), lin_t.end());
+		nlp.A.makeCompressed();
+		nlp.a0 = Eigen::Map<const Eigen::VectorXd>(a0.data(), m_lin);
+		nlp.l_lin = Eigen::Map<const Eigen::VectorXd>(l_lin.data(), m_lin);
+		nlp.u_lin = Eigen::Map<const Eigen::VectorXd>(u_lin.data(), m_lin);
+		nlp.l = Eigen::Map<const Eigen::VectorXd>(l_nl.data(), m_nl);
+		nlp.u = Eigen::Map<const Eigen::VectorXd>(u_nl.data(), m_nl);
+		{
+			std::vector<Eigen::Triplet<double>> t;
+			for (int r = 0; r < m_nl; ++r)
+				for (int k = 0; k < n; ++k) t.emplace_back(r, k, 0.0);
+			nlp.J.resize(m_nl, n);
+			nlp.J.setFromTriplets(t.begin(), t.end());
+			nlp.J.makeCompressed();
+		}
+		std::unique_ptr<ExpressionTape> tape;
+		if (m_nl > 0) {
+			drake::VectorX<Expression> rows_e(m_nl);
+			for (int r = 0; r < m_nl; ++r) rows_e(r) = nl[r];
+			tape = std::make_unique<ExpressionTape>(rows_e, y);
+		}
+		Eigen::MatrixXd dense;
+		nlp.evaluate = [&](const Eigen::VectorXd& yy, Eigen::VectorXd* gv, LocalNLP::SparseRows* J) {
+			if (!tape) {
+				gv->resize(0);
+				return;
+			}
+			tape->Eval(yy, gv, &dense);
+			for (int r = 0; r < J->outerSize(); ++r)
+				for (LocalNLP::SparseRows::InnerIterator it(*J, r); it; ++it) it.valueRef() = dense(r, it.col());
+		};
+		auto violation = [&](const Eigen::VectorXd& yy) {
+			const Eigen::VectorXd ay = nlp.A * yy + nlp.a0;
+			double v = (nlp.l_lin - ay).cwiseMax(ay - nlp.u_lin).cwiseMax(0.0).lpNorm<Eigen::Infinity>();
+			Eigen::VectorXd gv;
+			LocalNLP::SparseRows J = nlp.J;
+			nlp.evaluate(yy, &gv, &J);
+			if (!gv.allFinite()) return kInf;
+			if (m_nl > 0) v = std::max(v, (nlp.l - gv).cwiseMax(gv - nlp.u).cwiseMax(0.0).lpNorm<Eigen::Infinity>());
+			return v;
+		};
+
+		const std::string at = fmt::format("node {} agent {}: local NLP ({} unknowns, {} linear + {} nonlinear rows)",
+						   node, j, n, m_lin, m_nl);
+		std::vector<Eigen::VectorXd> solutions;
+		double least = kInf;
+		for (const Eigen::VectorXd& seed : seeds) {
+			Eigen::VectorXd yv = seed;
+			LocalSolveRecord record;
+			try {
+				MakeLocalSolver(m.c.local_solver)->Solve(nlp, &yv, &record);
+			} catch (const std::exception&) {
+				continue;
+			}
+			const double v = violation(yv);
+			least = std::min(least, v);
+			if (!(v <= kLocalTol)) continue;
+			bool dup = false;
+			for (const auto& s : solutions) dup = dup || (s.head(d) - yv.head(d)).norm() < 1e-6;
+			if (!dup) solutions.push_back(yv);
+		}
+
+		CandidateSet found;
+		found.node = node;
+		found.agent = j;
+		found.link = link_names.empty() ? std::string() : link_names.front();
+		found.ik_solutions = static_cast<int>(solutions.size());
+		if (solutions.empty()) {
+			out.candidates.push_back(std::move(found));
+			Fail(source, true, fmt::format("{}: no solution from {} starts (least violation {:.3g})", at,
+						       seeds.size(), least));
+			return -1;
+		}
+		std::vector<Eigen::VectorXd> qs, free;
+		for (const auto& s : solutions) qs.push_back(s.head(d));
+		std::vector<int> free_idx;
+		std::vector<std::string> hits;
+		if (m.c.checker != nullptr) {
+			const CollisionScene scene = Scene(sg, j, &source);
+			const std::vector<CollisionResult> results = m.c.checker->CheckBatch(g, j, qs, scene);
+			for (size_t b = 0; b < qs.size(); ++b) {
+				if (results[b].free) free_idx.push_back(static_cast<int>(b));
+				else hits.push_back(results[b].hit);
+			}
+		} else {
+			for (size_t b = 0; b < qs.size(); ++b) free_idx.push_back(static_cast<int>(b));
+		}
+		for (int b : free_idx) free.push_back(qs[b]);
+		found.configurations = free;
+		found.rejected = hits;
+		if (free.empty()) {
+			out.candidates.push_back(std::move(found));
+			Fail(source, true, fmt::format("{}: all {} solutions collide ({})", at, qs.size(), fmt::join(hits, "; ")));
+			return -1;
+		}
+		int choice = -1;
+		const int option = Choose(static_cast<int>(free.size()), false, &choice);
+		if (option >= static_cast<int>(free.size())) {
+			Source exhausted;
+			exhausted.choices = {choice};
+			Fail(exhausted, false, fmt::format("{}: solution choice {} exhausted", at, choice));
+			return -1;
+		}
+		source.choices.insert(choice);
+		const Eigen::VectorXd& sol = solutions[free_idx[option]];
+		for (int k = 0; k < d; ++k) Set(m.Find(Cell::kConfig, sg, j, k), sol(k), source);
+		for (size_t i = 0; i < extra_ids.size(); ++i) Set(extra_ids[i], sol(d + i), source);
+		Environment env;
+		for (int k = 0; k < d; ++k) env.insert(q(k), sol(k));
+		for (const auto& [id, e] : block)
+			if (m.cells[id].kind == Cell::kLink) Set(id, e.Evaluate(env), source);
+		if (!found.link.empty() && m.wd == 3) {
+			Eigen::Vector3d p;
+			Eigen::Matrix3d R;
+			for (int k = 0; k < m.LinkWidth(); ++k) {
+				const int id = m.Find(Cell::kLink, sg, j, k, found.link);
+				const double v = id >= 0 && values[id].known ? values[id].v : kNaN;
+				if (k < 3) p(k) = v;
+				else R((k - 3) / 3, (k - 3) % 3) = v;
+			}
+			if (p.allFinite() && R.allFinite()) {
+				found.world_T_link.linear() = R;
+				found.world_T_link.translation() = p;
+			}
+		}
+		found.chosen = option;
+		out.candidates.push_back(std::move(found));
+		std::vector<std::string> extras;
+		for (size_t i = 0; i < extra_ids.size(); ++i)
+			extras.push_back(fmt::format("{} = {:.6g}", m.Name(extra_ids[i]), sol(d + i)));
+		out.log.push_back(fmt::format("{}: {} solutions from {} starts, {} collision-free; choice {} takes #{}: q = "
+					      "[{:.4f}]{}",
+					      at, solutions.size(), seeds.size(), free.size(), choice, option,
+					      fmt::join(Eigen::VectorXd(sol.head(d)), ", "),
+					      extras.empty() ? "" : fmt::format(", {}", fmt::join(extras, ", "))));
+		return 1;
+	}
+
+	// A local solution's rows hold to within this.
+	static constexpr double kLocalTol = 1e-8;
+
 	// Step 3: one choice; false when nothing is entangled or it failed.
 	bool ChooseOne() {
 		std::set<int> entangled;
@@ -921,9 +1322,13 @@ private:
 	void Propagate() {
 		while (!out.failed) {
 			if (SolveEqualities()) continue;
+			if (PromoteChecks()) continue;
 			const int ik = SolveOneIK();
 			if (ik < 0) return;
 			if (ik > 0) continue;
+			const int local = SolveOneLocal();
+			if (local < 0) return;
+			if (local > 0) continue;
 			if (!ChooseOne()) return;
 		}
 	}
@@ -1093,10 +1498,11 @@ Search Backjump(const Model& model, int propagations, int threads) {
 
 PropagationOracle::PropagationOracle(std::map<int, std::shared_ptr<IkSolver>> ik_solvers,
 				     std::shared_ptr<CollisionChecker> collision_checker, int max_assignments, int samples,
-				     int propagations, int threads, double tolerance)
+				     int propagations, int threads, double tolerance, std::set<int> local_agents,
+				     LocalNLPSolver local_solver)
 	: _ik_solvers(std::move(ik_solvers)), _collision_checker(std::move(collision_checker)),
 	  _max_assignments(max_assignments), _samples(samples), _propagations(propagations), _threads(threads),
-	  _tolerance(tolerance) {
+	  _tolerance(tolerance), _local_agents(std::move(local_agents)), _local_solver(local_solver) {
 	for (const auto& [agent, solver] : _ik_solvers)
 		if (!solver) throw std::invalid_argument(fmt::format("PropagationOracle: agent {}'s IK solver is None", agent));
 	if (max_assignments < 1 || samples < 1 || propagations < 1 || threads < 1)
@@ -1166,8 +1572,9 @@ InitialGuess PropagationOracle::Initialize(const InitializationRequest& request)
 				candidates[k].push_back(j);
 	}
 
-	const Model::Context context{graph,    subgraph,    presolve, node_of, rank, request, _ik_solvers,
-				     _collision_checker.get(), _samples, _tolerance};
+	const Model::Context context{graph,       subgraph,       presolve,      node_of,
+				     rank,        request,        _ik_solvers,   _collision_checker.get(),
+				     _samples,    _tolerance,     _local_agents, _local_solver};
 	InitialGuess guess;
 	guess.nodes = request.nodes;
 	std::vector<std::vector<Pair>> nogoods;

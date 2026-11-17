@@ -705,20 +705,31 @@ void init_submodule_goc_mpc(py::module_& m) {
                 .def_property_readonly("inflation", &VampCollisionChecker::inflation)
                 .def_property_readonly("robots", &VampCollisionChecker::robots)
                 .def_static("robot_names", &VampRobot::Names);
+        py::enum_<LocalNLPSolver>(goc_mpc, "LocalNLPSolver")
+                .value("kPenalizedLM", LocalNLPSolver::kPenalizedLM)
+                .value("kProxQPLM", LocalNLPSolver::kProxQPLM)
+                .value("kSl1LP", LocalNLPSolver::kSl1LP);
+
         py::class_<PropagationOracle, InitializationOracle, std::shared_ptr<PropagationOracle>>(
                 goc_mpc, "PropagationOracle")
                 // ik_solvers per agent id; threads > 1 needs C++ IK solvers and checker.
+                // local_agents: the agents solved by a local NLP (local_solver) when no
+                // full link pose is known for IK.
                 .def(py::init<std::map<int, std::shared_ptr<IkSolver>>, std::shared_ptr<CollisionChecker>, int, int,
-                              int, int, double>(),
+                              int, int, double, std::set<int>, LocalNLPSolver>(),
                      py::arg("ik_solvers"), py::arg("collision_checker") = nullptr, py::arg("max_assignments") = 64,
                      py::arg("samples") = 64, py::arg("propagations") = 1024, py::arg("threads") = 1,
-                     py::arg("tolerance") = 1e-6, py::keep_alive<1, 2>(), py::keep_alive<1, 3>())
+                     py::arg("tolerance") = 1e-6, py::arg("local_agents") = std::set<int>{},
+                     py::arg("local_solver") = LocalNLPSolver::kProxQPLM, py::keep_alive<1, 2>(),
+                     py::keep_alive<1, 3>())
                 .def_property_readonly("ik_solvers", &PropagationOracle::ik_solvers)
                 .def_property_readonly("collision_checker", &PropagationOracle::collision_checker)
                 .def_property_readonly("max_assignments", &PropagationOracle::max_assignments)
                 .def_property_readonly("samples", &PropagationOracle::samples)
                 .def_property_readonly("propagations", &PropagationOracle::propagations)
-                .def_property_readonly("threads", &PropagationOracle::threads);
+                .def_property_readonly("threads", &PropagationOracle::threads)
+                .def_property_readonly("local_agents", &PropagationOracle::local_agents)
+                .def_property_readonly("local_solver", &PropagationOracle::local_solver);
         py::class_<UrDhParameters>(goc_mpc, "UrDhParameters")
                 .def(py::init([](double d1, double a2, double a3, double d4, double d5, double d6) {
                         return UrDhParameters{d1, a2, a3, d4, d5, d6};
@@ -813,11 +824,6 @@ void init_submodule_goc_mpc(py::module_& m) {
                      py::return_value_policy::reference_internal)
                 .def("view_route_solution", &VRPWaypointMPC::view_route_solution,
                      py::return_value_policy::reference_internal);
-
-        py::enum_<LocalNLPSolver>(goc_mpc, "LocalNLPSolver")
-                .value("kPenalizedLM", LocalNLPSolver::kPenalizedLM)
-                .value("kProxQPLM", LocalNLPSolver::kProxQPLM)
-                .value("kSl1LP", LocalNLPSolver::kSl1LP);
 
         py::class_<LocalSolveRecord>(goc_mpc, "LocalSolveRecord")
                 .def_readonly("success", &LocalSolveRecord::success)
