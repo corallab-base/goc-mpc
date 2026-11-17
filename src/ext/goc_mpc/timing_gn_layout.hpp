@@ -71,6 +71,12 @@ struct InteractionRow {
 	int tau_offset_i = 0, count_i = 0;
 	int tau_offset_j = 0, count_j = 0;
 	double min_tau = 0.0;
+	// Constant node dwells (GraphOfConstraints::set_node_dwell) inside each
+	// side's cumulative time: agent i's time is sum(taus_i) + offset_i, and
+	// likewise for j. LESS_THAN counts agent i's own node as left (its dwell
+	// included) and agent j's as reached (excluded); EQUAL counts both as
+	// reached.
+	double offset_i = 0.0, offset_j = 0.0;
 	AgentInteraction::Type type;
 };
 
@@ -108,6 +114,9 @@ struct ProblemLayout {
 	// timing solve's merged BlockSegments and the output spline's bridged
 	// knots can never disagree. Empty matrix for an agent with K == 0.
 	std::vector<Eigen::MatrixXi> agent_block_active;
+	// Per-agent dwell (s) at knots 1..K (entry k - 1), from the graph's
+	// node_dwell_map; a dwell knot's velocity is fixed at zero (no v column).
+	std::vector<Eigen::VectorXd> agent_dwells;
 };
 
 Eigen::VectorXd CumsumWithZero(const Eigen::VectorXd& x, int n);

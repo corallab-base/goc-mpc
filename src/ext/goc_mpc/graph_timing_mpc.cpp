@@ -160,7 +160,7 @@ namespace {
 // evaluator, so the two can never silently disagree about what "this row's
 // current value" means.
 std::pair<double, double> InteractionGiGj(const Eigen::VectorXd& x, const InteractionRow& ir) {
-	double gi = 0.0, gj = 0.0;
+	double gi = ir.offset_i, gj = ir.offset_j;
 	for (int k = 0; k < ir.count_i; ++k) gi += x(ir.tau_offset_i + k);
 	for (int k = 0; k < ir.count_j; ++k) gj += x(ir.tau_offset_j + k);
 	return {gi, gj};
@@ -201,12 +201,12 @@ double TotalInteractionViolation(const Eigen::VectorXd& x, const ProblemLayout& 
 }
 
 // The interaction rows over the taus alone, in local tau indices: EQUAL rows
-// A tau = 0, LESS_THAN rows C tau <= u.
+// A tau = b, LESS_THAN rows C tau <= u (b and u carry the rows' dwell offsets).
 struct TauConstraints {
 	std::vector<int> cols;   // local index -> global tau column
 	std::vector<int> local;  // global column -> local index (-1: not a tau)
 	Eigen::MatrixXd A, C;
-	Eigen::VectorXd u;
+	Eigen::VectorXd b, u;
 };
 
 TauConstraints BuildTauConstraints(const ProblemLayout& layout) {
@@ -223,6 +223,7 @@ TauConstraints BuildTauConstraints(const ProblemLayout& layout) {
 		(ir.type == AgentInteraction::Type::EQUAL ? n_eq : n_lt)++;
 	tc.A = Eigen::MatrixXd::Zero(n_eq, nt);
 	tc.C = Eigen::MatrixXd::Zero(n_lt, nt);
+	tc.b = Eigen::VectorXd::Zero(n_eq);
 	tc.u = Eigen::VectorXd::Zero(n_lt);
 	int r_eq = 0, r_lt = 0;
 	for (const auto& ir : layout.interactions) {
@@ -231,9 +232,9 @@ TauConstraints BuildTauConstraints(const ProblemLayout& layout) {
 		for (int k = 0; k < ir.count_i; ++k) row(tc.local[ir.tau_offset_i + k]) += 1.0;
 		for (int k = 0; k < ir.count_j; ++k) row(tc.local[ir.tau_offset_j + k]) -= 1.0;
 		if (eq) {
-			++r_eq;
+			tc.b(r_eq++) = ir.offset_j - ir.offset_i;
 		} else {
-			tc.u(r_lt++) = -ir.min_tau;
+			tc.u(r_lt++) = -ir.min_tau - ir.offset_i + ir.offset_j;
 		}
 	}
 	return tc;
@@ -275,7 +276,7 @@ void ProjectTausOntoInteractions(const ProblemLayout& layout, Eigen::VectorXd* x
 	const Eigen::VectorXd tau0 = (*x)(tc.cols);
 	const Eigen::VectorXd w = tau0.cwiseInverse();
 	const std::optional<Eigen::VectorXd> tau = SolveTauQp(
-		w.cwiseProduct(w).asDiagonal(), -w, tc, Eigen::VectorXd::Zero(tc.A.rows()), tc.u,
+		w.cwiseProduct(w).asDiagonal(), -w, tc, tc.b, tc.u,
 		Eigen::VectorXd::Constant(nt, kTauMin), Eigen::VectorXd::Constant(nt, kTauMax));
 	if (!tau) return;
 	Eigen::VectorXd projected = *x;
@@ -421,7 +422,7 @@ SqpResult RunReducedNewton(const ProblemLayout& layout, double acceleration_cost
 		const Eigen::VectorXd lo = (Eigen::VectorXd::Constant(nt, kTauMin) - tau).cwiseMax(-radius * tau);
 		const Eigen::VectorXd hi = (Eigen::VectorXd::Constant(nt, kTauMax) - tau).cwiseMin(radius * tau);
 		const std::optional<Eigen::VectorXd> step =
-			SolveTauQp(H, cur.g, tc, -tc.A * tau, tc.u - tc.C * tau, lo, hi);
+			SolveTauQp(H, cur.g, tc, tc.b - tc.A * tau, tc.u - tc.C * tau, lo, hi);
 		if (!step) {
 			radius *= 0.25;
 			if (radius < kMinRelativeRadius) break;
@@ -753,9 +754,13 @@ void StoreResult(
 		std::vector<Eigen::MatrixXd>* vs_list,
 		std::vector<Eigen::VectorXd>* time_deltas_list,
 		std::map<int, int>* agent_spline_length_map,
-		const std::vector<std::vector<int>>& agent_nodes_list) {
+		const std::vector<std::vector<int>>& agent_nodes_list,
+		std::vector<Eigen::VectorXd>* dwells_list) {
 
+	dwells_list->resize(graph.num_agents);
 	for (int i = 0; i < graph.num_agents; ++i) {
+		(*dwells_list)[i] = i < static_cast<int>(layout.agent_dwells.size())
+			? layout.agent_dwells[i] : Eigen::VectorXd(0);
 		// Per-agent, not a single shared width -- see this file's
 		// constructor and timing_gn_layout.cpp's CumulativeOffsets comment
 		// for why a shared width silently corrupts memory once agents'
@@ -864,7 +869,8 @@ bool GraphTimingMPC::solve(
 	_last_solve_time = _timer.Tick();
 
 	StoreResult(*_graph, layout, result, *_splines,
-		    &_vs_list, &_time_deltas_list, &_agent_spline_length_map, _agent_nodes_list);
+		    &_vs_list, &_time_deltas_list, &_agent_spline_length_map, _agent_nodes_list,
+		    &_agent_dwells_list);
 	return true;
 }
 
@@ -927,7 +933,8 @@ bool GraphTimingMPC::solve_dense(
 	_last_solve_time = _timer.Tick();
 
 	StoreResult(*_graph, layout, result, *_splines,
-		    &_vs_list, &_time_deltas_list, &_agent_spline_length_map, _agent_nodes_list);
+		    &_vs_list, &_time_deltas_list, &_agent_spline_length_map, _agent_nodes_list,
+		    &_agent_dwells_list);
 	return true;
 }
 
@@ -1030,7 +1037,45 @@ void GraphTimingMPC::fill_cubic_splines(std::vector<CubicConfigurationSpline*>& 
 			const Eigen::MatrixXi& mask =
 				(i < static_cast<int>(_agent_block_active_list.size()))
 					? _agent_block_active_list[i] : kNoMask;
-			if (mask.rows() == spline_length_i && mask.cols() == NB)
+			const bool mask_ok = mask.rows() == spline_length_i && mask.cols() == NB;
+
+			// A dwell at knot k (set_node_dwell) repeats the knot `dwell`
+			// seconds later with the same position, zero velocity on both
+			// copies, so the spline holds still there; later knots shift.
+			const Eigen::VectorXd dwells =
+				i < static_cast<int>(_agent_dwells_list.size()) &&
+				_agent_dwells_list[i].size() == spline_length_i - 1
+					? _agent_dwells_list[i] : Eigen::VectorXd::Zero(spline_length_i - 1);
+			const int n_dwell = static_cast<int>((dwells.array() > 0.0).count());
+			if (n_dwell > 0) {
+				const int N = spline_length_i + n_dwell;
+				Eigen::MatrixXd wps_d(N, a_d), vs_d(N, t_d);
+				Eigen::VectorXd times_d(N);
+				Eigen::MatrixXi mask_d(mask_ok ? N : 0, NB);
+				double shift = 0.0;
+				int r = 0;
+				for (int k = 0; k < spline_length_i; ++k) {
+					wps_d.row(r) = wps_i.row(k);
+					vs_d.row(r) = vs_i.row(k);
+					times_d(r) = times_i(k) + shift;
+					if (mask_ok) mask_d.row(r) = mask.row(k);
+					++r;
+					if (k >= 1 && dwells(k - 1) > 0.0) {
+						vs_d.row(r - 1).setZero();
+						shift += dwells(k - 1);
+						wps_d.row(r) = wps_i.row(k);
+						vs_d.row(r).setZero();
+						times_d(r) = times_i(k) + shift;
+						if (mask_ok) mask_d.row(r).setOnes();
+						++r;
+					}
+				}
+				splines[i]->set_block_active_mask(mask_ok ? mask_d : Eigen::MatrixXi());
+				splines[i]->set(wps_d, vs_d, times_d);
+				continue;
+			}
+
+			if (mask_ok)
 				splines[i]->set_block_active_mask(mask);
 			else
 				splines[i]->set_block_active_mask(Eigen::MatrixXi());

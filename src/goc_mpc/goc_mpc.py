@@ -531,7 +531,6 @@ class GraphOfConstraintsMPC():
         if len(self.remaining_phases) == 0:
             return False
         assignments = self.waypoint_mpc.view_assignments()
-        var_assignments = self.waypoint_mpc.view_var_assignments()
         changed = False
         for node in self._frontier_nodes():
             if node in self.graph.unpassable_nodes or node not in self.remaining_phases:
@@ -554,15 +553,25 @@ class GraphOfConstraintsMPC():
                     logger.debug("Did not complete %s -- failed phi id(s) [tol=%.3f]: %s",
                                  self.graph.get_node_name(node), self.phi_tolerance, failed)
                 continue
-            logger.info("Completed %s", self.graph.get_node_name(node))
-            self.completed_phases |= {node}
-            self.remaining_phases.remove(node)
-            self.last_grasp_commands.extend(self.graph.get_grasp_changes(node, assignments))
-            self._maybe_commit(node, var_assignments)
-            self._maybe_start_holds(node, x)
-            self._maybe_end_holds(node)
+            self.complete_node(node, x)
             changed = True
         return changed
+
+    def complete_node(self, node, x) -> None:
+        """Marks `node` complete against the live state `x`, with the
+        bookkeeping a completion carries (grasp changes, committing its
+        variable's assignment, starting and ending holds). `_check_progression`
+        calls this once a frontier node's phis hold; an executor that decides
+        completion itself (e.g. at the bottom of a grasp it runs while the
+        plan dwells at the node) calls it directly."""
+        logger.info("Completed %s", self.graph.get_node_name(node))
+        self.completed_phases |= {node}
+        self.remaining_phases.remove(node)
+        self.last_grasp_commands.extend(
+            self.graph.get_grasp_changes(node, self.waypoint_mpc.view_assignments()))
+        self._maybe_commit(node, self.waypoint_mpc.view_var_assignments())
+        self._maybe_start_holds(node, x)
+        self._maybe_end_holds(node)
 
     def poll(self, x) -> tuple[bool, bool]:
         """Cheap, solve-free progression/backtracking check against the
@@ -693,6 +702,11 @@ class GraphOfConstraintsMPC():
             if success:
                 self.timing_mpc.fill_cubic_splines(self.last_cycle_splines, x, v0_for_spline)
                 if self._collision_refiner is not None:
+                    if self.graph.node_dwell_map:
+                        # The refiners rebuild knot times from the time
+                        # deltas alone, without the dwells.
+                        raise NotImplementedError(
+                            "collision refinement doesn't support node dwells (set_node_dwell)")
                     refine_start = time.perf_counter()
                     self.last_cycle_collision_refinement = self._collision_refiner.refine(
                         self.timing_mpc, self.last_cycle_splines, x, v0_for_spline)

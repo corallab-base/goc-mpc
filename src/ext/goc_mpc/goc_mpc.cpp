@@ -395,6 +395,10 @@ void init_submodule_goc_mpc(py::module_& m) {
 		     py::arg("u"),
 		     py::arg("v"),
 		     py::arg("minimum_time_delta"))
+		.def("set_node_dwell", &GraphOfConstraints::set_node_dwell,
+		     py::arg("node"), py::arg("seconds"))
+		.def("get_node_dwell", &GraphOfConstraints::get_node_dwell, py::arg("node"))
+		.def_readonly("node_dwell_map", &GraphOfConstraints::node_dwell_map)
 		// VARIABLE CONSTRAINTS ///////////////////////////////////////
 		.def("add_variable_constraint", &GraphOfConstraints::add_variable_constraint)
 		.def("add_variable_ineq_constraint", &GraphOfConstraints::add_variable_ineq_constraint)
@@ -983,6 +987,7 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("view_wps_list", &GraphTimingMPC::view_wps_list)
 		.def("view_vs_list", &GraphTimingMPC::view_vs_list)
 		.def("view_time_deltas_list", &GraphTimingMPC::view_time_deltas_list)
+		.def("view_agent_dwells_list", &GraphTimingMPC::view_agent_dwells_list)
 		.def("view_agent_nodes_list", &GraphTimingMPC::view_agent_nodes_list)
 		.def("view_agent_spline_length_map", &GraphTimingMPC::view_agent_spline_length_map)
 		.def("get_last_solve_time", &GraphTimingMPC::get_last_solve_time)

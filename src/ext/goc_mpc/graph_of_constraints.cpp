@@ -1210,6 +1210,20 @@ void GraphOfConstraints::add_edge_min_tau_constraint(int u,
 	edge_to_min_tau_map[std::make_pair(u, v)] = minimum_time_delta;
 }
 
+void GraphOfConstraints::set_node_dwell(int node, double seconds) {
+	DRAKE_DEMAND(node >= 0 && node < structure.num_nodes());
+	if (seconds > 0.0) {
+		node_dwell_map[node] = seconds;
+	} else {
+		node_dwell_map.erase(node);
+	}
+}
+
+double GraphOfConstraints::get_node_dwell(int node) const {
+	const auto it = node_dwell_map.find(node);
+	return it == node_dwell_map.end() ? 0.0 : it->second;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 //                            VARIABLE CONSTRAINTS                           //
 ///////////////////////////////////////////////////////////////////////////////

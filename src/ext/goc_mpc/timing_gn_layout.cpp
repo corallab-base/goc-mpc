@@ -209,6 +209,13 @@ Eigen::MatrixXi AgentBlockActiveMask(
 		}
 	}
 
+	// A dwell node (set_node_dwell) holds the whole agent still, so it is a
+	// knot for every block.
+	for (int r = 1; r <= K; ++r) {
+		const int node = node_ids[r - 1];
+		if (node >= 0 && graph.node_dwell_map.contains(node)) mask.row(r).setOnes();
+	}
+
 	// Pass 2: synthetic (-1) nodes. `p`/`q` scan out to the bracketing real
 	// knots (0 == x0, K == last); a dense sequence always ends on a real
 	// node so `q` terminates, but clamp anyway.
@@ -248,7 +255,8 @@ ProblemLayout BuildProblemLayoutCore(
 		const std::vector<Eigen::VectorXd>& prev_time_deltas_list,
 		const std::vector<std::vector<int>>& prev_agent_nodes_list,
 		const std::map<int, int>& prev_agent_spline_length_map,
-		const std::map<int, std::vector<VelocityRow>>& node_velocity_rows) {
+		const std::map<int, std::vector<VelocityRow>>& node_velocity_rows,
+		const std::map<int, double>& node_dwell) {
 
 	ProblemLayout layout;
 	const int num_agents = static_cast<int>(splines.size());
@@ -265,6 +273,20 @@ ProblemLayout BuildProblemLayoutCore(
 	auto block_active = [&](int i, int knot, int b) -> bool {
 		const Eigen::MatrixXi& m = agent_block_active[i];
 		return m.size() == 0 || m(knot, b) != 0;
+	};
+
+	// Each agent's dwell at knots 1..K (entry k - 1); only real nodes dwell.
+	layout.agent_dwells.resize(num_agents);
+	for (int i = 0; i < num_agents; ++i) {
+		const std::vector<int>& nodes = agent_node_ids[i];
+		layout.agent_dwells[i] = Eigen::VectorXd::Zero(static_cast<int>(nodes.size()));
+		for (int k = 0; k < static_cast<int>(nodes.size()); ++k) {
+			const auto it = nodes[k] < 0 ? node_dwell.end() : node_dwell.find(nodes[k]);
+			if (it != node_dwell.end()) layout.agent_dwells[i](k) = it->second;
+		}
+	}
+	auto dwells_at = [&](int i, int knot) -> bool {
+		return knot >= 1 && knot <= layout.agent_dwells[i].size() && layout.agent_dwells[i](knot - 1) > 0.0;
 	};
 
 	// Per-agent, per-block list of active knot indices (always starts 0,
@@ -295,9 +317,10 @@ ProblemLayout BuildProblemLayoutCore(
 			aknots[i][b].push_back(0);
 			for (int k = 1; k <= K - 1; ++k) {
 				if (!block_active(i, k, b)) continue;
+				aknots[i][b].push_back(k);
+				if (dwells_at(i, k)) continue;  // velocity fixed at zero
 				vcol[i][b][k] = n;
 				n += offs[b].tangent_size;
-				aknots[i][b].push_back(k);
 			}
 			aknots[i][b].push_back(K);
 		}
@@ -362,10 +385,13 @@ ProblemLayout BuildProblemLayoutCore(
 				if (k_lo == 0) {
 					bs.v0_idx = -1;
 					bs.v0_const = v0_i.segment(off.tangent_offset, off.tangent_size);
+				} else if (dwells_at(i, k_lo)) {
+					bs.v0_idx = -1;
+					bs.v0_const = Eigen::VectorXd::Zero(off.tangent_size);
 				} else {
 					bs.v0_idx = vcol[i][b].at(k_lo);
 				}
-				if (k_hi == K) {
+				if (k_hi == K || dwells_at(i, k_hi)) {
 					bs.v1_idx = -1;
 					bs.v1_const = Eigen::VectorXd::Zero(off.tangent_size);
 				} else {
@@ -407,8 +433,17 @@ ProblemLayout BuildProblemLayoutCore(
 	}
 
 	// Interaction rows -- exactly linear, contiguous per-agent tau ranges.
+	// A row's node sits at its agent's knot depth + 1; the dwells before it
+	// (knots 1..depth) shift when it is reached, its own dwell when it is left.
+	auto dwell_sum = [&](int i, int knots) -> double {
+		const Eigen::VectorXd& d = layout.agent_dwells[i];
+		return d.head(std::clamp(knots, 0, static_cast<int>(d.size()))).sum();
+	};
 	for (const AgentInteraction& p : agent_interactions) {
 		InteractionRow ir;
+		const bool less_than = p.type == AgentInteraction::Type::LESS_THAN;
+		ir.offset_i = dwell_sum(p.agent_i, p.agent_i_depth + (less_than ? 1 : 0));
+		ir.offset_j = dwell_sum(p.agent_j, p.agent_j_depth);
 		ir.tau_offset_i = layout.agents[p.agent_i].tau_offset;
 		ir.count_i = p.agent_i_depth + 1;
 		ir.tau_offset_j = layout.agents[p.agent_j].tau_offset;
@@ -547,7 +582,7 @@ ProblemLayout BuildProblemLayoutCore(
 					if (row.a(c) == 0.0) continue;
 					int b = 0;
 					while (c >= offs[b].tangent_offset + offs[b].tangent_size) ++b;
-					if (k == K) continue;  // zero
+					if (k == K || dwells_at(i, k)) continue;  // zero
 					const auto vit = vcol[i][b].find(k);
 					if (vit == vcol[i][b].end()) {
 						bridged = true;
@@ -562,10 +597,10 @@ ProblemLayout BuildProblemLayoutCore(
 					coeffs.push_back(row.a(c));
 				}
 				if (bridged) continue;
-				if (cols.empty()) {  // the last knot: every velocity is zero
+				if (cols.empty()) {  // the last knot or a dwell: every velocity is zero
 					if ((row.lb > 1e-9 || row.ub < -1e-9) && warned.insert({node, i, -1}).second) {
 						std::cout << "GraphTimingMPC: velocity constraint at node " << node << " (agent " << i
-							  << "'s last) can't hold: every velocity is zero there.\n";
+							  << "'s last, or a dwell) can't hold: every velocity is zero there.\n";
 					}
 					continue;
 				}
@@ -662,7 +697,7 @@ ProblemLayout BuildProblemLayout(
 		splines, *agent_nodes_list_out, agent_wps, agent_interactions,
 		agent_block_active, graph.edge_to_min_tau_map, x0, v0,
 		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
-		prev_agent_spline_length_map, graph.node_to_velocity_rows);
+		prev_agent_spline_length_map, graph.node_to_velocity_rows, graph.node_dwell_map);
 	layout.agent_block_active = std::move(agent_block_active);
 	return layout;
 }
@@ -706,7 +741,7 @@ ProblemLayout BuildDenseProblemLayout(
 		splines, agent_dense_node_ids, agent_dense_wps, agent_interactions,
 		agent_block_active, edge_to_min_tau_map, x0, v0,
 		prev_vs_list, prev_time_deltas_list, prev_agent_nodes_list,
-		prev_agent_spline_length_map, graph.node_to_velocity_rows);
+		prev_agent_spline_length_map, graph.node_to_velocity_rows, graph.node_dwell_map);
 	layout.agent_block_active = std::move(agent_block_active);
 	return layout;
 }

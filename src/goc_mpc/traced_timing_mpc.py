@@ -551,6 +551,9 @@ class TracedTimingMPC:
     def view_time_deltas_list(self):
         return self._timing.view_time_deltas_list()
 
+    def view_agent_dwells_list(self):
+        return self._timing.view_agent_dwells_list()
+
     def view_agent_nodes_list(self):
         return self._timing.view_agent_nodes_list()
 

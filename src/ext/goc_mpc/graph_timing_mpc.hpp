@@ -177,6 +177,9 @@ struct GraphTimingMPC {
 	// its BlockSegments across, with no second constrained_columns pass.
 	// Empty entry == that agent had no active spline that cycle.
 	std::vector<Eigen::MatrixXi> _agent_block_active_list;
+	// Per agent, the dwell (s) at each of its resolved nodes
+	// (GraphOfConstraints::set_node_dwell), aligned with _agent_nodes_list.
+	std::vector<Eigen::VectorXd> _agent_dwells_list;
 
 	double _time_cost;
 	double _time_cost2;
@@ -309,6 +312,9 @@ struct GraphTimingMPC {
 	const std::vector<Eigen::MatrixXd> &view_wps_list() const { return _wps_list; }
 	const std::vector<Eigen::MatrixXd> &view_vs_list() const { return _vs_list; }
 	const std::vector<Eigen::VectorXd> &view_time_deltas_list() const { return _time_deltas_list; }
+	// Per agent, the dwell at each node of view_agent_nodes_list(): an
+	// agent's spline lasts sum(time deltas) + sum(dwells).
+	const std::vector<Eigen::VectorXd> &view_agent_dwells_list() const { return _agent_dwells_list; }
 	const std::vector<std::vector<int>> &view_agent_nodes_list() const { return _agent_nodes_list; }
 	const std::map<int, int> &view_agent_spline_length_map() const { return _agent_spline_length_map; }
 	const double get_last_solve_time() { return _last_solve_time; }

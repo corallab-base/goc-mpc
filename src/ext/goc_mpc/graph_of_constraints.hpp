@@ -403,6 +403,8 @@ struct GraphOfConstraints {
 	std::map<int, std::vector<int>> node_to_phis_map;
 	std::map<std::pair<int, int>, std::vector<int>> edge_to_phis_map;
 	std::map<std::pair<int, int>, double> edge_to_min_tau_map;
+	// Seconds the agent visiting a node holds still there (set_node_dwell).
+	std::map<int, double> node_dwell_map;
 	std::set<int> unpassable_nodes;
 
 	// Optional human-readable names for nodes (e.g. "approach", "pick_up"),
@@ -1160,6 +1162,16 @@ struct GraphOfConstraints {
 	void add_edge_min_tau_constraint(int u,
 					 int v,
 					 double minimum_time_delta);
+
+	// The agent visiting `node` holds still there for `seconds` before
+	// moving on: the timing solve fixes its velocity at the node to zero and
+	// adds the dwell to every later arrival time in its path (cross-agent
+	// orderings included, the node itself counting as reached at the start
+	// of its dwell and left at the end), and its spline gets a constant
+	// piece of that length at the node. A dwell node is a knot for every
+	// block of its agent. `seconds <= 0` removes the dwell.
+	void set_node_dwell(int node, double seconds);
+	double get_node_dwell(int node) const;
 
 	// Variable Constraints
 
