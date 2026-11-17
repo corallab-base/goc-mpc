@@ -21,8 +21,9 @@ whether that sequence is the graph's real nodes (`solve()`) or a denser one
 with traced interior waypoints spliced in between them (`solve_dense()`).
 Each consecutive pair of positions on the resolved per-agent path (x0 ->
 first node -> second node -> ...) is planned through the agent's `ntfields`
-`Field` (see `AgentField`) into a dense obstacle-avoiding polyline, or kept as
-a straight segment for an agent without one;
+`Field` (see `AgentField`) or its own `segment_planners` entry into a dense
+obstacle-avoiding polyline, or kept as a straight segment for an agent with
+neither;
 `GraphOfConstraints.reindex_agent_interactions` then remaps the
 cross-agent interactions' depths (originally indices into the real-node-only
 list `get_agent_paths` returns) onto that denser sequence, so
@@ -43,11 +44,12 @@ segment at a time.
 
 import functools
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 
 from .fields import AgentField
+from ._ext.configuration_spline import BlockType
 from .goc_mpc import GraphOfConstraints, GraphTimingMPC
 
 
@@ -163,16 +165,28 @@ def _resample_by_arclength(path, n_points):
     ], axis=1)
 
 
-def _interpolate_trailing(lead, start, goal):
+def _torus_columns(spec) -> np.ndarray:
+    """Boolean mask over an agent's ambient columns: True on Torus blocks."""
+    return np.concatenate([np.full(b.size, b.type == BlockType.Torus) for b in spec]).astype(bool)
+
+
+def _interpolate_trailing(lead, start, goal, torus=None):
     """`lead` (K, dim), a path over the leading `dim` columns from `start[:dim]`
     to `goal[:dim]`, with the trailing columns of `start`/`goal` interpolated
-    linearly in `lead`'s arc length."""
+    linearly in `lead`'s arc length. Columns where the mask `torus` (over all
+    of `start`'s columns) is True are angles: they turn the short way, and the
+    path ends exactly at `goal`."""
     dim = lead.shape[1]
     if start.shape[0] == dim:
         return lead
     cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(lead, axis=0), axis=1))])
     alpha = cum / cum[-1] if cum[-1] > 0.0 else np.linspace(0.0, 1.0, len(lead))
-    trailing = start[dim:] + alpha[:, None] * (goal[dim:] - start[dim:])
+    delta = goal[dim:] - start[dim:]
+    angle = np.zeros_like(delta, dtype=bool) if torus is None else np.asarray(torus, dtype=bool)[dim:]
+    delta[angle] = (delta[angle] + np.pi) % (2.0 * np.pi) - np.pi
+    trailing = start[dim:] + alpha[:, None] * delta
+    trailing[:, angle] = (trailing[:, angle] + np.pi) % (2.0 * np.pi) - np.pi
+    trailing[0], trailing[-1] = start[dim:], goal[dim:]
     return np.concatenate([lead, trailing], axis=1)
 
 
@@ -263,11 +277,19 @@ class TracedTimingMPC:
             # `None` uses each field's method's own default planner.
             planner: str | None = None,
             planner_kwargs: Mapping | None = None,
+            # Per-agent `plan(start, goal) -> (K, dim)` path over the agent's
+            # leading `dim` columns, from start[:dim] to goal[:dim], or None.
+            # An agent's planner takes the place of its field.
+            segment_planners: Sequence[Callable | None] | None = None,
     ):
         if len(fields) != graph.num_agents:
             raise ValueError(f"fields has {len(fields)} entries for {graph.num_agents} agents")
+        self.segment_planners = [None] * graph.num_agents if segment_planners is None else list(segment_planners)
+        if len(self.segment_planners) != graph.num_agents:
+            raise ValueError(f"segment_planners has {len(self.segment_planners)} entries for {graph.num_agents} agents")
         self.graph = graph
-        self.fields = list(fields)
+        self._torus = [_torus_columns(spec) for spec in graph._robot_specs]
+        self.fields = [None if p is not None else f for f, p in zip(fields, self.segment_planners)]
         self.planner = planner
         self.planner_kwargs = dict(planner_kwargs or {})
         #: Segments in the last `solve` whose planner did not reach its goal;
@@ -327,13 +349,20 @@ class TracedTimingMPC:
         planned through that agent's `AgentField`: the leading columns in
         field coordinates by the `ntfields` planner, mapped back, endpoints
         exact, trailing columns interpolated. Segments on the same field are
-        planned together. An agent whose entry is None gets the straight
-        segment."""
+        planned together. An agent with a segment planner gets its path
+        instead; an agent with neither gets the straight segment."""
         segments = [(agent, np.asarray(start, dtype=float), np.asarray(goal, dtype=float))
                     for agent, start, goal in segments]
         traced = [None] * len(segments)
         groups = {}
         for k, (agent, start, goal) in enumerate(segments):
+            plan = self.segment_planners[agent]
+            if plan is not None:
+                lead = np.asarray(plan(start, goal), dtype=float)
+                dim = lead.shape[1]
+                lead[0], lead[-1] = start[:dim], goal[:dim]
+                traced[k] = _interpolate_trailing(lead, start, goal, self._torus[agent])
+                continue
             spec = self.fields[agent]
             if spec is None:
                 traced[k] = np.stack([start, goal])
@@ -364,10 +393,11 @@ class TracedTimingMPC:
             else:
                 results = [PLANNERS[planner](field, s, g, **self.planner_kwargs) for s, g in zip(starts, goals)]
             for k, spec, result in zip(ks, specs, results):
-                traced[k] = self._map_back(spec, segments[k][1], segments[k][2], result)
+                traced[k] = self._map_back(spec, segments[k][1], segments[k][2], result,
+                                           self._torus[segments[k][0]])
         return traced
 
-    def _map_back(self, spec, start, goal, result):
+    def _map_back(self, spec, start, goal, result, torus):
         offset = np.asarray(spec.offset, dtype=float)
         dim = offset.shape[0]
         lead = result.path.detach().cpu().numpy().astype(float) * float(spec.scale) + offset
@@ -377,7 +407,7 @@ class TracedTimingMPC:
         else:
             self.last_failed_segments += 1
             lead = np.concatenate([lead, goal[None, :dim]], axis=0)
-        return _interpolate_trailing(lead, start, goal)
+        return _interpolate_trailing(lead, start, goal, torus)
 
     @staticmethod
     def _agent_segments(x0_i, coarse_wps_i):
