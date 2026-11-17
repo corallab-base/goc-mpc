@@ -19,6 +19,8 @@
 #include "oracles/vamp_environment.hpp"
 #include "graph_timing_mpc.hpp"
 #include "graph_short_path_mpc.hpp"
+#include "repulsive_refiner.hpp"
+#include "spacetime_repulsion.hpp"
 
 using drake::symbolic::Expression;
 namespace py = pybind11;
@@ -1042,6 +1044,125 @@ void init_submodule_goc_mpc(py::module_& m) {
 		.def("clear_agent_sdf_grid", &ObstacleSet::clear_agent_sdf_grid, py::arg("agent"))
 		.def("agent_sdf_grid", &ObstacleSet::agent_sdf_grid, py::arg("agent"),
 		     py::return_value_policy::reference_internal);
+
+	// Space-time repulsion (spacetime_repulsion.hpp) and the spline refiner
+	// built on it (repulsive_refiner.hpp).
+	{
+		namespace st = spacetime_repulsion;
+		namespace rr = repulsive_refinement;
+		py::class_<st::Kernel>(goc_mpc, "SpaceTimeKernel")
+			.def(py::init([](double alpha, double beta, double time_scale, double cutoff, double relax,
+					 double reference_gap) {
+				     st::Kernel k{alpha, beta, time_scale, cutoff, relax, reference_gap};
+				     st::CheckKernel(k);
+				     return k;
+			     }),
+			     py::arg("alpha") = 2.0, py::arg("beta") = 4.5, py::arg("time_scale") = 1.0,
+			     py::arg("cutoff") = 0.3, py::arg("relax") = 0.05, py::arg("reference_gap") = 0.1)
+			.def_readwrite("alpha", &st::Kernel::alpha)
+			.def_readwrite("beta", &st::Kernel::beta)
+			.def_readwrite("time_scale", &st::Kernel::time_scale)
+			.def_readwrite("cutoff", &st::Kernel::cutoff)
+			.def_readwrite("relax", &st::Kernel::relax)
+			.def_readwrite("reference_gap", &st::Kernel::reference_gap);
+		py::class_<st::Clearance>(goc_mpc, "SpaceTimeClearance")
+			.def_readonly("inter_agent", &st::Clearance::inter_agent)
+			.def_readonly("obstacle", &st::Clearance::obstacle);
+		// Energies and their gradients w.r.t. the sampled sphere centres and
+		// sample times: per agent, `times[a]` its samples, `centers[a]`
+		// (samples * spheres) x workspace_dim, `radii[a]` its spheres.
+		auto make_agents = [](const std::vector<Eigen::VectorXd>& times, const std::vector<Eigen::MatrixXd>& centers,
+				      const std::vector<Eigen::VectorXd>& radii) {
+			if (centers.size() != radii.size() || times.size() != radii.size())
+				throw std::invalid_argument("spacetime_repulsion: times, centers and radii differ in length");
+			std::vector<st::AgentSamples> agents(centers.size());
+			for (size_t a = 0; a < centers.size(); ++a) agents[a] = {times[a], centers[a], radii[a]};
+			return agents;
+		};
+		goc_mpc.def(
+			"spacetime_repulsion",
+			[make_agents](const std::vector<Eigen::VectorXd>& times, const std::vector<Eigen::MatrixXd>& centers,
+				      const std::vector<Eigen::VectorXd>& radii, const ObstacleSet* obstacles,
+				      const st::Kernel& kernel, double obstacle_weight, bool gradient) {
+				const st::Result r = st::Evaluate(make_agents(times, centers, radii), obstacles, kernel,
+								  obstacle_weight, gradient);
+				return py::make_tuple(r.inter_agent, r.obstacle, r.gradient, r.time_gradient, r.pairs);
+			},
+			py::arg("times"), py::arg("centers"), py::arg("radii"), py::arg("obstacles") = nullptr,
+			py::arg("kernel") = st::Kernel{}, py::arg("obstacle_weight") = 1.0, py::arg("gradient") = true);
+		goc_mpc.def(
+			"spacetime_clearance",
+			[make_agents](const std::vector<Eigen::VectorXd>& times, const std::vector<Eigen::MatrixXd>& centers,
+				      const std::vector<Eigen::VectorXd>& radii, const ObstacleSet* obstacles) {
+				return st::MeasureClearance(make_agents(times, centers, radii), obstacles);
+			},
+			py::arg("times"), py::arg("centers"), py::arg("radii"), py::arg("obstacles") = nullptr);
+
+		py::class_<rr::AgentKnots>(goc_mpc, "RefinerKnots")
+			.def(py::init([](Eigen::VectorXd times, Eigen::MatrixXd wps, Eigen::MatrixXd vs, Eigen::MatrixXi active,
+					 Eigen::Matrix<bool, Eigen::Dynamic, 1> wps_free,
+					 Eigen::Matrix<bool, Eigen::Dynamic, 1> vs_free,
+					 Eigen::Matrix<bool, Eigen::Dynamic, 1> times_free) {
+				     return rr::AgentKnots{times, wps, vs, active, wps_free, vs_free, times_free};
+			     }),
+			     py::arg("times"), py::arg("wps"), py::arg("vs"), py::arg("active"), py::arg("wps_free"),
+			     py::arg("vs_free"), py::arg("times_free"))
+			.def_readonly("times", &rr::AgentKnots::times)
+			.def_readonly("wps", &rr::AgentKnots::wps)
+			.def_readonly("vs", &rr::AgentKnots::vs)
+			.def_readonly("active", &rr::AgentKnots::active)
+			.def_readonly("wps_free", &rr::AgentKnots::wps_free)
+			.def_readonly("vs_free", &rr::AgentKnots::vs_free)
+			.def_readonly("times_free", &rr::AgentKnots::times_free);
+		py::class_<rr::Options>(goc_mpc, "RefinerOptions")
+			.def(py::init<>())
+			.def_readwrite("kernel", &rr::Options::kernel)
+			.def_readwrite("repulsion_weight", &rr::Options::repulsion_weight)
+			.def_readwrite("obstacle_weight", &rr::Options::obstacle_weight)
+			.def_readwrite("speed_weight", &rr::Options::speed_weight)
+			.def_readwrite("max_speed", &rr::Options::max_speed)
+			.def_readwrite("sample_dt", &rr::Options::sample_dt)
+			.def_readwrite("horizon_margin", &rr::Options::horizon_margin)
+			.def_readwrite("max_iterations", &rr::Options::max_iterations)
+			.def_readwrite("target_clearance", &rr::Options::target_clearance)
+			.def_readwrite("max_step", &rr::Options::max_step)
+			.def_readwrite("metric_scale", &rr::Options::metric_scale)
+			.def_readwrite("min_knot_dt", &rr::Options::min_knot_dt)
+			.def_readwrite("memory", &rr::Options::memory)
+			.def_readwrite("max_backtracks", &rr::Options::max_backtracks)
+			.def_readwrite("armijo", &rr::Options::armijo)
+			.def_readwrite("agent_radii", &rr::Options::agent_radii);
+		py::class_<rr::Report>(goc_mpc, "RefinerReport")
+			.def_readonly("moved", &rr::Report::moved)
+			.def_readonly("iterations", &rr::Report::iterations)
+			.def_readonly("evaluations", &rr::Report::evaluations)
+			.def_readonly("energy_initial", &rr::Report::energy_initial)
+			.def_readonly("energy_final", &rr::Report::energy_final)
+			.def_readonly("clearance_initial", &rr::Report::clearance_initial)
+			.def_readonly("clearance_final", &rr::Report::clearance_final)
+			.def_readonly("pairs_initial", &rr::Report::pairs_initial)
+			.def_readonly("pairs_final", &rr::Report::pairs_final)
+			.def_readonly("time", &rr::Report::time)
+			.def_readonly("time_sampling", &rr::Report::time_sampling)
+			.def_readonly("time_energy", &rr::Report::time_energy)
+			.def_readonly("time_pullback", &rr::Report::time_pullback)
+			.def_readonly("time_clearance", &rr::Report::time_clearance)
+			.def_readonly("stop_reason", &rr::Report::stop_reason);
+		py::class_<rr::Refiner>(goc_mpc, "RepulsiveRefiner")
+			.def(py::init<const GraphOfConstraints&, const ObstacleSet*, rr::Options>(), py::arg("graph"),
+			     py::arg("obstacles"), py::arg("options"), py::keep_alive<1, 2>(), py::keep_alive<1, 3>())
+			.def("options", &rr::Refiner::options, py::return_value_policy::reference_internal)
+			.def("energy_and_gradient", &rr::Refiner::EnergyAndGradient, py::arg("knots"))
+			// Returns (refined knots, report); the inputs are left alone.
+			.def("refine", [](const rr::Refiner& self, std::vector<rr::AgentKnots> knots) {
+				rr::Report report;
+				{
+					py::gil_scoped_release release;
+					report = self.Refine(knots);
+				}
+				return py::make_tuple(knots, report);
+			}, py::arg("knots"));
+	}
 
 	py::class_<GraphShortPathMPC>(goc_mpc, "GraphShortPathMPC")
 		.def(py::init<const GraphOfConstraints&, unsigned int, unsigned int, double,

@@ -95,6 +95,8 @@ pybind11_add_module(_ext MODULE
     "src/ext/goc_mpc/agent_collision_model.cpp"
     "src/ext/goc_mpc/sqp_short_path_layout.cpp"
     "src/ext/goc_mpc/graph_short_path_mpc.cpp"
+    "src/ext/goc_mpc/spacetime_repulsion.cpp"
+    "src/ext/goc_mpc/repulsive_refiner.cpp"
 )
 target_link_libraries(_ext PRIVATE drake::drake nanoflann::nanoflann proxsuite::proxsuite ${SCIP_LIBRARIES})
 target_include_directories(_ext PRIVATE ${SCIP_INCLUDE_DIRS})
